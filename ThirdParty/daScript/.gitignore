@@ -1,0 +1,147 @@
+*.DS_Store
+.DS_Store
+
+benchdata.db
+
+*.output
+*.temp
+*.sf2
+
+# build artifacts
+build/
+build-track/
+build-rwdi/
+build-asan/
+build-ubsan/
+build-linux-asan/
+build-linux/
+build-mingw/
+build_eastl/
+# EASTL local-verify checkouts (build_eastl uses these via -isystem)
+eastl/
+eabase/
+# docs
+site/doc-latex/
+# daspkg per-package cmake build dirs (utils/daspkg/commands.das:976 -> {pkg_dir}/_build)
+_build/
+modules/**/_build/
+# All build binaries stored here
+bin/
+# JIT stores dll's here
+.jitted_scripts/
+# All build libraries stored here
+lib/
+modules/**/*.shared_module
+examples/**/*.shared_module
+_aot_generated/
+.vscode/
+.cache/
+
+opencoede.json
+
+# scratch smoke scripts from clang-mingw64 enablement (not part of any feature)
+_smoke*.das
+_smoke*.cpp
+_smoke*.o
+
+modules/dasSFML/libsfml/
+# site/doc/ is the Sphinx HTML output deployed by .github/workflows/pages.yml.
+# Source for site/* (forge.css, blog/_posts/*.md, _news/*.md, etc.) IS tracked;
+# the build-time output (blog/*.html, news/*.html, files/wasm/, etc.) is
+# ignored via site/.gitignore.
+site/doc/
+doc/sphinx-build/
+doc/sphinx-build-latex/
+doc/source/stdlib/generated/
+doc/source/__pycache__/
+doc/source/_build/doctrees/environment.pickle
+doc/source/_build/
+
+web/emsdk/
+web/cmake_temp/
+web/CMakeXxdImpl.txt
+web/output/daScript.html
+web/output/daScript.js
+web/output/daScript.js.mem
+web/output/daScript.wasm
+web/output/.idea/
+
+yzg.code-workspace
+daScript.code-workspace
+
+examples/wip.das
+examples/wip_macro.das
+
+utils/dasFormatter/ds_parser.output
+src/parser/ds2_parser.output
+src/parser/ds_parser.output
+
+# MCP / ast-grep (platform-specific config)
+.mcp.json
+sgconfig.yml
+utils/mcp/mcp_server.log
+.playwright-mcp/
+
+# Emscripten SDK (local install)
+emsdk/
+
+# Local `cmake --install` tree (produced by `cmake --install build --prefix install`
+# during dev iteration — used by sibling-repo work like dasProfile that consumes
+# the SDK via `find_package(DAS)`).
+install/
+
+# daspkg artifacts
+daspkg.lock
+.daspkg_global.lock
+.daspkg_standalone
+# dasImgui ships from its own repo (https://github.com/borisbat/dasImgui);
+# the modules/dasImgui/ tree is daspkg-installed locally and must NOT be
+# tracked here, or the root cmake will try to build the daspkg-standalone
+# module in-tree (broken master 2026-05-12 -> 13).
+modules/dasImgui/
+modules/.daspkg_tmp/
+modules/.daspkg_backup/
+modules/.daspkg_cache/
+modules/.daspkg.log
+examples/**/modules/
+utils/**/modules/
+# Exception: MCP test fixture for project_root flag (utils/mcp/test_tools.das
+# Tier 1 tests need a daspkg-style modules/<mod>/.das_module layout to verify
+# that -project_root flows through correctly).
+!utils/mcp/tests/_pretend_root/modules/
+!utils/mcp/tests/_pretend_root/modules/**
+
+# Claude Code (local settings + runtime state)
+.claude/
+examples/games/sequence/modules/.daspkg.log
+tutorials/integration/cpp/_standalone_ctx_generated/standalone_context.das.cpp
+tutorials/integration/cpp/_standalone_ctx_generated/standalone_context.das.h
+modules/dasAudio/dasModuleAudio.pdb
+modules/dasHV/dasModuleHV.pdb
+modules/dasLiveHost/dasModuleLiveHost.pdb
+modules/dasMinfft/dasModuleMinfft.pdb
+modules/dasPUGIXML/dasModulePUGIXML.pdb
+modules/dasSQLITE/dasModuleSQLITE.pdb
+modules/dasStbImage/dasModuleStbImage.pdb
+modules/dasStdDlg/dasModuleStdDlg.pdb
+modules/dasUnitTest/dasModuleUnitTest.pdb
+tree-sitter-daslang/daslang.pdb
+libhv.*.log
+modules/dasAudio/dasModuleAudio_debug.pdb
+modules/dasHV/dasModuleHV_debug.pdb
+modules/dasLiveHost/dasModuleLiveHost_debug.pdb
+modules/dasMinfft/dasModuleMinfft_debug.pdb
+modules/dasPUGIXML/dasModulePUGIXML_debug.pdb
+modules/dasSQLITE/dasModuleSQLITE_debug.pdb
+modules/dasStbImage/dasModuleStbImage_debug.pdb
+modules/dasStdDlg/dasModuleStdDlg_debug.pdb
+modules/dasUnitTest/dasModuleUnitTest_debug.pdb
+build-ubsan/.ninja_log
+doc/sphinx-build-latex/environment.pickle
+opencode.json
+test-results/
+logs/
+# flatten-fuzz transient dumps (generated source + failure/residual reproducers)
+_flatten_fuzz_*.das
+flatten_fuzz_fail_*.das
+flatten_fuzz_residual_*.das

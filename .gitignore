@@ -1,0 +1,50 @@
+# ===== 构建产物 =====
+.xmake/
+build/
+Build/
+/Bin/
+logs/
+
+# ===== IDE / 工具 =====
+.zed/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.codegraph/
+.playwright-mcp/
+
+# ===== Python =====
+__pycache__/
+*.pyc
+
+# ===== 自动生成代码 =====
+**/Generated/
+!**/Generated/.gitignore
+**/AutoGen/*.gen.h
+**/AutoGen/*.gen.cpp
+!**/AutoGen/.gitignore
+
+# ===== 测试残留 =====
+test_compiler_tmp/
+
+# ===== 三方库（源码 vendoring，按需选择性提交） =====
+# 如果选择 git submodule 管理 ThirdParty/，则取消下面的注释
+# ThirdParty/*/
+# !ThirdParty/.gitignore
+
+# ===== ThirdParty 构建中间文件 + 编译产物 =====
+ThirdParty/Build/
+
+# libpq 是手动管理的，不忽略
+ThirdParty/Bin/*
+!ThirdParty/Bin/libpq/
+
+# ===== 运行时 =====
+*.log
+core.*
+*.dmp
+
+# ===== 文档（AI 辅助生成，按需提交） =====
+Doc/

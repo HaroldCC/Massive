@@ -1,0 +1,149 @@
+Checks: "
+  bugprone-*,
+  -bugprone-exception-escape,
+  -bugprone-easily-swappable-parameters,
+
+  clang-analyzer-*,
+
+  concurrency-*,
+
+  cppcoreguidelines-*,
+  -cppcoreguidelines-macro-usage,
+  -cppcoreguidelines-owning-memory,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -cppcoreguidelines-pro-type-vararg,
+  -cppcoreguidelines-avoid-c-arrays,
+  -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  -cppcoreguidelines-pro-bounds-array-to-pointer-decay,
+  -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  -cppcoreguidelines-pro-type-cstyle-cast,
+  -cppcoreguidelines-non-private-member-variables-in-classes,
+
+  google-*,
+  -google-readability-casting,
+
+  hicpp-*,
+  -hicpp-vararg,
+  -hicpp-use-auto,
+  -hicpp-no-array-decay,
+  -hicpp-avoid-c-arrays,
+  -hicpp-signed-bitwise,
+
+  modernize-*,
+  -modernize-use-trailing-return-type,
+  -modernize-avoid-bind,
+  -modernize-avoid-c-arrays,
+  -modernize-use-auto,
+
+  performance-*,
+
+  portability-*,
+
+  readability-*,
+  -readability-magic-numbers,
+  -readability-make-member-function-const,
+  -readability-implicit-bool-conversion,
+  -readability-redundant-access-specifiers,
+
+  "
+
+CheckOptions:
+  # 结构体名使用大驼峰
+  - key:             readability-identifier-naming.StructCase
+    value:           CamelCase
+
+  # 结构体成员使用小驼峰，无前缀
+  - key:             readability-identifier-naming.PublicMemberCase
+    value:           camelBack
+
+  # 枚举类型名使用大驼峰
+  - key:             readability-identifier-naming.EnumCase
+    value:           CamelCase
+
+  # 枚举常量全大写+下划线（MSG_MOVE_REQ, SCENE_MAIN_CITY）
+  - key:             readability-identifier-naming.EnumConstantCase
+    value:           UPPER_CASE
+
+  # 抽象接口类使用大驼峰，并且加上I前缀
+  - key:             readability-identifier-naming.AbstractClassCase
+    value:           CamelCase
+  - key:             readability-identifier-naming.AbstractClassPrefix
+    value:           I
+
+  # 类名使用大驼峰
+  - key:             readability-identifier-naming.ClassCase
+    value:           CamelCase
+
+  # 类静态常量使用 k + 大驼峰（kHotThreshold, kMaxPacketSize）
+  - key:             readability-identifier-naming.ClassConstantCase
+    value:           CamelCase
+  - key:             readability-identifier-naming.ClassConstantPrefix
+    value:           k
+
+  # 类成员变量使用前缀 _ + 小驼峰
+  - key:             readability-identifier-naming.PrivateMemberCase
+    value:           camelBack
+  - key:             readability-identifier-naming.PrivateMemberPrefix
+    value:           _
+
+  # 类静态成员变量使用前缀 _ + 小驼峰
+  - key:             readability-identifier-naming.ClassMemberCase
+    value:           camelBack
+  - key:             readability-identifier-naming.ClassMemberPrefix
+    value:           _
+
+  # 常量使用前缀 g_ + 大驼峰
+  # - key:             readability-identifier-naming.ConstantCase
+  #   value:           CamelCase
+  # - key:             readability-identifier-naming.ConstantPrefix
+  #   value:           g_
+
+  # 函数使用大驼峰
+  - key:             readability-identifier-naming.FunctionCase
+    value:           CamelCase
+
+  # 变量使用小驼峰
+  - key:             readability-identifier-naming.VariableCase
+    value:           camelBack
+
+  # 全局变量使用前缀 g_ + 小驼峰
+  - key:             readability-identifier-naming.GlobalVariableCase
+    value:           CamelCase
+  - key:             readability-identifier-naming.GlobalVariablePrefix
+    value:           g_
+
+  # 宏定义使用大写下划线
+  - key:             readability-identifier-naming.MacroDefinitionCase
+    value:           UPPER_CASE
+
+  # 函数参数使用小驼峰
+  - key:             readability-identifier-naming.ParameterCase
+    value:           camelBack
+
+  # 模板参数名称使用大驼峰
+  - key:             readability-identifier-naming.TemplateParameterCase
+    value:           CamelCase
+
+  # 使用typedef和using重命名类型时，使用大驼峰
+  - key:             readability-identifier-naming.TypedefCase
+    value:           CamelCase
+  - key:             readability-identifier-naming.TypeAliasCase
+    value:           CamelCase
+
+  - key: readability-function-size.LineThreshold
+    value: 150
+  # 函数参数超过5个的警报
+  - key: readability-function-size.ParameterThreshold
+    value: 5
+  # 函数嵌套超过4个的警报
+  - key: readability-function-size.NestingThreshold
+    value: 5
+  - key: misc-non-private-member-variables-in-classes.IgnoreClassesWithAllMemberVariablesBeingPublic
+    value: true
+  - key: cppcoreguidelines-non-private-member-variables-in-classes.IgnoreClassesWithAllMemberVariablesBeingPublic
+    value: true
+  - key: cppcoreguidelines-pro-type-member-init.UseAssignment
+    value: true
+WarningsAsErrors: ""
+HeaderFilterRegex: "/(src|test)/include"
+AnalyzeTemporaryDtors: true

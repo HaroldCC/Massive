@@ -1,0 +1,103 @@
+#include "daScript/misc/platform.h"
+
+#ifdef _MSC_VER
+#pragma warning(disable:4505)
+#endif
+
+#include "daScript/simulate/simulate_fusion.h"
+
+#if DAS_FUSION
+
+#include "daScript/simulate/sim_policy.h"
+#include "daScript/ast/ast.h"
+#include "daScript/simulate/simulate_fusion_op1.h"
+#include "vecmath/dag_vecMathDecl.h"
+
+namespace das {
+
+/* Return Any */
+
+#undef IMPLEMENT_ANY_OP1_NODE
+#define IMPLEMENT_ANY_OP1_NODE(INLINE,OPNAME,TYPE,CTYPE,RCTYPE,COMPUTE) \
+    struct SimNode_Op1##COMPUTE : SimNode_Op1Fusion { \
+        NO_ASAN_INLINE vec4f doEval ( Context & context ) { \
+            DAS_PROFILE_NODE \
+            auto lv =  subexpr.compute##COMPUTE(context); \
+            context.stopFlags |= EvalFlags::stopForReturn; \
+            DAS_LDU_WORKHORSE(context.abiResult(), lv, CTYPE); \
+            return v_zero(); \
+        } \
+        DAS_EVAL_ABI virtual vec4f eval ( Context & context ) override { \
+            return doEval(context); \
+        } \
+    };
+
+#undef FUSION_OP1_SUBEXPR
+#define FUSION_OP1_SUBEXPR(CTYPE,node)      ((static_cast<SimNode_Return*>(node))->subexpr)
+
+#include "daScript/simulate/simulate_fusion_op1_impl.h"
+#include "daScript/simulate/simulate_fusion_op1_perm.h"
+
+IMPLEMENT_ANY_OP1_FUSION_POINT(__forceinline,Return,,vec4f,vec4f)
+
+/* Return Scalar */
+
+#undef MATCH_ANY_OP1_NODE
+#define MATCH_ANY_OP1_NODE(CTYPE,NODENAME,COMPUTE) \
+    else if ( is(info,node_x,NODENAME,(typeName<CTYPE>::name())) ) { return ccode.makeNode<SimNode_Op1##COMPUTE>(); }
+
+#undef IMPLEMENT_ANY_OP1_NODE
+#define IMPLEMENT_ANY_OP1_NODE(INLINE,OPNAME,TYPE,CTYPE,RCTYPE,COMPUTE) \
+    struct SimNode_Op1##COMPUTE : SimNode_Op1Fusion { \
+        DAS_EVAL_ABI virtual vec4f eval ( Context & context ) override { \
+            DAS_PROFILE_NODE \
+            auto lv =  FUSION_OP_PTR_VALUE(CTYPE,subexpr.compute##COMPUTE(context)); \
+            context.stopFlags |= EvalFlags::stopForReturn; \
+            context.abiResult() = cast<CTYPE>::from(lv); \
+            return v_zero(); \
+        } \
+    };
+
+#include "daScript/simulate/simulate_fusion_op1_impl.h"
+#include "daScript/simulate/simulate_fusion_op1_perm.h"
+
+    IMPLEMENT_OP1_WORKHORSE_FUSION_POINT(Return);
+
+/* Return Vec */
+
+#undef IMPLEMENT_ANY_OP1_NODE
+#define IMPLEMENT_ANY_OP1_NODE(INLINE,OPNAME,TYPE,CTYPE,RCTYPE,COMPUTE) \
+    struct SimNode_Op1##COMPUTE : SimNode_Op1Fusion { \
+        NO_ASAN_INLINE vec4f doEval ( Context & context ) { \
+            DAS_PROFILE_NODE \
+            auto lv =  subexpr.compute##COMPUTE(context); \
+            context.stopFlags |= EvalFlags::stopForReturn; \
+            DAS_LDU_WORKHORSE(context.abiResult(), lv, CTYPE); \
+            return v_zero(); \
+        } \
+        DAS_EVAL_ABI virtual vec4f eval ( Context & context ) override { \
+            return doEval(context); \
+        } \
+    };
+
+#include "daScript/simulate/simulate_fusion_op1_impl.h"
+#include "daScript/simulate/simulate_fusion_op1_perm.h"
+
+    IMPLEMENT_OP1_NUMERIC_VEC(Return);
+
+#undef REGISTER_OP1_FUSION_POINT
+#define REGISTER_OP1_FUSION_POINT(OPNAME,TYPE,CTYPE) \
+    (*getFusionEngine())[#OPNAME].emplace_back(new Op1FusionPoint_##OPNAME##_##CTYPE());
+
+#include "daScript/simulate/simulate_fusion_op1_reg.h"
+
+    void createFusionEngine_return()
+    {
+        REGISTER_OP1_WORKHORSE_FUSION_POINT(Return);
+        REGISTER_OP1_NUMERIC_VEC(Return);
+        (*getFusionEngine())["Return"].emplace_back(new Op1FusionPoint_Return_vec4f());
+    }
+}
+
+#endif
+

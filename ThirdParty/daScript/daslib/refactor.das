@@ -1,0 +1,213 @@
+options gen2
+options indenting = 4
+options strict_smart_pointers = true
+
+module refactor shared private
+
+//! Automated refactoring tools.
+//!
+//! Provides ``extract_method`` and ``rename`` tag-function macros that
+//! restructure code at compile time. Used by editor tooling and IDE
+//! integration.
+
+require daslib/ast_boost
+require daslib/templates_boost
+require daslib/macro_boost
+require daslib/json_boost
+require daslib/defer
+require strings
+
+let LOG_REFACTOR = 100500
+
+[tag_function(extract_method_tag), sideeffects, unused_argument(method_name)]
+def public extract_method(method_name : string; blk : block) {
+    //! Marks a block of code for method extraction refactoring.
+    invoke(blk)
+}
+
+[tag_function(extract_method_tag), sideeffects]
+def public extract_expression(method_name : string; expr) {
+    //! Marks an expression for expression extraction refactoring.
+    return expr
+}
+
+def log_range(at : LineInfo) {
+    return "{describe(at)}-{int(at.last_line)}:{int(at.last_column)}"
+}
+
+struct ExtractMethodDesc {
+    //! Descriptor for extract-method refactoring.
+    call_name : string
+    function_declaration : string
+    call_expression : string
+    @safe_when_uninitialized call_at : LineInfo
+    @safe_when_uninitialized function_body_at : LineInfo
+}
+
+def JV(li : LineInfo) {
+    let fname = li.fileInfo != null ? string(li.fileInfo.name) : ""
+    let tabSize = li.fileInfo?.tabSize ?? 4
+    var inscope kv <- { "line" => "{int(li.line)}", "column" => "{int(li.column)}", "last_line" => "{int(li.last_line)}", "last_column" => "{int(li.last_column)}", "file" => fname, "tab" => "{tabSize}" }
+    return JV(kv)
+}
+
+[tag_function_macro(tag="extract_method_tag")]
+class ExtractMethodMacro : AstFunctionAnnotation {
+    //! Function annotation implementing extract-method refactoring.
+    method_tag = "!!!extract_method"
+    def override verifyCall(var call : ExprCallFunc?; args, progArgs : AnnotationArgumentList; var errors : das_string) : bool {
+        if (!(call.arguments[0] is ExprConstString)) {
+            print("extract_method: first argument must be a string literal")
+            return false
+        }
+        var captured <- capture_block(call.arguments[1])
+        sort(captured) <| $(a, b) => string(a.variable.name) < string(b.variable.name)
+        let call_name = string((call.arguments[0] as ExprConstString).value)
+        let function_declaration = build_string() $(writer) {
+            writer |> write("def ")
+            writer |> write(call_name)
+            if (!empty(captured)) {
+                writer |> write(" ( ")
+                var first = true
+                for (v in captured) {
+                    if (first) {
+                        first = false
+                    } else {
+                        writer |> write("; ")
+                    }
+                    // access_info_pass_mutable: a callee inside the extracted block demands a
+                    // mutable ref even if it never writes — a const param would not compile
+                    let needs_mutable = v.variable.access_flags.access_ref || v.variable.access_info.access_info_pass_mutable
+                    if (!v.variable._type.flags.constant && needs_mutable) {
+                        writer |> write("var ")
+                    }
+                    writer |> write(v.variable.name)
+                    writer |> write(":")
+                    writer |> write(describe(v.variable._type))
+                    if (v.variable._type.isWorkhorseType && needs_mutable) {
+                        writer |> write("&")
+                    }
+                }
+                writer |> write(" )")
+            }
+        }
+
+        let call_expression = build_string() $(writer) {
+            writer |> write(call_name)
+            writer |> write("(")
+            if (!empty(captured)) {
+                var first = true
+                for (v in captured) {
+                    if (first) {
+                        first = false
+                    } else {
+                        writer |> write(",")
+                    }
+                    writer |> write(v.variable.name)
+                }
+            }
+            writer |> write(")")
+        }
+        assume atCall = call.atEnclosure
+        assume atBlock = call.arguments[1].at
+        var jv <- JV(ExtractMethodDesc(
+            call_name = call_name,
+            function_declaration = function_declaration,
+            call_expression = call_expression,
+            call_at = atCall,
+            function_body_at = atBlock
+        ))
+        to_compilation_log("{method_tag}\n{write_json(jv)}\n!!!\n")
+        unsafe {
+            delete jv
+        }
+        return true
+    }
+}
+
+struct ExtractVariableDesc {
+    //! Descriptor for extract-variable refactoring.
+    variable_name : string
+    variable_type : string
+    variable_keyword : string
+    is_reference : bool
+    @safe_when_uninitialized call_at : LineInfo
+    @safe_when_uninitialized variable_init_at : LineInfo
+}
+
+[tag_function(extract_variable_tag), sideeffects]
+def public extract_variable_nonref(method_name : string; expr) {
+    //! Marks an expression for variable extraction by value.
+    return expr
+}
+
+[tag_function(extract_variable_tag), sideeffects]
+def public extract_variable_ref(method_name : string; var expr : auto(TT)& ==const) : TT& {
+    //! Marks an expression for variable extraction by reference.
+    unsafe {
+        return expr
+    }
+}
+
+[call_macro(name="extract_variable")]
+class ExtractVariableMacro : AstCallMacro {
+    //! Call macro implementing extract-variable refactoring.
+    def override visit(prog : ProgramPtr; mod : Module?; var expr : ExprCallMacro?) : ExpressionPtr {
+        if (!(expr.arguments[0] is ExprConstString)) {
+            macro_error(prog, expr.at, "extract_variable: first argument must be a string literal")
+            return null
+        }
+        assume varType = expr.arguments[1]._type
+        if (varType == null || varType.isAutoOrAlias) {
+            macro_error(prog, expr.at, "extract_variable: unresolve expression type")
+            return null
+        }
+        var ccall = new ExprCall(at = expr.at)
+        ccall.name := (varType.isRef && !varType.isConst) ? "extract_variable_ref" : "extract_variable_nonref"
+        ccall.arguments |> emplace_new <| clone_expression(expr.arguments[0])
+        ccall.arguments |> emplace_new <| clone_expression(expr.arguments[1])
+        return ccall
+    }
+}
+
+[tag_function_macro(tag="extract_variable_tag")]
+class ExtractVariableFunction : AstFunctionAnnotation {
+    //! Function annotation for extract-variable target functions.
+    method_tag = "!!!extract_variable"
+    def override transform(var call : ExprCallFunc?; var errors : das_string) : ExpressionPtr {
+        assume cffg = call.func.fromGeneric
+        assume varType = call.arguments[1]._type
+        if (call.func != null && cffg != null && cffg.name == "extract_variable") {
+            if (varType.isConst || !varType.isRef) {
+                var ccall = clone_expression(call)
+                (ccall as ExprCall).name := "extract_variable_nonref"
+                return ccall
+            }
+        }
+        return null
+    }
+    def override verifyCall(var call : ExprCallFunc?; args, progArgs : AnnotationArgumentList; var errors : das_string) : bool {
+        if (!(call.arguments[0] is ExprConstString)) {
+            print("extract_variable: first argument must be a string literal")
+            return false
+        }
+        assume varType = call.arguments[1]._type
+        let variable_name = string((call.arguments[0] as ExprConstString).value)
+        assume atCall = call.atEnclosure
+        assume atBlock = call.arguments[1].at
+        var jv <- JV(ExtractVariableDesc(
+            variable_name = variable_name,
+            call_at = atCall,
+            variable_type = describe(varType),
+            variable_keyword = varType.isConst ? "let" : "var",
+            is_reference = varType.isRef && !varType.isConst,
+            variable_init_at = atBlock
+        ))
+        to_compilation_log("{method_tag}\n{write_json(jv)}\n!!!\n")
+        unsafe {
+            delete jv
+        }
+        return true
+    }
+}
+

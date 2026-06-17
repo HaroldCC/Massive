@@ -1,0 +1,215 @@
+// Tutorial PEG-02: Arithmetic Calculator
+//
+// This tutorial covers:
+//   - Operator precedence via grammar layering
+//   - The `number` built-in terminal
+//   - PEEK for positive lookahead, ! for negative lookahead
+//   - commit (cut operator) for error reporting
+//   - WS for whitespace handling
+//   - Recursive rules (parenthesized expressions)
+//
+// Prerequisites: Tutorial PEG-01
+//
+// Run: daslang.exe tutorials/dasPEG/02_calculator.das
+
+options gen2
+options no_unused_block_arguments = false
+options no_unused_function_arguments = false
+options no_aot = true
+options strict_smart_pointers = true
+options stack = 1000000
+
+require peg/peg
+
+
+// ──────────────────────────────────────────────────────────────────────────
+// The Calculator Grammar
+// ──────────────────────────────────────────────────────────────────────────
+//
+// Operator precedence is encoded in the grammar structure:
+//   expr  ->  add       (lowest precedence: + and -)
+//   add   ->  mul       (middle: * and /)
+//   mul   ->  unary     (high: unary -)
+//   unary ->  prim      (highest: numbers and parentheses)
+//
+// Each level tries its operator, then falls through to the next level.
+// This is the classic PEG approach to precedence.
+
+def calc(input : string; blk : block<(val : int; err : array<ParsingError>) : void>) {
+    parse(input) {
+        // Entry rule: parse the full expression, expect EOF
+        var expr : int
+        rule(add as a, WS, EOF) {
+            return a
+        }
+
+        // Addition and subtraction (left-associative via left-recursion)
+        var add : int
+        rule(add as a, WS, "+", commit, WS, mul as m) {
+            return a + m
+        }
+        rule(add as a, WS, "-", commit, WS, mul as m) {
+            return a - m
+        }
+        rule(mul as m) {
+            return m
+        }
+
+        // Multiplication and division
+        var mul : int
+        rule(mul as m, WS, "*", commit, WS, unary as u) {
+            return m * u
+        }
+        rule(mul as m, WS, "/", commit, WS, unary as u) {
+            return m / u
+        }
+        rule(unary as u) {
+            return u
+        }
+
+        // Unary negation
+        var unary : int
+        rule("-", commit, WS, unary as u) {
+            return -u
+        }
+        rule(prim as p) {
+            return p
+        }
+
+        // Primary: parenthesized expression or number
+        var prim : int
+        rule("(", commit, WS, add as a, WS, ")") {
+            return a
+        }
+        rule(PEEK(set('0'..'9')), commit, number as n) {
+            return n
+        }
+    }
+}
+
+
+// ──────────────────────────────────────────────────────────────────────────
+// Evaluating expressions
+// ──────────────────────────────────────────────────────────────────────────
+
+def eval_and_print(input : string) {
+    calc(input) $(val; err) {
+        if (empty(err)) {
+            print("  {input} = {val}\n")
+        } else {
+            print("  {input} -> ERROR: {err[0].text}\n")
+        }
+    }
+}
+
+
+// ──────────────────────────────────────────────────────────────────────────
+// Negative lookahead — guard an identifier against reserved keywords
+// ──────────────────────────────────────────────────────────────────────────
+//
+// `!rule` is the mirror image of PEEK: it consumes nothing, but the match
+// succeeds only when `rule` FAILS at this position. The classic use is keyword
+// guarding — accept an identifier UNLESS it is a reserved word. We negate a
+// `keyword` rule that matches a WHOLE keyword (the literal up to EOF), so "if"
+// and "then" are rejected but identifiers that merely start with them ("ifx")
+// are still accepted. (Negating the bare literal `!"if"` would wrongly reject
+// "ifx" too, since the literal matches a prefix.)
+
+def identifier(input : string; blk : block<(val : string; err : array<ParsingError>) : void>) {
+    parse(input) {
+        var ident : string
+        rule(!keyword, "{+alpha}" as word, EOF) {
+            return word
+        }
+        // A reserved keyword is the whole word: the literal then EOF.
+        var keyword : void?
+        rule("if", EOF) {
+            return null
+        }
+        rule("then", EOF) {
+            return null
+        }
+        var alpha : void?
+        rule(set('a'..'z', 'A'..'Z')) {
+            return null
+        }
+    }
+}
+
+def try_identifier(input : string) {
+    // A keyword-rejected parse captures no word, so `val` stays empty. (`err` is
+    // empty on a bare lookahead failure — there is no `commit` — so the captured
+    // value, not the error list, is what distinguishes accept from reject here.)
+    identifier(input) $(val; _err) {
+        if (!empty(val)) {
+            print("  {input} -> identifier \"{val}\"\n")
+        } else {
+            print("  {input} -> rejected (reserved keyword)\n")
+        }
+    }
+}
+
+
+[export]
+def main {
+    print("=== Basic arithmetic ===\n")
+    eval_and_print("2 + 3")
+    eval_and_print("10 - 4")
+    eval_and_print("6 * 7")
+    eval_and_print("20 / 4")
+
+    print("\n=== Precedence ===\n")
+    eval_and_print("2 + 3 * 4")       // 14, not 20
+    eval_and_print("(2 + 3) * 4")     // 20
+    eval_and_print("10 - 2 * 3")      // 4
+
+    print("\n=== Unary minus ===\n")
+    eval_and_print("-5")
+    eval_and_print("-5 + 3")
+    eval_and_print("-(2 + 3)")
+
+    print("\n=== Complex expressions ===\n")
+    eval_and_print("1 + 2 * 2 + 1 - (3 * 2 + 1 * 2) - 1 - 1 - 1 * 2")
+    eval_and_print("((((1 + 2))))")
+
+    print("\n=== Error cases ===\n")
+    eval_and_print("2 +")
+    eval_and_print("(2 + 3")
+    eval_and_print("* 3")
+
+    print("\n=== Negative lookahead (keyword guard) ===\n")
+    try_identifier("hello")     // accepted — not a keyword
+    try_identifier("if")        // rejected — reserved
+    try_identifier("then")      // rejected — reserved
+    try_identifier("ifx")       // accepted — only the exact keyword is reserved
+}
+
+// Expected output:
+// === Basic arithmetic ===
+//   2 + 3 = 5
+//   10 - 4 = 6
+//   6 * 7 = 42
+//   20 / 4 = 5
+//
+// === Precedence ===
+//   2 + 3 * 4 = 14
+//   (2 + 3) * 4 = 20
+//   10 - 2 * 3 = 4
+//
+// === Unary minus ===
+//   -5 = -5
+//   -5 + 3 = -2
+//   -(2 + 3) = -5
+//
+// === Complex expressions ===
+//   1 + 2 * 2 + 1 - (3 * 2 + 1 * 2) - 1 - 1 - 1 * 2 = -6
+//   ((((1 + 2)))) = 3
+//
+// === Error cases ===
+//   (error messages for invalid expressions)
+//
+// === Negative lookahead (keyword guard) ===
+//   hello -> identifier "hello"
+//   if -> rejected (reserved keyword)
+//   then -> rejected (reserved keyword)
+//   ifx -> identifier "ifx"

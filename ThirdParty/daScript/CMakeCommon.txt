@@ -1,0 +1,384 @@
+MACRO(SOURCE_GROUP_FILES _groupName _fileNames )
+	STRING(REGEX REPLACE "/" "\\\\" _groupNameP ${_groupName} )
+	SOURCE_GROUP( ${_groupNameP} FILES ${${_fileNames}} )
+	SET_SOURCE_FILES_PROPERTIES( ${${_fileNames}} PROPERTIES "MY_GROUP_NAME" ${_groupNameP} )
+ENDMACRO(SOURCE_GROUP_FILES)
+
+include(CheckIPOSupported)
+check_ipo_supported(RESULT supported OUTPUT error)
+
+MACRO(SETUP_LTO _targetName)
+	# Disable Win32 LTO due to compiler bug (most likely `v_ldu_ptr` inlining).
+	IF(supported AND NOT (MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 4))
+        set_property(TARGET ${_targetName} PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+    ENDIF()
+ENDMACRO()
+
+IF(WIN32)
+include(CheckCXXSourceRuns)
+
+# AVX
+set(CMAKE_REQUIRED_FLAGS "-mavx")
+set(AVX_TEST_SOURCE "
+#include <immintrin.h>
+int main() {
+    __m256 a = _mm256_set_ps(0, 1, 2, 3, 4, 5, 6, 7);
+    __m256 b = _mm256_set_ps(7, 6, 5, 4, 3, 2, 1, 0);
+    __m256 c = _mm256_add_ps(a, b);
+    return 0;
+}")
+check_cxx_source_runs("${AVX_TEST_SOURCE}" AVX_SUPPORTED)
+
+# AVX2
+set(CMAKE_REQUIRED_FLAGS "-mavx2")
+set(AVX2_TEST_SOURCE "
+#include <immintrin.h>
+int main() {
+    __m256i a = _mm256_set_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    __m256i b = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
+    __m256i c = _mm256_add_epi32(a, b);
+    return 0;
+}")
+check_cxx_source_runs("${AVX2_TEST_SOURCE}" AVX2_SUPPORTED)
+
+set(AVX512_TEST_SOURCE "
+#include <immintrin.h>
+int main() {
+    __m512d a = _mm512_set_pd(0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0);
+    __m512d b = _mm512_set_pd(7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0);
+    __m512d c = _mm512_add_pd(a, b);
+    return 0;
+}")
+
+check_cxx_source_runs("${AVX512_TEST_SOURCE}" AVX512_SUPPORTED)
+
+# SSE2
+set(CMAKE_REQUIRED_FLAGS "-msse2")
+set(SSE2_TEST_SOURCE "
+#include <emmintrin.h>
+int main() {
+    __m128i a = _mm_set_epi32(0, 1, 2, 3);
+    __m128i b = _mm_set_epi32(3, 2, 1, 0);
+    __m128i c = _mm_add_epi32(a, b);
+    return 0;
+}")
+check_cxx_source_runs("${SSE2_TEST_SOURCE}" SSE2_SUPPORTED)
+ENDIF()
+
+MACRO(SETUP_SANITIZERS)
+    # apple | unix | win32 clang
+    IF(APPLE OR UNIX OR (WIN32 AND (("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang" AND (NOT CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")))))
+        IF(DAS_USE_SANITIZER STREQUAL "address" OR DAS_USE_SANITIZER STREQUAL "asan")
+            MESSAGE(STATUS "Enabling AddressSanitizer")
+            ADD_COMPILE_OPTIONS(-fsanitize=address -fno-sanitize-recover=all -fno-omit-frame-pointer)
+            ADD_LINK_OPTIONS(-fsanitize=address)
+            ADD_COMPILE_DEFINITIONS(DAS_VEC_SAFE_LOADS=1)
+        ELSEIF(DAS_USE_SANITIZER STREQUAL "undefined" OR DAS_USE_SANITIZER STREQUAL "ubsan")
+            MESSAGE(STATUS "Enabling UndefinedBehaviorSanitizer")
+            # Ignore overflows, negative integer shifts (left side), and enums values.
+            # Das allows to create, for e.g. x &= ~EnumT.a, which is technically UB on c++ side
+            ADD_COMPILE_OPTIONS(-fsanitize=undefined -fno-sanitize-recover=all -fno-sanitize=signed-integer-overflow -fno-sanitize=shift -fno-sanitize=enum)
+            ADD_LINK_OPTIONS(-fsanitize=undefined)
+            ADD_COMPILE_DEFINITIONS(DAS_VEC_SAFE_LOADS=1)
+        ELSEIF(DAS_USE_SANITIZER STREQUAL "thread" OR DAS_USE_SANITIZER STREQUAL "tsan")
+            MESSAGE(STATUS "Enabling ThreadSanitizer")
+            ADD_COMPILE_OPTIONS(-fsanitize=thread)
+            ADD_LINK_OPTIONS(-fsanitize=thread)
+            ADD_COMPILE_DEFINITIONS(DAS_VEC_SAFE_LOADS=1)
+        ENDIF()
+    ELSEIF(MSVC)
+        IF(DAS_USE_SANITIZER STREQUAL "address" OR DAS_USE_SANITIZER STREQUAL "asan")
+            MESSAGE(STATUS "Enabling AddressSanitizer")
+            ADD_COMPILE_OPTIONS(/fsanitize=address)
+        ENDIF()
+    ENDIF()
+ENDMACRO()
+
+# Some options are defines and should be exported together with library.
+MACRO(SETUP_LIB_DEFINITIONS _target)
+    # Allow command-line override: cmake -DDAS_NO_ASSERTIONS=1
+    if(DEFINED DAS_NO_ASSERTIONS)
+        if(DAS_NO_ASSERTIONS)
+            target_compile_definitions(${_target} PUBLIC DAS_NO_ASSERTIONS)
+        endif()
+        # else: don't define it at all
+    else()
+        target_compile_definitions(${_target} PUBLIC
+            $<$<CONFIG:Release>:DAS_NO_ASSERTIONS>
+            $<$<CONFIG:MinSizeRel>:DAS_NO_ASSERTIONS>
+            $<$<CONFIG:RelWithDebInfo>:DAS_NO_ASSERTIONS>
+        )
+    endif()
+    # RelWithDebInfo is our heap-leak audit configuration and MUST match Release
+    # codegen (fusion, inlining) so diagnostics are representative of what ships.
+    target_compile_definitions(${_target} PUBLIC
+        $<$<CONFIG:Release>:DAS_FUSION=2>
+        $<$<CONFIG:MinSizeRel>:DAS_FUSION=1>
+        $<$<CONFIG:RelWithDebInfo>:DAS_FUSION=2>
+    )
+ENDMACRO()
+
+MACRO(SETUP_COMPILER)
+    SETUP_SANITIZERS()
+    IF("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
+        # GNU uses strict aliasing optimizations too hard, which breaks our code
+        ADD_COMPILE_OPTIONS(-Wno-strict-aliasing) # disable warnings
+        ADD_COMPILE_OPTIONS(-fno-strict-aliasing) # disable strict aliasing optimizations
+    ENDIF()
+    # Treat signed integer overflow as two's-complement wrap.
+    # daslang signed arithmetic is defined to wrap. AOT lowers it to plain C++
+    # `int * int` / `int + int`, which is UB at the C++ level and modern
+    # clangs (AppleClang 21+, mingw clang 22+, presumably newer linux clangs)
+    # exploit it (e.g. the LCG step in daslib/random.das becomes miscompiled,
+    # producing values that violate the trailing `& 0x7FFF` mask). -fwrapv
+    # makes the C++ output faithfully match daslang's semantics across every
+    # gcc / clang-driver build (excluding clang-cl, which uses MSVC-style
+    # flags and doesn't expose this option; MSVC defaults to wrap anyway).
+    IF("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU" OR
+       ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang" AND
+        NOT CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC") OR
+       "${CMAKE_CXX_COMPILER_ID}" STREQUAL "AppleClang")
+        ADD_COMPILE_OPTIONS(-fwrapv)
+    ENDIF()
+    IF(EMSCRIPTEN)
+        ADD_COMPILE_OPTIONS(-Wno-ignored-attributes)
+        ADD_COMPILE_OPTIONS(-Wno-unused-command-line-argument)
+        ADD_COMPILE_OPTIONS(-Wno-ignored-pragmas)
+        ADD_COMPILE_OPTIONS(-Wno-deprecated-declarations)
+		set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-invalid-offsetof")
+		SET(CMAKE_CXX_FLAGS_RELEASE "-O3 -fno-rtti -fomit-frame-pointer -fno-stack-protector -s -DNDEBUG=1")
+		SET(CMAKE_CXX_FLAGS_MINSIZEREL "-Os -fno-rtti -fomit-frame-pointer -fno-stack-protector -s -DNDEBUG=1")
+		SET(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -fno-rtti -fno-stack-protector -DNDEBUG=1")
+	ELSEIF(APPLE)
+		ADD_DEFINITIONS(-DITS_PLATFORM_APPLE=1)
+		ADD_DEFINITIONS(-Wall -Wextra -pedantic)
+		# -fwrapv now applied unconditionally to every gcc/clang build at the
+		# top of SETUP_COMPILER (was Apple-only originally; mingw clang 22+
+		# hits the same UB-exploit, see comment above the unified gate).
+		# UNCOMMENT FOR ASAN
+		# ADD_DEFINITIONS("-fsanitize=thread")
+		# SET(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=thread")
+        IF ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
+			ADD_COMPILE_OPTIONS(-Wno-pedantic)
+			ADD_COMPILE_OPTIONS(-Wno-ignored-attributes)
+			ADD_COMPILE_OPTIONS(-Wno-unused-but-set-variable)
+			ADD_COMPILE_OPTIONS(-Wno-unused-parameter)
+			ADD_COMPILE_OPTIONS(-Wno-strict-aliasing)
+			ADD_COMPILE_OPTIONS(-Wno-extra)
+			ADD_COMPILE_OPTIONS(-Wno-unused-value)
+			ADD_COMPILE_OPTIONS(-Wno-unused-variable)
+			ADD_COMPILE_OPTIONS(-Wno-class-memaccess)
+			ADD_COMPILE_OPTIONS(-Wno-invalid-offsetof)
+		    SET(CMAKE_CXX_FLAGS_RELEASE "-O3 -fno-rtti -fomit-frame-pointer -fno-stack-protector -s -DNDEBUG=1")
+			SET(CMAKE_CXX_FLAGS_MINSIZEREL "-Os -fno-rtti -fomit-frame-pointer -fno-stack-protector -s -DNDEBUG=1")
+		    SET(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -fno-rtti -fno-stack-protector -DNDEBUG=1")
+        ELSE()
+			ADD_COMPILE_OPTIONS(-Wno-c99-extensions)
+			ADD_COMPILE_OPTIONS(-Wno-unused-variable)
+			ADD_COMPILE_OPTIONS(-Wno-deprecated-declarations)
+			ADD_COMPILE_OPTIONS(-Wno-missing-field-initializers)
+			ADD_COMPILE_OPTIONS(-Wno-deprecated-copy)
+            SET(CMAKE_CXX_FLAGS_RELEASE "-O3 -fno-rtti -fomit-frame-pointer -fno-stack-protector -DNDEBUG=1")
+			SET(CMAKE_CXX_FLAGS_MINSIZEREL "-Os -fno-rtti -fomit-frame-pointer -fno-stack-protector -DNDEBUG=1")
+            SET(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -fno-rtti -fno-stack-protector -DNDEBUG=1")
+			SET(CMAKE_EXE_LINKER_FLAGS_RELEASE "${CMAKE_EXE_LINKER_FLAGS_RELEASE} -s")
+			SET(CMAKE_EXE_LINKER_FLAGS_MINSIZEREL "${CMAKE_EXE_LINKER_FLAGS_MINSIZEREL} -s")
+        ENDIF()
+    ELSEIF(UNIX)
+        ADD_COMPILE_OPTIONS(-Wno-ignored-attributes)
+        ADD_COMPILE_OPTIONS(-Wall -Wextra -Wno-missing-field-initializers)
+		set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-invalid-offsetof")
+		IF("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
+			set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unqualified-std-cast-call")
+		ENDIF()
+		SET(CMAKE_CXX_FLAGS_RELEASE "-O3 -fno-rtti -fomit-frame-pointer -fno-stack-protector -DNDEBUG=1")
+		SET(CMAKE_CXX_FLAGS_MINSIZEREL "-Os -fno-rtti -fomit-frame-pointer -fno-stack-protector -DNDEBUG=1")
+		SET(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -fno-rtti -fno-stack-protector -DNDEBUG=1")
+	ELSEIF(WIN32)
+		IF("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang" AND (NOT CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")) # clang only, not clang-cl
+			SET(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -v")
+			ADD_DEFINITIONS(-D_CRT_SECURE_NO_WARNINGS)
+			ADD_COMPILE_OPTIONS(-msse2)
+			ADD_COMPILE_OPTIONS(-Wno-unused-parameter)
+			ADD_COMPILE_OPTIONS(-Wno-ignored-attributes)
+			ADD_COMPILE_OPTIONS(-Wno-deprecated-declarations)
+			ADD_COMPILE_OPTIONS(-Wno-implicit-exception-spec-mismatch)
+			ADD_COMPILE_OPTIONS(-Wno-missing-field-initializers)
+			ADD_COMPILE_OPTIONS(-Wno-tautological-constant-compare)
+			ADD_COMPILE_OPTIONS(-Wno-microsoft-cast)
+			# Program's methods are declared dllimport in the headers and defined here without
+			# the attribute — inherent to the static+shared dual build, flagged on every ast TU.
+			ADD_COMPILE_OPTIONS(-Wno-inconsistent-dllimport)
+			set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-invalid-offsetof")
+			SET(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG=1")
+			SET(CMAKE_CXX_FLAGS_MINSIZEREL "-Os -DNDEBUG=1")
+			SET(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -DNDEBUG=1")
+			#SET(CMAKE_CXX_LINK_EXECUTABLE "<CMAKE_CXX_COMPILER> -fuse-ld=lld-link -nostartfiles -nostdlib <FLAGS> <CMAKE_CXX_LINK_FLAGS> <LINK_FLAGS> <OBJECTS> -o <TARGET> -Xlinker /pdb:<TARGET_PDB> -Xlinker /version:<TARGET_VERSION_MAJOR>.<TARGET_VERSION_MINOR>  <LINK_LIBRARIES> <MANIFESTS>")
+		ELSE()
+			ADD_COMPILE_OPTIONS(-bigobj)
+			ADD_DEFINITIONS(-DITS_PLATFORM_WIN32=1)
+			ADD_DEFINITIONS(-D_CRT_SECURE_NO_WARNINGS)
+			# setup parallel build
+			cmake_host_system_information(RESULT Ncpu QUERY NUMBER_OF_LOGICAL_CORES)
+			message("PARALLEL BUILD ON ${Ncpu} CORES" )
+			set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /MP${Ncpu}")
+			set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /utf-8")
+			# end setup
+			string(REPLACE "/W3" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+			string(REPLACE "/EHsc" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+			string(REPLACE "INCREMENTAL:YES" "INCREMENTAL:NO" CMAKE_EXE_LINKER_FLAGS_DEBUG ${CMAKE_EXE_LINKER_FLAGS_DEBUG})
+			string(REPLACE "INCREMENTAL:YES" "INCREMENTAL:NO" CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO ${CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO})
+			ADD_DEFINITIONS("/W4")
+			IF("${CMAKE_SIZEOF_VOID_P}" STREQUAL "4")
+				MESSAGE("32 bit build")
+				ADD_DEFINITIONS("-DDAS_ENABLE_FPE")
+				ADD_DEFINITIONS("/arch:IA32")
+				ADD_DEFINITIONS("-D_TARGET_SIMD_SSE=2")
+			ELSEIF(AVX2_SUPPORTED)
+				MESSAGE("AVX2 bit build")
+				ADD_DEFINITIONS("/arch:AVX2")
+			ELSEIF(AVX_SUPPORTED)
+				MESSAGE("AVX bit build")
+				ADD_DEFINITIONS("/arch:AVX")
+			ELSEIF(SSE2_SUPPORTED)
+				ADD_DEFINITIONS("/arch:SSE2")
+			ENDIF()
+			IF(DAS_USE_STATIC_STD_LIBS)
+				SET(MSVC_STD_LIB_FLAG "/MT")
+			ELSE()
+				SET(MSVC_STD_LIB_FLAG "/MD")
+			ENDIF()
+			# /Z7 (debug info embedded in each .obj) instead of /Zi (a single
+			# shared .pdb): /Zi serializes parallel cl.exe through mspdbsrv and
+			# cannot be cached by the sccache compiler launcher. /Z7 is valid on
+			# every generator (the linker still emits a .pdb via /DEBUG). Must
+			# cover BOTH languages: C TUs (uriparser, sqlite3, ...) inherit
+			# CMake's default /Zi for Debug AND RelWithDebInfo; CXX Debug inherits
+			# the default too while CXX RelWithDebInfo is set explicitly below.
+			STRING(REPLACE "/Zi" "/Z7" CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG}")
+			STRING(REPLACE "/Zi" "/Z7" CMAKE_C_FLAGS_RELWITHDEBINFO "${CMAKE_C_FLAGS_RELWITHDEBINFO}")
+			STRING(REPLACE "/Zi" "/Z7" CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG}")
+			SET(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /EHa")
+			SET(CMAKE_CXX_FLAGS_RELEASE "${MSVC_STD_LIB_FLAG} /Ot /Ox /Oi /DNDEBUG=1 /Gy /GS- /GR- /EHa /DDAS_FREE_LIST=1")
+			SET(CMAKE_CXX_FLAGS_MINSIZEREL "${MSVC_STD_LIB_FLAG} /Os /Oi /DNDEBUG=1 /Gy /GS- /GR- /EHa /DDAS_FREE_LIST=1")
+			SET(CMAKE_CXX_FLAGS_RELWITHDEBINFO "/Z7 ${MSVC_STD_LIB_FLAG} /Ot /Oi /DNDEBUG=1 /Gy /GS- /GR- /EHa")
+
+			# HUGE LINKER HEAP
+			set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /HEAP:536870912")
+		ENDIF()
+	ENDIF()
+    ADD_DEFINITIONS(-DSIZE_OF_VOID_P=${CMAKE_SIZEOF_VOID_P})
+	ADD_DEFINITIONS(-DDAS_INSTALL_BINDIR="${CMAKE_INSTALL_PREFIX}/${DAS_INSTALL_BINDIR}" -DDAS_INSTALL_DATADIR="${CMAKE_INSTALL_PREFIX}/${DAS_INSTALL_DATADIR}")
+ENDMACRO()
+
+MACRO(DAS_APPLY_STRICT_WARNINGS _target)
+    IF(MSVC AND NOT "${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
+        target_compile_options(${_target} PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:/W4;/WX;/wd4100;/wd4244;/wd4267;/wd4273;/wd4310;/wd4456;/wd4457;/wd4458;/wd4459>)
+    ELSEIF(NOT MSVC)
+        target_compile_options(${_target} PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:-Wnon-virtual-dtor;-Werror>)
+        IF("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang" OR "${CMAKE_CXX_COMPILER_ID}" STREQUAL "AppleClang")
+            target_compile_options(${_target} PRIVATE
+                $<$<COMPILE_LANGUAGE:CXX>:-Woverloaded-virtual;-Wno-unqualified-std-cast-call>)
+        ELSEIF("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
+            target_compile_options(${_target} PRIVATE
+                $<$<COMPILE_LANGUAGE:CXX>:-Wno-overloaded-virtual;-Wno-array-bounds;-Wno-clobbered;-Wno-maybe-uninitialized;-Wno-stringop-overflow>)
+        ENDIF()
+    ENDIF()
+ENDMACRO()
+
+MACRO(SETUP_CPP11 _targetName)
+	IF(APPLE)
+		SET_TARGET_PROPERTIES(${_targetName} PROPERTIES XCODE_ATTRIBUTE_CLANG_CXX_LANGUAGE_STANDARD "c++17")
+		SET_TARGET_PROPERTIES(${_targetName} PROPERTIES XCODE_ATTRIBUTE_CLANG_CXX_LIBRARY "libc++")
+		SET_TARGET_PROPERTIES(${_targetName} PROPERTIES XCODE_ATTRIBUTE_ARCHS "$(ARCHS_STANDARD_64_BIT)")
+		SET_TARGET_PROPERTIES(${_targetName} PROPERTIES XCODE_ATTRIBUTE_ONLY_ACTIVE_ARCH "YES")
+        SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-register -std=c++17")
+	ENDIF()
+	IF ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
+        #SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -m64 -std=c++1z -stdlib=libc++")
+	ENDIF()
+	IF (WIN32)
+		IF("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang" AND (NOT CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")) # clang only, not clang-cl
+			SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -m64 -std=c++17")
+		ELSE()
+			SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /std:c++17")
+		ENDIF()
+	ENDIF()
+ENDMACRO()
+
+function(CMAKE_TEXT_XXD project_name file_name)
+	add_custom_command(
+		DEPENDS ${file_name}
+		OUTPUT ${file_name}.inc
+		VERBATIM
+		WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  		COMMAND ${CMAKE_COMMAND} -DFILE_TYPE:STRING="TEXT" -DINPUT_FILE_NAME:STRING=${file_name}
+			-P ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/CMakeXxdImpl.txt
+	)
+
+	set(XXD_DEPENDS_LIST_${project_name} ${XXD_DEPENDS_LIST_${project_name}} ${file_name}.inc PARENT_SCOPE)
+ 	execute_process(
+		WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+		COMMAND ${CMAKE_COMMAND} -DFILE_TYPE:STRING="TEXT" -DINPUT_FILE_NAME:STRING=${file_name}
+			-P ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/CMakeXxdImpl.txt
+	)
+endfunction()
+
+MACRO(ADD_TARGET_PROJECT_XXD_DEPENDS target project_name)
+	IF(NOT TARGET ${project_name}_xxd)
+		ADD_CUSTOM_TARGET(${project_name}_xxd ALL
+			DEPENDS ${XXD_DEPENDS_LIST_${project_name}}
+			WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+		)
+	ENDIF()
+	ADD_DEPENDENCIES(${target} ${project_name}_xxd)
+ENDMACRO()
+
+MACRO(ADD_PROJECT_XXD_DEPENDS project_name)
+	ADD_TARGET_PROJECT_XXD_DEPENDS(${project_name} ${project_name})
+ENDMACRO()
+
+
+MACRO(FIND_FLEX_AND_BISON)
+	find_package(BISON)
+	find_package(FLEX)
+ENDMACRO(FIND_FLEX_AND_BISON)
+
+
+MACRO(FLEX input)
+	IF(NOT(FLEX_FOUND AND ((FLEX_VERSION MATCHES "2\.*"))))
+		MESSAGE(STATUS "FLEX not found or version is less than 2.x; pre-generated files will be used." )
+	ELSE()
+		MESSAGE(STATUS "FLEX `${FLEX_VERSION}` found" )
+		get_filename_component(input_src ${input} ABSOLUTE)
+		get_filename_component(input_dir ${input_src} DIRECTORY)
+		get_filename_component(input_name ${input} NAME_WE)
+		get_filename_component(input_name_ext ${input} NAME)
+		ADD_CUSTOM_COMMAND(
+			DEPENDS ${input_src}
+			OUTPUT ${input_dir}/${input_name}.cpp
+			WORKING_DIRECTORY ${input_dir}
+			COMMAND ${FLEX_EXECUTABLE} --outfile=${input_name}.cpp ${input_name_ext}
+			COMMENT "flex (v ${FLEX_VERSION}) ${input} to ${input_dir}/${input_name}.cpp")
+	ENDIF()
+ENDMACRO()
+
+MACRO(BISON input)
+	IF(NOT(BISON_FOUND AND ((BISON_VERSION MATCHES "3\.*"))))
+		MESSAGE(STATUS "BISON not found, or version is less than 3.x; pre-generated files will be used." )
+	ELSE()
+		MESSAGE(STATUS "BISON `${BISON_VERSION}` found" )
+		get_filename_component(input_src ${input} ABSOLUTE)
+		get_filename_component(input_dir ${input_src} DIRECTORY)
+		get_filename_component(input_name ${input} NAME_WE)
+		get_filename_component(input_name_ext ${input} NAME)
+		ADD_CUSTOM_COMMAND(
+			DEPENDS ${input_src}
+			OUTPUT ${input_dir}/${input_name}.cpp ${input_dir}/${input_name}.hpp ${input_dir}/${input_name}.output
+			WORKING_DIRECTORY ${input_dir}
+			COMMAND ${BISON_EXECUTABLE} --output=${input_name}.cpp --defines=${input_name}.hpp ${input_name_ext}
+			COMMENT "bison (v ${BISON_VERSION}) ${input} to ${input_dir}/${input_name}.cpp + ${input_dir}/${input_name}.hpp + ${input_dir}/${input_name}.output")
+	ENDIF()
+ENDMACRO()

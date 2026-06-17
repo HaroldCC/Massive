@@ -1,0 +1,1032 @@
+#include "daScript/misc/platform.h"
+#include "daScript/ast/ast.h"
+#include "daScript/ast/ast_generate.h"
+#include "daScript/ast/ast_infer_type.h"
+#include "daScript/ast/ast_visitor.h"
+
+namespace das {
+
+    bool InferTypes::isBitfieldOp(const Function *fnc) const {
+        if (fnc->module->name == "$" && fnc->arguments[0]->type->isBitfield()) {
+            return true;
+        }
+        return false;
+    }
+
+    bool InferTypes::hasExtraCloneFor(const TypeDeclPtr & cloneType, bool srcConst) const {
+        for (auto & ef : extraFunctions) {
+            if (ef->name != "clone") continue;
+            if (ef->arguments.size() != 2) continue;
+            auto & destT = ef->arguments[0]->type;
+            if (!destT->isSameType(*cloneType, RefMatters::no, ConstMatters::no, TemporaryMatters::no, AllowSubstitute::no, true, true)) continue;
+            auto & srcT = ef->arguments[1]->type;
+            if (srcT->constant != srcConst) continue;
+            return true;
+        }
+        return false;
+    }
+
+    ExpressionPtr InferTypes::tryPromoteConstInt(const ExpressionPtr & expr, const TypeDeclPtr & targetType, bool & rangeError) {
+        rangeError = false;
+        if (!expr) return nullptr;
+        if (!targetType) return nullptr;
+        if (targetType->baseType==Type::tFixedArray) return nullptr;
+        // Source: ExprConstInt/ExprConstUInt directly, OR ExprOp1("-", such const)
+        // (when const-folding is disabled, the parser leaves -N as ExprOp1).
+        Expression *constExpr = expr;
+        bool negate = false;
+        if (!constExpr->rtti_isConstant() && expr->rtti_isOp1()) {
+            auto op1 = static_cast<ExprOp1 *>(expr);
+            if (op1->op == "-" && op1->subexpr && op1->subexpr->rtti_isConstant()) {
+                constExpr = op1->subexpr;
+                negate = true;
+            }
+        }
+        if (!constExpr->rtti_isConstant()) return nullptr;
+        auto srcConst = static_cast<ExprConst *>(constExpr);
+        int64_t value = 0;
+        if (srcConst->baseType == Type::tInt) {
+            value = static_cast<int64_t>(static_cast<ExprConstInt *>(srcConst)->getValue());
+        } else if (srcConst->baseType == Type::tUInt) {
+            value = static_cast<int64_t>(static_cast<ExprConstUInt *>(srcConst)->getValue());
+        } else {
+            return nullptr;
+        }
+        if (negate) value = -value;
+        if (srcConst->baseType == targetType->baseType) return nullptr;
+        // upper bound is passed as string so unsigned 64-bit types print their actual max
+        // (UINT64_MAX), not a misleading INT64_MAX from a signed int64_t.
+        auto reportRange = [&](const char *typeName, int64_t lo, const string &hi) {
+            rangeError = true;
+            error("constant value " + to_string(value) + " does not fit in " + typeName,
+                  "expected range [" + to_string(lo) + ".." + hi + "]", "",
+                  expr->at, CompilationError::exceeds_constant_range);
+        };
+        ExprConst *newNode = nullptr;
+        switch (targetType->baseType) {
+        case Type::tInt8:
+            if (value < -128 || value > 127) { reportRange("int8", -128, "127"); return nullptr; }
+            newNode = new ExprConstInt8(expr->at, int8_t(value));
+            break;
+        case Type::tInt16:
+            if (value < -32768 || value > 32767) { reportRange("int16", -32768, "32767"); return nullptr; }
+            newNode = new ExprConstInt16(expr->at, int16_t(value));
+            break;
+        case Type::tInt:
+            if (value < int64_t(INT32_MIN) || value > int64_t(INT32_MAX)) { reportRange("int", INT32_MIN, to_string(INT32_MAX)); return nullptr; }
+            newNode = new ExprConstInt(expr->at, int32_t(value));
+            break;
+        case Type::tInt64:
+            newNode = new ExprConstInt64(expr->at, value);
+            break;
+        case Type::tUInt8:
+            if (value < 0 || value > 255) { reportRange("uint8", 0, "255"); return nullptr; }
+            newNode = new ExprConstUInt8(expr->at, uint8_t(value));
+            break;
+        case Type::tUInt16:
+            if (value < 0 || value > 65535) { reportRange("uint16", 0, "65535"); return nullptr; }
+            newNode = new ExprConstUInt16(expr->at, uint16_t(value));
+            break;
+        case Type::tUInt:
+            if (value < 0 || value > int64_t(UINT32_MAX)) { reportRange("uint", 0, to_string(UINT32_MAX)); return nullptr; }
+            newNode = new ExprConstUInt(expr->at, uint32_t(value));
+            break;
+        case Type::tUInt64:
+            if (value < 0) { reportRange("uint64", 0, "18446744073709551615"); return nullptr; }
+            newNode = new ExprConstUInt64(expr->at, uint64_t(value));
+            break;
+        case Type::tBitfield8: {
+            if (value < 0 || value > 255) { reportRange("bitfield8", 0, "255"); return nullptr; }
+            auto bf = new ExprConstBitfield(expr->at, uint64_t(value));
+            bf->baseType = Type::tBitfield8;
+            bf->bitfieldType = new TypeDecl(*targetType);
+            newNode = bf;
+            break;
+        }
+        case Type::tBitfield16: {
+            if (value < 0 || value > 65535) { reportRange("bitfield16", 0, "65535"); return nullptr; }
+            auto bf = new ExprConstBitfield(expr->at, uint64_t(value));
+            bf->baseType = Type::tBitfield16;
+            bf->bitfieldType = new TypeDecl(*targetType);
+            newNode = bf;
+            break;
+        }
+        case Type::tBitfield: {
+            if (value < 0 || value > int64_t(UINT32_MAX)) { reportRange("bitfield", 0, to_string(UINT32_MAX)); return nullptr; }
+            auto bf = new ExprConstBitfield(expr->at, uint64_t(value));
+            bf->baseType = Type::tBitfield;
+            bf->bitfieldType = new TypeDecl(*targetType);
+            newNode = bf;
+            break;
+        }
+        case Type::tBitfield64: {
+            if (value < 0) { reportRange("bitfield64", 0, "18446744073709551615"); return nullptr; }
+            auto bf = new ExprConstBitfield(expr->at, uint64_t(value));
+            bf->baseType = Type::tBitfield64;
+            bf->bitfieldType = new TypeDecl(*targetType);
+            newNode = bf;
+            break;
+        }
+        case Type::tFloat: {
+            float fval = float(value);
+            auto cf = new ExprConstFloat(expr->at, fval);
+            if (int64_t(fval) != value) cf->inexactFloatPromotion = true;
+            newNode = cf;
+            break;
+        }
+        case Type::tDouble: {
+            double dval = double(value);
+            auto cd = new ExprConstDouble(expr->at, dval);
+            if (int64_t(dval) != value) cd->inexactFloatPromotion = true;
+            newNode = cd;
+            break;
+        }
+        default:
+            return nullptr;
+        }
+        newNode->promotedFromInt = true;
+        return newNode;
+    }
+    ExpressionPtr InferTypes::visit(ExprOp1 *expr) {
+        if (!expr->subexpr->type || expr->subexpr->type->isAliasOrExpr())
+            return Visitor::visit(expr); // failed to infer
+        // pointer arithmetics
+        if (expr->subexpr->type->isPointer()) {
+            if (!expr->subexpr->type->firstType) {
+                error("operations on 'void' pointers are prohibited; " +
+                          describeType(expr->subexpr->type),
+                      "", "",
+                      expr->at, CompilationError::cant_type);
+            } else {
+                string pop;
+                if (expr->op == "++" || expr->op == "+++") {
+                    pop = "i_das_ptr_inc";
+                } else if (expr->op == "--" || expr->op == "---") {
+                    pop = "i_das_ptr_dec";
+                }
+                if (!pop.empty()) {
+                    if ( expr->subexpr->type->firstType->isAuto() ) {
+                        error("type is not fully inferred, fixed array dimension is unknown", "", "",
+                          expr->at, CompilationError::not_resolved_yet_array_type);
+                        return Visitor::visit(expr);
+                    }
+                    reportAstChanged();
+                    auto popc = new ExprCall(expr->at, pop);
+                    auto stride = expr->subexpr->type->firstType->getSizeOf();
+                    popc->arguments.push_back(expr->subexpr->clone());
+                    popc->arguments.push_back(new ExprConstInt(expr->at, stride));
+                    return popc;
+                } else {
+                    error("pointer arithmetics only allows +, -, +=, -=, ++, --; not" + expr->op, "", "",
+                          expr->at, CompilationError::invalid_pointer_arithmetic);
+                }
+            }
+        }
+        if (expr->op == "++" || expr->op == "+++" || expr->op == "--" || expr->op == "---") {
+            if (expr->subexpr->type->isWorkhorseType()) {
+                if (!expr->subexpr->type->ref) {
+                    error(expr->op + " can't be applied to non reference " + describeType(expr->subexpr->type), "", "",
+                          expr->at, CompilationError::cant_apply_op);
+                    return Visitor::visit(expr);
+                } else if (expr->subexpr->type->constant) {
+                    error(expr->op + " can't be applied to constant " + describeType(expr->subexpr->type), "", "",
+                          expr->at, CompilationError::cant_apply_op);
+                    return Visitor::visit(expr);
+                }
+                if (unsafeTableLookup && expr->subexpr->rtti_isAt()) { // tab[expr]++ is always safe
+                    auto pAt = static_cast<ExprAt *>(expr->subexpr);
+                    if (!pAt->alwaysSafe && pAt->subexpr->type && pAt->subexpr->type->isGoodTableType()) {
+                        pAt->alwaysSafe = true;
+                        reportAstChanged();
+                    }
+                }
+            }
+        }
+        auto opName = "_::" + expr->op;
+        auto tempCall = new ExprLooksLikeCall(expr->at, opName);
+        tempCall->arguments.push_back(expr->subexpr);
+        expr->func = inferFunctionCall(tempCall);
+        if (opName != tempCall->name) { // this happens when the operator gets instanced
+            reportAstChanged();
+            auto opCall = new ExprCall(expr->at, tempCall->name);
+            opCall->arguments = das::move(tempCall->arguments);
+            return opCall;
+        }
+        if (expr->func) {
+            if (expr->func->firstArgReturnType || isBitfieldOp(expr->func)) {
+                TypeDecl::clone(expr->type, expr->subexpr->type);
+                expr->type->ref = false;
+            } else {
+                TypeDecl::clone(expr->type, expr->func->result);
+            }
+            if (!expr->func->arguments[0]->type->isRef())
+                expr->subexpr = Expression::autoDereference(expr->subexpr);
+            // lets try to fold it
+            if (expr->func && expr->func->unsafeOperation && safeExpression(expr)) {
+                error("unsafe operator '" + expr->name + "' must be inside the 'unsafe' block", "", "",
+                      expr->at, CompilationError::unsafe_operator);
+            } else if (enableInferTimeFolding && isConstExprFunc(expr->func)) {
+                if (auto se = getConstExpr(expr->subexpr)) {
+                    expr->subexpr = se;
+                    return evalAndFold(expr);
+                }
+            }
+        }
+        return Visitor::visit(expr);
+    }
+    bool InferTypes::isAssignmentOperator(const string &op) {
+        return (op == "+=") || (op == "-=") || (op == "*=") || (op == "/=") || (op == "%=") || (op == "&=") || (op == "|=") || (op == "^=") || (op == "||=") || (op == "&&=") || (op == "^^=") || (op == "<<=") || (op == ">>=") || (op == "<<<=") || (op == ">>>=");
+    }
+    bool InferTypes::isLogicOperator(const string &op) {
+        return (op == "==") || (op == "!=") || (op == ">=") || (op == "<=") || (op == ">") || (op == "<");
+    }
+    bool InferTypes::isCommutativeOperator(const string &op) {
+        return (op == "*") || (op == "+") || isLogicOperator(op);
+    }
+    string InferTypes::flipCommutativeOperatorSide(const string &op) {
+        if (op == ">")
+            return "<";
+        else if (op == "<")
+            return ">";
+        else if (op == ">=")
+            return "<=";
+        else if (op == "<=")
+            return ">=";
+        else
+            return op;
+    }
+    bool InferTypes::canOperateOnPointers(const TypeDeclPtr &leftType, const TypeDeclPtr &rightType, TemporaryMatters tmatter) const {
+        if (leftType->baseType == Type::tPointer) {
+            return leftType->isSameType(*rightType, RefMatters::no, ConstMatters::no, tmatter, AllowSubstitute::yes);
+        } else {
+            return leftType->isSameType(*rightType, RefMatters::no, ConstMatters::no, tmatter, AllowSubstitute::no);
+        }
+    }
+    bool InferTypes::isSameSmartPtrType(const TypeDeclPtr &lt, const TypeDeclPtr &rt, bool leftOnly) {
+        auto lt_smart = lt->smartPtr;
+        auto rt_smart = rt->smartPtr;
+        if (leftOnly) {
+            // smart smart  - ok
+            // smart ptr    - ok
+            // ptr   smart  - not OK
+            // ptr   ptr    - ok
+            if (!lt_smart && rt_smart)
+                return false;
+        }
+        lt->smartPtr = false;
+        rt->smartPtr = false;
+        bool res = canOperateOnPointers(lt, rt, TemporaryMatters::no);
+        lt->smartPtr = lt_smart;
+        rt->smartPtr = rt_smart;
+        return res;
+    }
+    void InferTypes::preVisit(ExprOp2 *expr) {
+        Visitor::preVisit(expr);
+        if (!strictProperties && isAssignmentOperator(expr->op)) {
+            if (expr->left->rtti_isField()) {
+                auto field = static_cast<ExprField*>(expr->left);
+                field->underClone = true;
+            } else if (expr->left->rtti_isVar()) {
+                auto var = static_cast<ExprVar*>(expr->left);
+                var->underClone = true;
+            } else if (expr->left->rtti_isAt()) {
+                auto at = static_cast<ExprAt*>(expr->left);
+                at->underClone = true;
+            }
+        }
+    }
+    void InferTypes::removeR2v(ExpressionPtr &expr) {
+        if (expr->rtti_isCallLikeExpr()) {
+            auto call = static_cast<ExprLooksLikeCall*>(expr);
+            if (call->arguments.size() == 2) {
+                if (call->arguments[1]->rtti_isR2V()) {
+                    auto arg = static_cast<ExprRef2Value*>(call->arguments[1]);
+                    call->arguments[1] = arg->subexpr;
+                    reportAstChanged();
+                }
+            }
+        }
+    }
+    ExpressionPtr InferTypes::promoteOp2ToProperty(ExprOp2 *expr) {
+        // a.b += c  -> a`b`set(a`b`get() + c)
+        if (expr->right->type && !expr->right->type->isAutoOrAlias()) {
+            auto opName = expr->op;
+            opName.pop_back();
+            if (expr->left->rtti_isVar()) {
+                ExprVar *evar = (ExprVar *)(expr->left);
+                if (auto propGet = promoteToProperty(evar, nullptr)) { // we need both get and set
+                    auto opRight = new ExprOp2(expr->at, opName, propGet, expr->right);
+                    opRight->type = new TypeDecl(*expr->right->type);
+                    if (auto cloneSet = promoteToProperty(evar, opRight)) {
+                        removeR2v(cloneSet);
+                        return cloneSet;
+                    } else {
+                        expr->left = propGet;
+                        return expr;
+                    }
+                }
+            } else if (expr->left->rtti_isField()) {
+                ExprField *efield = (ExprField *)(expr->left);
+                if (auto propSetOp = promoteToProperty(efield, expr->right, expr->op)) {
+                    removeR2v(propSetOp);
+                    return propSetOp;                                           // we need only set
+                } else if (auto propGet = promoteToProperty(efield, nullptr)) { // we need both get and set
+                    auto opRight = new ExprOp2(expr->at, opName, propGet, expr->right);
+                    opRight->type = new TypeDecl(*expr->right->type);
+                    if (auto cloneSet = promoteToProperty(efield, opRight)) {
+                        removeR2v(cloneSet);
+                        return cloneSet;
+                    } else {
+                        expr->left = propGet;
+                        return expr;
+                    }
+                }
+            } else if (expr->left->rtti_isAt()) {
+                ExprAt *eat = (ExprAt *)(expr->left);
+                if ( !eat->subexpr->type || eat->subexpr->type->isExprType() ) {
+                    return nullptr;
+                }
+                auto complexName = "[]" + expr->name;
+                if (auto atComplex = inferGenericOperator3(complexName, eat->at, eat->subexpr, eat->index, expr->right)) {
+                    atComplex->alwaysSafe = eat->alwaysSafe | expr->alwaysSafe;
+                    removeR2v(atComplex);
+                    return atComplex;                                                                    // we need only set
+                } else if (auto atGet = inferGenericOperator("[]", eat->at, eat->subexpr, eat->index)) { // we need bot get and set
+                    atGet->alwaysSafe = eat->alwaysSafe | expr->alwaysSafe;
+                    auto opRight = new ExprOp2(expr->at, opName, atGet, expr->right);
+                    opRight->type = new TypeDecl(*expr->right->type);
+                    if (auto atSet = inferGenericOperator3("[]=", eat->at, eat->subexpr, eat->index, opRight)) {
+                        atSet->alwaysSafe = eat->alwaysSafe | expr->alwaysSafe;
+                        removeR2v(atSet);
+                        return atSet;
+                    } else {
+                        reportAstChanged();
+                        expr->left = atGet;
+                        return nullptr;
+                    }
+                }
+            }
+        }
+        return nullptr;
+    }
+    ExpressionPtr InferTypes::visit(ExprOp2 *expr) {
+        if (!strictProperties && expr->right->type && isAssignmentOperator(expr->op)) {
+            if (auto nExpr = promoteOp2ToProperty(expr)) {
+                reportAstChanged();
+                return nExpr;
+            }
+        }
+        if (!expr->left->type || expr->left->type->isAliasOrExpr())
+            return Visitor::visit(expr); // failed to infer
+        if (!expr->right->type || expr->right->type->isAliasOrExpr())
+            return Visitor::visit(expr); // failed to infer
+        // flippling commutative operations, if the constant is on the left
+        if (expr->left->rtti_isConstant() && !expr->right->rtti_isConstant()) {               // if left is const, but right is not
+            if (expr->left->type->isNumericComparable() && isCommutativeOperator(expr->op)) { // if its compareable, and its a logic operator
+                auto flip = flipCommutativeOperatorSide(expr->op);                            // we swap left and right, and change the op
+                auto nexpr = new ExprOp2(expr->at, flip, expr->right, expr->left);
+                reportAstChanged();
+                return nexpr;
+            }
+        }
+        // pointer arithmetics
+        if (expr->left->type->isPointer() && expr->right->type->isIndexExt()) {
+            if (!expr->left->type->firstType) {
+                error("operations on 'void' pointers are prohibited; " +
+                          describeType(expr->left->type),
+                      "", "",
+                      expr->at, CompilationError::cant_type);
+            } else {
+                string pop;
+                if (expr->op == "+") {
+                    pop = "i_das_ptr_add";
+                } else if (expr->op == "-") {
+                    pop = "i_das_ptr_sub";
+                } else if (expr->op == "+=") {
+                    pop = "i_das_ptr_set_add";
+                } else if (expr->op == "-=") {
+                    pop = "i_das_ptr_set_sub";
+                }
+                if (!pop.empty()) {
+                    reportAstChanged();
+                    auto popc = new ExprCall(expr->at, pop);
+                    popc->alwaysSafe = expr->alwaysSafe;
+                    auto stride = expr->left->type->firstType->getSizeOf();
+                    popc->arguments.push_back(expr->left->clone());
+                    popc->arguments.push_back(expr->right->clone());
+                    popc->arguments.push_back(new ExprConstInt(expr->at, stride));
+                    return popc;
+                } else {
+                    error("pointer arithmetics only allows +, -, +=, -=, ++, --; not" + expr->op, "", "",
+                          expr->at, CompilationError::invalid_pointer_arithmetic);
+                }
+            }
+        }
+        // infer
+        if (expr->left->type->isPointer() && expr->right->type->isPointer()) {
+            if (!isSameSmartPtrType(expr->left->type, expr->right->type)) {
+                error("operations on incompatible pointers are prohibited; " +
+                          describeType(expr->left->type) + " vs " + describeType(expr->right->type),
+                      "", "",
+                      expr->at, CompilationError::invalid_type);
+            }
+            if (expr->op == "-") {
+                if (!expr->left->type->firstType) {
+                    error("operations on 'void' pointers are prohibited; " +
+                              describeType(expr->left->type),
+                          "", "",
+                          expr->at, CompilationError::cant_type);
+                } else {
+                    reportAstChanged();
+                    auto popc = new ExprCall(expr->at, "i_das_ptr_diff");
+                    auto stride = expr->left->type->firstType->getSizeOf();
+                    popc->arguments.push_back(expr->left->clone());
+                    popc->arguments.push_back(expr->right->clone());
+                    popc->arguments.push_back(new ExprConstInt(expr->at, stride));
+                    return popc;
+                }
+            }
+        }
+        // NOTE: mismatched-enum operands are gated AFTER the custom-operator lookup
+        // below (see reportOp2Errors) — a user-defined operator |(E1;E2) must win over
+        // the "different enumerations" error, so the gate can't run before resolution.
+        // try promoting int literal on either side to match the other side's type
+        {
+            bool rangeError = false;
+            if (auto promoted = tryPromoteConstInt(expr->right, expr->left->type, rangeError)) {
+                reportAstChanged();
+                expr->right = promoted;
+                return Visitor::visit(expr);
+            }
+            if (rangeError) {
+                expr->type = new TypeDecl(); // suppress downstream mismatching_numeric_type
+                return Visitor::visit(expr);
+            }
+            if (auto promoted = tryPromoteConstInt(expr->left, expr->right->type, rangeError)) {
+                reportAstChanged();
+                expr->left = promoted;
+                return Visitor::visit(expr);
+            }
+            if (rangeError) {
+                expr->type = new TypeDecl();
+                return Visitor::visit(expr);
+            }
+        }
+        auto opName = "_::" + expr->op;
+        auto tempCall = new ExprLooksLikeCall(expr->at, opName);
+        tempCall->arguments.push_back(expr->left);
+        tempCall->arguments.push_back(expr->right);
+        expr->func = inferFunctionCall(tempCall, InferCallError::operatorOp2);
+        if (opName != tempCall->name) { // this happens when the operator gets instanced
+            reportAstChanged();
+            auto opCall = new ExprCall(expr->at, tempCall->name);
+            opCall->arguments = das::move(tempCall->arguments);
+            return opCall;
+        }
+        if (expr->func) {
+            if (expr->func->firstArgReturnType) {
+                TypeDecl::clone(expr->type, expr->left->type);
+                expr->type->ref = false;
+            } else if (isBitfieldOp(expr->func)) {
+                TypeDecl::clone(expr->type, expr->func->result);
+                if (!expr->left->type->alias.empty()) {
+                    expr->type->alias = expr->left->type->alias;
+                } else if (!expr->right->type->alias.empty()) {
+                    expr->type->alias = expr->right->type->alias;
+                }
+            } else {
+                TypeDecl::clone(expr->type, expr->func->result);
+            }
+            if (!expr->func->arguments[0]->type->isRef())
+                expr->left = Expression::autoDereference(expr->left);
+            if (!expr->func->arguments[1]->type->isRef())
+                expr->right = Expression::autoDereference(expr->right);
+            // lets try to fold it
+            if (expr->func && expr->func->unsafeOperation && !safeExpression(expr)) {
+                error("unsafe operator '" + expr->name + "' must be inside the 'unsafe' block", "", "",
+                      expr->at, CompilationError::unsafe_operator);
+            } else if (enableInferTimeFolding && isConstExprFunc(expr->func)) {
+                auto lcc = getConstExpr(expr->left);
+                auto rcc = getConstExpr(expr->right);
+                if (lcc && rcc) {
+                    expr->left = lcc;
+                    expr->right = rcc;
+                    return evalAndFold(expr);
+                }
+            }
+        }
+        return Visitor::visit(expr);
+    }
+    ExpressionPtr InferTypes::visit(ExprOp3 *expr) {
+        if (!expr->subexpr->type || !expr->left->type || !expr->right->type)
+            return Visitor::visit(expr);
+        // infer
+        if (expr->op != "?") {
+            error("Op3 currently only supports '?:'", "", "",
+                  expr->at, CompilationError::invalid_op3_expression);
+            return Visitor::visit(expr);
+        }
+        expr->subexpr = Expression::autoDereference(expr->subexpr);
+        if (!expr->subexpr->type->isSimpleType(Type::tBool)) {
+            error("cond operator condition must be boolean", "", "",
+                  expr->at, CompilationError::condition_must_be_bool);
+        } else if (!expr->left->type->isSameType(*expr->right->type, RefMatters::no, ConstMatters::no, TemporaryMatters::no)) {
+            error("cond operator must return the same types on both sides",
+                  "\t" + (verbose ? (expr->left->type->describe() + " vs " + expr->right->type->describe()) : ""), "",
+                  expr->at, CompilationError::mismatching_type);
+        } else if (expr->left->type->isVoid()) {
+            error("cond operator must return a value, not void", "", "",
+                  expr->at, CompilationError::invalid_type);
+        } else {
+            if (expr->left->type->ref ^ expr->right->type->ref) { // if either one is not ref
+                expr->left = Expression::autoDereference(expr->left);
+                expr->right = Expression::autoDereference(expr->right);
+            }
+            TypeDecl::clone(expr->type, expr->left->type);
+            expr->type->constant |= expr->right->type->constant;
+            // lets try to fold it
+            if (enableInferTimeFolding) {
+                auto ccc = getConstExpr(expr->subexpr);
+                auto lcc = getConstExpr(expr->left);
+                auto rcc = getConstExpr(expr->right);
+                if (ccc && lcc && rcc) {
+                    expr->subexpr = ccc;
+                    expr->left = lcc;
+                    expr->right = rcc;
+                    return evalAndFold(expr);
+                }
+            }
+        }
+        return Visitor::visit(expr);
+    }
+    bool InferTypes::isVoidOrNothing(const TypeDeclPtr &ptr) const {
+        return !ptr || ptr->isVoid();
+    }
+    bool InferTypes::canCopyOrMoveType(const TypeDeclPtr &leftType, const TypeDeclPtr &rightType, TemporaryMatters tmatter, Expression *leftExpr,
+                                       const string &errorText, CompilationError errorCode, const LineInfo &at) const {
+        if (leftType->baseType == Type::tPointer) {
+            if (!leftType->isVoidPointer() && rightType->isVoidPointer()) {
+                if (leftExpr->rtti_isNullPtr()) { // anyptr = null ok, otherwise no void copy
+                    return true;
+                } else {
+                    error(errorText + "; " + describeType(leftType) + " = " + describeType(rightType),
+                          "void pointer can't be copied to a non-void pointer", "", at, errorCode);
+                    return false;
+                }
+            }
+            if (!relaxedPointerConst) {
+                if (!leftType->constant && rightType->constant && !(leftType->firstType && leftType->firstType->constant) && !isVoidOrNothing(leftType->firstType)) {
+                    error(errorText + "; " + describeType(leftType) + " = " + describeType(rightType),
+                          "can't copy constant to non-constant pointer. needs to be " + describeType(leftType->firstType) + " const?", "", at, errorCode);
+                    return false;
+                }
+            }
+            if (!leftType->isSameType(*rightType, RefMatters::no, ConstMatters::no, tmatter, AllowSubstitute::yes, true, true)) {
+                error(errorText + "; " + describeType(leftType) + " = " + describeType(rightType),
+                      "not the same type", "", at, errorCode);
+                return false;
+            } else {
+                return true;
+            }
+        } else {
+            if (leftType->isSameType(*rightType, RefMatters::no, ConstMatters::no, tmatter, AllowSubstitute::no, true, true)) {
+                if (!relaxedPointerConst) {
+                    if (!leftType->constant && rightType->constant && !rightType->canCloneFromConst()) {
+                        reportCantCloneFromConst(errorText, errorCode, rightType, at);
+                        return false;
+                    }
+                }
+                return true;
+            } else {
+                error(errorText + "; " + describeType(leftType) + " = " + describeType(rightType),
+                      "not the same type", "", at, errorCode);
+                return false;
+            }
+        }
+    }
+    string InferTypes::moveErrorInfo(ExprMove *expr) const {
+        if (verbose) {
+            return ", " + describeType(expr->left->type) + " <- " + describeType(expr->right->type);
+        } else {
+            return "";
+        }
+    }
+    void InferTypes::preVisit(ExprMove *expr) {
+        Visitor::preVisit(expr);
+        markNoDiscard(expr->right);
+    }
+    ExpressionPtr InferTypes::visit(ExprMove *expr) {
+        if (!expr->left->type || !expr->right->type)
+            return Visitor::visit(expr);
+        // infer
+        if (!canCopyOrMoveType(expr->left->type, expr->right->type, TemporaryMatters::no, expr->right,
+                               "can only move compatible type", CompilationError::cant_move, expr->at)) {
+        } else if (!expr->left->type->isRef()) {
+            error("can only move to a reference" + moveErrorInfo(expr), "", "",
+                  expr->at, CompilationError::cant_move);
+        } else if (!expr->right->type->isRef() && !expr->right->type->isMoveableValue()) {
+            error("can only move from a reference" + moveErrorInfo(expr), "", "",
+                  expr->at, CompilationError::cant_move);
+        } else if (!expr->allowConstantLValue && expr->left->type->constant) {
+            error("can't move to a constant value" + moveErrorInfo(expr), "", "",
+                  expr->at, CompilationError::cant_move);
+        } else if (!expr->left->type->canMove()) {
+            error("this type can't be moved, use clone (:=) instead" + moveErrorInfo(expr), "", "",
+                  expr->at, CompilationError::cant_type);
+        } else if (expr->right->type->constant) {
+            error("can't move from a constant value" + moveErrorInfo(expr), "", "",
+                  expr->at, CompilationError::cant_move);
+        } else if (expr->right->type->isTemp(true, false)) {
+            error("can't move temporary value" + moveErrorInfo(expr), "", "",
+                  expr->at, CompilationError::cant_move);
+        } else if (strictSmartPointers && !safeExpression(expr) && expr->right->type->needInScope()) {
+            error("moving values which contain smart pointers is unsafe",
+                  "try `move(smart_ptr&) <| smart_ptr&` or `move_new(smart_ptr&) <| new [[YouTypeHere ...]]` instead", "",
+                  expr->at, CompilationError::unsafe_smart_pointer);
+        } else if (expr->right->type->isPointer() && expr->right->type->smartPtr) {
+            if (!expr->right->type->ref && !safeExpression(expr) && !expr->right->rtti_isAscend()) {
+                error("moving from the smart pointer value requires unsafe", "",
+                      "try moving from reference instead",
+                      expr->at, CompilationError::unsafe_move);
+                return Visitor::visit(expr);
+            }
+        } else if (expr->left->type->hasClasses() && !safeExpression(expr)) {
+            error("moving classes requires unsafe" + moveErrorInfo(expr), "", "",
+                  expr->at, CompilationError::unsafe_class);
+        } else if (
+            forceInscopePod && !expr->podDelete && func && (func->module->allowPodInscope && (!func->fromGeneric || func->fromGeneric->module->allowPodInscope)) // both modules allow pod inscope
+            && !func->hasUnsafe && isPodDelete(expr->left->type)                                                                                           // its a pod type
+        ) {
+            reportAstChanged();
+            if (logs && logInscopePod) {
+                if (!expr->at.empty() && expr->at.fileInfo) {
+                    *logs << expr->at.fileInfo->name << ":" << expr->at.line << ":" << expr->at.column << " ";
+                }
+                *logs << "In-scope POD applied to '" << *expr << "' in function '" << func->module->name << "::" << func->name << "'\n";
+            }
+            // we convert left <- right into
+            // var left`temp & = left
+            // builtin_collect_local_and_zero(left`temp, size_of(left))
+            // left`temp <- right // unconvertable
+            auto pBlock = new ExprBlock();
+            pBlock->at = expr->at;
+            pBlock->isCollapseable = true;
+            scopes.back()->needCollapse = true;
+            auto pLet = new ExprLet();
+            pLet->at = expr->at;
+            pLet->alwaysSafe = true;
+            pLet->generated = true;
+            auto pVar = new Variable();
+            pVar->at = expr->left->at;
+            pVar->type = new TypeDecl(Type::autoinfer);
+            pVar->type->ref = true;
+            pVar->name = "_pod_inscope_temp_" + to_string(pVar->at.line) + "_" + to_string(pVar->at.column);
+            pVar->init = expr->left->clone();
+            pVar->generated = true;
+            pLet->variables.push_back(pVar);
+            auto pCall = new ExprCall(expr->at, "_::builtin_collect_local_and_zero");
+            pCall->alwaysSafe = true;
+            pCall->arguments.push_back(new ExprVar(expr->at, pVar->name));
+            pCall->arguments.push_back(new ExprConstUInt(expr->at, expr->left->type->getSizeOf()));
+            auto pMove = new ExprMove(expr->at, new ExprVar(expr->at, pVar->name), expr->right->clone());
+            pMove->podDelete = true;
+            pBlock->list.push_back(pLet);
+            pBlock->list.push_back(pCall);
+            pBlock->list.push_back(pMove);
+            return pBlock;
+        }
+        expr->type = new TypeDecl(); // we return nothing
+        return Visitor::visit(expr);
+    }
+    string InferTypes::copyErrorInfo(ExprCopy *expr) const {
+        if (verbose) {
+            return ", " + describeType(expr->left->type) + " = " + describeType(expr->right->type);
+        } else {
+            return "";
+        }
+    }
+    void InferTypes::preVisit(ExprCopy *expr) {
+        Visitor::preVisit(expr);
+        if (!strictProperties) {
+            if (expr->left->rtti_isField()) {
+                auto field = static_cast<ExprField*>(expr->left);
+                field->underClone = true;
+            } else if (expr->left->rtti_isVar()) {
+                auto var = static_cast<ExprVar*>(expr->left);
+                var->underClone = true;
+            } else if (expr->left->rtti_isAt()) {
+                auto at = static_cast<ExprAt*>(expr->left);
+                at->underClone = true;
+            }
+        }
+        markNoDiscard(expr->right);
+    }
+    ExpressionPtr InferTypes::visit(ExprCopy *expr) {
+        if (auto nExpr = promoteAssignmentToProperty(expr)) {
+            reportAstChanged();
+            return nExpr;
+        }
+        if (!expr->left->type || !expr->right->type)
+            return Visitor::visit(expr);
+        // try promoting RHS int literal to LHS type
+        {
+            bool rangeError = false;
+            if (auto promoted = tryPromoteConstInt(expr->right, expr->left->type, rangeError)) {
+                reportAstChanged();
+                expr->right = promoted;
+                return Visitor::visit(expr);
+            }
+            if (rangeError) {
+                expr->type = new TypeDecl(); // suppress downstream type-mismatch
+                return Visitor::visit(expr);
+            }
+        }
+        // infer
+        if (!canCopyOrMoveType(expr->left->type, expr->right->type, TemporaryMatters::no, expr->right,
+                               "can only copy compatible type", CompilationError::cant_copy, expr->at)) {
+        } else if (!expr->left->type->isRef()) {
+            error("can only copy to a reference" + copyErrorInfo(expr), "", "",
+                  expr->at, CompilationError::cant_copy);
+        } else if (!expr->allowConstantLValue && expr->left->type->constant) {
+            error("can't write to a constant value" + copyErrorInfo(expr), "", "",
+                  expr->at, CompilationError::cant_write);
+        } else if (!expr->allowCopyTemp && expr->right->type->isTemp(true, false)) {
+            error("can't copy temporary value" + copyErrorInfo(expr), "", "",
+                  expr->at, CompilationError::cant_copy);
+        } else if (expr->left->type->hasClasses() && !safeExpression(expr)) {
+            error("copying classes requires unsafe" + copyErrorInfo(expr), "", "",
+                  expr->at, CompilationError::unsafe_class);
+        }
+        if (!expr->left->type->canCopy()) {
+            error("this type can't be copied" + copyErrorInfo(expr),
+                  "", "use move (<-) or clone (:=) instead", expr->at, CompilationError::cant_type);
+            if (canRelaxAssign(expr->right)) {
+                reportAstChanged();
+                return new ExprMove(expr->at, expr->left->clone(), expr->right->clone());
+            }
+        }
+        expr->type = new TypeDecl(); // we return nothing
+        return Visitor::visit(expr);
+    }
+    void InferTypes::preVisit(ExprClone *expr) {
+        Visitor::preVisit(expr);
+        if (expr->left->rtti_isField()) {
+            auto field = static_cast<ExprField*>(expr->left);
+            field->underClone = true;
+        } else if (expr->left->rtti_isVar()) {
+            auto var = static_cast<ExprVar*>(expr->left);
+            var->underClone = true;
+        } else if (expr->left->rtti_isAt()) {
+            auto at = static_cast<ExprAt*>(expr->left);
+            at->underClone = true;
+        }
+        markNoDiscard(expr->right);
+    }
+    ExpressionPtr InferTypes::promoteAssignmentToProperty(ExprOp2 *expr) {
+        if (expr->right->type && !expr->right->type->isAutoOrAlias()) {
+            if (expr->left->rtti_isVar()) {
+                ExprVar *evar = (ExprVar *)(expr->left);
+                if (auto cloneSet = promoteToProperty(evar, expr->right)) {
+                    return cloneSet;
+                }
+                if (auto propGet = promoteToProperty(evar, nullptr)) {
+                    expr->left = propGet;
+                    return expr;
+                }
+            } else if (expr->left->rtti_isField()) {
+                ExprField *efield = (ExprField *)(expr->left);
+                if (auto cloneSet = promoteToProperty(efield, expr->right)) {
+                    return cloneSet;
+                }
+                if (auto propGet = promoteToProperty(efield, nullptr)) {
+                    expr->left = propGet;
+                    return expr;
+                }
+                if (expr->right->type->isBool() && efield->value->type && efield->value->type->isBitfield()) { // bitfield.field = bool
+                    auto value = efield->value;
+                    if (value->rtti_isR2V()) {
+                        value = static_cast<ExprRef2Value*>(value)->subexpr;
+                    }
+                    if (value->type->ref) {
+                        // lets find the right field
+                        auto fidx = efield->value->type->bitFieldIndex(efield->name);
+                        if (fidx != -1) {
+                            reportAstChanged();
+                            auto mask = new ExprConstBitfield(efield->at, uint64_t(1) << uint64_t(fidx));
+                            mask->bitfieldType = new TypeDecl(*efield->value->type);
+                            auto call = new ExprCall(efield->at, "__bit_set");
+                            call->arguments.push_back(value->clone());
+                            call->arguments.push_back(mask);
+                            call->arguments.push_back(expr->right->clone());
+                            return call;
+                        }
+                    }
+                }
+            } else if (expr->left->rtti_isAt()) {
+                ExprAt *eat = (ExprAt *)(expr->left);
+                // lets find []= operator
+                auto opName = "[]" + expr->name;
+                if (auto opAtEq = inferGenericOperator3(opName, expr->at, eat->subexpr, eat->index, expr->right)) {
+                    opAtEq->alwaysSafe = eat->alwaysSafe | expr->alwaysSafe;
+                    return opAtEq;
+                }
+                // now, lets see if at itself can be promoted
+                if (auto OpAt = inferGenericOperator("[]", expr->at, eat->subexpr, eat->index)) {
+                    reportAstChanged();
+                    OpAt->alwaysSafe = eat->alwaysSafe;
+                    expr->left = OpAt;
+                    return nullptr;
+                }
+            }
+        }
+        return nullptr;
+    }
+    ExpressionPtr InferTypes::visit(ExprClone *expr) {
+        if (auto nExpr = promoteAssignmentToProperty(expr)) {
+            reportAstChanged();
+            return nExpr;
+        }
+        if (!expr->left->type || !expr->right->type) {
+            return Visitor::visit(expr);
+        }
+        if (expr->left->type->isAliasOrExpr() || expr->right->type->isAliasOrExpr()) {
+            return Visitor::visit(expr); // failed to infer
+        }
+        // try promoting RHS int literal to LHS type
+        {
+            bool rangeError = false;
+            if (auto promoted = tryPromoteConstInt(expr->right, expr->left->type, rangeError)) {
+                reportAstChanged();
+                expr->right = promoted;
+                return Visitor::visit(expr);
+            }
+            if (rangeError) {
+                expr->type = new TypeDecl(); // suppress downstream mismatching_clone_type
+                return Visitor::visit(expr);
+            }
+        }
+        // lets infer clone call (and instance generic if need be)
+        auto opName = "_::clone";
+        auto tempCall = new ExprLooksLikeCall(expr->at, opName);
+        tempCall->arguments.push_back(expr->left);
+        tempCall->arguments.push_back(expr->right);
+        expr->func = inferFunctionCall(tempCall, InferCallError::tryOperator);
+        if (expr->func || opName != tempCall->name) { // this happens when the clone gets instanced
+            reportAstChanged();
+            auto opCall = new ExprCall(expr->at, tempCall->name);
+            opCall->arguments = das::move(tempCall->arguments);
+            return opCall;
+        }
+        // infer
+        if (!isSameSmartPtrType(expr->left->type, expr->right->type, true)) {
+            error("can only clone the same type " + describeType(expr->left->type) + " vs " + describeType(expr->right->type), "", "",
+                  expr->at, CompilationError::mismatching_clone_type);
+        } else if (!expr->left->type->isRef()) {
+            error("can only clone to a reference", "", "",
+                  expr->at, CompilationError::cant_clone);
+        } else if (expr->left->type->constant) {
+            error("can't write to a constant value " + expr->left->describe(), "type " + describeType(expr->left->type), "",
+                  expr->at, CompilationError::cant_clone);
+        } else if (!expr->left->type->canClone()) {
+            reportCantClone("type " + describeType(expr->left->type) + " can't be cloned from " + describeType(expr->right->type),
+                            expr->left->type, expr->at);
+        } else if (!relaxedPointerConst && expr->right->type->constant && !expr->right->type->canCloneFromConst()) {
+            reportCantCloneFromConst("type can't be cloned from const type", CompilationError::cant_copy,
+                                     expr->right->type, expr->at);
+        } else {
+            auto cloneType = expr->left->type;
+            if (cloneType->isHandle()) {
+                expr->type = new TypeDecl(); // we return nothing
+                return Visitor::visit(expr);
+            } else if (cloneType->isString() && (expr->right->type->isTemp() || multiContext)) {
+                reportAstChanged();
+                auto cloneFn = new ExprCall(expr->at, "clone_string");
+                cloneFn->arguments.push_back(expr->right->clone());
+                return new ExprCopy(expr->at, expr->left->clone(), cloneFn);
+            } else if (cloneType->isPointer() && cloneType->smartPtr) {
+                if ( !cloneType->firstType || !cloneType->firstType->annotation ) {
+                    error("can only clone smart pointer to handled type", "", "",
+                          expr->at, CompilationError::invalid_clone_smart_pointer_type);
+                    return Visitor::visit(expr);
+                }
+                if ( !cloneType->firstType->isHandle() ) {
+                    error("can only clone smart pointer to handled type", "", "",
+                          expr->at, CompilationError::invalid_clone_smart_pointer_type);
+                    return Visitor::visit(expr);
+                }
+                if ( !cloneType->firstType->annotation->isSmart() ) {
+                    error("pointer to " + cloneType->describe() + " can't be a smart pointer", "", "",
+                          expr->at, CompilationError::invalid_clone_smart_pointer_type);
+                    return Visitor::visit(expr);
+                }
+                auto fnClone = makeCloneSmartPtr(expr->at, cloneType, expr->right->type);
+                if (program->addFunction(fnClone)) {
+                    reportAstChanged();
+                    auto cloneFn = new ExprCall(expr->at, "_::clone");
+                    cloneFn->arguments.push_back(expr->left->clone());
+                    cloneFn->arguments.push_back(expr->right->clone());
+                    return cloneFn;
+                } else {
+                    reportMissingFinalizer("smart pointer clone mismatch ", expr->at, cloneType);
+                    return Visitor::visit(expr);
+                }
+            } else if (cloneType->canCopy(expr->right->type->isTemp() || multiContext)) {
+                reportAstChanged();
+                auto eCopy = new ExprCopy(expr->at, expr->left->clone(), expr->right->clone());
+                eCopy->allowCopyTemp = true;
+                return eCopy;
+            } else if (cloneType->isGoodArrayType() || cloneType->isGoodTableType()) {
+                reportAstChanged();
+                auto cloneFn = new ExprCall(expr->at, "_::clone");
+                cloneFn->arguments.push_back(expr->left->clone());
+                cloneFn->arguments.push_back(expr->right->clone());
+                return cloneFn;
+            } else if (cloneType->isStructure()) {
+                reportAstChanged();
+                auto stt = cloneType->structType;
+                auto fnList = getCloneFunc(cloneType, cloneType);
+                if (verifyCloneFunc(fnList, expr->at)) {
+                    if (fnList.size() == 0) {
+                        auto clf = makeClone(stt);
+                        if (relaxedPointerConst) {
+                            clf->arguments[1]->type->constant = true; // we clone from const, regardless
+                        }
+                        clf->privateFunction = true;
+                        extraFunctions.push_back(clf);
+                    }
+                    auto cloneFn = new ExprCall(expr->at, "_::clone");
+                    cloneFn->arguments.push_back(expr->left->clone());
+                    cloneFn->arguments.push_back(expr->right->clone());
+                    return cloneFn;
+                } else {
+                    return Visitor::visit(expr);
+                }
+            } else if (cloneType->isTuple()) {
+                reportAstChanged();
+                auto rhsType = new TypeDecl(*cloneType);
+                rhsType->constant = expr->right->type->constant;
+                auto fnList = getCloneFunc(cloneType, rhsType);
+                if (verifyCloneFunc(fnList, expr->at)) {
+                    if (fnList.size() == 0 && !hasExtraCloneFor(cloneType, expr->right->type->constant)) {
+                        auto clf = makeCloneTuple(expr->at, cloneType, expr->right->type->constant);
+                        clf->privateFunction = true;
+                        extraFunctions.push_back(clf);
+                    }
+                    auto cloneFn = new ExprCall(expr->at, "_::clone");
+                    cloneFn->arguments.push_back(expr->left->clone());
+                    cloneFn->arguments.push_back(expr->right->clone());
+                    return cloneFn;
+                } else {
+                    return Visitor::visit(expr);
+                }
+            } else if (cloneType->isVariant()) {
+                reportAstChanged();
+                auto rhsType = new TypeDecl(*cloneType);
+                rhsType->constant = expr->right->type->constant;
+                auto fnList = getCloneFunc(cloneType, rhsType);
+                if (verifyCloneFunc(fnList, expr->at)) {
+                    if (fnList.size() == 0 && !hasExtraCloneFor(cloneType, expr->right->type->constant)) {
+                        auto clf = makeCloneVariant(expr->at, cloneType, expr->right->type->constant);
+                        clf->privateFunction = true;
+                        extraFunctions.push_back(clf);
+                    }
+                    auto cloneFn = new ExprCall(expr->at, "_::clone");
+                    cloneFn->arguments.push_back(expr->left->clone());
+                    cloneFn->arguments.push_back(expr->right->clone());
+                    return cloneFn;
+                } else {
+                    return Visitor::visit(expr);
+                }
+            } else if (cloneType->baseType==Type::tFixedArray) {
+                reportAstChanged();
+                auto cloneFn = new ExprCall(expr->at, "clone_dim");
+                cloneFn->arguments.push_back(expr->left->clone());
+                cloneFn->arguments.push_back(expr->right->clone());
+                return cloneFn;
+            } else {
+                reportCantClone("this type can't be cloned " + describeType(cloneType),
+                                cloneType, expr->at);
+            }
+        }
+        return Visitor::visit(expr);
+    }
+    void InferTypes::preVisit(ExprTryCatch *expr) {
+        Visitor::preVisit(expr);
+        if (func)
+            func->hasTryRecover = true;
+    }
+    ExpressionPtr InferTypes::visit(ExprTryCatch *expr) {
+        if (jitEnabled()) {
+            auto tryBlock = new ExprMakeBlock(expr->try_block->at, expr->try_block);
+            ((ExprBlock *)tryBlock->block)->returnType = new TypeDecl(Type::autoinfer);
+            auto catchBlock = new ExprMakeBlock(expr->catch_block->at, expr->catch_block);
+            ((ExprBlock *)catchBlock->block)->returnType = new TypeDecl(Type::autoinfer);
+            auto ccall = new ExprCall(expr->at, "builtin_try_recover");
+            ccall->arguments.push_back(tryBlock);
+            ccall->arguments.push_back(catchBlock);
+            return ccall;
+        }
+        return Visitor::visit(expr);
+    }
+
+}

@@ -1,0 +1,1944 @@
+options gen2
+options indenting = 4
+options no_unused_block_arguments = false
+options no_unused_function_arguments = false
+options no_aot = true
+
+// OLD das restrictions
+options unsafe_table_lookup = false
+options strict_smart_pointers = false
+options relaxed_pointer_const = true
+
+module glsl_internal shared public
+
+require daslib/ast
+require daslib/rtti
+require strings
+
+require daslib/ast_boost
+require daslib/templates_boost
+require daslib/strings_boost
+require daslib/ast_used
+
+let DEBUG_SHADER_TEXT = false
+let DEBUG_SHADER_BINDINGS = false
+
+enum ShaderType {
+    vertex
+    fragment
+    compute
+}
+
+bitfield ShaderExportCaps {
+    output_shader_lines                         // output #line declarations
+    write_version                               // output shader version on top
+    output_inout                                // output regular variable declarations for inout variables (disable allows BGFX replcament declarations)
+    output_inout_stub                           // output $input and $output declarations for the inout varaibles for BGFX
+    output_inout_decl                           // output inout variable declarations to the separate DECL variable for BGFX
+    replace_hlsl_incompatible_operations        // replace MUL and vector comparisons
+    restrict_uniform_types                      // restrict uniform types to BGFX-compatible
+    restrict_vertex_attribute_names             // restrict vertex attribute names to BGFX-compatible
+    restrict_array_as_result                    // restrict arrays as function results or global variables (due to initializer)
+    output_unfirom_macro_declarations           // output BGFX-style image and sampler declarations
+    output_compatibility_constructors           // output VEC2, VEC3, etc constructors. also MUL for matrix and vector multiplications
+    output_hlsl_style_compute_layout            // output NUM_THREADS(x,y,z) macro in front of main of the compute shader
+    output_structure_initializers               // generate Foo_STRUCTURE_INITIALIZER instead of Foo() for HLSL compatibility
+    allow_unitialized_local_arrays              // var a: float[9] can be local, and will not be initialized for HLSL (only if restrict_array_as_result)
+    resolve_supported_semantics                 // resolve semantics from variable name (a_color0, v_position etc)
+}
+
+class GlslShader : AstFunctionAnnotation {
+    shaderType = ShaderType.vertex
+    write_version = true
+    output_inout = true
+    output_inout_stub = false
+    output_inout_decl = false
+    output_shader_lines = true
+    replace_hlsl_incompatible_operations = false
+    restrict_uniform_types = false
+    restrict_vertex_attribute_names = false
+    restrict_array_as_result = false
+    output_unfirom_macro_declarations = false
+    output_compatibility_constructors = false
+    output_hlsl_style_compute_layout = false
+    output_structure_initializers = false
+    allow_unitialized_local_arrays = false
+    resolve_supported_semantics = false
+    def get_glsl_prefix {
+        return ""
+    }
+    def generate_bind_uniform_dummy(var func : FunctionPtr) {
+        pass
+    }
+    def generate_bind_uniform(fnMain : FunctionPtr; var fn : FunctionPtr) {
+        pass
+    }
+    def override apply(var func : FunctionPtr; var group : ModuleGroup; args : AnnotationArgumentList; var errors : das_string) : bool {
+        func.flags.exports = true // note: this is temporary, until we are done with dependency collecting etc
+        let argName = args |> find_arg("name") ?as tString ?? "{func.name}`shader_text"
+        if (!add_global_var(compiling_module(), argName, new TypeDecl(at = func.at, baseType = Type.tString), func.at, false)) {
+            errors := "can't add global variable {argName}"
+            return false
+        }
+        if (output_inout_decl) {
+            let decl_name = "{argName}_DECL"
+            if (!add_global_var(compiling_module(), decl_name, new TypeDecl(at = func.at, baseType = Type.tString), func.at, false)) {
+                errors := "can't add global variable {decl_name}"
+                return false
+            }
+        }
+        generate_bind_uniform_dummy(func)
+        return true
+    }
+    def override patch(var func : FunctionPtr; var group : ModuleGroup; args, progArgs : AnnotationArgumentList; var errors : das_string; var astChanged : bool&) : bool {
+        for_each_function(compiling_module(), bind_uniform_function_name(func)) $(bfun) {
+            if (bfun.flags.exports) {
+                bfun.flags.exports = false
+                generate_bind_uniform(func, bfun)
+                astChanged = true
+            }
+        }
+        return true
+    }
+    def buildCaps {
+        var caps : ShaderExportCaps
+        if (write_version) {
+            caps.write_version = true
+        }
+        if (output_inout) {
+            caps.output_inout = true
+        }
+        if (output_inout_stub) {
+            caps.output_inout_stub = true
+        }
+        if (output_inout_decl) {
+            caps.output_inout_decl = true
+        }
+        if (output_shader_lines) {
+            caps.output_shader_lines = true
+        }
+        if (replace_hlsl_incompatible_operations) {
+            caps.replace_hlsl_incompatible_operations = true
+        }
+        if (restrict_uniform_types) {
+            caps.restrict_uniform_types = true
+        }
+        if (restrict_vertex_attribute_names) {
+            caps.restrict_vertex_attribute_names = true
+        }
+        if (restrict_array_as_result) {
+            caps.restrict_array_as_result = true
+        }
+        if (output_unfirom_macro_declarations) {
+            caps.output_unfirom_macro_declarations = true
+        }
+        if (output_compatibility_constructors) {
+            caps.output_compatibility_constructors = true
+        }
+        if (output_hlsl_style_compute_layout) {
+            caps.output_hlsl_style_compute_layout = true
+        }
+        if (output_structure_initializers) {
+            caps.output_structure_initializers = true
+        }
+        if (allow_unitialized_local_arrays) {
+            caps.allow_unitialized_local_arrays = true
+        }
+        if (resolve_supported_semantics) {
+            caps.resolve_supported_semantics = true
+        }
+        return caps
+    }
+    def override fixup(var func : FunctionPtr; var group : ModuleGroup; args, progArgs : AnnotationArgumentList; var errors : das_string) : bool {
+        let argName = args |> find_arg("name") ?as tString ?? "{func.name}`shader_text"
+        let version = args |> find_arg("version") ?as tInt ?? (shaderType == ShaderType.compute ? 430 : 330)
+        var compute_local_size : int3
+        if (shaderType == ShaderType.compute) {
+            let arg_local_size_x = args |> find_arg("local_size_x")
+            if (arg_local_size_x is tInt) {
+                compute_local_size.x = arg_local_size_x as tInt
+            } else {
+                errors := "missing local_size_x"
+                return false
+            }
+            compute_local_size.y = args |> find_arg("local_size_y") ?as tInt ?? 0
+            compute_local_size.z = args |> find_arg("local_size_z") ?as tInt ?? 0
+        }
+        // TODO: 'find_global(name)'
+        var err : array<string>
+        var glob <- find_variable(compiling_module(), argName)
+        if (glob != null && glob.init == null) {
+            if (glob.name == argName) {
+                let caps = buildCaps()
+                let gres = generate_glsl(func, err, shaderType, version, compute_local_size, caps)
+                let shader_text = "{gres.inout_stub}{get_glsl_prefix()}{gres.body}"
+                glob.init = new ExprConstString(at = func.at,
+                    value := shader_text,
+                    _type = new TypeDecl(at = func.at, baseType = Type.tString)
+                )
+                if (!err |> empty()) {
+                    glob.init := null
+                } else {
+                    glob._type.flags.constant = true
+                    if (output_inout_decl) {
+                        let decl_name = "{argName}_DECL"
+                        var glob_def <- find_variable(compiling_module(), decl_name)
+                        if (glob_def != null) {
+                            glob_def.init = new ExprConstString(at = func.at,
+                                value := gres.inout_decl,
+                                _type = new TypeDecl(at = func.at, baseType = Type.tString)
+                            )
+                            glob_def := null
+                        }
+                    }
+                }
+            }
+        }
+        glob := null
+        if (!err |> empty()) {
+            errors := join(err, "\n")
+            return false
+        }
+        return true
+    }
+}
+
+let private glsl_restricted_vertex_attribute_names <- {
+    "a_position"    => true,
+    "a_normal"      => true,
+    "a_tangent"     => true,
+    "a_bitangent"   => true,
+    "a_color0"      => true,
+    "a_color1"      => true,
+    "a_color2"      => true,
+    "a_color3"      => true,
+    "a_indices"     => true,
+    "a_weight"      => true,
+    "a_texcoord0"   => true,
+    "a_texcoord1"   => true,
+    "a_texcoord2"   => true,
+    "a_texcoord3"   => true,
+    "a_texcoord4"   => true,
+    "a_texcoord5"   => true,
+    "a_texcoord6"   => true,
+    "a_texcoord7"   => true
+}
+
+let private glsl_types <- {
+    Type.tFloat         => "float",
+    Type.tFloat2        => "vec2",
+    Type.tFloat3        => "vec3",
+    Type.tFloat4        => "vec4",
+    Type.tInt           => "int",
+    Type.tInt2          => "ivec2",
+    Type.tInt3          => "ivec3",
+    Type.tInt4          => "ivec4",
+    Type.tBool          => "bool",
+    Type.tRange         => "ivec2",
+    Type.tURange        => "uvec2",
+    Type.tVoid          => "void",
+    Type.tEnumeration   => "int"
+}
+
+let private glsl_handle_types <- {
+    "float4x4"      => "mat4",
+    "float3x3"      => "mat3"
+}
+
+let private glsl_functions <- {
+    "float3x3"  =>  "mat3",
+    "float2"    =>  "vec2",
+    "float3"    =>  "vec3",
+    "float4"    =>  "vec4",
+    "int2"    =>  "ivec2",
+    "int3"    =>  "ivec3",
+    "int4"    =>  "ivec4",
+    "uint2"    =>  "uvec2",
+    "uint3"    =>  "uvec3",
+    "uint4"    =>  "uvec4",
+    "floori"    =>  "floor",
+    "lerp"      =>  "mix",
+    "atan2"     =>  "atan",
+    "fast_normalize" => "normalize",
+    "saturate"  =>  "SATURATE",
+    "int_bits_to_float" => "intBitsToFloat",
+    "uint_bits_to_float" => "uintBitsToFloat",
+    "float_bits_to_int" => "floatBitsToInt",
+    "float_bits_to_uint" => "floatBitsToUint",
+    "discard"   =>  "_discard",
+    "_"         =>  "_"
+}
+
+let private glsl_compatibility_constructors <- {
+    "float4x4"  =>  "MAT4",
+    "float3x3"  =>  "MAT3",
+    "float4"  =>  "VEC4",
+    "float3"  =>  "VEC3",
+    "float2"  =>  "VEC2",
+    "int4"  =>  "IVEC4",
+    "int3"  =>  "IVEC3",
+    "int2"  =>  "IVEC2",
+    "uint4"  =>  "UVEC4",
+    "uint3"  =>  "UVEC3",
+    "uint2"  =>  "UVEC2"
+}
+
+class GlslExport : AstVisitor {
+    errors : array<string>
+    writer : StringBuilderWriter?
+    tab : int = 0
+    stnames   : table<string; bool>
+    depFun    : table<uint64; bool>
+    depVar    : table<uint64; bool>
+    depStruct : table<uint64; bool>
+    depEnum   : table<uint64; bool>
+    trackLine : int = 0
+    trackFile : string
+    shaderType : ShaderType
+    version : int = 0
+    renames : array<tuple<name : string; repl : string>>
+    astVisitorAdapter : VisitorAdapter?
+    compute_local_size : int3
+    caps : ShaderExportCaps
+    inout_stub : string
+    inout_decl : string
+    def GlslExport(var w : StringBuilderWriter; sht : ShaderType; ver : int; cls : int3; cp : ShaderExportCaps) {
+        unsafe {
+            writer = addr(w)
+        }
+        shaderType = sht
+        version = ver
+        compute_local_size = cls
+        caps = cp
+    }
+    def operator delete {
+        delete stnames
+        delete depFun
+        delete depVar
+        delete depStruct
+        delete depEnum
+        delete renames
+    }
+// TODO: fixme (egyptian braces)
+    def newLine(count : int) {
+        for (_t in range(count)) {
+            *writer |> write("\n")
+        }
+        trackLine += count
+    }
+    def error(txt : string; at : LineInfo) {
+        let fname = at.fileInfo != null ? "{at.fileInfo.name}" : ""
+        errors |> push("\tGLSL: {txt} at {fname}:{int(at.line)}:{int(at.column)}")
+    }
+    def line(at : LineInfo) {
+        if (!caps.output_shader_lines) return
+        if (at.fileInfo != null) {
+            peek(at.fileInfo.name) $(atname) {
+                if (trackLine != int(at.line) || trackFile != atname) {
+                    trackLine = int(at.line)
+                    trackFile := atname
+                    let trackFileText = trackFile |> replace("\\", "/")
+                    *writer |> write("#line {trackLine} \"{trackFileText}\"\n")
+                }
+            }
+        }
+    }
+// GLSL TYPE
+    def describe_glsl_type_ex(t : TypeDeclPtr; write_dim : bool) {
+        let st = build_string() $(var tw) {
+            // if t.flags.ref
+            //    tw |> write("& ") // inout?
+            // element kind lives at the chain leaf; [d] suffixes come from the chain
+            var et = t
+            while (et.baseType == Type.tFixedArray && et.firstType != null) {
+                et = et.firstType
+            }
+            if (et.baseType == Type.tStructure) {
+                tw |> write("{et.structType.name}")
+            } elif (et.baseType == Type.tHandle) {
+                peek(et.annotation.name) $(aname) {
+                    tw |> write(glsl_handle_types?[aname] ?? "error")
+                }
+            } elif (glsl_types |> key_exists(et.baseType)) {
+                tw |> write(glsl_types?[et.baseType] ?? "error")
+            } else {
+                error("unsupported type {et.baseType}", t.at)
+                tw |> write("error")
+            }
+            if (write_dim) {
+                var lvl = t
+                while (lvl.baseType == Type.tFixedArray && lvl.firstType != null) {
+                    tw |> write("[{lvl.fixedDim}]")
+                    lvl = lvl.firstType
+                }
+            }
+        }
+        return st
+    }
+    def describe_glsl_type(t : TypeDeclPtr) {
+        return describe_glsl_type_ex(t, true)
+    }
+    def write_dim_suffix(t : TypeDeclPtr) {
+        // GLSL declarator suffix: one [d] per chain level, outermost first
+        var lvl = t
+        while (lvl.baseType == Type.tFixedArray && lvl.firstType != null) {
+            *writer |> write("[{lvl.fixedDim}]")
+            lvl = lvl.firstType
+        }
+    }
+    def glsl_function_name(fun : FunctionPtr) {
+        var funname = build_string() $(var tw) {
+            for (Ch in string(fun.name)) {
+                if (Ch == '`') {
+                    tw |> write("_")
+                } else {
+                    tw |> write_char(Ch)
+                }
+            }
+        }
+        if (fun.flags.builtIn) {
+            pass
+        } elif (fun._module.name == "builtin") {
+            pass
+        } elif (fun._module.name == "glsl_common") {
+            pass
+        } elif (fun._module.name == "math" || fun._module.name == "math_bits") {
+            pass
+        } elif (fun._module.name != "") {
+            funname = "{funname}_in_{fun._module.name}"
+        }
+        while (stnames |> key_exists(funname)) {
+            funname = "_{funname}" // nolint:PERF004 rarely iterates more than once
+        }
+        return funname
+    }
+    def describe_glsl_function(fun : FunctionPtr) {
+        let st = build_string() $(var tw) {
+            tw |> write <| describe_glsl_type(fun.result)
+            let funname = glsl_function_name(fun)
+            tw |> write(" {funname} ( ")
+            for (arg, i in fun.arguments, count()) {
+                if (i != 0) {
+                    tw |> write(", ")
+                }
+                if (arg._type.isRef && !arg._type.flags.constant) {
+                    tw |> write("inout ")
+                }
+                tw |> write <| describe_glsl_type(arg._type)
+                tw |> write(" {arg.name}")
+            }
+            tw |> write(" )")
+        }
+        return st
+    }
+    def produce_zero(t : TypeDeclPtr) {
+        if (t.baseType == Type.tFixedArray) {
+            *writer |> write("{describe_glsl_type(t)}(")
+            var ct <- clone_type(t.firstType)   // element of the fixed-array chain
+            for (d in range(t.fixedDim)) {
+                if (d != 0) {
+                    *writer |> write(",")
+                }
+                produce_zero(ct)
+            }
+            ct := null
+            *writer |> write(")")
+        } elif (t.baseType == Type.tStructure) {
+            if (caps.output_structure_initializers) {
+                *writer |> write("{t.structType.name}_STRUCTURE_INITIALIZER(")
+            } else {
+                *writer |> write("{t.structType.name}(")
+            }
+            for (fld, i in t.structType.fields, count()) {
+                if (i != 0) {
+                    *writer |> write(",")
+                }
+                produce_zero(fld._type)
+            }
+            *writer |> write(")")
+        } elif (t.baseType == Type.tHandle) {
+            if (t.annotation.name == "float3x3") {
+                if (caps.output_compatibility_constructors) {
+                    *writer |> write("MAT3(VEC3(0),VEC3(0),VEC3(0))")
+                } else {
+                    *writer |> write("mat3(vec3(0),vec3(0),vec3(0))")
+                }
+            } elif (t.annotation.name == "float4x4") {
+                if (caps.output_compatibility_constructors) {
+                    *writer |> write("MAT4(VEC4(0),VEC4(0),VEC4(0),VEC4(0))")
+                } else {
+                    *writer |> write("mat4(vec4(0),vec4(0),vec4(0),vec4(0))")
+                }
+            } else {
+                error("unsupported zero for handled type {describe(t)}", t.at)
+            }
+        } elif (t.baseType == Type.tInt) {
+            *writer |> write("0")
+        } elif (t.baseType == Type.tInt2 || t.baseType == Type.tRange) {
+            *writer |> write("ivec2(0,0)")
+        } elif (t.baseType == Type.tInt3) {
+            *writer |> write("ivec3(0,0,0)")
+        } elif (t.baseType == Type.tInt4) {
+            *writer |> write("ivec4(0,0,0,0)")
+        } elif (t.baseType == Type.tUInt || t.baseType == Type.tURange) {
+            *writer |> write("0u")
+        } elif (t.baseType == Type.tUInt2) {
+            *writer |> write("uvec2(0u,0u)")
+        } elif (t.baseType == Type.tUInt3) {
+            *writer |> write("uvec3(0u,0u,0u)")
+        } elif (t.baseType == Type.tUInt4) {
+            *writer |> write("uvec4(0u,0u,0u,0u)")
+        } elif (t.baseType == Type.tFloat) {
+            *writer |> write("0.0")
+        } elif (t.baseType == Type.tFloat2) {
+            *writer |> write("vec2(0.0f,0.0f)")
+        } elif (t.baseType == Type.tFloat3) {
+            *writer |> write("vec3(0.0f,0.0f,0.0f)")
+        } elif (t.baseType == Type.tFloat4) {
+            *writer |> write("vec4(0.0f,0.0f,0.0f,0.0f)")
+        } elif (t.baseType == Type.tBool) {
+            *writer |> write("false")
+        } elif (t.baseType == Type.tEnumeration) {
+            *writer |> write("0")
+        } else {
+            error("unsupported zero for type {describe(t)}", t.at)
+        }
+    }
+// any subexpression to string in current context
+    def describe_subexpression(expr : ExpressionPtr) {
+        let oldWriter = writer
+        let st = build_string() $(var newWriter) {
+            unsafe {
+                writer = addr(newWriter)
+            }
+            visit(expr, astVisitorAdapter)
+        }
+        writer = oldWriter
+        return st
+    }
+// check if main
+    def isMainFunction(fun : FunctionPtr) {
+        var isMain = false
+        for (ann in fun.annotations) {
+            peek(ann.annotation.name) $(aname) {
+                if (aname |> find("vertex_program") != -1 || aname |> find("fragment_program") != -1 || aname |> find("compute_program") != -1) {
+                    isMain = true
+                }
+            }
+        }
+        return isMain
+    }
+// program
+    def override preVisitProgramBody(prog : ProgramPtr; mod : Module?) : void {
+        var any = false
+        for_each_function(mod, "") $(fun) {
+            if (depFun |> key_exists(intptr(fun))) {
+                if (!isMainFunction(fun)) {
+                    if (fun._module.name != "glsl_common") {
+                        let ss = describe_glsl_function(fun)
+                        *writer |> write("{ss};")
+                        newLine(1)
+                        any = true
+                    }
+                }
+            }
+        }
+        if (any) {
+            newLine(1)
+        }
+    }
+    def override preVisitProgram(prog : ProgramPtr) : void {
+        if (caps.write_version) {
+            *writer |> write("#version {version} core\n\n")
+        }
+        // TODO: only output builtin functions which are necessary
+        if (version >= 400 && shaderType != ShaderType.compute) {
+            *writer |> write("void _discard ( ) \{ discard; \}\n")
+        }
+        *writer |> write("float rcp ( float r ) \{ return 1.0 / r; \}\n")
+        *writer |> write("vec2 rcp ( vec2 r ) \{ return 1.0 / r; \}\n")
+        *writer |> write("vec3 rcp ( vec3 r ) \{ return 1.0 / r; \}\n")
+        *writer |> write("vec4 rcp ( vec4 r ) \{ return 1.0 / r; \}\n")
+        *writer |> write("ivec2 range ( int r ) \{ return ivec2(0,r); \}\n")
+        *writer |> write("ivec2 range ( int f, int t ) \{ return ivec2(f,t); \}\n")
+        *writer |> write("float SATURATE ( float a ) \{ return clamp(a,0.,1.); \}\n")
+        *writer |> write("vec2 SATURATE ( vec2 a ) \{ return clamp(a,vec2(0.,0.),vec2(1.,1.)); \}\n")
+        *writer |> write("vec3 SATURATE ( vec3 a ) \{ return clamp(a,vec3(0.,0.,0.),vec3(1.,1.,1.)); \}\n")
+        *writer |> write("vec4 SATURATE ( vec4 a ) \{ return clamp(a,vec4(0.,0.,0.,0.),vec4(1.,1.,1.,1.)); \}\n")
+        *writer |> write("void sincos ( float a, out float sv, out float cv ) \{ sv=sin(a); cv=cos(a); \}\n")
+        *writer |> write("float length_sq ( vec2 t ) \{ return dot(t,t); \}\n")
+        *writer |> write("float length_sq ( vec3 t ) \{ return dot(t,t); \}\n")
+        *writer |> write("float length_sq ( vec4 t ) \{ return dot(t,t); \}\n")
+        *writer |> write("float mad ( float a, float b, float c ) \{ return a*b+c; \}\n")
+        *writer |> write("vec2 mad ( vec2 a, float b, vec2 c ) \{ return a*vec2(b,b)+c; \}\n")
+        *writer |> write("vec3 mad ( vec3 a, float b, vec3 c ) \{ return a*vec3(b,b,b)+c; \}\n")
+        *writer |> write("vec4 mad ( vec4 a, float b, vec4 c ) \{ return a*vec4(b,b,b,b)+c; \}\n")
+        *writer |> write("vec2 mad ( vec2 a, vec2 b, vec2 c ) \{ return a*b+c; \}\n")
+        *writer |> write("vec3 mad ( vec3 a, vec3 b, vec3 c ) \{ return a*b+c; \}\n")
+        *writer |> write("vec4 mad ( vec4 a, vec4 b, vec4 c ) \{ return a*b+c; \}\n")
+        *writer |> write("float distance_sq ( vec3 a, vec3 b ) \{ return length_sq(a-b); \}\n")
+        *writer |> write("float inv_distance_sq ( vec3 a, vec3 b ) \{ return 1. / distance_sq(a,b); \}\n")
+        if (caps.output_compatibility_constructors) {
+            /*
+            *writer |> write("#define VEC2 vec2\n")
+            *writer |> write("#define VEC3 vec3\n")
+            *writer |> write("#define VEC4 vec4\n")
+            *writer |> write("#define IVEC2 ivec2\n")
+            *writer |> write("#define IVEC3 ivec3\n")
+            *writer |> write("#define IVEC4 ivec4\n")
+            *writer |> write("#define UVEC2 uvec2\n")
+            *writer |> write("#define UVEC3 uvec3\n")
+            *writer |> write("#define UVEC4 uvec4\n")
+            *writer |> write("#define MAT3 mat3\n")
+            *writer |> write("#define MAT4 mat4\n")
+            */
+            // vec2
+            *writer |> write("vec2 VEC2(float c) \{ return vec2(c,c); \}\n")
+            *writer |> write("vec2 VEC2(float x, float y) \{ return vec2(x,y); \}\n")
+            *writer |> write("vec2 VEC2(ivec2 c) \{ return vec2(float(c.x),float(c.y)); \}\n")
+            *writer |> write("vec2 VEC2(uvec2 c) \{ return vec2(float(c.x),float(c.y)); \}\n")
+            // vec3
+            *writer |> write("vec3 VEC3(float c) \{ return vec3(c,c,c); \}\n")
+            *writer |> write("vec3 VEC3(float x, float y, float z) \{ return vec3(x,y,z); \}\n")
+            *writer |> write("vec3 VEC3(vec2 xy, float z) \{ return vec3(xy.x,xy.y,z); \}\n")
+            *writer |> write("vec3 VEC3(float x, vec2 yz) \{ return vec3(x,yz.x,yz.y); \}\n")
+            *writer |> write("vec3 VEC3(ivec3 c) \{ return vec3(float(c.x),float(c.y),float(c.z)); \}\n")
+            // vec4
+            *writer |> write("vec4 VEC4(float c) \{ return vec4(c,c,c,c); \}\n")
+            *writer |> write("vec4 VEC4(vec2 xy, float z, float w) \{ return vec4(xy.x,xy.y,z,w); \}\n")
+            *writer |> write("vec4 VEC4(vec2 xy, vec2 zw) \{ return vec4(xy.x,xy.y,zw.x,zw.y); \}\n")
+            *writer |> write("vec4 VEC4(float x, float y, vec2 zw) \{ return vec4(x,y,zw.x,zw.y); \}\n")
+            *writer |> write("vec4 VEC4(float x, vec2 yz, float w) \{ return vec4(x,yz.x,yz.y,w); \}\n")
+            *writer |> write("vec4 VEC4(vec3 xyz, float w) \{ return vec4(xyz.x,xyz.y,xyz.z,w); \}\n")
+            *writer |> write("vec4 VEC4(float x, vec3 yzw) \{ return vec4(x,yzw.x,yzw.y,yzw.z); \}\n")
+            *writer |> write("vec4 VEC4(float x, float y, float z, float w) \{ return vec4(x,y,z,w); \}\n")
+            *writer |> write("vec4 VEC4(ivec4 c) \{ return vec4(float(c.x),float(c.y),float(c.z),float(c.w)); \}\n")
+
+            // ivec2
+            *writer |> write("ivec2 IVEC2(int c) \{ return ivec2(c,c); \}\n")
+            *writer |> write("ivec2 IVEC2(uvec2 c) \{ return ivec2(int(c.x),int(c.y)); \}\n")
+            *writer |> write("ivec2 IVEC2(int x, int y) \{ return ivec2(x,y); \}\n")
+            // ivec3
+            *writer |> write("ivec3 IVEC3(int c) \{ return ivec3(c,c,c); \}\n")
+            *writer |> write("ivec3 IVEC3(int x, int y, int z) \{ return ivec3(x,y,z); \}\n")
+            *writer |> write("ivec3 IVEC3(ivec2 xy, int z) \{ return ivec3(xy.x,xy.y,z); \}\n")
+            *writer |> write("ivec3 IVEC3(int x, ivec2 yz) \{ return ivec3(x,yz.x,yz.y); \}\n")
+            // ivec4
+            *writer |> write("ivec4 IVEC4(int c) \{ return ivec4(c,c,c,c); \}\n")
+            *writer |> write("ivec4 IVEC4(ivec2 xy, int z, int w) \{ return ivec4(xy.x,xy.y,z,w); \}\n")
+            *writer |> write("ivec4 IVEC4(ivec2 xy, ivec2 zw) \{ return ivec4(xy.x,xy.y,zw.x,zw.y); \}\n")
+            *writer |> write("ivec4 IVEC4(int x, int y, ivec2 zw) \{ return ivec4(x,y,zw.x,zw.y); \}\n")
+            *writer |> write("ivec4 IVEC4(int x, ivec2 yz, int w) \{ return ivec4(x,yz.x,yz.y,w); \}\n")
+            *writer |> write("ivec4 IVEC4(ivec3 xyz, int w) \{ return ivec4(xyz.x,xyz.y,xyz.z,w); \}\n")
+            *writer |> write("ivec4 IVEC4(int x, ivec3 yzw) \{ return ivec4(x,yzw.x,yzw.y,yzw.z); \}\n")
+            *writer |> write("ivec4 IVEC4(int x, int y, int z, int w) \{ return ivec4(x,y,z,w); \}\n")
+            // uvec2
+            *writer |> write("uvec2 UVEC2(uint c) \{ return uvec2(c,c); \}\n")
+            *writer |> write("uvec2 UVEC2(ivec2 c) \{ return uvec2(uint(c.x),uint(c.y)); \}\n")
+            *writer |> write("uvec2 UVEC2(uint x, uint y) \{ return uvec2(x,y); \}\n")
+            // uvec3
+            *writer |> write("uvec3 UVEC3(uint c) \{ return uvec3(c,c,c); \}\n")
+            *writer |> write("uvec3 UVEC3(uint x, uint y, uint z) \{ return uvec3(x,y,z); \}\n")
+            *writer |> write("uvec3 UVEC3(uvec2 xy, uint z) \{ return uvec3(xy.x,xy.y,z); \}\n")
+            *writer |> write("uvec3 UVEC3(uint x, uvec2 yz) \{ return uvec3(x,yz.x,yz.y); \}\n")
+            // uvec4
+            *writer |> write("uvec4 UVEC4(uint c) \{ return uvec4(c,c,c,c); \}\n")
+            *writer |> write("uvec4 UVEC4(uvec2 xy, uint z, uint w) \{ return uvec4(xy.x,xy.y,z,w); \}\n")
+            *writer |> write("uvec4 UVEC4(uvec2 xy, uvec2 zw) \{ return uvec4(xy.x,xy.y,zw.x,zw.y); \}\n")
+            *writer |> write("uvec4 UVEC4(uint x, uint y, uvec2 zw) \{ return uvec4(x,y,zw.x,zw.y); \}\n")
+            *writer |> write("uvec4 UVEC4(uint x, uvec2 yz, uint w) \{ return uvec4(x,yz.x,yz.y,w); \}\n")
+            *writer |> write("uvec4 UVEC4(uvec3 xyz, uint w) \{ return uvec4(xyz.x,xyz.y,xyz.z,w); \}\n")
+            *writer |> write("uvec4 UVEC4(uint x, uvec3 yzw) \{ return uvec4(x,yzw.x,yzw.y,yzw.z); \}\n")
+            *writer |> write("uvec4 UVEC4(uint x, uint y, uint z, uint w) \{ return uvec4(x,y,z,w); \}\n")
+            // mat3
+            *writer |> write("mat3 MAT3(vec3 a, vec3 b, vec3 c) \{ mat3 res; res[0]=a; res[1]=b; res[2]=c; return res; \}\n")
+            *writer |> write("mat3 MAT3(mat4 m) \{ mat3 res; res[0]=m[0].xyz; res[1]=m[1].xyz; res[2]=m[2].xyz; return res; \}\n")
+            // mat4
+            *writer |> write("mat4 MAT4(vec4 a, vec4 b, vec4 c, vec4 d) \{ mat4 res; res[0]=a; res[1]=b; res[2]=c; res[3]=d; return res; \}\n")
+            // mul mat vec
+            *writer |> write("vec3 MUL(mat3 a, vec3 b) \{ return a[0]*b.x + a[1]*b.y + a[2]*b.z; \}\n")
+            *writer |> write("mat3 MUL(mat3 a, mat3 b) \{
+                mat3 res;
+                res[0] = a[0]*b[0].x + a[1]*b[0].y + a[2]*b[0].z;
+                res[1] = a[0]*b[1].x + a[1]*b[1].y + a[2]*b[1].z;
+                res[2] = a[0]*b[2].x + a[1]*b[2].y + a[2]*b[2].z;
+                return res; \}\n")
+            *writer |> write("vec4 MUL(mat4 a, vec4 b) \{ return a[0]*b.x + a[1]*b.y + a[2]*b.z + a[3]*b.w; \}\n")
+            *writer |> write("mat4 MUL(mat4 a, mat4 b) \{
+                mat4 res;
+                res[0] = a[0]*b[0].x + a[1]*b[0].y + a[2]*b[0].z + a[3]*b[0].w;
+                res[1] = a[0]*b[1].x + a[1]*b[1].y + a[2]*b[1].z + a[3]*b[1].w;
+                res[2] = a[0]*b[2].x + a[1]*b[2].y + a[2]*b[2].z + a[3]*b[2].w;
+                res[3] = a[0]*b[3].x + a[1]*b[3].y + a[2]*b[3].z + a[3]*b[3].w;
+                return res; \}\n")
+            // and done
+            *writer |> write("\n")
+        }
+        if (shaderType == ShaderType.compute) {
+            if (!caps.output_hlsl_style_compute_layout) {
+                if (compute_local_size.z != 0) {
+                    *writer |> write("layout (local_size_x={compute_local_size.x}, local_size_y={compute_local_size.y}, local_size_z={compute_local_size.z}) in;\n")
+                } elif (compute_local_size.y != 0) {
+                    *writer |> write("layout (local_size_x={compute_local_size.x}, local_size_y={compute_local_size.y}) in;\n")
+                } else {
+                    *writer |> write("layout (local_size_x={compute_local_size.x}) in;\n")
+                }
+            }
+        }
+    }
+// type
+    ET : bool = false
+    def override preVisitTypeDecl(typ : TypeDeclPtr) {
+        ET = typ.isExprType
+        if (ET) {
+            *writer |> write("/*[")
+        }
+    }
+    def override visitTypeDecl(typ : TypeDeclPtr) {
+        if (ET) {
+            *writer |> write("]*/")
+        }
+        return typ
+    }
+// enumeration
+    def override canVisitEnumeration(enu : Enumeration?) {
+        return false
+    }
+// structure
+    def override canVisitStructure(str : Structure?) {
+        if (!(depStruct |> key_exists(intptr(str)))) return false
+        return !(str._module.name == "glsl_common")
+    }
+    def override preVisitStructure(str : StructurePtr) {
+        if (str.flags.isClass) {
+            error("classes are not supported", str.at)
+        }
+        line(str.at)
+        *writer |> write("struct {str.name}")
+        newLine(1)
+        *writer |> write("\{")
+        newLine(1)
+    }
+    def override preVisitStructureField(str : StructurePtr; decl : FieldDeclaration; last : bool) {
+        line(decl.at)
+        *writer |> write("\t")
+        //if decl.annotation |> length != 0
+        //    *writer |> write("[{describe(decl.annotation)}] ")
+        *writer |> write("{describe_glsl_type_ex(decl._type,false)} {decl.name}")
+        if (decl.init != null) {
+            error("structure initialization is not supported", decl.init.at)
+        }
+    }
+    def override visitStructureField(str : StructurePtr; decl : FieldDeclaration; last : bool) {
+        write_dim_suffix(decl._type)
+        *writer |> write(";")
+        newLine(1)
+    }
+    def override visitStructure(str : StructurePtr) : StructurePtr {
+        *writer |> write("};")
+        newLine(2)
+        if (caps.output_structure_initializers) {
+            *writer |> write("{str.name} {str.name}_STRUCTURE_INITIALIZER ( ")
+            var first = true
+            for (fl in str.fields) {
+                if (first) {
+                    first = false
+                } else {
+                    *writer |> write(", ")
+                }
+                *writer |> write(describe_glsl_type(fl._type))
+                *writer |> write(" _{fl.name}")
+            }
+            *writer |> write(" )\n")
+            *writer |> write("\{\n")
+            *writer |> write("\t{str.name} RESULT;\n")
+            for (fl in str.fields) {
+                *writer |> write("\tRESULT.{fl.name} = _{fl.name};\n")
+            }
+            *writer |> write("\treturn RESULT;\n")
+            *writer |> write("\}\n\n")
+        }
+        return str
+    }
+// function
+    def override canVisitFunction(arg : Function?) : bool {
+        if (!depFun |> key_exists(intptr(arg)) || arg._module.name == "glsl_common") return false
+        return !(arg._module.name == "math" || arg._module.name == "math_bits")
+    }
+    def override preVisitFunction(fun : FunctionPtr) {
+        if (caps.restrict_array_as_result) {
+            if (fun.result.baseType == Type.tFixedArray) {
+                error("returning arrays is prohibited in this shader model", fun.at)
+            }
+        }
+        let isMain = isMainFunction(fun)
+        if (isMain && shaderType == ShaderType.compute) {
+            if (caps.output_hlsl_style_compute_layout) {
+                if (compute_local_size.z != 0) {
+                    *writer |> write("NUM_THREADS({compute_local_size.x},{compute_local_size.y},{compute_local_size.z})\n")
+                } elif (compute_local_size.y != 0) {
+                    *writer |> write("NUM_THREADS({compute_local_size.x},{compute_local_size.y},1)\n")
+                } else {
+                    *writer |> write("NUM_THREADS({compute_local_size.x},1,1)\n")
+                }
+            }
+        }
+        line(fun.at)
+        *writer |> write("{describe_glsl_type(fun.result)} ")
+        let fnName = isMain ? "main" : glsl_function_name(fun)
+        *writer |> write("{fnName}(")
+    }
+    def override preVisitFunctionBody(fun : FunctionPtr; expr : ExpressionPtr) {
+        *writer |> write(")")
+        for (ann in fun.annotations) {
+            if (ann.annotation.name == "pixel_shader") {// TODO: other ann
+                let argo = ann.arguments |> find_arg("output")
+                if (argo is tString) {
+                    *writer |> write(" : {argo as tString}")
+                }
+            }
+        }
+        newLine(1)
+    }
+    def override visitFunction(fun : FunctionPtr) : FunctionPtr {
+        newLine(1)
+        return fun
+    }
+    def override preVisitFunctionArgument(fun : FunctionPtr; arg : VariablePtr; last : bool) {
+        if (arg._type.isRef && !arg._type.flags.constant) {
+            *writer |> write("inout ")
+        }
+        *writer |> write("{describe_glsl_type(arg._type)} {arg.name} ")
+    }
+    def override visitFunctionArgument(fun : FunctionPtr; arg : VariablePtr; last : bool) {
+        if (!last) {
+            *writer |> write(", ")
+        }
+        return arg
+    }
+    def override canVisitFunctionArgumentInit(fun : Function?; arg : VariablePtr; value : ExpressionPtr) : bool {
+        return false
+    }
+// block
+    def override preVisitExprBlock(blk : ExprBlock?) {
+        if (blk.blockFlags.isClosure) {
+            error("closure is not supported", blk.at)
+        }
+        *writer |> write("{repeat("\t",tab)}\{")
+        newLine(1)
+        tab ++
+    }
+    def override visitExprBlock(blk : ExprBlock?) : ExpressionPtr {
+        tab --
+        *writer |> write("{repeat("\t",tab)}\}")
+        newLine(1)
+        return blk
+    }
+    def override preVisitExprBlockExpression(blk : ExprBlock?; expr : ExpressionPtr) {
+        line(expr.at)
+        *writer |> write("{repeat("\t",tab)}")
+    }
+    def override visitExprBlockExpression(blk : ExprBlock?; expr : ExpressionPtr) {
+        *writer |> write(";")
+        newLine(1)
+        return expr
+    }
+    def override visitExprBlockFinal(blk : ExprBlock?) {
+        error("finally is not supported", blk.at)
+    }
+// let
+    def override preVisitExprLetVariable(expr : ExprLet?; arg : VariablePtr; lastArg : bool) {
+        if (arg._type.flags.ref) {
+            error("local references are not supported by GLSL", arg.at)
+        }
+        line(arg.at)
+        *writer |> write("{describe_glsl_type_ex(arg._type,false)} {arg.name}")
+        write_dim_suffix(arg._type)
+    }
+    def override visitExprLetVariable(expr : ExprLet?; arg : VariablePtr; lastArg : bool) {
+        if (arg.init == null) {
+            var needZero = true
+            if (caps.restrict_array_as_result) {
+                if (caps.allow_unitialized_local_arrays) {
+                    if (arg._type.baseType == Type.tFixedArray) {
+                        needZero = false
+                    }
+                }
+            }
+            if (needZero) {
+                *writer |> write(" = ")
+                produce_zero(arg._type)
+            }
+        }
+        if (!lastArg) {
+            *writer |> write(";")
+        }
+        return arg
+    }
+    def override preVisitExprLetVariableInit(blk : ExprLet?; arg : VariablePtr; expr : ExpressionPtr) {
+        // if arg.flags.init_via_move
+        // elif arg.flags.init_via_clone
+        *writer |> write(" = ")
+    }
+// global let
+    def override canVisitGlobalVariable(arg : Variable?) : bool {
+        if (!depVar |> key_exists(intptr(arg))) return false
+        return !("{arg._module.name}" |> find("glsl_") != -1)
+    }
+    def checkUniformType(typ : TypeDeclPtr) {
+        if (!caps.restrict_uniform_types || typ.baseType == Type.tFloat4) return
+        if (typ.baseType == Type.tHandle) {
+            if (typ.annotation.name == "float3x3" || typ.annotation.name == "float4x4") return
+        }
+        if (typ.baseType == Type.tStructure) {
+            if ("{typ.structType.name}" |> find("sampler") != -1
+                || "{typ.structType.name}" |> find("image") != -1) return
+        }
+        error("unsupported uniform type {describe(typ)}", typ.at)
+    }
+    def getSamplerType(typ : TypeDeclPtr) : string {
+        if (typ.baseType == Type.tStructure) {
+            if ("{typ.structType.name}" |> find("sampler") != -1) return string(typ.structType.name)
+        }
+        return ""
+    }
+    def getImageType(typ : TypeDeclPtr) : string {
+        if (typ.baseType == Type.tStructure) {
+            if ("{typ.structType.name}" |> find("image") != -1) return string(typ.structType.name)
+        }
+        return ""
+    }
+    def outputSamplerMacro(arg : VariablePtr) : bool {
+        if (!caps.output_unfirom_macro_declarations) return false
+        let st = getSamplerType(arg._type)
+        if (st == "") return false
+        let stage = arg.annotation |> find_arg("stage") ?as tInt ?? 0
+        let sfunc = to_upper(st)
+        *writer |> write(sfunc)
+        *writer |> write("({arg.name},{stage})")
+        return true
+    }
+    def outputImageMacro(arg : VariablePtr) : bool {
+        if (!caps.output_unfirom_macro_declarations) return false
+        let st = getImageType(arg._type)
+        if (st == "") return false
+        let format =  arg.annotation |> find_arg("format") ?as tString ?? "rgba8"
+        let binding = arg.annotation |> find_arg("stage") ?as tInt ?? 0
+        var suffix = "_RW"
+        if (arg.annotation |> find_arg("writeonly") ?as tBool ?? false) {
+            suffix = "_WR"
+        } elif (arg.annotation |> find_arg("readonly") ?as tBool ?? false) {
+            suffix = "_RO"
+        }
+        let sfunc = to_upper(st)
+        *writer |> write(sfunc)
+        *writer |> write("{suffix}({arg.name},{format},{binding})")
+        return true
+    }
+    def override preVisitGlobalLetVariable(arg : VariablePtr; lastArg : bool) {
+        line(arg.at)
+        if (caps.restrict_array_as_result) {
+            if (arg._type.baseType == Type.tFixedArray) {
+                let need_init = arg.annotation |> find_arg("need_init") ?as tBool ?? true
+                let group_shared = arg.annotation |> find_arg("groupshared") ?as tBool ?? false
+                if (need_init && !group_shared) {
+                    error("returning arrays is prohibited in this shader model", arg.at)
+                }
+            }
+        }
+        if (!caps.output_inout) {
+            if (!(arg.annotation |> find_arg("inout") is nothing) ||
+                 !(arg.annotation |> find_arg("in") is nothing) ||
+                 !(arg.annotation |> find_arg("out") is nothing)) {
+                *writer |> write("// ")
+            }
+        }
+        if (arg.annotation |> find_arg("ssbo") is tBool) {
+            let binding = arg.annotation |> find_arg("stage") ?as tInt ?? 0
+            *writer |> write("layout(std430, binding={binding}) buffer {arg.name}_ssbo")
+            newLine(1)
+            *writer |> write("\{")
+            newLine(1)
+            *writer |> write("    {describe_glsl_type(arg._type)} {arg.name};")
+            newLine(1)
+            *writer |> write("\}")
+        } else {
+            var needInit = arg.annotation |> find_arg("need_init") ?as tBool ?? true
+            if (arg.annotation |> find_arg("groupshared") ?as tBool ?? false) {
+                needInit = false
+            }
+            if (shaderType == ShaderType.vertex) {
+                if (arg.annotation |> find_arg("uniform") is tBool) {
+                    checkUniformType(arg._type)
+                    if (outputSamplerMacro(arg)) return
+                    *writer |> write("uniform "); needInit = false
+                }
+                let argLoc = arg.annotation |> find_arg("location")
+                if (argLoc is tInt) {
+                    *writer |> write("layout(location={argLoc as tInt}) "); needInit = false
+                }
+                if (arg.annotation |> find_arg("in") is tBool) {
+                    *writer |> write("in "); needInit = false
+                }
+                if (arg.annotation |> find_arg("inout") is tBool) {
+                    *writer |> write("out "); needInit = false
+                }
+            } elif (shaderType == ShaderType.fragment) {
+                if (arg.annotation |> find_arg("uniform") is tBool) {
+                    checkUniformType(arg._type)
+                    if (outputSamplerMacro(arg)) return
+                    *writer |> write("uniform "); needInit = false
+                }
+                if (arg.annotation |> find_arg("in") is tBool) {
+                    *writer |> write("in "); needInit = false
+                }
+                if (arg.annotation |> find_arg("out") is tBool) {
+                    *writer |> write("out "); needInit = false
+                }
+                if (arg.annotation |> find_arg("inout") is tBool) {
+                    *writer |> write("in "); needInit = false
+                }
+            } elif (shaderType == ShaderType.compute) {
+                if (arg.annotation |> find_arg("groupshared") is tBool) {
+                    if (caps.output_unfirom_macro_declarations) {
+                        *writer |> write("SHARED ")
+                    } else {
+                        *writer |> write("shared ")
+                    }
+                }
+                if (arg.annotation |> find_arg("uniform") is tBool) {
+                    checkUniformType(arg._type)
+                    if (outputSamplerMacro(arg) || outputImageMacro(arg)) return
+                    *writer |> write("uniform "); needInit = false
+                }
+                if (arg.annotation |> find_arg("in") is tBool) {
+                    *writer |> write("in "); needInit = false
+                }
+                if (arg.annotation |> find_arg("out") is tBool) {
+                    *writer |> write("out "); needInit = false
+                }
+                if (arg.annotation |> find_arg("inout") is tBool) {
+                    *writer |> write("in "); needInit = false
+                }
+                if (is_glsl_structure(arg, "image2D") || is_glsl_structure(arg, "image3D")) {
+                    var layouts : array<string>
+                    let i_writeonly = arg.annotation |> find_arg("writeonly")
+                    if (i_writeonly is tBool) {
+                        *writer |> write("writeonly "); needInit = false
+                    }
+                    let i_readonly = arg.annotation |> find_arg("readonly")
+                    if (i_readonly is tBool) {
+                        *writer |> write("readonly "); needInit = false
+                    }
+                    let s_format = arg.annotation |> find_arg("format")
+                    if (s_format is tString) {
+                        layouts |> push(s_format as tString)
+                    }
+                    let i_binding = arg.annotation |> find_arg("stage")
+                    if (i_binding is tInt) {
+                        layouts |> push("binding={i_binding as tInt}")
+                    }
+                    if (!empty(layouts)) {
+                        let lstr = join(layouts, ",")
+                        *writer |> write("layout({lstr}) "); needInit = false
+                    }
+                }
+            }
+            *writer |> write("{describe_glsl_type_ex(arg._type,false)} {arg.name}")
+            write_dim_suffix(arg._type)
+            if (arg.init == null && needInit) {
+                *writer |> write(" = ")
+                produce_zero(arg._type)
+            }
+        }
+    }
+    def override visitGlobalLetVariable(arg : VariablePtr; lastArg : bool) {
+        let reg = arg.annotation |> find_arg("register")
+        if (reg is tString) {
+            *writer |> write(": register({reg as tString})")
+        }
+        *writer |> write(";")
+        newLine(2)
+        var is_inout = false
+        if (caps.output_inout_stub) {
+            is_inout = true
+            if (!(arg.annotation |> find_arg("inout") is nothing)) {
+                if (shaderType == ShaderType.vertex) {
+                    inout_stub += "$output {arg.name}\n"
+                } elif (shaderType == ShaderType.compute || shaderType == ShaderType.fragment) {
+                    inout_stub += "$input {arg.name}\n"
+                }
+            } elif (!(arg.annotation |> find_arg("in") is nothing)) {
+                inout_stub += "$input {arg.name}\n"
+                if (caps.restrict_vertex_attribute_names) {
+                    if (!glsl_restricted_vertex_attribute_names |> key_exists("{arg.name}")) {
+                        var names <- [for (n in keys(glsl_restricted_vertex_attribute_names)); n]
+                        let allowed_names = join(names, ",")
+                        error("invalid vertex attribute name {arg.name}, supported names are {allowed_names}", arg.at)
+                        delete names
+                    }
+                }
+            } elif (!(arg.annotation |> find_arg("out") is nothing)) {
+                inout_stub += "$output {arg.name}\n"
+            } else {
+                is_inout = false
+            }
+        }
+        if (is_inout && caps.output_inout_decl) {
+            let sema = arg.annotation |> find_arg("semantics")
+            var suffix = ""
+            if (sema is tString) {
+                suffix = " : {sema as tString}"
+            }
+            if (caps.resolve_supported_semantics) {
+                if (suffix == "") {
+                    var aname = ""
+                    peek(arg.name) $(s) {
+                        aname = to_upper(s)
+                    }
+                    if (glsl_supported_semantics |> key_exists(aname)) {
+                        suffix = " : {aname}"
+                    } else {
+                        let atail = slice(aname, 2)
+                        if (glsl_supported_semantics |> key_exists(atail)) {
+                            suffix = " : {atail}"
+                        }
+                    }
+                }
+                if (suffix == "") {
+                    error("missing semantics for {arg.name}", arg.at)
+                }
+            }
+            inout_decl += "{describe_glsl_type(arg._type)} {arg.name}{suffix};\n"
+        }
+        return arg
+    }
+    def override preVisitGlobalLetVariableInit(arg : VariablePtr; expr : ExpressionPtr) {
+        // if arg.flags.init_via_move
+        // elif arg.flags.init_via_clone
+        *writer |> write(" = ")
+    }
+// string builder
+    def override preVisitExprStringBuilder(expr : ExprStringBuilder?) {
+        error("string builder is not supported", expr.at)
+    }
+// new
+    def override preVisitExprNew(expr : ExprNew?) {
+        error("new is not supported", expr.at)
+    }
+// named call
+    def override preVisitExprNamedCall(expr : ExprNamedCall?) {
+        error("named call is not supported", expr.at)
+    }
+// looks like call (debug,assert,verify,erase,find,key_exists,keys,values,invoke,memzero etc)
+    def isInvokeMethod(expr : ExprLooksLikeCall?) {
+        return (expr ?as ExprInvoke)?.isInvokeMethod ?? false
+    }
+    def override preVisitExprLooksLikeCall(expr : ExprLooksLikeCall?) {
+        if (isInvokeMethod(expr)) {
+            pass
+        } else {
+            *writer |> write("{expr.name}(")
+        }
+    }
+    def override visitExprLooksLikeCall(expr : ExprLooksLikeCall?) : ExpressionPtr {
+        *writer |> write(")")
+        return expr
+    }
+    def override preVisitExprLooksLikeCallArgument(expr : ExprLooksLikeCall?; arg : ExpressionPtr; last : bool) {
+        let isInvoke = isInvokeMethod(expr)
+        if (isInvoke && arg == expr.arguments[1]) {
+            *writer |> write("/*")
+        }
+    }
+    def override visitExprLooksLikeCallArgument(expr : ExprLooksLikeCall?; arg : ExpressionPtr; last : bool) {
+        let isInvoke = isInvokeMethod(expr)
+        if (isInvoke && arg == expr.arguments[0]) {
+            *writer |> write("(")
+        } elif (isInvoke && arg == expr.arguments[1]) {
+            *writer |> write("*/")
+        } elif (!last) {
+            *writer |> write(",")
+        }
+        return arg
+    }
+// call
+    def override preVisitExprCall(expr : ExprCall?) {
+        var fnName : string
+        unsafe {
+            fnName = glsl_function_name(reinterpret<FunctionPtr> expr.func)
+        }
+        if (caps.output_compatibility_constructors) {
+            glsl_compatibility_constructors |> get(fnName) $(newName) {
+                fnName = newName
+            }
+        }
+        glsl_functions |> get(fnName) $(newName) {
+            fnName = newName
+        }
+        *writer |> write("{fnName}(")
+    }
+    def override visitExprCall(expr : ExprCall?) : ExpressionPtr {
+        *writer |> write(")")
+        return expr
+    }
+    def override visitExprCallArgument(expr : ExprCall?; arg : ExpressionPtr; last : bool) {
+        if (!last) {
+            *writer |> write(",")
+        }
+        return arg
+    }
+// null coaelescing
+    def override preVisitExprNullCoalescing(expr : ExprNullCoalescing?) : void {
+        error("null coaelescing is not supported", expr.at)
+    }
+// at
+    def override visitExprAt(expr : ExprAt?) : ExpressionPtr {
+        *writer |> write("]")
+        return expr
+    }
+    def override preVisitExprAtIndex(expr : ExprAt?; index : ExpressionPtr) {
+        *writer |> write("[")
+    }
+// safe at
+    def override preVisitExprSafeAt(expr : ExprSafeAt?) : void {
+        error("safe index is not supported", expr.at)
+    }
+// is
+    def override preVisitExprIsType(expr : ExprIs?; typeDecl : TypeDeclPtr) : void {
+        error("is type is not supported", expr.at)
+    }
+// op2
+    def getReplaceOp2(expr : ExprOp2?) : tuple<fun : string; replOp : bool> {
+        if (expr.op == "%" && !expr._type.isInteger) return (fun = "mod", replOp = true)
+        if (caps.replace_hlsl_incompatible_operations) {
+            if (expr.op == "*") {
+                if (is_any_matrix(expr.left._type) || is_any_matrix(expr.right._type)) return (fun = "MUL", replOp = true)
+            }
+            if (expr.op == "==" || expr.op == "!=") {
+                if (is_any_matrix(expr.left._type) || expr.left._type.isVectorType || is_any_matrix(expr.right._type) || expr.right._type.isVectorType) return (fun = "all", replOp = false)
+            }
+        }
+        return (fun = "", replOp = false)
+    }
+    def override preVisitExprOp2(expr : ExprOp2?) {
+        let repl = getReplaceOp2(expr)
+        *writer |> write("{repl.fun}(")
+    }
+    def override visitExprOp2(expr : ExprOp2?) : ExpressionPtr {
+        *writer |> write(")")
+        return expr
+    }
+    def override preVisitExprOp2Right(expr : ExprOp2?; right : ExpressionPtr) {
+        let repl = getReplaceOp2(expr)
+        if (repl.replOp) {
+            *writer |> write(", ")
+        } else {
+            *writer |> write(" {expr.op} ")
+        }
+    }
+// op3
+    def override preVisitExprOp3(expr : ExprOp3?) {
+        *writer |> write("(")
+    }
+    def override visitExprOp3(expr : ExprOp3?) : ExpressionPtr {
+        *writer |> write(")")
+        return expr
+    }
+    def override preVisitExprOp3Left(expr : ExprOp3?; left : ExpressionPtr) {
+        *writer |> write(" ? ")
+    }
+    def override preVisitExprOp3Right(expr : ExprOp3?; right : ExpressionPtr) {
+        *writer |> write(" : ")
+    }
+// copy
+    def override preVisitExprCopyRight(expr : ExprCopy?; right : ExpressionPtr) {
+        *writer |> write(" = ")
+    }
+// move
+    def override preVisitExprMoveRight(expr : ExprMove?; right : ExpressionPtr) {
+        error("move is not supported", expr.at)
+    }
+// clone
+    def override preVisitExprCloneRight(expr : ExprClone?; right : ExpressionPtr) {
+        error("clone is not supported", expr.at)
+    }
+// with
+    def override preVisitExprWith(expr : ExprWith?) {
+        error("with is not supported", expr.at)
+    }
+// while
+    def override preVisitExprWhile(expr : ExprWhile?) {
+        *writer |> write("while ( ")
+    }
+    def override preVisitExprWhileBody(expr : ExprWhile?; right : ExpressionPtr) {
+        *writer |> write(") ")
+        newLine(1)
+    }
+// try-catch
+    def override preVisitExprTryCatch(expr : ExprTryCatch?) {
+        error("try-recover is not supported", expr.at)
+    }
+// if-then-else
+    def override preVisitExprIfThenElse(expr : ExprIfThenElse?) {
+        *writer |> write("if (")
+    }
+    def override preVisitExprIfThenElseIfBlock(expr : ExprIfThenElse?; ifBlock : ExpressionPtr) {
+        *writer |> write(")")
+        newLine(1)
+    }
+    def override preVisitExprIfThenElseElseBlock(expr : ExprIfThenElse?; elseBlock : ExpressionPtr) {
+        *writer |> write("{repeat("\t",tab)}")
+        if (elseBlock.__rtti == "ExprIfThenElse") {
+            *writer |> write("else ")
+        } else {
+            *writer |> write("else")
+            newLine(1)
+        }
+    }
+// for
+    def isDimFor(svar : ExpressionPtr) {
+        return svar._type.baseType == Type.tFixedArray
+    }
+    def isRangeFor(svar : ExpressionPtr) {
+        let bt = svar._type.baseType
+        return bt == Type.tRange || bt == Type.tURange
+    }
+    def override preVisitExprFor(expr : ExprFor?) {
+        for (source in expr.sources) {
+            if (!isRangeFor(source) && !isDimFor(source)) {
+                error("only range for or dim for are supported for now {describe(source._type)}", source.at)
+                return
+            }
+        }
+        *writer |> write("\{")
+    }
+    def override preVisitExprForSource(expr : ExprFor?; source : ExpressionPtr; last : bool) : void {
+        newLine(1)
+        let index = get_for_source_index(expr, source)
+        if (isDimFor(source)) {
+            *writer |> write("{repeat("\t",tab)}int {expr.iteratorVariables[index].name} = 0; //")
+        } elif (isRangeFor(source)) {
+            let svtype = "{describe_glsl_type(source._type)}"
+            *writer |> write("{repeat("\t",tab)}{svtype} _for_range_v{expr.iteratorVariables[index].name} = ")
+        }
+    }
+    def override visitExprForSource(expr : ExprFor?; source : ExpressionPtr; last : bool) : ExpressionPtr {
+        let index = get_for_source_index(expr, source)
+        if (isDimFor(source)) {
+            pass
+        } elif (isRangeFor(source)) {
+            *writer |> write(";")
+            newLine(1)
+            let sname = "{expr.iteratorVariables[index].name}"
+            let stype = "{describe_glsl_type(expr.iteratorVariables[index]._type)}"
+            *writer |> write("{repeat("\t",tab)}{stype} {sname} = _for_range_v{sname}.x;")
+        }
+        return source
+    }
+    def override preVisitExprForBody(expr : ExprFor?) {
+        newLine(1)
+        *writer |> write("{repeat("\t",tab)}while ( ")
+        for (source, svar, iter in expr.sources, expr.iteratorVariables, expr.iterators) {
+            if (iter != expr.iterators[0]) {
+                *writer |> write(" && ")
+            }
+            if (isDimFor(source)) {
+                // the loop indexes ONE level - bound is the outer (head) count
+                let sdim = source._type.fixedDim
+                *writer |> write("{svar.name}!={sdim}")
+                let newsrc = "{describe_subexpression(source)}[{svar.name}]"
+                renames |> push((name = "{iter}", repl = newsrc))
+            } elif (isRangeFor(source)) {
+                *writer |> write("{svar.name}!=_for_range_v{svar.name}.y")
+            }
+        }
+        *writer |> write(" )")
+        newLine(1)
+        *writer |> write("{repeat("\t",tab)}\{")
+        newLine(1)
+        *writer |> write("{repeat("\t",tab-1)}")
+    }
+    def override visitExprFor(expr : ExprFor?) : ExpressionPtr {
+        for (svar, source in expr.iteratorVariables, expr.sources) {
+            *writer |> write("{repeat("\t",tab)}")
+            if (isDimFor(source)) {
+                renames |> pop()
+                *writer |> write("{svar.name}++;")
+            } elif (isRangeFor(source)) {
+                *writer |> write("{svar.name}++;")
+            }
+            newLine(1)
+        }
+        *writer |> write("{repeat("\t",tab)}\}\}")
+        return expr
+    }
+// make variant
+    def override preVisitExprMakeVariant(expr : ExprMakeVariant?) {
+        error("variant is not supported", expr.at)
+    }
+// make structure
+    def outputMakeStruct(expr : ExprMakeStruct?; index : int) {
+        var prev = -1
+        for (st, _j in *(expr.structs[index]), count()) {
+            for (sf, i in expr._type.structType.fields, count()) {
+                if (sf.name == st.name) {
+                    if (prev > i) {
+                        error("out of order initialization is not supported by GLSL yet", st.at)
+                    }
+                    if (!st.value.flags.noSideEffects) {
+                        prev = i
+                    }
+                }
+            }
+        }
+        for (sf, i in expr._type.structType.fields, count()) {
+            if (i != 0) {
+                *writer |> write(",")
+            }
+            var has = false
+            for (st, _j in *(expr.structs[index]), count()) {
+                if (sf.name == st.name) {
+                    has = true
+                    visit(st.value, astVisitorAdapter)
+                }
+            }
+            if (!has) {
+                produce_zero(sf._type)
+            }
+        }
+    }
+    def override preVisitExprMakeStruct(expr : ExprMakeStruct?) {
+        if (expr._block != null) {
+            error("structure initialization with the block is not supported", expr.at)
+        }
+        *writer |> write("{expr.makeType.structType.name}")
+        if (caps.output_structure_initializers) {
+            *writer |> write("_STRUCTURE_INITIALIZER")
+        }
+        let nStructs = length(expr.structs)
+        if (nStructs != 1) {
+            *writer |> write("[{nStructs}]")
+        }
+        *writer |> write("(")
+        if (nStructs != 1) {
+            for (n in range(nStructs)) {
+                if (n != 0) {
+                    *writer |> write(",")
+                }
+                *writer |> write("{expr.makeType.structType.name}(")
+                outputMakeStruct(expr, n)
+                *writer |> write(")")
+            }
+        } else {
+            outputMakeStruct(expr, 0)
+        }
+        *writer |> write(")")
+    }
+    def override canVisitExprMakeStructBody(expr : ExprMakeStruct?) : bool {
+        return false
+    }
+// make array
+    def override preVisitExprMakeArray(expr : ExprMakeArray?) {
+        let atype = describe_glsl_type(expr._type)
+        *writer |> write("({atype}(")
+    }
+    def override visitExprMakeArray(expr : ExprMakeArray?) : ExpressionPtr {
+        *writer |> write("))")
+        return expr
+    }
+    def override preVisitExprMakeArrayIndex(expr : ExprMakeArray?; index : int; init : ExpressionPtr; last : bool) : void {
+        *writer |> write("(")
+    }
+    def override visitExprMakeArrayIndex(expr : ExprMakeArray?; index : int; init : ExpressionPtr; last : bool) : ExpressionPtr {
+        *writer |> write(")")
+        if (!last) {
+            *writer |> write(",")
+        }
+        return init
+    }
+
+// make tuple
+    def override preVisitExprMakeTuple(expr : ExprMakeTuple?) {
+        // TODO: support nameless structure
+        error("tuple is not supported YET", expr.at)
+    }
+// array comprehension
+    def override preVisitExprArrayComprehension(expr : ExprArrayComprehension?) {
+        error("array comprehension is not supported", expr.at)
+    }
+// type info
+    def override preVisitExprTypeInfo(expr : ExprTypeInfo?) {
+        error("typeinfo is not supported", expr.at)
+    }
+// ptr to ref
+    def override preVisitExprPtr2Ref(expr : ExprPtr2Ref?) {
+        error("deref is not supported", expr.at)
+    }
+// label
+    def override preVisitExprLabel(expr : ExprLabel?) {
+        error("label is not supported", expr.at)
+    }
+// goto
+    def override preVisitExprGoto(expr : ExprGoto?) {
+        error("goto is not supported", expr.at)
+    }
+// ref 2 ptr
+    def override preVisitExprRef2Ptr(expr : ExprRef2Ptr?) {
+        error("addr is not supported", expr.at)
+    }
+// ref to value
+    def override preVisitExprRef2Value(expr : ExprRef2Value?) {
+        *writer |> write("/*r2v*/ (")
+    }
+    def override visitExprRef2Value(expr : ExprRef2Value?) : ExpressionPtr {
+        *writer |> write(")")
+        return expr
+    }
+// @@
+    def override preVisitExprAddr(expr : ExprAddr?) {
+        error("function addr is not supported", expr.at)
+    }
+// assert / verify
+    def override preVisitExprAssert(expr : ExprAssert?) : void {
+        error("assert is not supported", expr.at)
+    }
+// static_assert
+    def override preVisitExprStaticAssert(expr : ExprStaticAssert?) : void {
+        error("static_assert is not supported", expr.at)
+    }
+// quote
+    def override preVisitExprQuote(expr : ExprQuote?) : void {
+        error("quote is not supported", expr.at)
+    }
+// debug
+    def override preVisitExprDebug(expr : ExprDebug?) : void {
+        error("debug is not supported", expr.at)
+    }
+// invoke
+    def override preVisitExprInvoke(expr : ExprInvoke?) : void {
+        error("invoke is not supported", expr.at)
+    }
+// erase
+    def override preVisitExprErase(expr : ExprErase?) : void {
+        error("erase is not supported", expr.at)
+    }
+// set insert
+    def override preVisitExprSetInsert(expr : ExprSetInsert?) : void {
+        error("insert is not supported", expr.at)
+    }
+// find
+    def override preVisitExprFind(expr : ExprFind?) : void {
+        error("find is not supported", expr.at)
+    }
+// key exists
+    def override preVisitExprKeyExists(expr : ExprKeyExists?) : void {
+        error("keyexists is not supported", expr.at)
+    }
+// ascend
+    def override preVisitExprAscend(expr : ExprAscend?) {
+        error("new is not supported", expr.at)
+    }
+// cast
+    def override preVisitExprCast(expr : ExprCast?) {
+        error("cast is not supported", expr.at)
+    }
+// delete
+    def override preVisitExprDelete(expr : ExprDelete?) {
+        error("delete is not supported", expr.at)
+    }
+// var
+    def override preVisitExprVar(expr : ExprVar?) {
+        let l = length(renames)
+        let en = "{expr.name}"
+        for (i in range(l)) {
+            let ri = l - i - 1
+            if (renames[ri].name == en) {
+                *writer |> write(renames[ri].repl)
+                return
+            }
+        }
+        *writer |> write("{expr.name}")
+    }
+// field
+    def override visitExprField(expr : ExprField?) : ExpressionPtr {
+        *writer |> write(".{expr.name}")
+        return expr
+    }
+// safe field
+    def override preVisitExprSafeField(expr : ExprSafeField?) : void {
+        error("'?.' is not supported", expr.at)
+    }
+// swizzle
+    def override visitExprSwizzle(expr : ExprSwizzle?) : ExpressionPtr {
+        *writer |> write(".")
+        let f2name = fixed_array<string>("x", "y", "z", "w")
+        for (fch in expr.fields) {
+            let f = int(fch)
+            *writer |> write("{f>=0 && f<=3 ? f2name[f] : "?"}")
+        }
+        return expr
+    }
+// is variant
+    def override preVisitExprIsVariant(expr : ExprIsVariant?) : void {
+        error("'is' is not supported", expr.at)
+    }
+// as variant
+    def override preVisitExprAsVariant(expr : ExprAsVariant?) : void {
+        error("'as' is not supported", expr.at)
+    }
+// safe as variant
+    def override preVisitExprSafeAsVariant(expr : ExprSafeAsVariant?) : void {
+        error("'?as' is not supported", expr.at)
+    }
+// op1
+    def override preVisitExprOp1(expr : ExprOp1?) : void {
+        let op = "{expr.op}"
+        if (op != "+++" && op != "---") {
+            *writer |> write(op)
+        }
+        *writer |> write("(")
+    }
+    def override visitExprOp1(expr : ExprOp1?) : ExpressionPtr {
+        let op = "{expr.op}"
+        *writer |> write(")")
+        if (op == "+++" || op == "---") {
+            *writer |> write("{slice(op,0,-1)}")
+        }
+        return expr
+    }
+// return
+    def override preVisitExprReturn(expr : ExprReturn?) : void {
+        *writer |> write("return ")
+    }
+// yield
+    def override preVisitExprYield(expr : ExprYield?) : void {
+        error("yield is not supported", expr.at)
+    }
+// break
+    def override preVisitExprBreak(expr : ExprBreak?) : void {
+        *writer |> write("break")
+    }
+// continue
+    def override preVisitExprContinue(expr : ExprContinue?) : void {
+        *writer |> write("continue")
+    }
+// make block
+    def override preVisitExprMakeBlock(expr : ExprMakeBlock?) : void {
+        error("'make block' is not supported", expr.at)
+    }
+// make generator
+    def override preVisitExprMakeGenerator(expr : ExprMakeGenerator?) : void {
+        error("'make generator' is not supported", expr.at)
+    }
+// memzero
+    def override preVisitExprMemZero(expr : ExprMemZero?) : void {
+        error("memzero is not supported", expr.at)
+    }
+// const ptr
+    def override preVisitExprConstPtr(expr : ExprConstPtr?) : void {
+        error("pointer is not supported", expr.at)
+    }
+// const enumeraiton
+    def override preVisitExprConstEnumeration(expr : ExprConstEnumeration?) : void {
+        let val = find_enum_value(expr.enumType, "{expr.value}")
+        *writer |> write("{int(val)}")
+    }
+// const bitfield
+    def override preVisitExprConstBitfield(expr : ExprConstBitfield?) : void {
+        *writer |> write("{expr.value}")
+    }
+// const int 8
+    def override preVisitExprConstInt8(expr : ExprConstInt8?) : void {
+        *writer |> write("{expr.value}")
+    }
+// const int 16
+    def override preVisitExprConstInt16(expr : ExprConstInt16?) : void {
+        *writer |> write("{expr.value}")
+    }
+// const int 64
+    def override preVisitExprConstInt64(expr : ExprConstInt64?) : void {
+        *writer |> write("{expr.value}")
+    }
+// const int
+    def override preVisitExprConstInt(expr : ExprConstInt?) : void {
+        *writer |> write("{expr.value}")
+    }
+// const int2
+    def override preVisitExprConstInt2(expr : ExprConstInt2?) : void {
+        if (caps.output_compatibility_constructors) {
+            *writer |> write("IVEC2({expr.value})")
+        } else {
+            *writer |> write("ivec2({expr.value})")
+        }
+    }
+// const int3
+    def override preVisitExprConstInt3(expr : ExprConstInt3?) : void {
+        if (caps.output_compatibility_constructors) {
+            *writer |> write("IVEC3({expr.value})")
+        } else {
+            *writer |> write("ivec3({expr.value})")
+        }
+    }
+// const int4
+    def override preVisitExprConstInt4(expr : ExprConstInt4?) : void {
+        if (caps.output_compatibility_constructors) {
+            *writer |> write("IVEC4({expr.value})")
+        } else {
+            *writer |> write("ivec4({expr.value})")
+        }
+    }
+// const uint 8
+    def override preVisitExprConstUInt8(expr : ExprConstUInt8?) : void {
+        *writer |> write("{expr.value}")
+    }
+// const uint 16
+    def override preVisitExprConstUInt16(expr : ExprConstUInt16?) : void {
+        *writer |> write("{expr.value}")
+    }
+// const uint 64
+    def override preVisitExprConstUInt64(expr : ExprConstUInt64?) : void {
+        *writer |> write("{expr.value}")
+    }
+// const uint
+    def override preVisitExprConstUInt(expr : ExprConstUInt?) : void {
+        *writer |> write("{expr.value}u")
+    }
+// const uint2
+    def override preVisitExprConstUInt2(expr : ExprConstUInt2?) : void {
+        if (caps.output_compatibility_constructors) {
+            *writer |> write("UVEC2({expr.value.x}u,{expr.value.y}u)")
+        } else {
+            *writer |> write("uvec2({expr.value})")
+        }
+    }
+// const uint3
+    def override preVisitExprConstUInt3(expr : ExprConstUInt3?) : void {
+        if (caps.output_compatibility_constructors) {
+            *writer |> write("UVEC3({expr.value.x}u, {expr.value.y}u, {expr.value.z}u)")
+        } else {
+            *writer |> write("uvec3({expr.value})")
+        }
+    }
+// const uint4
+    def override preVisitExprConstUInt4(expr : ExprConstUInt4?) : void {
+        if (caps.output_compatibility_constructors) {
+            *writer |> write("UVEC4({expr.value.x}u,{expr.value.y}u,{expr.value.z}u,{expr.value.w}u)")
+        } else {
+            *writer |> write("uvec4({expr.value})")
+        }
+    }
+// const range
+    def override preVisitExprConstRange(expr : ExprConstRange?) : void {
+        if (caps.output_compatibility_constructors) {
+            *writer |> write("IVEC2({expr.value})")
+        } else {
+            *writer |> write("ivec2({expr.value})")
+        }
+    }
+// const urnage
+    def override preVisitExprConstURange(expr : ExprConstURange?) : void {
+        if (caps.output_compatibility_constructors) {
+            *writer |> write("UVEC2({expr.value.x}u,{expr.value.y}u)")
+        } else {
+            *writer |> write("uvec2({expr.value})")
+        }
+    }
+// const bool
+    def override preVisitExprConstBool(expr : ExprConstBool?) : void {
+        *writer |> write("{expr.value}")
+    }
+// const float
+    def override preVisitExprConstFloat(expr : ExprConstFloat?) : void {
+        *writer |> fmt(":g", expr.value)
+    }
+// const float2
+    def override preVisitExprConstFloat2(expr : ExprConstFloat2?) : void {
+        if (caps.output_compatibility_constructors) {
+            *writer |> write("VEC2(")
+        } else {
+            *writer |> write("vec2(")
+        }
+        *writer |> fmt(":g", expr.value.x)
+        *writer |> write(",")
+        *writer |> fmt(":g", expr.value.y)
+        *writer |> write(")")
+    }
+// const float3
+    def override preVisitExprConstFloat3(expr : ExprConstFloat3?) : void {
+        if (caps.output_compatibility_constructors) {
+            *writer |> write("VEC3(")
+        } else {
+            *writer |> write("vec3(")
+        }
+        *writer |> fmt(":g", expr.value.x)
+        *writer |> write(",")
+        *writer |> fmt(":g", expr.value.y)
+        *writer |> write(",")
+        *writer |> fmt(":g", expr.value.z)
+        *writer |> write(")")
+    }
+// const float4
+    def override preVisitExprConstFloat4(expr : ExprConstFloat4?) : void {
+        if (caps.output_compatibility_constructors) {
+            *writer |> write("VEC4(")
+        } else {
+            *writer |> write("vec4(")
+        }
+        *writer |> fmt(":g", expr.value.x)
+        *writer |> write(",")
+        *writer |> fmt(":g", expr.value.y)
+        *writer |> write(",")
+        *writer |> fmt(":g", expr.value.z)
+        *writer |> write(",")
+        *writer |> fmt(":g", expr.value.w)
+        *writer |> write(")")
+    }
+// string
+    def override preVisitExprConstString(expr : ExprConstString?) : void {
+        error("string constant is not supported", expr.at)
+    }
+// const double
+    def override preVisitExprConstDouble(expr : ExprConstDouble?) : void {
+        *writer |> write("{expr.value}")
+    }
+// fake context
+    def override preVisitExprFakeContext(expr : ExprFakeContext?) : void {
+        error("__context__ is not supported", expr.at)
+    }
+// fake line info
+    def override preVisitExprFakeLineInfo(expr : ExprFakeLineInfo?) : void {
+        error("__lineinfo__ is not supported", expr.at)
+    }
+// reader
+    def override preVisitExprReader(expr : ExprReader?) : void {
+        error("call macro is not supported", expr.at)
+    }
+// call macro
+    def override preVisitExprCallMacro(expr : ExprCallMacro?) : void {
+        error("call macro is not supported", expr.at)
+    }
+}
+
+[macro_function]
+def generate_glsl(fnMain : FunctionPtr; var errors : array<string>; shaderType : ShaderType; version : int; comp_loc_size : int3; caps : ShaderExportCaps) : tuple<body : string; inout_stub : string; inout_decl : string> {
+    var inout_stub = ""
+    var inout_decl = ""
+    let st = build_string() $(var writer) {
+        var astVisitor = new GlslExport(writer, shaderType, version, comp_loc_size, caps)
+        make_visitor(*astVisitor) $(adapter) {
+            astVisitor.astVisitorAdapter = adapter
+            collect_dependencies(fnMain) $(vfun, vvar) {
+                for (f in vfun) {
+                    astVisitor.depFun[intptr(f)] = true
+                }
+                for (v in vvar) {
+                    astVisitor.depVar[intptr(v)] = true
+                }
+                collect_used_types(vfun, vvar) $(onlyUsed) : void {
+                    for (st in keys(onlyUsed.st)) {
+                        astVisitor.depStruct[intptr(st)] = true
+                        astVisitor.stnames["{st.name}"] = true
+                    }
+                    for (en in keys(onlyUsed.en)) {
+                        astVisitor.depStruct[intptr(en)] = true
+                    }
+                    visit_modules(compiling_program(), astVisitor.astVisitorAdapter)
+                }
+            }
+        }
+        errors <- astVisitor.errors
+        inout_stub = astVisitor.inout_stub
+        inout_decl = astVisitor.inout_decl
+        unsafe {
+            delete astVisitor
+        }
+    }
+    if (DEBUG_SHADER_TEXT) {
+        print("{st}\n\n")
+    }
+    return (body = st, inout_stub = inout_stub, inout_decl = inout_decl)
+}
+
+[macro_function]
+def bind_uniform_function_name(fnMain : FunctionPtr) {
+    return "{fnMain.name}_bind_uniform"
+}
+
+[macro_function]
+def is_glsl_structure(arg; name : string) {
+    if (arg._type.baseType == Type.tStructure) {
+        if (arg._type.structType._module.name == "glsl_common" && arg._type.structType.name == name) return true
+    }
+    return false
+}
+
+[macro_function]
+def is_any_matrix(typ : TypeDeclPtr) {
+    if (typ.baseType != Type.tHandle) return false
+    return typ.annotation.name == "float3x3" || typ.annotation.name == "float3x4" || typ.annotation.name == "float4x4"
+}
+
+struct public FieldDeclInfo {
+    sizei : int
+    typet : Type
+    normalized : bool
+    as_int : bool
+}
+
+[macro_function]
+def get_decl_type_from_name(name : string) {
+    if (name == "") {
+        return Type.none
+    } elif (name == "float" || name == "FLOAT" || name == "GL_FLOAT") {
+        return Type.tFloat
+    } elif (name == "uint8" || name == "UINT8" || name == "GL_BYTE") {
+        return Type.tUInt8
+    } elif (name == "int16" || name == "INT16" || name == "GL_SHORT") {
+        return Type.tInt16
+    } elif (name == "double" || name == "DOUBLE" || name == "GL_DOUBLE") return Type.tDouble
+    return Type.none
+}
+
+[macro_function]
+def get_decl_info(typ : TypeDeclPtr; arguments : AnnotationArgumentList) : tuple<ok : bool; info : FieldDeclInfo> {
+    if (typ.baseType == Type.tFixedArray || !(typ.isNumeric || typ.isVectorType)) return (ok = false, info = FieldDeclInfo())
+    var fdi = FieldDeclInfo(
+        sizei = arguments |> find_arg("size") ?as tInt ?? -1,
+        typet = get_decl_type_from_name(arguments |> find_arg("type") ?as tString ?? ""),
+        normalized = arguments |> find_arg("normalized") ?as tBool ?? false,
+        as_int = arguments |> find_arg("as_int") ?as tBool ?? false
+    )
+    if (fdi.sizei == -1) {
+        fdi.sizei = typ.isVectorType ? typ.vectorDim : 1
+    }
+    if (fdi.typet == Type.none) {
+        if (typ.baseType == Type.tFloat || typ.baseType == Type.tFloat2 || typ.baseType == Type.tFloat3 || typ.baseType == Type.tFloat4) {
+            fdi.typet = Type.tFloat
+        } elif (typ.baseType == Type.tUInt8 || typ.baseType == Type.tInt16 || typ.baseType == Type.tDouble) {
+            fdi.typet = typ.baseType
+        }
+    }
+    return fdi.typet != Type.none ? (ok = true, info = fdi) : (ok = false, info = FieldDeclInfo())
+}
+
+var public glsl_supported_semantics <- {
+    "POSITION" => true,
+    "NORMAL" => true,
+    "TANGENT" => true,
+    "BITANGENT" => true,
+    "COLOR0" => true,
+    "COLOR1" => true,
+    "COLOR2" => true,
+    "COLOR3" => true,
+    "INDICES" => true,
+    "WEIGHT" => true,
+    "TEXCOORD0" => true,
+    "TEXCOORD1" => true,
+    "TEXCOORD2" => true,
+    "TEXCOORD3" => true,
+    "TEXCOORD4" => true,
+    "TEXCOORD5" => true,
+    "TEXCOORD6" => true,
+    "TEXCOORD7" => true
+}

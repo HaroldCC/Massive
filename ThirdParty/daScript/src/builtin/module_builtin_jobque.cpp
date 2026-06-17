@@ -1,0 +1,1007 @@
+#include "daScript/misc/platform.h"
+
+#include "daScript/misc/performance_time.h"
+#include "daScript/simulate/aot_builtin_jobque.h"
+#include "daScript/ast/ast.h"
+#include "daScript/ast/ast_handle.h"
+
+#include "daScript/misc/job_que.h"
+#include "module_builtin_rtti.h"
+
+MAKE_TYPE_FACTORY(JobStatus, JobStatus)
+MAKE_TYPE_FACTORY(Channel, Channel)
+MAKE_TYPE_FACTORY(LockBox, LockBox)
+MAKE_TYPE_FACTORY(Stream, Stream)
+
+MAKE_TYPE_FACTORY(Atomic32, AtomicTT<int32_t>)
+MAKE_TYPE_FACTORY(Atomic64, AtomicTT<int64_t>)
+
+namespace das {
+
+    template <typename TT>
+    struct AddReleaseGuard {
+        AddReleaseGuard ( TT * tt, Context * c, LineInfoArg * a ) : t(tt), at(a), context(c) {
+            t->addRef(a);
+        }
+        ~AddReleaseGuard () {
+            if ( int ref = t->releaseRef(at) ) {
+                context->throw_error_at(at, "synch primitive deleted while being used (ref=%i)", ref);
+            }
+        }
+        TT * t;
+        LineInfoArg * at;
+        Context * context;
+    };
+
+    LockBox::~LockBox() {
+        lock_guard<mutex> guard(mCompleteMutex);
+        box.clear();
+    }
+
+    void LockBox::set ( void * data, TypeInfo * ti, Context * context ) {
+        lock_guard<mutex> guard(mCompleteMutex);
+        box = Feature(data,ti,context);
+        box.fOwner = this;
+        box.fOwnerTrackId = mTrackId;
+        mCond.notify_all();
+    }
+
+    void LockBox::get ( const TBlock<void,void *> & blk, Context * context, LineInfoArg * at ) {
+        lock_guard<mutex> guard(mCompleteMutex);
+        das_invoke<void>::invoke<void *>(context, at, blk, box.data);
+    }
+
+    void LockBox::fill ( void * data, TypeInfo * ti, Context * context ) {
+        lock_guard<mutex> guard(mCompleteMutex);
+        box = Feature(data,ti,context);
+        box.fOwner = this;
+        box.fOwnerTrackId = mTrackId;
+        mRemaining = 1;
+        mCond.notify_all();
+    }
+
+    void LockBox::grab ( const TBlock<void,void *> & blk, Context * context, LineInfoArg * at ) {
+        lock_guard<mutex> guard(mCompleteMutex);
+        das_invoke<void>::invoke<void *>(context, at, blk, box.data);
+        box.clear();
+        mRemaining = 0;
+        mCond.notify_all();
+    }
+
+    void LockBox::update ( const TBlock<void *,void *> & blk, TypeInfo * ti, Context * context, LineInfoArg * at ) {
+        lock_guard<mutex> guard(mCompleteMutex);
+        void * oldData = box.data;
+        box.data = das_invoke<void *>::invoke<void *>(context, at, blk, box.data);
+        if ( oldData != box.data ) {
+            box.setFrom(context);
+            box.type = ti;
+        }
+    }
+
+    Channel::~Channel() {
+        lock_guard<mutex> guard(mCompleteMutex);
+        pipe = {};
+        tail.clear();
+        DAS_ASSERT(mRef==0);
+    }
+
+    void Channel::push ( void * data, TypeInfo * ti, Context * context ) {
+        lock_guard<mutex> guard(mCompleteMutex);
+        pipe.emplace_back(data, ti, context!=owner ? context : nullptr);
+        pipe.back().fOwner = this;
+        pipe.back().fOwnerTrackId = mTrackId;
+        mCond.notify_all();  // notify_one??
+    }
+
+    void Channel::pushBatch ( void ** data, int count, TypeInfo * ti, Context * context ) {
+        lock_guard<mutex> guard(mCompleteMutex);
+        auto pushCtx = context!=owner ? context : nullptr;
+        for ( int i=0; i!=count; ++i ) {
+            pipe.emplace_back(data[i], ti, pushCtx);
+            pipe.back().fOwner = this;
+            pipe.back().fOwnerTrackId = mTrackId;
+        }
+        mCond.notify_all();  // notify_one??
+    }
+
+    void Channel::pop ( const TBlock<void,void *> & blk, Context * context, LineInfoArg * at ) {
+        while ( true ) {
+            unique_lock<mutex> uguard(mCompleteMutex);
+            if ( !mCond.wait_for(uguard, chrono::milliseconds(mSleepMs), [&]() {
+                bool continue_waiting = (mRemaining>0) && pipe.empty();
+                return !continue_waiting;
+            }) ) {
+                this_thread::yield();
+            } else {
+                break;
+            }
+        }
+        lock_guard<mutex> guard(mCompleteMutex);
+        if ( pipe.empty() ) {
+            tail.clear();
+        } else {
+            tail = das::move(pipe.front());
+            pipe.pop_front();
+        }
+        das_invoke<void>::invoke<void *>(context, at, blk, tail.data);
+    }
+
+    bool Channel::tryPop ( const TBlock<void,void *> & blk, Context * context, LineInfoArg * at ) {
+        lock_guard<mutex> guard(mCompleteMutex);
+        if ( pipe.empty() ) {
+            return false;
+        }
+        tail = das::move(pipe.front());
+        pipe.pop_front();
+        das_invoke<void>::invoke<void *>(context, at, blk, tail.data);
+        return true;
+    }
+
+    bool Channel::popWithTimeout ( int timeoutMs, const TBlock<void,void *> & blk, Context * context, LineInfoArg * at ) {
+        unique_lock<mutex> uguard(mCompleteMutex);
+        if ( !mCond.wait_for(uguard, chrono::milliseconds(timeoutMs), [&]() {
+            return !pipe.empty() || mRemaining <= 0;
+        }) ) {
+            return false;
+        }
+        if ( pipe.empty() ) {
+            return false;
+        }
+        tail = das::move(pipe.front());
+        pipe.pop_front();
+        das_invoke<void>::invoke<void *>(context, at, blk, tail.data);
+        return true;
+    }
+
+    bool Channel::isEmpty() const {
+        lock_guard<mutex> guard(mCompleteMutex);
+        return pipe.empty();
+    }
+
+    int32_t JobStatus::size() const {
+        lock_guard<mutex> guard(mCompleteMutex);
+        return (int32_t) mRemaining;
+    }
+
+    int32_t Channel::total() const {
+        lock_guard<mutex> guard(mCompleteMutex);
+        return (int32_t) pipe.size();
+    }
+
+    int JobStatus::append(int size) {
+        lock_guard<mutex> guard(mCompleteMutex);
+        mRemaining += size;
+        return mRemaining;
+    }
+
+    void channelGather ( Channel * ch, const TBlock<void,void *> & blk, Context * context, LineInfoArg * at ) {
+        if ( !ch ) context->throw_error_at(at, "channelGather: channel is null");
+        ch->gather([&](void * data, TypeInfo *, Context *) {
+            das_invoke<void>::invoke<void *>(context, at, blk, data);
+        });
+    }
+
+    void channelGatherEx ( Channel * ch, const TBlock<void,void *,const TypeInfo *, Context &> & blk, Context * context, LineInfoArg * at ) {
+        if ( !ch ) context->throw_error_at(at, "channelGather: channel is null");
+        ch->gatherEx(context, [&](void * data, TypeInfo * tinfo, Context * ctx) {
+            das_invoke<void>::invoke<void *,const TypeInfo *,Context &>(context, at, blk, data, tinfo, *ctx);
+        });
+    }
+
+    void channelGatherAndForward ( Channel * ch, Channel * toCh, const TBlock<void,void *> & blk, Context * context, LineInfoArg * at ) {
+        if ( !ch ) context->throw_error_at(at, "channelGather: channel is null");
+        ch->gather_and_forward(toCh, [&](void * data, TypeInfo *, Context *) {
+            das_invoke<void>::invoke<void *>(context, at, blk, data);
+        });
+    }
+
+    void channelPeek ( Channel * ch, const TBlock<void,void *> & blk, Context * context, LineInfoArg * at ) {
+        if ( !ch ) context->throw_error_at(at, "channelPeek: channel is null");
+        ch->for_each_item([&](void * data, TypeInfo *, Context *) {
+            das_invoke<void>::invoke<void *>(context, at, blk, data);
+        });
+    }
+
+    void channelVerify ( Channel * ch, Context * context, LineInfoArg * at ) {
+        if ( !ch ) context->throw_error_at(at, "channelVerify: channel is null");
+        ch->for_each_item([&](void * data, TypeInfo * ti, Context * ctx) {
+            Context * vctx = ctx ? ctx : ch->getOwner();
+            auto size = ti->firstType->size;
+            size = (size + 15) & ~15;
+            printf("verify %p of size %i (%i)\n", data, int(ti->firstType->size), int(size));
+            if ( !vctx->heap->isValidPtr((char *) data, size) ) {
+                os_debug_break();
+                context->throw_error_at(at, "channelVerify: channel contains non-owned pointer");
+            }
+        });
+    }
+
+    vec4f channelPush ( Context & context, SimNode_CallBase * call, vec4f * args ) {
+        auto ch = cast<Channel *>::to(args[0]);
+        if ( !ch ) context.throw_error_at(call->debugInfo, "channelPush: channel is null");
+        void * data = cast<void *>::to(args[1]);
+        TypeInfo * ti = call->types[1];
+        ch->push(data, ti, &context);
+        return v_zero();
+    }
+
+    vec4f channelPushBatch ( Context & context, SimNode_CallBase * call, vec4f * args ) {
+        auto ch = cast<Channel *>::to(args[0]);
+        if ( !ch ) context.throw_error_at(call->debugInfo, "channelPushBatch: channel is null");
+        TypeInfo * ti = call->types[1];
+        if (ti->type != Type::tArray){
+            context.throw_error_at(call->debugInfo, "channelPushBatch: type must be array");
+        }
+        if (!ti->firstType || ti->firstType->type != Type::tPointer){
+            context.throw_error_at(call->debugInfo, "channelPushBatch: array must be of pointer type");
+        }
+        Array * data = cast<Array *>::to(args[1]);
+        ch->pushBatch((void**)data->data, data->size, ti->firstType, &context);
+        return v_zero();
+    }
+
+    void channelPop ( Channel * ch, const TBlock<void,void*> & blk, Context * context, LineInfoArg * at ) {
+        if ( !ch ) context->throw_error_at(at, "channelPop: channel is null");
+        ch->pop(blk,context,at);
+    }
+
+    bool channelTryPop ( Channel * ch, const TBlock<void,void*> & blk, Context * context, LineInfoArg * at ) {
+        if ( !ch ) context->throw_error_at(at, "channelTryPop: channel is null");
+        return ch->tryPop(blk,context,at);
+    }
+
+    bool channelPopWithTimeout ( Channel * ch, int32_t timeoutMs, const TBlock<void,void*> & blk, Context * context, LineInfoArg * at ) {
+        if ( !ch ) context->throw_error_at(at, "channelPopWithTimeout: channel is null");
+        return ch->popWithTimeout(timeoutMs,blk,context,at);
+    }
+
+    int jobAppend ( JobStatus * ch, int size, Context * context, LineInfoArg * at ) {
+        if ( !ch ) context->throw_error_at(at, "jobAppend: job is null");
+        return ch->append(size);
+    }
+    void withChannel ( const TBlock<void,Channel *> & blk, Context * context, LineInfoArg * at ) {
+        Channel ch(context);
+        AddReleaseGuard<Channel> guard(&ch, context, at);
+        das_invoke<void>::invoke<Channel *>(context, at, blk, &ch);
+    }
+
+    void withChannelEx ( int32_t count, const TBlock<void,Channel *> & blk, Context * context, LineInfoArg * at ) {
+        Channel ch(context,count);
+        AddReleaseGuard<Channel> guard(&ch, context, at);
+        das_invoke<void>::invoke<Channel *>(context, at, blk, &ch);
+    }
+
+    Channel * channelCreate( Context * context, LineInfoArg * at ) {
+        Channel * ch = new Channel(context);
+        if ( at ) ch->mCreatedAt = at->describe();
+        ch->addRef(at);
+        return ch;
+    }
+
+    void channelRemove( Channel * & ch, Context * context, LineInfoArg * at ) {
+        if ( !ch ) context->throw_error_at(at, "channelRemove: channel is null");
+        if (!ch->isValid()) context->throw_error_at(at, "channel is invalid (already deleted?)");
+        if (ch->releaseRef(at)) context->throw_error_at(at, "channel being deleted while being used");
+        delete ch;
+        ch = nullptr;
+    }
+
+    Stream::~Stream() {
+        lock_guard<mutex> guard(mCompleteMutex);
+        pipe.clear();
+        DAS_ASSERT(mRef==0);
+    }
+
+    void Stream::push ( const uint8_t * data, uint64_t size ) {
+        lock_guard<mutex> guard(mCompleteMutex);
+        pipe.emplace_back();
+        auto & v = pipe.back();
+        v.resize(size);
+        if ( size ) memcpy(v.data(), data, size);
+        mCond.notify_all();
+    }
+
+    void Stream::pushBatch ( const uint8_t * const * data, const uint64_t * sizes, int64_t count ) {
+        lock_guard<mutex> guard(mCompleteMutex);
+        for ( int64_t i=0; i<count; ++i ) {
+            pipe.emplace_back();
+            auto & v = pipe.back();
+            v.resize(sizes[i]);
+            if ( sizes[i] ) memcpy(v.data(), data[i], sizes[i]);
+        }
+        mCond.notify_all();
+    }
+
+    static void invoke_stream_block ( const TBlock<void, TTemporary<TArray<uint8_t> const>> & blk,
+                                      const uint8_t * data, uint64_t size,
+                                      Context * context, LineInfoArg * at ) {
+        Array arr;
+        array_mark_locked(arr, (void *)data, size);
+        vec4f args[1];
+        args[0] = cast<Array *>::from(&arr);
+        context->invoke(blk, args, nullptr, at);
+    }
+
+    void Stream::pop ( const TBlock<void, TTemporary<TArray<uint8_t> const>> & blk, Context * context, LineInfoArg * at ) {
+        while ( true ) {
+            unique_lock<mutex> uguard(mCompleteMutex);
+            if ( !mCond.wait_for(uguard, chrono::milliseconds(mSleepMs), [&]() {
+                bool continue_waiting = (mRemaining>0) && pipe.empty();
+                return !continue_waiting;
+            }) ) {
+                this_thread::yield();
+            } else {
+                break;
+            }
+        }
+        vector<uint8_t> item;
+        {
+            lock_guard<mutex> guard(mCompleteMutex);
+            if ( !pipe.empty() ) {
+                item = das::move(pipe.front());
+                pipe.pop_front();
+            }
+        }
+        invoke_stream_block(blk, item.data(), item.size(), context, at);
+    }
+
+    bool Stream::tryPop ( const TBlock<void, TTemporary<TArray<uint8_t> const>> & blk, Context * context, LineInfoArg * at ) {
+        vector<uint8_t> item;
+        {
+            lock_guard<mutex> guard(mCompleteMutex);
+            if ( pipe.empty() ) return false;
+            item = das::move(pipe.front());
+            pipe.pop_front();
+        }
+        invoke_stream_block(blk, item.data(), item.size(), context, at);
+        return true;
+    }
+
+    bool Stream::popWithTimeout ( int timeoutMs, const TBlock<void, TTemporary<TArray<uint8_t> const>> & blk, Context * context, LineInfoArg * at ) {
+        vector<uint8_t> item;
+        {
+            unique_lock<mutex> uguard(mCompleteMutex);
+            if ( !mCond.wait_for(uguard, chrono::milliseconds(timeoutMs), [&]() {
+                return !pipe.empty() || mRemaining <= 0;
+            }) ) {
+                return false;
+            }
+            if ( pipe.empty() ) return false;
+            item = das::move(pipe.front());
+            pipe.pop_front();
+        }
+        invoke_stream_block(blk, item.data(), item.size(), context, at);
+        return true;
+    }
+
+    bool Stream::isEmpty() const {
+        lock_guard<mutex> guard(mCompleteMutex);
+        return pipe.empty();
+    }
+
+    int Stream::total() const {
+        lock_guard<mutex> guard(mCompleteMutex);
+        return (int) pipe.size();
+    }
+
+    Stream * streamCreate ( Context *, LineInfoArg * at ) {
+        Stream * ch = new Stream();
+        if ( at ) ch->mCreatedAt = at->describe();
+        ch->addRef(at);
+        return ch;
+    }
+
+    void streamRemove ( Stream * & ch, Context * context, LineInfoArg * at ) {
+        if ( !ch ) context->throw_error_at(at, "streamRemove: stream is null");
+        if (!ch->isValid()) context->throw_error_at(at, "stream is invalid (already deleted?)");
+        if (ch->releaseRef(at)) context->throw_error_at(at, "stream being deleted while being used");
+        delete ch;
+        ch = nullptr;
+    }
+
+    void withStream ( const TBlock<void, Stream *> & blk, Context * context, LineInfoArg * at ) {
+        Stream ch;
+        AddReleaseGuard<Stream> guard(&ch, context, at);
+        das_invoke<void>::invoke<Stream *>(context, at, blk, &ch);
+    }
+
+    void withStreamEx ( int32_t count, const TBlock<void, Stream *> & blk, Context * context, LineInfoArg * at ) {
+        Stream ch(count);
+        AddReleaseGuard<Stream> guard(&ch, context, at);
+        das_invoke<void>::invoke<Stream *>(context, at, blk, &ch);
+    }
+
+    void streamPush ( Stream * ch, const TArray<uint8_t> & data, Context * context, LineInfoArg * at ) {
+        if ( !ch ) context->throw_error_at(at, "streamPush: stream is null");
+        ch->push((const uint8_t *)data.data, data.size);
+    }
+
+    void streamPushBatch ( Stream * ch, const TArray<TArray<uint8_t>> & data, Context * context, LineInfoArg * at ) {
+        if ( !ch ) context->throw_error_at(at, "streamPushBatch: stream is null");
+        if ( data.size == 0 ) return;
+        vector<const uint8_t *> ptrs;
+        vector<uint64_t> sizes;
+        ptrs.reserve(data.size);
+        sizes.reserve(data.size);
+        auto items = (const TArray<uint8_t> *)data.data;
+        for ( uint64_t i=0; i!=data.size; ++i ) {
+            ptrs.push_back((const uint8_t *)items[i].data);
+            sizes.push_back(items[i].size);
+        }
+        ch->pushBatch(ptrs.data(), sizes.data(), int64_t(data.size));
+    }
+
+    void streamPop ( Stream * ch, const TBlock<void, TTemporary<TArray<uint8_t> const>> & blk, Context * context, LineInfoArg * at ) {
+        if ( !ch ) context->throw_error_at(at, "streamPop: stream is null");
+        ch->pop(blk, context, at);
+    }
+
+    bool streamTryPop ( Stream * ch, const TBlock<void, TTemporary<TArray<uint8_t> const>> & blk, Context * context, LineInfoArg * at ) {
+        if ( !ch ) context->throw_error_at(at, "streamTryPop: stream is null");
+        return ch->tryPop(blk, context, at);
+    }
+
+    bool streamPopWithTimeout ( Stream * ch, int32_t timeoutMs, const TBlock<void, TTemporary<TArray<uint8_t> const>> & blk, Context * context, LineInfoArg * at ) {
+        if ( !ch ) context->throw_error_at(at, "streamPopWithTimeout: stream is null");
+        return ch->popWithTimeout(timeoutMs, blk, context, at);
+    }
+
+    void streamGather ( Stream * ch, const TBlock<void, TTemporary<TArray<uint8_t> const>> & blk, Context * context, LineInfoArg * at ) {
+        if ( !ch ) context->throw_error_at(at, "streamGather: stream is null");
+        ch->gather([&](Array * arr) {
+            vec4f args[1];
+            args[0] = cast<Array *>::from(arr);
+            context->invoke(blk, args, nullptr, at);
+        });
+    }
+
+    void streamPeek ( Stream * ch, const TBlock<void, TTemporary<TArray<uint8_t> const>> & blk, Context * context, LineInfoArg * at ) {
+        if ( !ch ) context->throw_error_at(at, "streamPeek: stream is null");
+        ch->for_each_item([&](Array * arr) {
+            vec4f args[1];
+            args[0] = cast<Array *>::from(arr);
+            context->invoke(blk, args, nullptr, at);
+        });
+    }
+
+    struct StreamAnnotation : ManagedStructureAnnotation<Stream,false> {
+        StreamAnnotation(ModuleLibrary & ml) : ManagedStructureAnnotation ("Stream", ml) {
+            addProperty<DAS_BIND_MANAGED_PROP(isEmpty)>("isEmpty");
+            addProperty<DAS_BIND_MANAGED_PROP(isReady)>("isReady");
+            addProperty<DAS_BIND_MANAGED_PROP(size)>("size");
+            addProperty<DAS_BIND_MANAGED_PROP(total)>("total");
+        }
+        virtual int32_t getGcFlags(das_set<Structure *> &, das_set<Annotation *> &) const override {
+            return TypeDecl::gcFlag_heap;
+        }
+    };
+
+    struct ChannelAnnotation : ManagedStructureAnnotation<Channel,false> {
+        ChannelAnnotation(ModuleLibrary & ml) : ManagedStructureAnnotation ("Channel", ml) {
+            addProperty<DAS_BIND_MANAGED_PROP(isEmpty)>("isEmpty");
+            addProperty<DAS_BIND_MANAGED_PROP(isReady)>("isReady");
+            addProperty<DAS_BIND_MANAGED_PROP(size)>("size");
+            addProperty<DAS_BIND_MANAGED_PROP(total)>("total");
+        }
+        virtual int32_t getGcFlags(das_set<Structure *> &, das_set<Annotation *> &) const override {
+            return TypeDecl::gcFlag_heap | TypeDecl::gcFlag_stringHeap;
+        }
+        virtual void walk(DataWalker & walker, void * data) override {
+            bool gResolve = daScriptEnvironment::getBound()->g_resolve_annotations;
+            daScriptEnvironment::getBound()->g_resolve_annotations = false;
+            BasicStructureAnnotation::walk(walker, data);
+            Channel * ch = (Channel *) data;
+            if ( !ch->isValid() ) {
+                walker.invalidData();
+            } else {
+                ch->for_each_item([&](void * data, TypeInfo * ti, Context *) {
+                    walker.walk((char *)&data, ti);
+                });
+            }
+            daScriptEnvironment::getBound()->g_resolve_annotations = gResolve;
+        }
+    };
+
+    struct JobStatusAnnotation : ManagedStructureAnnotation<JobStatus,false> {
+        JobStatusAnnotation(ModuleLibrary & ml) : ManagedStructureAnnotation ("JobStatus", ml) {
+            addProperty<DAS_BIND_MANAGED_PROP(isReady)>("isReady");
+            addProperty<DAS_BIND_MANAGED_PROP(isValid)>("isValid");
+        }
+    };
+
+    mutex              g_jobQueMutex;
+    shared_ptr<JobQue> g_jobQue;
+
+    LockBox * lockBoxCreate( Context *, LineInfoArg * at ) {
+        LockBox * ch = new LockBox();
+        if ( at ) ch->mCreatedAt = at->describe();
+        ch->addRef(at);
+        return ch;
+    }
+
+    void lockBoxRemove( LockBox * & ch, Context * context, LineInfoArg * at ) {
+        if ( !ch ) context->throw_error_at(at, "lockBoxRemove: lock box is null");
+        if (!ch->isValid()) context->throw_error_at(at, "lock box is invalid (already deleted?)");
+        if (ch->releaseRef(at)) context->throw_error_at(at, "lock box being deleted while being used");
+        delete ch;
+        ch = nullptr;
+    }
+
+    void withLockBox ( const TBlock<void,LockBox *> & blk, Context * context, LineInfoArg * at ) {
+        LockBox ch;
+        AddReleaseGuard<LockBox> guard(&ch, context, at);
+        das_invoke<void>::invoke<LockBox *>(context, at, blk, &ch);
+    }
+
+    vec4f lockBoxSet ( Context & context, SimNode_CallBase * call, vec4f * args ) {
+        auto ch = cast<LockBox *>::to(args[0]);
+        if ( !ch ) context.throw_error_at(call->debugInfo, "lockBoxSet: box is null");
+        void * data = cast<void *>::to(args[1]);
+        TypeInfo * ti = call->types[1];
+        ch->set(data, ti, &context);
+        return v_zero();
+    }
+
+    void lockBoxUpdate ( LockBox * ch, TypeInfo * ti, const TBlock<void *,void*> & blk, Context * context, LineInfoArg * at ) {
+        if ( !ch ) context->throw_error_at(at, "lockBoxUpdate: box is null");
+        ch->update(blk,ti,context,at);
+    }
+
+    void lockBoxGet ( LockBox * ch, const TBlock<void,void*> & blk, Context * context, LineInfoArg * at ) {
+        if ( !ch ) context->throw_error_at(at, "lockBoxGet: box is null");
+        ch->get(blk,context,at);
+    }
+
+    vec4f lockBoxFill ( Context & context, SimNode_CallBase * call, vec4f * args ) {
+        auto ch = cast<LockBox *>::to(args[0]);
+        if ( !ch ) context.throw_error_at(call->debugInfo, "lockBoxFill: box is null");
+        void * data = cast<void *>::to(args[1]);
+        TypeInfo * ti = call->types[1];
+        ch->fill(data, ti, &context);
+        return v_zero();
+    }
+
+    void lockBoxGrab ( LockBox * ch, const TBlock<void,void*> & blk, Context * context, LineInfoArg * at ) {
+        if ( !ch ) context->throw_error_at(at, "lockBoxGrab: box is null");
+        ch->grab(blk,context,at);
+    }
+
+    struct LockBoxAnnotation : ManagedStructureAnnotation<LockBox,false> {
+        LockBoxAnnotation(ModuleLibrary & ml) : ManagedStructureAnnotation ("LockBox", ml) {
+            addProperty<DAS_BIND_MANAGED_PROP(isReady)>("isReady");
+        }
+        virtual int32_t getGcFlags(das_set<Structure *> &, das_set<Annotation *> &) const override {
+            return TypeDecl::gcFlag_heap | TypeDecl::gcFlag_stringHeap;
+        }
+        virtual void walk(DataWalker & walker, void * data) override {
+            bool gResolve = daScriptEnvironment::getBound()->g_resolve_annotations;
+            daScriptEnvironment::getBound()->g_resolve_annotations = false;
+            BasicStructureAnnotation::walk(walker, data);
+            LockBox * ch = (LockBox *) data;
+            if ( !ch->isValid() ) {
+                walker.invalidData();
+            } else {
+                ch->peek([&](void * data, TypeInfo * ti, Context *) {
+                    walker.walk((char *)&data, ti);
+                });
+            }
+            daScriptEnvironment::getBound()->g_resolve_annotations = gResolve;
+        }
+    };
+
+
+    template <typename TT>
+    struct AtomicAnnotation : ManagedStructureAnnotation<AtomicTT<TT>,false> {
+        AtomicAnnotation(const char * ttname, ModuleLibrary & ml) : ManagedStructureAnnotation<AtomicTT<TT>,false> (ttname, ml) {
+        }
+        virtual void walk(DataWalker & walker, void * data) override {
+            BasicStructureAnnotation::walk(walker, data);
+            auto ch = (AtomicTT<TT> *) data;
+            TypeInfo info;
+            memset(&info, 0, sizeof(TypeInfo));
+            info.type = sizeof(TT)==4 ? Type::tInt : Type::tInt64;
+            vec4f vd = cast<TT>::from(ch->get());
+            walker.walk(vd, &info);
+        }
+    };
+}
+
+das::Context* get_clone_context( das::Context * ctx, uint32_t category );//link time resolved dependencies
+
+namespace das {
+    void new_job_invoke ( Lambda lambda, Func fn, int32_t lambdaSize, Context * context, LineInfoArg * lineinfo ) {
+        if ( !g_jobQue ) context->throw_error_at(lineinfo, "need to be in 'with_job_que' block");
+        shared_ptr<Context> forkContext;
+        forkContext.reset(get_clone_context(context, uint32_t(ContextCategory::job_clone)));
+        forkContext->sharedPtrContext = true;
+        auto ptr = forkContext->allocate(lambdaSize + 16,lineinfo);
+        forkContext->heap->mark_comment(ptr, "new [[ ]] in new_job");
+        memset ( ptr, 0, lambdaSize + 16 );
+        ptr += 16;
+        das_invoke_function<void>::invoke(forkContext.get(), lineinfo, fn, ptr, lambda.capture);
+        das_delete<Lambda>::clear(context, lambda);
+        auto bound = daScriptEnvironment::getBound();
+        g_jobQue->push([=]() mutable {
+            daScriptEnvironment::setBound(bound);
+            Lambda flambda(ptr);
+            das_invoke_lambda<void>::invoke(forkContext.get(), lineinfo, flambda);
+            das_delete<Lambda>::clear(forkContext.get(), flambda);
+        }, 0, JobPriority::Default);
+    }
+
+    static atomic<int32_t> g_jobQueAvailable{0};
+    static atomic<int32_t> g_jobQueTotalThreads{0};
+
+    bool is_job_que_shutting_down () {
+        return g_jobQueAvailable == 0;
+    }
+
+    void new_thread_invoke ( Lambda lambda, Func fn, int32_t lambdaSize, Context * context, LineInfoArg * lineinfo ) {
+        shared_ptr<Context> forkContext;
+        forkContext.reset(get_clone_context(context, uint32_t(ContextCategory::thread_clone)));
+        forkContext->sharedPtrContext = true;
+        auto ptr = forkContext->allocate(lambdaSize + 16,lineinfo);
+        forkContext->heap->mark_comment(ptr, "new [[ ]] in new_thread");
+        memset ( ptr, 0, lambdaSize + 16 );
+        ptr += 16;
+        das_invoke_function<void>::invoke(forkContext.get(), lineinfo, fn, ptr, lambda.capture);
+        das_delete<Lambda>::clear(context, lambda);
+        g_jobQueTotalThreads ++;
+        auto bound = daScriptEnvironment::getBound();
+        thread([=]() mutable {
+            daScriptEnvironment::setBound(bound);
+            Lambda flambda(ptr);
+            das_invoke_lambda<void>::invoke(forkContext.get(), lineinfo, flambda);
+            das_delete<Lambda>::clear(forkContext.get(), flambda);
+            g_jobQueTotalThreads --;
+            shutdownThreadLocalDebugAgent();
+        }).detach();
+    }
+
+    extern condition_variable debugger_stopped;
+    extern atomic<bool>       debugger_started;
+    extern atomic<bool>       stopped;
+    extern mutex              debugger_mutex;
+    extern atomic<bool>       stop_requested;
+
+    static void stop_debugger() {
+        g_jobQueTotalThreads --;
+        {
+            lock_guard guard{debugger_mutex};
+            stopped.store(true);
+        }
+        debugger_stopped.notify_all();
+    }
+
+    void new_debugger_thread ( const Block & lambda, Context * context, LineInfoArg * lineinfo ) {
+        g_jobQueTotalThreads ++;
+        debugger_started.store(true);
+        shared_ptr<Context> forkContext;
+        forkContext.reset(get_clone_context(context, uint32_t(ContextCategory::thread_clone)));
+        forkContext->sharedPtrContext = true;
+        auto bound = daScriptEnvironment::getBound();
+        thread([=]() mutable {
+            daScriptEnvironment::setBound(bound);
+            das_invoke<void>::invoke(forkContext.get(), lineinfo, lambda);
+            forkContext.reset();
+            stop_debugger();
+            stop_requested = false;
+            shutdownThreadLocalDebugAgent();
+        }).detach();
+    }
+
+    void withJobQue ( const TBlock<void> & block, Context * context, LineInfoArg * lineInfo ) {
+        if ( !g_jobQue ) {
+            lock_guard<mutex> guard(g_jobQueMutex);
+            g_jobQue = make_shared<JobQue>();
+        }
+        {
+            shared_ptr<JobQue> jq = g_jobQue;
+            context->invoke(block, nullptr, nullptr, lineInfo);
+        }
+        {
+            lock_guard<mutex> guard(g_jobQueMutex);
+            if ( g_jobQue.use_count()==1 ) g_jobQue.reset();
+        }
+    }
+
+    void jobStatusAddRef ( JobStatus * status, Context * context, LineInfoArg * at ) {
+        if ( !status ) context->throw_error_at(at, "jobStatusAddRef: status is null");
+        status->addRef(at);
+    }
+
+    void jobStatusReleaseRef ( JobStatus * & status, Context * context, LineInfoArg * at ) {
+        if ( !status ) context->throw_error_at(at, "jobStatusReleaseRef: status is null");
+        status->releaseRef(at);
+        status = nullptr;
+    }
+
+    void withJobStatus ( int32_t total, const TBlock<void,JobStatus *> & block, Context * context, LineInfoArg * lineInfo ) {
+        JobStatus status(total);
+        AddReleaseGuard<JobStatus> guard(&status, context, lineInfo);
+        vec4f args[1];
+        args[0] = cast<JobStatus *>::from(&status);
+        context->invoke(block,args,nullptr,lineInfo);
+    }
+
+    JobStatus * jobStatusCreate( Context *, LineInfoArg * at ) {
+        JobStatus * ch = new JobStatus();
+        if ( at ) ch->mCreatedAt = at->describe();
+        ch->addRef(at);
+        return ch;
+    }
+
+    void jobStatusRemove( JobStatus * & ch, Context * context, LineInfoArg * at ) {
+        if ( !ch ) context->throw_error_at(at, "jobStatusRemove: job status is null");
+        if (!ch->isValid()) context->throw_error_at(at, "job status is invalid (already deleted?)");
+        if (ch->releaseRef(at)) context->throw_error_at(at, "job status being deleted while being used");
+        delete ch;
+        ch = nullptr;
+    }
+
+    void waitForJob ( JobStatus * status, Context * context, LineInfoArg * at ) {
+        if ( !status ) context->throw_error_at(at, "waitForJob: status is null");
+        status->Wait();
+    }
+
+    void notifyJob ( JobStatus * status, Context * context, LineInfoArg * at ) {
+        if ( !status ) context->throw_error_at(at, "notifyJob: status is null");
+        if ( !status->Notify() ) context->throw_error_at(at, "notifyJob: nothing to notify");
+    }
+
+    void notifyAndReleaseJob ( JobStatus * & status, Context * context, LineInfoArg * at ) {
+        if ( !status ) context->throw_error_at(at, "notifyAndReleaseJob: status is null");
+        if ( !status->NotifyAndRelease(at) ) context->throw_error_at(at, "notifyAndReleaseJob: nothing to notify");
+        status = nullptr;
+    }
+
+    int getTotalHwJobs( Context * context, LineInfoArg * at ) {
+        if ( !g_jobQue ) context->throw_error_at(at, "need to be in 'with_job_que' block");
+        return g_jobQue->getTotalHwJobs();
+    }
+
+    int getTotalHwThreads () {
+        return JobQue::get_num_threads();
+    }
+
+    class Module_JobQue : public Module {
+    public:
+        Module_JobQue() : Module("jobque") {
+            DAS_PROFILE_SECTION("Module_JobQue");
+            g_jobQueAvailable++;
+            // libs
+            ModuleLibrary lib(this);
+            lib.addBuiltInModule();
+            addBuiltinDependency(lib, Module::require("rtti_core"));
+            // types
+            addAnnotation(new JobStatusAnnotation(lib));
+            auto cha = new ChannelAnnotation(lib);
+            cha->from("JobStatus");
+            addAnnotation(cha);
+            auto lbx = new LockBoxAnnotation(lib);
+            lbx->from("JobStatus");
+            addAnnotation(lbx);
+            auto stra = new StreamAnnotation(lib);
+            stra->from("JobStatus");
+            addAnnotation(stra);
+            auto a32 = new AtomicAnnotation<int32_t>("Atomic32",lib);
+            addAnnotation(a32);
+            auto a64 = new AtomicAnnotation<int64_t>("Atomic64",lib);
+            addAnnotation(a64);
+            // atomic 32
+            addExtern<DAS_BIND_FUN(atomicCreate<int32_t>)>(*this, lib, "atomic32_create",
+                SideEffects::modifyExternal, "atomicCreate<int32_t>")
+                    ->args({ "context","line" });
+            addExtern<DAS_BIND_FUN(atomicRemove<int32_t>)>(*this, lib, "atomic32_remove",
+                SideEffects::modifyArgumentAndExternal, "atomicRemove<int32_t>")
+                    ->args({ "atomic", "context","line" })->unsafeOperation = true;
+            addExtern<DAS_BIND_FUN(withAtomic<int32_t>)>(*this, lib,  "with_atomic32",
+                SideEffects::invoke, "withAtomic<int32_t>")
+                    ->args({"block","context","line"});
+            addExtern<DAS_BIND_FUN(atomicSet<int32_t>)>(*this, lib, "set",
+                SideEffects::modifyArgumentAndExternal, "atomicSet<int32_t>")
+                    ->args({ "atomic", "value", "context","line" });
+            addExtern<DAS_BIND_FUN(atomicGet<int32_t>)>(*this, lib, "get",
+                SideEffects::modifyArgumentAndExternal, "atomicGet<int32_t>")
+                    ->args({ "atomic", "context","line" });
+            addExtern<DAS_BIND_FUN(atomicInc<int32_t>)>(*this, lib, "inc",
+                SideEffects::modifyArgumentAndExternal, "atomicInc<int32_t>")
+                    ->args({ "atomic", "context","line" });
+            addExtern<DAS_BIND_FUN(atomicDec<int32_t>)>(*this, lib, "dec",
+                SideEffects::modifyArgumentAndExternal, "atomicDec<int32_t>")
+                    ->args({ "atomic", "context","line" });
+            // atomic 64
+            addExtern<DAS_BIND_FUN(atomicCreate<int64_t>)>(*this, lib, "atomic64_create",
+                SideEffects::modifyExternal, "atomicCreate<int64_t>")
+                    ->args({ "context","line" });
+            addExtern<DAS_BIND_FUN(atomicRemove<int64_t>)>(*this, lib, "atomic64_remove",
+                SideEffects::modifyArgumentAndExternal, "atomicRemove<int64_t>")
+                    ->args({ "atomic", "context","line" })->unsafeOperation = true;
+            addExtern<DAS_BIND_FUN(withAtomic<int64_t>)>(*this, lib,  "with_atomic64",
+                SideEffects::invoke, "withAtomic<int64_t>")
+                    ->args({"block","context","line"});
+            addExtern<DAS_BIND_FUN(atomicSet<int64_t>)>(*this, lib, "set",
+                SideEffects::modifyArgumentAndExternal, "atomicSet<int64_t>")
+                    ->args({ "atomic", "value", "context","line" });
+            addExtern<DAS_BIND_FUN(atomicGet<int64_t>)>(*this, lib, "get",
+                SideEffects::modifyArgumentAndExternal, "atomicGet<int64_t>")
+                    ->args({ "atomic", "context","line" });
+            addExtern<DAS_BIND_FUN(atomicInc<int64_t>)>(*this, lib, "inc",
+                SideEffects::modifyArgumentAndExternal, "atomicInc<int64_t>")
+                    ->args({ "atomic", "context","line" });
+            addExtern<DAS_BIND_FUN(atomicDec<int64_t>)>(*this, lib, "dec",
+                SideEffects::modifyArgumentAndExternal, "atomicDec<int64_t>")
+                    ->args({ "atomic", "context","line" });
+            // lock box
+            addExtern<DAS_BIND_FUN(lockBoxCreate)>(*this, lib, "lock_box_create",
+                SideEffects::invoke, "lockBoxCreate")
+                    ->args({ "context","line" });
+            addExtern<DAS_BIND_FUN(lockBoxRemove)>(*this, lib, "lock_box_remove",
+                SideEffects::invoke, "lockBoxRemove")
+                    ->args({ "box", "context","line" })->unsafeOperation = true;
+            addExtern<DAS_BIND_FUN(withLockBox)>(*this, lib,  "with_lock_box",
+                SideEffects::invoke, "withLockBox")
+                    ->args({"block","context","line"});
+            addInterop<lockBoxSet,void,LockBox *,vec4f>(*this, lib,  "_builtin_lockbox_set",
+                SideEffects::modifyArgumentAndExternal, "lockBoxSet")
+                    ->args({"box","data"});
+            addExtern<DAS_BIND_FUN(lockBoxGet)>(*this, lib,  "_builtin_lockbox_get",
+                SideEffects::modifyArgumentAndExternal, "lockBoxGet")
+                    ->args({"box","block","context","line"});
+            addExtern<DAS_BIND_FUN(lockBoxUpdate)>(*this, lib,  "_builtin_lockbox_update",
+                SideEffects::modifyArgumentAndExternal, "lockBoxUpdate")
+                    ->args({"box","type_info","block","context","line"});
+            addInterop<lockBoxFill,void,LockBox *,vec4f>(*this, lib,  "_builtin_lockbox_fill",
+                SideEffects::modifyArgumentAndExternal, "lockBoxFill")
+                    ->args({"box","data"});
+            addExtern<DAS_BIND_FUN(lockBoxGrab)>(*this, lib,  "_builtin_lockbox_grab",
+                SideEffects::modifyArgumentAndExternal, "lockBoxGrab")
+                    ->args({"box","block","context","line"});
+            // channel
+            addInterop<channelPush,void,Channel *,vec4f>(*this, lib,  "_builtin_channel_push",
+                SideEffects::modifyArgumentAndExternal, "channelPush")
+                    ->args({"channel","data"});
+            addInterop<channelPushBatch,void,Channel *,vec4f>(*this, lib,  "_builtin_channel_push_batch",
+                SideEffects::modifyArgumentAndExternal, "channelPushBatch")
+                    ->args({"channel","data"});
+            addExtern<DAS_BIND_FUN(channelPop)>(*this, lib,  "_builtin_channel_pop",
+                SideEffects::modifyArgumentAndExternal, "channelPop")
+                    ->args({"channel","block","context","line"});
+            addExtern<DAS_BIND_FUN(channelTryPop)>(*this, lib,  "_builtin_channel_try_pop",
+                SideEffects::modifyArgumentAndExternal, "channelTryPop")
+                    ->args({"channel","block","context","line"});
+            addExtern<DAS_BIND_FUN(channelPopWithTimeout)>(*this, lib,  "_builtin_channel_pop_with_timeout",
+                SideEffects::modifyArgumentAndExternal, "channelPopWithTimeout")
+                    ->args({"channel","timeout_ms","block","context","line"});
+            addExtern<DAS_BIND_FUN(channelGather)>(*this, lib,  "_builtin_channel_gather",
+                SideEffects::modifyArgumentAndExternal, "channelGather")
+                    ->args({"channel","block","context","line"});
+            addExtern<DAS_BIND_FUN(channelGatherEx)>(*this, lib,  "_builtin_channel_gather_ex",
+                SideEffects::modifyArgumentAndExternal, "channelGatherEx")
+                    ->args({"channel","block","context","line"});
+            addExtern<DAS_BIND_FUN(channelGatherAndForward)>(*this, lib,  "_builtin_channel_gather_and_forward",
+                SideEffects::modifyArgumentAndExternal, "channelGatherAndForward")
+                    ->args({"channel","toChannel","block","context","line"});
+            addExtern<DAS_BIND_FUN(channelPeek)>(*this, lib,  "_builtin_channel_peek",
+                SideEffects::modifyArgumentAndExternal, "channelPeek")
+                    ->args({"channel","block","context","line"});
+            addExtern<DAS_BIND_FUN(channelVerify)>(*this, lib,  "_builtin_channel_verify",
+                SideEffects::modifyArgumentAndExternal, "channelVerify")
+                    ->args({"channel","context","line"});
+            addExtern<DAS_BIND_FUN(jobAppend)>(*this, lib, "append",
+                SideEffects::modifyArgument, "jobAppend")
+                    ->args({"channel","size","context","line"});
+            addExtern<DAS_BIND_FUN(withChannel)>(*this, lib,  "with_channel",
+                SideEffects::invoke, "withChannel")
+                    ->args({"block","context","line"});
+            addExtern<DAS_BIND_FUN(withChannelEx)>(*this, lib,  "with_channel",
+                SideEffects::invoke, "withChannelEx")
+                    ->args({"count","block","context","line"});
+            addExtern<DAS_BIND_FUN(channelCreate)>(*this, lib, "channel_create",
+                SideEffects::invoke, "channelCreate")
+                    ->args({ "context","line" })->unsafeOperation = true;
+            addExtern<DAS_BIND_FUN(channelRemove)>(*this, lib, "channel_remove",
+                SideEffects::invoke, "channelRemove")
+                    ->args({ "channel", "context","line" })->unsafeOperation = true;
+            // stream
+            addExtern<DAS_BIND_FUN(streamPush)>(*this, lib, "_builtin_stream_push",
+                SideEffects::modifyArgumentAndExternal, "streamPush")
+                    ->args({"stream","data","context","line"});
+            addExtern<DAS_BIND_FUN(streamPushBatch)>(*this, lib, "_builtin_stream_push_batch",
+                SideEffects::modifyArgumentAndExternal, "streamPushBatch")
+                    ->args({"stream","data","context","line"});
+            addExtern<DAS_BIND_FUN(streamPop)>(*this, lib, "_builtin_stream_pop",
+                SideEffects::modifyArgumentAndExternal, "streamPop")
+                    ->args({"stream","block","context","line"});
+            addExtern<DAS_BIND_FUN(streamTryPop)>(*this, lib, "_builtin_stream_try_pop",
+                SideEffects::modifyArgumentAndExternal, "streamTryPop")
+                    ->args({"stream","block","context","line"});
+            addExtern<DAS_BIND_FUN(streamPopWithTimeout)>(*this, lib, "_builtin_stream_pop_with_timeout",
+                SideEffects::modifyArgumentAndExternal, "streamPopWithTimeout")
+                    ->args({"stream","timeout_ms","block","context","line"});
+            addExtern<DAS_BIND_FUN(streamGather)>(*this, lib, "_builtin_stream_gather",
+                SideEffects::modifyArgumentAndExternal, "streamGather")
+                    ->args({"stream","block","context","line"});
+            addExtern<DAS_BIND_FUN(streamPeek)>(*this, lib, "_builtin_stream_peek",
+                SideEffects::modifyArgumentAndExternal, "streamPeek")
+                    ->args({"stream","block","context","line"});
+            addExtern<DAS_BIND_FUN(withStream)>(*this, lib, "with_stream",
+                SideEffects::invoke, "withStream")
+                    ->args({"block","context","line"});
+            addExtern<DAS_BIND_FUN(withStreamEx)>(*this, lib, "with_stream",
+                SideEffects::invoke, "withStreamEx")
+                    ->args({"count","block","context","line"});
+            addExtern<DAS_BIND_FUN(streamCreate)>(*this, lib, "stream_create",
+                SideEffects::invoke, "streamCreate")
+                    ->args({ "context","line" })->unsafeOperation = true;
+            addExtern<DAS_BIND_FUN(streamRemove)>(*this, lib, "stream_remove",
+                SideEffects::invoke, "streamRemove")
+                    ->args({ "stream", "context","line" })->unsafeOperation = true;
+            // job status
+            addExtern<DAS_BIND_FUN(withJobStatus)>(*this, lib,  "with_job_status",
+                SideEffects::modifyExternal, "withJobStatus")
+                    ->args({"total","block","context","line"});
+            addExtern<DAS_BIND_FUN(jobStatusAddRef)>(*this, lib, "add_ref",
+                SideEffects::modifyArgumentAndAccessExternal, "jobStatusAddRef")
+                    ->args({"status","context","line"});
+            addExtern<DAS_BIND_FUN(jobStatusReleaseRef)>(*this, lib, "release",
+                SideEffects::modifyArgumentAndAccessExternal, "jobStatusReleaseRef")
+                    ->args({"status","context","line"});
+            addExtern<DAS_BIND_FUN(waitForJob)>(*this, lib,  "join",
+                SideEffects::modifyExternal, "waitForJob")
+                    ->args({"job","context","line"});
+            addExtern<DAS_BIND_FUN(notifyJob)>(*this, lib,  "notify",
+                SideEffects::modifyExternal, "notifyJob")
+                    ->args({"job","context","line"});
+            addExtern<DAS_BIND_FUN(notifyAndReleaseJob)>(*this, lib,  "notify_and_release",
+                SideEffects::modifyExternal, "notifyAndReleaseJob")
+                    ->args({"job","context","line"});
+            addExtern<DAS_BIND_FUN(jobStatusCreate)>(*this, lib, "job_status_create",
+                SideEffects::invoke, "jobStatusCreate")
+                    ->args({ "context","line" });
+            addExtern<DAS_BIND_FUN(jobStatusRemove)>(*this, lib, "job_status_remove",
+                SideEffects::invoke, "jobStatusRemove")
+                    ->args({ "jobStatus", "context","line" })->unsafeOperation = true;
+            // fork \ invoke \ etc
+            addExtern<DAS_BIND_FUN(new_job_invoke)>(*this, lib,  "new_job_invoke",
+                SideEffects::modifyExternal, "new_job_invoke")
+                    ->args({"lambda","function","lambdaSize","context","line"});
+            addExtern<DAS_BIND_FUN(withJobQue)>(*this, lib,  "with_job_que",
+                SideEffects::modifyExternal, "withJobQue")
+                    ->args({"block","context","line"});
+            addExtern<DAS_BIND_FUN(getTotalHwJobs)>(*this, lib,  "get_total_hw_jobs",
+                SideEffects::accessExternal, "getTotalHwJobs")
+                    ->args({"context","line"});
+            addExtern<DAS_BIND_FUN(getTotalHwThreads)>(*this, lib,  "get_total_hw_threads",
+                SideEffects::accessExternal, "getTotalHwThreads");
+            addExtern<DAS_BIND_FUN(new_thread_invoke)>(*this, lib,  "new_thread_invoke",
+                SideEffects::modifyExternal, "new_thread_invoke")
+                    ->args({"lambda","function","lambdaSize","context","line"});
+            addExtern<DAS_BIND_FUN(new_debugger_thread)>(*this, lib,  "new_debugger_thread",
+                SideEffects::modifyExternal, "new_debugger_thread")
+                    ->args({"block","context","line"});
+            addExtern<DAS_BIND_FUN(is_job_que_shutting_down)>(*this, lib,  "is_job_que_shutting_down",
+                SideEffects::modifyExternal, "is_job_que_shutting_down");
+        }
+        virtual ModuleAotType aotRequire ( TextWriter & tw ) const override {
+            tw << "#include \"daScript/simulate/aot_builtin_jobque.h\"\n";
+            return ModuleAotType::cpp;
+        }
+        virtual ~Module_JobQue() {
+            g_jobQueAvailable--;
+            if ( g_jobQueAvailable == 0 ) {
+                while ( g_jobQueTotalThreads ) {
+                    builtin_sleep(0);
+                }
+                lock_guard<mutex> guard(g_jobQueMutex);
+                g_jobQue.reset();
+            }
+        }
+    protected:
+
+        // bool needShutdown = false;
+    };
+}
+
+REGISTER_MODULE_IN_NAMESPACE(Module_JobQue,das);
+

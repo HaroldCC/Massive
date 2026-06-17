@@ -1,0 +1,73 @@
+-- ==========================================
+-- ThirdParty — 第三方依赖统一声明
+--
+-- A 组: 外部编译产物 (OpenSSL, Protobuf, daScript, libpq)
+--   → headeronly 封装 Bin/ 路径
+-- B 组: xmake 内编译为静态库 (Fmt, TracyClient)
+-- C 组: 纯头文件 (Asio, EnTT, Spdlog, ConcurrentQueue)
+--
+-- 所有 include/linkdir 路径指向 ThirdParty/Bin/<name>/{include,lib}。
+-- $(projectdir) 是 xmake 内置变量，展开为项目根目录。
+-- ==========================================
+
+-- ==========================================
+-- A 组: 外部编译产物（headeronly 封装路径信息）
+-- ==========================================
+
+target("OpenSSL")
+    set_kind("headeronly")
+    add_includedirs("$(projectdir)/ThirdParty/Bin/openssl/include", {public = true})
+    add_linkdirs("$(projectdir)/ThirdParty/Bin/openssl/lib", {public = true})
+
+target("Protobuf")
+    set_kind("headeronly")
+    add_includedirs("$(projectdir)/ThirdParty/Bin/protobuf/include", {public = true})
+    add_linkdirs("$(projectdir)/ThirdParty/Bin/protobuf/lib", {public = true})
+
+target("DaScript")
+    set_kind("headeronly")
+    add_includedirs("$(projectdir)/ThirdParty/Bin/dasScript/include", {public = true})
+    add_linkdirs("$(projectdir)/ThirdParty/Bin/dasScript/lib", {public = true})
+
+target("LibPQ")
+    set_kind("headeronly")
+    add_includedirs("$(projectdir)/ThirdParty/Bin/libpq/include", {public = true})
+    add_linkdirs("$(projectdir)/ThirdParty/Bin/libpq/lib", {public = true})
+
+-- ==========================================
+-- B 组: xmake 内编译为静态库
+-- ==========================================
+
+target("Fmt")
+    set_kind("static")
+    set_warnings("none")
+    add_files("fmt/src/format.cc")
+    add_includedirs("$(projectdir)/ThirdParty/fmt/include", {public = true})
+
+target("TracyClient")
+    set_kind("static")
+    set_warnings("none")
+    add_files("tracy/public/TracyClient.cpp")
+    add_includedirs("$(projectdir)/ThirdParty/tracy/public", {public = true})
+    add_defines("TRACY_ENABLE")
+
+-- ==========================================
+-- C 组: 纯头文件
+-- ==========================================
+
+target("Asio")
+    set_kind("headeronly")
+    add_includedirs("$(projectdir)/ThirdParty/asio/asio/include", {public = true})
+
+target("EnTT")
+    set_kind("headeronly")
+    add_includedirs("$(projectdir)/ThirdParty/entt/src", {public = true})
+
+target("Spdlog")
+    set_kind("headeronly")
+    add_includedirs("$(projectdir)/ThirdParty/spdlog/include", {public = true})
+    add_deps("Fmt")         -- spdlog 需要 fmt 头文件
+
+target("ConcurrentQueue")
+    set_kind("headeronly")
+    add_includedirs("$(projectdir)/ThirdParty/concurrentqueue", {public = true})

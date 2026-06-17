@@ -1,0 +1,945 @@
+#pragma once
+
+#include "daScript/ast/ast_typefactory.h"
+#include "daScript/simulate/runtime_iterator.h"
+#include "daScript/simulate/jit_abi.h"
+#include "daScript/misc/free_list.h"
+#include "daScript/misc/gc_node.h"
+#include <limits.h> // ULONG_MAX
+
+namespace das {
+
+    struct TypeDecl;
+    typedef TypeDecl * TypeDeclPtr;
+
+    class Structure;
+    typedef Structure * StructurePtr;
+
+    class Enumeration;
+    typedef Enumeration * EnumerationPtr;
+
+    struct Annotation;
+    typedef Annotation * AnnotationPtr;
+
+    struct TypeAnnotation;
+    typedef TypeAnnotation * TypeAnnotationPtr;
+
+    struct Expression;
+    typedef Expression * ExpressionPtr;
+
+    typedef das_map<string,TypeDeclPtr> AliasMap;
+    typedef das_map<TypeDecl *,int> OptionsMap;
+    typedef vector<pair<string,string>> AliasDefs;
+
+    class Visitor;
+
+    class Module;
+    class ModuleLibrary;
+    class ModuleGroup;
+
+    typedef das_hash_map<string,pair<TypeDeclPtr,bool>> TypeAliasMap;
+
+    struct AstSerializer;
+
+    struct DAS_API TypeDecl : gc_node {
+        enum {
+            dimAuto = -1,
+            dimConst = -2,
+        };
+        enum class DescribeExtra     { no, yes };
+        enum class DescribeContracts { no, yes };
+        enum class DescribeModule    { no, yes };
+        enum {
+            gcFlag_heap = (1<<0),
+            gcFlag_stringHeap = (1<<1)
+        };
+        TypeDecl() { gc_magic = GC_MAGIC_TYPEDECL; }
+        TypeDecl(const TypeDecl & decl);
+        TypeDecl & operator = (const TypeDecl & decl) = delete;
+        TypeDecl(Type tt) : baseType(tt) { gc_magic = GC_MAGIC_TYPEDECL; }
+        TypeDecl(Structure * sp) : baseType(Type::tStructure), structType(sp) { gc_magic = GC_MAGIC_TYPEDECL; }
+        TypeDecl(Enumeration * ep);
+        TypeDeclPtr visit ( Visitor & vis );
+        friend StringWriter& operator<< (StringWriter& stream, const TypeDecl & decl);
+        string getMangledName ( bool fullName=false ) const;
+        void getMangledName ( TextWriter & tw, bool fullName=false ) const;
+        bool canAot() const;
+        bool canAot( das_set<Structure *> & recAot ) const;
+        bool isSameType ( const TypeDecl & decl, RefMatters refMatters, ConstMatters constMatters,
+            TemporaryMatters temporaryMatters, AllowSubstitute allowSubstitute = AllowSubstitute::no, bool topLevel = true, bool isPassType = false ) const;
+        bool isSameExactType ( const TypeDecl & decl ) const;
+        void sanitize();
+        bool isExprType() const;
+        bool isExprTypeAnywhere() const;
+        bool isExprTypeAnywhere(das_set<Structure*> & dep) const;
+        __forceinline bool isSimpleType () const;
+        __forceinline bool isSimpleType ( Type typ ) const;
+        __forceinline bool isArray() const;
+        __forceinline bool isFixedArray() const;
+        __forceinline bool isGoodIteratorType() const;
+        __forceinline bool isGoodArrayType() const;
+        __forceinline bool isGoodTableType() const;
+        __forceinline bool isGoodBlockType() const;
+        __forceinline bool isGoodFunctionType() const;
+        __forceinline bool isGoodLambdaType() const;
+        __forceinline bool isGoodTupleType() const;
+        __forceinline bool isGoodVariantType() const;
+        __forceinline bool isVoid() const;
+        __forceinline bool isRef() const;
+        __forceinline bool isAnyType() const;
+        bool isRefType() const;
+        bool isRefOrPointer() const { return isRef() || isPointer(); }
+        bool canWrite() const;
+        bool isTemp( bool topLevel = true, bool refMatters = true) const;
+        bool isTemp(bool topLevel, bool refMatters, das_set<Structure*> & dep) const;
+        __forceinline bool isTempType(bool refMatters = true) const;
+        bool isFullyInferred(das_set<Structure*> & dep) const;
+        bool isFullyInferred() const;
+        // WARNING: this is really really slow, use faster tests when u can isAutoOrAlias for one
+        // type chain is fully resolved, and not aliased \ auto
+        bool isFullySealed(das_set<const Structure *> & all ) const;
+        bool isFullySealed() const;
+        bool isShareable(das_set<Structure*> & dep) const;
+        bool isShareable() const;
+        bool isIndex() const;
+        bool isIndexExt() const;
+        bool isBool() const;
+        bool isInteger() const;
+        bool isSignedInteger() const;
+        bool isUnsignedInteger() const;
+        bool isSignedIntegerOrIntVec() const;
+        bool isUnsignedIntegerOrIntVec() const;
+        bool isFloatOrDouble() const;
+        bool isNumeric() const;
+        bool isNumericStorage() const;
+        bool isNumericComparable() const;
+        __forceinline bool isPointer() const;
+        __forceinline bool isSmartPointer() const;
+        __forceinline bool isVoidPointer() const;
+        __forceinline bool isIterator() const;
+        __forceinline bool isLambda() const;
+        __forceinline bool isEnum() const;
+        __forceinline bool isEnumT() const;
+        __forceinline bool isHandle() const;
+        __forceinline bool isStructure() const;
+        bool isClass() const;
+        __forceinline bool isFunction() const;
+        __forceinline bool isTuple() const;
+        __forceinline bool isVariant() const;
+        __forceinline bool isMoveableValue() const;
+        int getSizeOf() const;
+        uint64_t getSizeOf64() const;
+        uint64_t getSizeOf64(bool & failed) const;
+        int getCountOf() const;
+        uint64_t getCountOf64() const;
+        int getAlignOf() const;
+        int getAlignOfFailed(bool & failed) const;
+        int getBaseSizeOf() const;
+        uint64_t getBaseSizeOf64() const;
+        uint64_t getBaseSizeOf64(bool & failed) const;
+        int getStride() const;
+        uint64_t getStride64() const;
+        int getTupleSize() const;
+        uint64_t getTupleSize64() const;
+        uint64_t getTupleSize64(bool & failed) const;
+        int getTupleAlign() const;
+        int getTupleAlignFailed(bool & failed) const;
+        int getTupleFieldOffset ( int index ) const;
+        int getVariantSize() const;
+        uint64_t getVariantSize64() const;
+        uint64_t getVariantSize64(bool & failed) const;
+        int getVariantAlign() const;
+        int getVariantAlignFailed(bool & failed) const;
+        int getVariantFieldOffset ( int index ) const;
+        int getVariantUniqueFieldIndex ( const TypeDeclPtr & uniqueType ) const;
+        int getVectorFieldOffset ( int index ) const;
+        string describe ( DescribeExtra extra = DescribeExtra::yes, DescribeContracts contracts = DescribeContracts::yes, DescribeModule module = DescribeModule::yes, AliasDefs * aliasDefs = nullptr, bool topAlias = true ) const;
+        bool canCloneFromConst() const;
+        __forceinline bool canCopy() const { return canCopy(false); }
+        bool canCopy(bool tempMatters) const;
+        bool canMove() const;
+        bool canClone() const;
+        bool canNew() const;
+        bool canDeletePtr() const;
+        bool canDelete() const;
+        bool needDelete() const;
+        bool isPod() const;
+        bool isRawPod() const;
+        bool isNoHeapType() const;
+        bool isWorkhorseType() const; // we can return this, or pass this
+        bool isTableKeyType() const;  // workhorse or by value annotation
+        bool isPolicyType() const;
+        bool isVecPolicyType() const;
+        bool isReturnType() const;
+        bool isCtorType() const;
+        __forceinline bool isRange() const;
+        __forceinline bool isString() const;
+        __forceinline bool isConst() const;
+        bool isFoldable() const;
+        void collectAliasList(vector<string> & aliases) const;
+        bool isAutoArrayResolved() const;
+        bool isAuto() const;
+        bool isAutoOrAlias() const;
+        bool isAutoWithoutOptions(bool & appendHasOptions) const;
+        bool isAotAlias () const;
+        bool isAliasOrA2A(bool a2a) const;
+        bool isAlias() const;
+        bool isAliasOrExpr() const;
+        __forceinline bool isVectorType() const;
+        bool isBaseVectorType() const;
+        __forceinline bool isBitfield() const;
+        bool isSafeToDelete() const;
+        bool isSafeToDelete ( das_set<Structure*> & dep) const;
+        bool isLocal() const;
+        bool isLocal( das_set<Structure*> & dep ) const;
+        bool hasClasses() const;
+        bool hasClasses( das_set<Structure*> & dep ) const;
+        int32_t gcFlags() const;
+        int32_t gcFlags( das_set<Structure *> & dep, das_set<Annotation *> & depA ) const;
+        bool hasNonTrivialCtor() const;
+        bool hasNonTrivialCtor( das_set<Structure*> & dep ) const;
+        bool hasNonTrivialDtor() const;
+        bool hasNonTrivialDtor( das_set<Structure*> & dep ) const;
+        bool hasNonTrivialCopy() const;
+        bool hasNonTrivialCopy( das_set<Structure*> & dep ) const;
+        bool canBePlacedInContainer() const;
+        bool canBePlacedInContainer( das_set<Structure*> & dep ) const;
+        bool unsafeInit() const;
+        bool unsafeInit( das_set<Structure*> & dep ) const;
+        bool needInScope() const;
+        bool needInScope( das_set<Structure*> & dep ) const;
+        bool hasStringData() const;
+        bool hasStringData( das_set<void*> & dep ) const;
+        Annotation * isPointerToAnnotation() const;
+        Type getVectorBaseType() const;
+        int getVectorDim() const;
+        bool canInitWithZero() const;
+        static Type getVectorType ( Type baseType, int dim );
+        static Type getRangeType ( Type baseType, int dim );
+        static int getMaskFieldIndex ( char ch );
+        static bool isSequencialMask ( const vector<uint8_t> & fields );
+        static bool buildSwizzleMask ( const string & mask, int dim, vector<uint8_t> & fields );
+        static TypeDeclPtr inferGenericType ( const TypeDeclPtr & autoT, const TypeDeclPtr & initT, bool topLevel, bool isPassType, OptionsMap * options );
+        static TypeDeclPtr inferGenericInitType ( const TypeDeclPtr & autoT, const TypeDeclPtr & initT );
+        static void applyAutoContracts ( const TypeDeclPtr & TT, const TypeDeclPtr & autoT );
+        static void applyRefToRef ( const TypeDeclPtr & TT, bool topLevel = false );
+        static void updateAliasMap ( const TypeDeclPtr & decl, const TypeDeclPtr & pass, AliasMap & aliases, OptionsMap & options );
+        Type getRangeBaseType() const;
+        TypeDecl * findAlias ( const string & name, bool allowAuto = false, bool * constUnderDim = nullptr );
+        bool computeAliasCache();     // eager full walk, populates aliasCacheValid/aliasCacheHasAlias on every visited node; returns true if subtree contains any alias
+        int findArgumentIndex(const string & name) const;
+        int tupleFieldIndex( const string & name ) const;
+        int variantFieldIndex( const string & name ) const;
+        __forceinline int bitFieldIndex( const string & name ) const;
+        void addVariant(const string & name, const TypeDeclPtr & tt);
+        string findBitfieldName ( uint64_t value ) const;
+        void collectAliasing ( TypeAliasMap & aliases, das_set<Structure *> & dep, bool viaPointer ) const;
+        void collectContainerAliasing ( TypeAliasMap & aliases, das_set<Structure *> & dep, bool viaPointer ) const;
+        void serialize ( AstSerializer & ser );
+        void gc_collect ( gc_root * target, gc_root * from = nullptr );
+        string typeMacroName() const;
+        uint64_t getOwnSemanticHash() const;
+        uint64_t getMangledNameHash() const;
+        uint64_t getOwnSemanticHash(HashBuilder & hb, das_set<Structure *> & dep, das_set<Annotation *> & adep) const;
+        uint64_t getSemanticHash() const;
+        uint64_t getSemanticHash(HashBuilder & hb) const;
+        void getLookupHash(uint64_t & hash) const;
+        static void clone ( TypeDeclPtr & dest, const TypeDeclPtr & src );
+        Type getR2VType() const;
+        int maxBitfieldBits() const;
+        LineInfo getDeclarationLocation() const;
+    public:
+        Type                    baseType = Type::tVoid;
+        Structure *             structType = nullptr;
+        Enumeration *           enumType = nullptr;
+        TypeAnnotation *        annotation = nullptr;
+        TypeDeclPtr             firstType = nullptr;      // map.first or array, or pointer
+        TypeDeclPtr             secondType = nullptr;     // map.second
+        vector<TypeDeclPtr>     argTypes;       // block arguments
+        vector<string>          argNames;
+        // tFixedArray rework (FIXED_ARRAY_REWORK.md): fixedDim/fixedDimExpr are meaningful
+        // only on baseType==tFixedArray nodes (one size per node, element in firstType,
+        // dimAuto/dimConst sentinels apply). typeMacroExpr carries the typeMacro/typeDecl/tag
+        // payload (dimExpr's old duty).
+        int32_t                 fixedDim = 0;
+        ExpressionPtr           fixedDimExpr = nullptr;
+        vector<ExpressionPtr>   typeMacroExpr;
+        union {
+            struct {
+                bool    ref : 1 ;
+                bool    constant : 1;
+                bool    temporary : 1;
+                bool    implicit : 1;
+                bool    removeRef : 1;
+                bool    removeConstant : 1;
+                bool    removeDim : 1;
+                bool    removeTemporary : 1;
+                bool    explicitConst : 1;
+                bool    aotAlias : 1;
+                bool    smartPtr : 1;
+                bool    smartPtrNative : 1;
+                bool    isExplicit : 1;
+                bool    isNativeDim : 1;
+                bool    isTag: 1;
+                bool    explicitRef : 1;
+                bool    isPrivateAlias : 1;    // this is a private alias. only matters in the context of module aliasTypes (for now)
+                bool    autoToAlias : 1;       // this allows conversion of auto to alias
+                bool    safeWhenUninitialized : 1; // exempt this type from "Uninitialized variable/field is unsafe" — analog of struct-level safe_when_uninitialized for tuples / variants / aliases
+                bool    enumStubBinding : 1;    // marks a parameter TypeDecl produced from a C++ EnumStub*/EnumStub*u
+                                                //  binding (set by typeFactory<EnumStub*[u]>). Used together with
+                                                //  enumStubIsUnsigned to dispatch enum→int casts by underlying signedness.
+                bool    enumStubIsUnsigned : 1; // when enumStubBinding is set: true if the binding expects an
+                                                //  unsigned-underlying enum (uint8/uint16/uint64). Lets `int(uint8Enum)`
+                                                //  resolve to enum8u_to_int instead of enum8_to_int so the byte
+                                                //  zero-extends instead of sign-extending.
+                bool    aliasCacheValid : 1;    // findAlias subtree cache validity flag
+                bool    aliasCacheHasAlias : 1; // findAlias subtree cache result (only meaningful when aliasCacheValid)
+            };
+            uint32_t flags = 0;
+        };
+        string              alias;
+        LineInfo            at;
+        Module *            module = nullptr;
+    };
+
+    struct MatchingOptionError {
+        TypeDeclPtr optionType = nullptr;
+        TypeDeclPtr option1 = nullptr;
+        TypeDeclPtr option2 = nullptr;
+    };
+
+    DAS_API void findMatchingOptions ( const TypeDeclPtr & type, vector<MatchingOptionError> & matching );
+
+    template <typename TT> struct ToBasicType {
+        enum { type = Type::none };
+        static_assert( int(type)!=int(Type::none),"This type is not supported or not bound. For the bound type missing or not included are "
+            "MAKE_TYPE_FACTORY or MAKE_EXTERNAL_TYPE_FACTORY as well as addAnnotation in the appropriate module.");
+    };
+
+    template<> struct ToBasicType<Bitfield>     { enum { type = Type::tBitfield }; };
+    template<> struct ToBasicType<Bitfield8>    { enum { type = Type::tBitfield8 }; };
+    template<> struct ToBasicType<Bitfield16>   { enum { type = Type::tBitfield16 }; };
+    template<> struct ToBasicType<Bitfield64>   { enum { type = Type::tBitfield64 }; };
+    template<> struct ToBasicType<EnumStub>     { enum { type = Type::tEnumeration }; };
+    template<> struct ToBasicType<EnumStub8>    { enum { type = Type::tEnumeration8 }; };
+    template<> struct ToBasicType<EnumStub16>   { enum { type = Type::tEnumeration16 }; };
+    template<> struct ToBasicType<EnumStub64>   { enum { type = Type::tEnumeration64 }; };
+    template<> struct ToBasicType<EnumStub8u>   { enum { type = Type::tEnumeration8 }; };
+    template<> struct ToBasicType<EnumStub16u>  { enum { type = Type::tEnumeration16 }; };
+    template<> struct ToBasicType<EnumStub64u>  { enum { type = Type::tEnumeration64 }; };
+    template<> struct ToBasicType<Sequence>     { enum { type = Type::tIterator }; };
+    template<> struct ToBasicType<Sequence *>   { enum { type = Type::tIterator }; };
+    template<> struct ToBasicType<void *>       { enum { type = Type::tPointer }; };
+    template<> struct ToBasicType<char *>       { enum { type = Type::tString }; };
+    template<> struct ToBasicType<bool>         { enum { type = Type::tBool }; };
+    template<> struct ToBasicType<int64_t>      { enum { type = Type::tInt64 }; };
+    template<> struct ToBasicType<uint64_t>     { enum { type = Type::tUInt64 }; };
+    template<> struct ToBasicType<int8_t>       { enum { type = Type::tInt8 }; };
+    template<> struct ToBasicType<uint8_t>      { enum { type = Type::tUInt8 }; };
+    template<> struct ToBasicType<int16_t>      { enum { type = Type::tInt16 }; };
+    template<> struct ToBasicType<uint16_t>     { enum { type = Type::tUInt16 }; };
+    template<> struct ToBasicType<int32_t>      { enum { type = Type::tInt }; };
+    template<> struct ToBasicType<uint32_t>     { enum { type = Type::tUInt }; };
+    template<> struct ToBasicType<float>        { enum { type = Type::tFloat }; };
+    template<> struct ToBasicType<void>         { enum { type = Type::tVoid }; };
+    template<> struct ToBasicType<char>         { enum { type = Type::tInt8 }; };
+#if defined(_WIN32)
+    // Broadened from _MSC_VER to cover mingw (clang-mingw64 + gcc-mingw) too —
+    // Windows LLP64 makes `long`/`unsigned long` 32-bit regardless of compiler.
+    // Without this, dasClangBind fails to build on mingw because libclang's
+    // CXUnsavedFile::Length (unsigned long) hits the primary template's
+    // static_assert.
+    template<> struct ToBasicType<long>             { enum { type = Type::tInt }; };
+    template<> struct ToBasicType<unsigned long>    { enum { type = Type::tUInt }; };
+    template<> struct ToBasicType<long double>      { enum { type = Type::tDouble }; };
+    template<> struct ToBasicType<wchar_t>          { enum { type = Type::tUInt16 }; };
+#endif
+#if defined(__APPLE__)
+    // note - under MSVC size_t is unsigned __int64 (or 32) accordingly
+    template<> struct ToBasicType<size_t>           { enum { type = sizeof(size_t)==8 ? Type::tUInt64 : Type::tUInt }; };
+    template<> struct ToBasicType<long>             { enum { type = Type::tInt }; };
+    template<> struct ToBasicType<long double>      { enum { type = Type::tDouble }; };
+    template<> struct ToBasicType<wchar_t>          { enum { type = Type::tUInt16 }; };
+#endif
+#if !defined(_MSC_VER) && !defined(__APPLE__) && !defined(_EMSCRIPTEN_VER) && defined(ULONG_MAX) && ULONG_MAX == UINT64_MAX
+    template<> struct ToBasicType<long long int>      { enum { type = Type::tInt64 }; };
+    template<> struct ToBasicType<unsigned long long int>     { enum { type = Type::tUInt64 }; };
+#endif
+#ifdef _EMSCRIPTEN_VER
+    template<> struct ToBasicType<unsigned long>    { enum { type = Type::tUInt }; };
+#endif
+    template<> struct ToBasicType<float2>       { enum { type = Type::tFloat2 }; };
+    template<> struct ToBasicType<float3>       { enum { type = Type::tFloat3 }; };
+    template<> struct ToBasicType<float4>       { enum { type = Type::tFloat4 }; };
+    template<> struct ToBasicType<int2>         { enum { type = Type::tInt2 }; };
+    template<> struct ToBasicType<int3>         { enum { type = Type::tInt3 }; };
+    template<> struct ToBasicType<int4>         { enum { type = Type::tInt4 }; };
+    template<> struct ToBasicType<uint2>        { enum { type = Type::tUInt2 }; };
+    template<> struct ToBasicType<uint3>        { enum { type = Type::tUInt3 }; };
+    template<> struct ToBasicType<uint4>        { enum { type = Type::tUInt4 }; };
+    template<> struct ToBasicType<double>       { enum { type = Type::tDouble }; };
+    template<> struct ToBasicType<range>        { enum { type = Type::tRange }; };
+    template<> struct ToBasicType<urange>       { enum { type = Type::tURange }; };
+    template<> struct ToBasicType<range64>      { enum { type = Type::tRange64 }; };
+    template<> struct ToBasicType<urange64>     { enum { type = Type::tURange64 }; };
+    template<> struct ToBasicType<Array *>      { enum { type = Type::tArray }; };
+    template<> struct ToBasicType<Table *>      { enum { type = Type::tTable }; };
+    template<> struct ToBasicType<Array>        { enum { type = Type::tArray }; };
+    template<> struct ToBasicType<Table>        { enum { type = Type::tTable }; };
+    template<> struct ToBasicType<Block>        { enum { type = Type::tBlock }; };
+    template<> struct ToBasicType<Func>         { enum { type = Type::tFunction }; };
+    template<> struct ToBasicType<Lambda>       { enum { type = Type::tLambda }; };
+    template<> struct ToBasicType<Tuple>        { enum { type = Type::tTuple }; };
+    template<> struct ToBasicType<Variant>      { enum { type = Type::tVariant }; };
+    template<> struct ToBasicType<Context *>    { enum { type = Type::fakeContext }; };
+    template<> struct ToBasicType<LineInfoArg *>{ enum { type = Type::fakeLineInfo }; };
+    template<> struct ToBasicType<vec4f>        { enum { type = Type::anyArgument }; };
+
+    template <typename TT>
+    struct typeFactory {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary &) {
+            auto t = new TypeDecl();
+            t->baseType = Type( ToBasicType<TT>::type );
+            t->constant = is_const<TT>::value;
+            return t;
+        }
+    };
+
+    // EnumStub*/EnumStub*u — bindings carry the enumStubBinding marker so overload
+    // resolution can dispatch enum→int casts by underlying signedness. The 32-bit
+    // tEnumeration variant is unaffected by sign-extension and stays generic.
+    template <>
+    struct typeFactory<EnumStub8> {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary &) {
+            auto t = new TypeDecl(Type::tEnumeration8);
+            t->enumStubBinding = true;
+            return t;
+        }
+    };
+
+    template <>
+    struct typeFactory<EnumStub16> {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary &) {
+            auto t = new TypeDecl(Type::tEnumeration16);
+            t->enumStubBinding = true;
+            return t;
+        }
+    };
+
+    template <>
+    struct typeFactory<EnumStub64> {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary &) {
+            auto t = new TypeDecl(Type::tEnumeration64);
+            t->enumStubBinding = true;
+            return t;
+        }
+    };
+
+    template <>
+    struct typeFactory<EnumStub8u> {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary &) {
+            auto t = new TypeDecl(Type::tEnumeration8);
+            t->enumStubBinding = true;
+            t->enumStubIsUnsigned = true;
+            return t;
+        }
+    };
+
+    template <>
+    struct typeFactory<EnumStub16u> {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary &) {
+            auto t = new TypeDecl(Type::tEnumeration16);
+            t->enumStubBinding = true;
+            t->enumStubIsUnsigned = true;
+            return t;
+        }
+    };
+
+    template <>
+    struct typeFactory<EnumStub64u> {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary &) {
+            auto t = new TypeDecl(Type::tEnumeration64);
+            t->enumStubBinding = true;
+            t->enumStubIsUnsigned = true;
+            return t;
+        }
+    };
+
+    template <>
+    struct typeFactory<char *> {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary &) {
+            auto t = new TypeDecl(Type::tString);
+            return t;
+        }
+    };
+
+    template <>
+    struct typeFactory<const char *> {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary &) {
+            auto t = new TypeDecl(Type::tString);
+            t->constant = true;
+            return t;
+        }
+    };
+
+    template <typename TT>
+    struct typeFactory<smart_ptr<TT>> {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary & lib) {
+            auto t = new TypeDecl(Type::tPointer);
+            t->firstType = typeFactory<TT>::make(lib);
+            t->smartPtr = true;
+            t->smartPtrNative = true;
+            return t;
+        }
+    };
+
+    template <typename TT>
+    struct typeFactory<smart_ptr_raw<TT>> {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary & lib) {
+            auto t = new TypeDecl(Type::tPointer);
+            t->firstType = typeFactory<TT>::make(lib);
+            t->smartPtr = true;
+            return t;
+        }
+    };
+
+    template <>
+    struct typeFactory<Array *> {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary &) {
+            auto t = new TypeDecl(Type::tArray);
+            return t;
+        }
+    };
+
+    template <>
+    struct typeFactory<Iterator *> {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary &) {
+            auto t = new TypeDecl(Type::tIterator);
+            return t;
+        }
+    };
+
+    template <>
+    struct typeFactory<const Iterator *> {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary &) {
+            auto t = new TypeDecl(Type::tIterator);
+            t->constant = true;
+            return t;
+        }
+    };
+
+    template <>
+    struct typeFactory<Table *> {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary &) {
+            auto t = new TypeDecl(Type::tTable);
+            return t;
+        }
+    };
+
+    template <>
+    struct typeFactory<Context *> {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary &) {
+            return new TypeDecl(Type::fakeContext);
+        }
+    };
+
+    template <>
+    struct typeFactory<LineInfoArg *> {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary &) {
+            return new TypeDecl(Type::fakeLineInfo);
+        }
+    };
+
+    template <typename ResultType, typename ...Args>
+    struct typeFactory<TBlock<ResultType,Args...>> {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary & lib) {
+            auto t = new TypeDecl(Type::tBlock);
+            t->firstType = typeFactory<ResultType>::make(lib);
+            t->argTypes = { typeFactory<Args>::make(lib)... };
+            return t;
+        }
+    };
+    template <typename ResultType, typename ...Args>
+    struct typeFactory<TFunc<ResultType,Args...>> {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary & lib) {
+            auto t = new TypeDecl(Type::tFunction);
+            t->firstType = typeFactory<ResultType>::make(lib);
+            t->argTypes = { typeFactory<Args>::make(lib)... };
+            return t;
+        }
+    };
+
+    template <typename ResultType, typename ...Args>
+    struct typeFactory<TLambda<ResultType,Args...>> {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary & lib) {
+            auto t = new TypeDecl(Type::tLambda);
+            t->firstType = typeFactory<ResultType>::make(lib);
+            t->argTypes = { typeFactory<Args>::make(lib)... };
+            return t;
+        }
+    };
+
+    template <typename TT>
+    struct typeFactory<TTemporary<TT>> {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary & lib) {
+            auto t = typeFactory<TT>::make(lib);
+            t->temporary = true;
+            return t;
+        }
+    };
+
+    template <typename TT>
+    struct typeFactory<TExplicit<TT>> {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary & lib) {
+            auto t = typeFactory<TT>::make(lib);
+            t->isExplicit = true;
+            return t;
+        }
+    };
+
+    template <typename TT>
+    struct TImplicit {};
+
+    template <typename TT>
+    struct typeFactory<TImplicit<TT>> {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary & lib) {
+            auto t = typeFactory<TT>::make(lib);
+            t->implicit = true;
+            return t;
+        }
+    };
+
+    template <typename TT>
+    struct TArray;
+
+    template <typename TT>
+    struct typeFactory<TArray<TT>> {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary & lib) {
+            auto t = new TypeDecl(Type::tArray);
+            t->firstType = typeFactory<TT>::make(lib);
+            return t;
+        }
+    };
+
+    template <typename TT, int size>
+    struct TDim;
+
+    // FIXED_ARRAY_REWORK.md, 1c: wrap an element type in a tFixedArray node, hoisting the
+    // canonical qualifiers — ref/const/temporary live on the outermost FA node only
+    inline TypeDeclPtr makeFixedArrayTypeDecl ( int32_t size, TypeDeclPtr element ) {
+        auto fa = new TypeDecl(Type::tFixedArray);
+        fa->fixedDim = size;
+        fa->firstType = element;
+        fa->ref = element->ref;             element->ref = false;
+        fa->constant = element->constant;   element->constant = false;
+        fa->temporary = element->temporary; element->temporary = false;
+        return fa;
+    }
+
+    template <typename TT, int size>
+    struct typeFactory<TDim<TT,size>> {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary & lib) {
+            return makeFixedArrayTypeDecl(size, typeFactory<TT>::make(lib));
+        }
+    };
+
+    template <typename TK, typename TV>
+    struct TTable;
+
+    template <typename TK, typename TV>
+    struct typeFactory<TTable<TK,TV>> {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary & lib) {
+            auto t = new TypeDecl(Type::tTable);
+            t->firstType = typeFactory<TK>::make(lib);
+            t->secondType = typeFactory<TV>::make(lib);
+            return t;
+        }
+    };
+
+    template <typename TT>
+    struct TSequence;
+
+    template <typename TT>
+    struct typeFactory<TSequence<TT>> {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary & lib) {
+            auto t = new TypeDecl(Type::tIterator);
+            t->firstType = typeFactory<TT>::make(lib);
+            return t;
+        }
+    };
+
+
+    template <typename TT, int dim>
+    struct typeFactory<TT[dim]> {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary & lib) {
+            // natural recursion maps C int[3][4] to FA(3, FA(4, int)) — outermost first
+            // (the old dim-vector push produced the inner-first order, a latent bug)
+            auto t = makeFixedArrayTypeDecl(dim, typeFactory<TT>::make(lib));
+            t->ref = false;
+            t->isNativeDim = true;
+            return t;
+        }
+    };
+
+    template <typename TT>
+    struct typeFactory<TT *> {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary & lib) {
+            auto pt = new TypeDecl(Type::tPointer);
+            if ( !is_void<TT>::value ) {
+                pt->firstType = typeFactory<TT>::make(lib);
+            }
+            return pt;
+        }
+    };
+
+    template <typename TT>
+    struct typeFactory<const TT *> {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary & lib) {
+            auto pt = new TypeDecl(Type::tPointer);
+            if ( !is_void<TT>::value ) {
+                pt->firstType = typeFactory<TT>::make(lib);
+                pt->firstType->constant = true;
+            }
+            pt->constant = true;
+            return pt;
+        }
+    };
+
+    template <typename TT>
+    struct typeFactory<TT &> {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary & lib) {
+            auto t = typeFactory<TT>::make(lib);
+            t->ref = true;
+            return t;
+        }
+    };
+
+    template <typename TT>
+    struct typeFactory<const TT &> {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary & lib) {
+            auto t = typeFactory<TT>::make(lib);
+            t->ref = true;
+            t->constant = true;
+            return t;
+        }
+    };
+
+    template <typename TT>
+    struct typeFactory<const TT> {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary & lib) {
+            auto t = typeFactory<TT>::make(lib);
+            t->constant = true;
+            return t;
+        }
+    };
+
+    template <typename FT, typename ST>
+    struct typeFactory<pair<FT,ST>> {
+        static ___noinline TypeDeclPtr make(const ModuleLibrary & lib) {
+            auto t = new TypeDecl(Type::tTuple);
+            t->argTypes.push_back(typeFactory<FT>::make(lib));
+            t->argTypes.push_back(typeFactory<ST>::make(lib));
+            return t;
+        }
+    };
+
+    template <typename TT>
+    __forceinline TypeDeclPtr makeType(const ModuleLibrary & ctx) {
+        return typeFactory<TT>::make(ctx);
+    }
+
+    template <typename TT>
+    ___noinline TypeDeclPtr makeArgumentType(const ModuleLibrary & ctx) {
+        auto tt = typeFactory<TT>::make(ctx);
+        if (tt->isRefType()) {
+            tt->ref = false;
+        } else if (!tt->isRef() && !tt->isAnyType()) {
+            // note:
+            //  C++ does not differentiate between void foo ( Foo ); and void foo ( const Foo );
+            //  DAS differenciates for pointers
+            tt->constant = true;
+        }
+        return tt;
+    }
+
+    das::TypeDeclPtr DAS_API makeHandleType(const das::ModuleLibrary & library, const char * typeName);
+
+    DAS_API bool splitTypeName ( const string & name, string & moduleName, string & funcName );
+
+    DAS_API bool isCircularType ( const TypeDeclPtr & type );
+    DAS_API bool hasImplicit ( const TypeDeclPtr & type );
+    bool isMatchingArgumentType ( const TypeDeclPtr & argType, const TypeDeclPtr & passType );
+
+    enum class CpptSubstitureRef { no, yes };
+    enum class CpptSkipRef { no, yes };
+    enum class CpptSkipConst { no, yes };
+    enum class CpptRedundantConst { no, yes };
+    enum class ChooseSmartPtr { no, yes };
+
+    string DAS_API describeCppType(const TypeDecl * type,
+                           CpptSubstitureRef substituteRef = CpptSubstitureRef::no,
+                           CpptSkipRef skipRef = CpptSkipRef::no,
+                           CpptSkipConst skipConst = CpptSkipConst::no,
+                           CpptRedundantConst redundantConst = CpptRedundantConst::yes,
+                           ChooseSmartPtr chooseSmartPtr = ChooseSmartPtr::no);
+
+    class DAS_API MangledNameParser {
+    public:
+        virtual ~MangledNameParser () = default;
+    protected:
+        virtual void error ( const string &, const char * );
+        string parseAnyName ( const char * & ch, bool allowModule );
+        string parseAnyNameInBrackets ( const char * & ch, bool allowModule );
+    public:
+        TypeDeclPtr parseTypeFromMangledName ( const char * & ch, const ModuleLibrary & library, Module * thisModule );
+    };
+}
+
+// TypeDecl inlines
+namespace das {
+    __forceinline int TypeDecl::bitFieldIndex ( const string & name ) const {
+        return findArgumentIndex(name);
+    }
+
+    __forceinline bool TypeDecl::isRange() const {
+        return baseType==Type::tRange || baseType==Type::tURange ||
+            baseType==Type::tRange64 || baseType==Type::tURange64;
+    }
+
+    __forceinline bool TypeDecl::isString() const {
+        return baseType==Type::tString;
+    }
+
+    __forceinline bool TypeDecl::isSimpleType(Type typ) const {
+        return baseType==typ && isSimpleType();
+    }
+
+    __forceinline bool TypeDecl::isArray() const {
+        return baseType==Type::tFixedArray;
+    }
+
+    __forceinline bool TypeDecl::isFixedArray() const {
+        return baseType==Type::tFixedArray;
+    }
+
+    __forceinline bool TypeDecl::isRef() const {
+        return ref || isRefType();
+    }
+
+    __forceinline bool TypeDecl::isTempType(bool refMatters) const {
+        return (ref && refMatters) || isRefType() || isPointer() || isString() || baseType==Type::tIterator || baseType==Type::autoinfer || baseType==Type::alias;
+    }
+
+    __forceinline bool TypeDecl::isHandle() const {
+        return baseType==Type::tHandle;
+    }
+
+    __forceinline bool TypeDecl::isStructure() const {
+        return baseType==Type::tStructure;
+    }
+
+    __forceinline bool TypeDecl::isTuple() const {
+        return baseType==Type::tTuple;
+    }
+
+    __forceinline bool TypeDecl::isFunction() const {
+        return baseType==Type::tFunction;
+    }
+
+    __forceinline bool TypeDecl::isVariant() const {
+        return baseType==Type::tVariant;
+    }
+
+    __forceinline bool TypeDecl::isMoveableValue() const {
+        return (isPointer() && smartPtr) || isLambda() || isIterator();
+    }
+
+    __forceinline bool TypeDecl::isSimpleType() const {
+        if ( baseType==Type::none || baseType==Type::tVoid
+            || baseType==Type::autoinfer || baseType==Type::alias || baseType==Type::option
+            || baseType==Type::anyArgument || baseType==Type::typeDecl || baseType==Type::typeMacro ) return false;
+        return !isRefType();
+    }
+
+    __forceinline bool TypeDecl::isGoodIteratorType() const {
+        return baseType==Type::tIterator && firstType;
+    }
+
+    __forceinline bool TypeDecl::isGoodBlockType() const {
+        return baseType==Type::tBlock;
+    }
+
+    __forceinline bool TypeDecl::isGoodFunctionType() const {
+        return baseType==Type::tFunction;
+    }
+
+    __forceinline bool TypeDecl::isGoodLambdaType() const {
+        return baseType==Type::tLambda;
+    }
+
+    __forceinline bool TypeDecl::isGoodArrayType() const {
+        return baseType==Type::tArray && firstType;
+    }
+
+    __forceinline bool TypeDecl::isGoodTupleType() const {
+        return baseType==Type::tTuple;
+    }
+
+    __forceinline bool TypeDecl::isGoodVariantType() const {
+        return baseType==Type::tVariant;
+    }
+
+    __forceinline bool TypeDecl::isGoodTableType() const {
+        return baseType==Type::tTable && firstType && secondType;
+    }
+
+    __forceinline bool TypeDecl::isVoid() const {
+        return baseType==Type::tVoid;
+    }
+
+    __forceinline bool TypeDecl::isPointer() const {
+        return baseType==Type::tPointer;
+    }
+
+    __forceinline bool TypeDecl::isSmartPointer() const {
+        return (baseType==Type::tPointer) && smartPtr;
+    }
+
+    __forceinline bool TypeDecl::isVoidPointer() const {
+        return isPointer() && (!firstType || firstType->isVoid());
+    }
+
+    __forceinline bool TypeDecl::isBitfield() const {
+        return (baseType==Type::tBitfield) || (baseType==Type::tBitfield8) ||
+                (baseType==Type::tBitfield16) || (baseType==Type::tBitfield64);
+    }
+
+    __forceinline bool TypeDecl::isIterator() const {
+        return baseType==Type::tIterator;
+    }
+
+    __forceinline bool TypeDecl::isLambda() const {
+        return baseType==Type::tLambda;
+    }
+
+    __forceinline bool TypeDecl::isEnumT() const {
+        return (baseType==Type::tEnumeration) || (baseType==Type::tEnumeration8)
+            || (baseType==Type::tEnumeration16) || (baseType==Type::tEnumeration64);
+    }
+
+    __forceinline bool TypeDecl::isEnum() const {
+        return isEnumT();
+    }
+
+    __forceinline bool TypeDecl::isVectorType() const {
+        return isBaseVectorType();
+    }
+
+    __forceinline bool TypeDecl::isConst() const {
+        return constant;
+    }
+
+    __forceinline bool TypeDecl::isAnyType() const {
+        return baseType==Type::anyArgument;
+    }
+}

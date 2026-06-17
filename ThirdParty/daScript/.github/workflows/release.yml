@@ -1,0 +1,300 @@
+name: Release
+
+# Trigger only on initial prerelease creation (the project's release pattern is
+# always cut-as-prerelease, iterate RCs, then optionally unflag to promote to
+# stable). `published` was double-firing: GitHub emits both `prereleased` and
+# `published` on a fresh prerelease, so every RC cut ran two identical builds
+# racing to clobber each other's assets. `released` would fire on promotion-
+# to-stable (the unflag step) — not adding it because promotion doesn't change
+# artifacts, and the artifacts uploaded at RC-cut time are exactly what ships.
+# `workflow_dispatch` is build+smoke validation only — the asset upload step
+# gates on `github.event_name == 'release'`, so dispatch runs never publish
+# anything. Use it to sanity-check workflow / build / smoke changes without
+# touching real release assets; recreate the release to re-upload.
+on:
+  workflow_dispatch:
+  release:
+    types: [prereleased]
+defaults:
+  run:
+    shell: bash
+
+jobs:
+
+  ###########################################################
+  pre_job:
+    ###########################################################
+    # continue-on-error: true # Uncomment once integration is finished
+    runs-on: ubuntu-latest-fat
+    # Map a step output to a job output
+    outputs:
+      should_skip: ${{ steps.skip_check.outputs.should_skip }}
+    steps:
+      - id: skip_check
+        uses: fkirc/skip-duplicate-actions@v5
+        with:
+          # All of these options are optional, so you can remove them if you are happy with the defaults
+          concurrent_skipping: 'same_content'
+          do_not_skip: '["pull_request", "workflow_dispatch", "release"]'
+
+  ###########################################################
+  build:
+    ###########################################################
+    needs: pre_job
+    if: needs.pre_job.outputs.should_skip != 'true'
+    runs-on: ${{ matrix.runner }}
+    env:
+      das_dll_build: ${{ github.event_name == 'release' && 'YES' || 'NO' }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # darwin15 (macOS Intel x86_64) was dropped after 0.6.2: the LLVM 22
+        # bump has no Intel-mac prebuilt (the LLVM 16 era did), and build.yml
+        # stopped gating on Intel for the same reason. 0.6.2 is the last
+        # release with a darwin15-x86_64 bundle.
+        target: [linux, linux_arm, darwin26, windows]
+        architecture: [32, 64, arm64]
+        cmake_preset: [ Release ]
+
+        include:
+          - target: linux
+            release_target: linux
+            release_arch: x86_64
+            runner: ubuntu-latest-fat
+            archive_ext: tar.gz
+
+          - target: linux_arm
+            release_target: linux
+            release_arch: arm64
+            runner: ubuntu-24.04-arm-fat
+            archive_ext: tar.gz
+
+          - target: darwin26
+            release_target: darwin26
+            release_arch: arm64
+            runner: macos-26-xlarge # Apple Silicon arm64
+            architecture_string: arm64
+            archive_ext: tar.gz
+
+          - target: windows
+            runner: windows-latest-fat
+            archive_ext: zip
+
+          - target: windows
+            build_system: cmake
+            cmake_generator: Ninja
+
+          - target: darwin26
+            build_system: cmake
+            cmake_generator: Ninja
+
+          - target: linux
+            build_system: cmake
+            cmake_generator: Ninja
+
+          - target: linux_arm
+            build_system: cmake
+            cmake_generator: Ninja
+
+          - target: windows
+            release_target: windows
+            release_arch: x86_64
+            architecture: 64
+            architecture_string: x64
+
+        exclude:
+          - target: darwin26
+            architecture: 32
+
+          - target: darwin26
+            architecture: 64
+
+          - target: linux
+            architecture: 32
+
+          - target: linux
+            architecture: arm64
+
+          - target: linux_arm
+            architecture: 32
+
+          # The linux_arm × 64 cell already produces daslang-bundle-linux-arm64.zip
+          # (release_arch: arm64 via the include overlay at L53-57, which applies
+          # to all linux_arm cells regardless of architecture). Lifting this
+          # exclude would make the ×arm64 cell build the same bundle name on the
+          # same ARM64 hardware (ubuntu-24.04-arm-fat) and clobber via the
+          # `--clobber` flag in the upload step. Wasted CI for no extra artifact.
+          - target: linux_arm
+            architecture: arm64
+
+          - target: windows
+            architecture: arm64
+
+          - target: windows
+            architecture: 32
+
+    steps:
+      - name: "SCM Checkout"
+        uses: actions/checkout@v4
+
+      - name: "Exclude workspace from Windows Defender"
+        if: runner.os == 'Windows'
+        shell: pwsh
+        continue-on-error: true
+        # Real-time Defender scans every .obj/.exe/.dll the build writes;
+        # excluding the workspace cuts Windows CI wall-time. continue-on-error:
+        # a managed-Defender runner must not fail the job.
+        run: |
+          Add-MpPreference -ExclusionPath "${{ github.workspace }}"
+          Add-MpPreference -ExclusionProcess "daslang.exe"
+          Add-MpPreference -ExclusionProcess "test_aot.exe"
+
+      - name: "Install CMake and Ninja"
+        uses: lukka/get-cmake@latest
+
+      - if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1 # need nasm for openssl
+
+      - name: "Set up MSVC environment (Windows)"
+        if: runner.os == 'Windows'
+        # cl.exe on PATH so the bash build step drives Ninja with MSVC. MUST run
+        # BEFORE the vcpkg openssl step: msvc-dev-cmd's vcvars sets VCPKG_ROOT to
+        # the VS-bundled vcpkg, so the openssl step has to write our VCPKG_ROOT
+        # last. (release.yml Windows is x64 only.)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: "Install: Required Dev Packages"
+        run: |
+          set -eux
+          case "${{ matrix.target }}${{ matrix.architecture }}" in
+            linux64|linux_arm*)
+              echo "MARCH=64" >> $GITHUB_ENV
+              sudo apt-get update -y
+              sudo apt-get install --no-install-recommends -y \
+                libatomic-ops-dev \
+                libglu1-mesa-dev \
+                freeglut3-dev \
+                mesa-common-dev \
+                libglfw3-dev \
+                libfreetype6-dev \
+                libudev-dev \
+                libopenal-dev \
+                libvorbis-dev \
+                libflac-dev \
+                libx11-dev \
+                libxrandr-dev \
+                libxcursor-dev \
+                libxinerama-dev \
+                libxi-dev
+              ;;
+            darwin26arm64)
+              brew install bison openssl
+              echo 'export PATH="/usr/local/opt/bison/bin:$PATH"' >> ~/.bash_profile
+              export LDFLAGS="-L/usr/local/opt/bison/lib -L$(brew --prefix openssl)/lib"
+              export CPPFLAGS="-I$(brew --prefix openssl)/include"
+              ;;
+          esac
+
+      - name: "Cache vcpkg + openssl"
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          # vcpkg.exe + ports/triplets/scripts + installed/<triplet>/openssl. Key is
+          # shared with build.yml so this reads build.yml's master-seeded slot.
+          path: vcpkg
+          key: vcpkg-${{ matrix.architecture == 32 && 'x86' || 'x64' }}-windows-v2
+
+      - name: "Install openssl windows"
+        if: runner.os == 'Windows'
+        run: |
+          if [ ! -x vcpkg/vcpkg.exe ] && [ ! -x vcpkg/vcpkg ]; then
+              git clone https://github.com/microsoft/vcpkg && ./vcpkg/bootstrap-vcpkg.sh
+          fi
+          ./vcpkg/vcpkg install openssl:${{ matrix.architecture == 32 && 'x86' || 'x64' }}-windows --binarycaching
+          echo "VCPKG_ROOT=$(pwd)/vcpkg" >> $GITHUB_ENV
+          echo "CMAKE_TOOLCHAIN_FILE=$(pwd)/vcpkg/scripts/buildsystems/vcpkg.cmake" >> $GITHUB_ENV
+          # Drop build intermediates so the saved cache holds only installed/ — ~1.2GiB -> ~0.1GiB.
+          rm -rf vcpkg/buildtrees vcpkg/downloads vcpkg/packages
+      - name: "Build: Daslang Linux with modules"
+        if: runner.os != 'Windows'
+        run: |
+          set -eux
+          mkdir build
+          ACTIVE_MODULES=$(cat ci/release_modules.txt | grep -v "^#" | cut -d':' -f2 | sed 's|^|-D|' | xargs)
+          case "${{ matrix.build_system }}" in
+            cmake)
+              case "${{ matrix.target }}${{ matrix.architecture }}" in
+                linux64)
+                  # Match build.yml: use clang. The default ubuntu-24.04 g++ (GCC 13.3)
+                  # rejects AOT-generated patterns like `struct User { TTuple<…,Profile> Profile; }`
+                  # with -Wchanges-meaning, even though daslib/aot_cpp.das now emits
+                  # elaborated `struct Profile` to avoid that — keeping clang consistent
+                  # across CI eliminates the divergence.
+                  CC=clang CXX=clang++ cmake --no-warn-unused-cli -B./build -DCMAKE_BUILD_TYPE:STRING=${{ matrix.cmake_preset }} \
+                    -G "${{ matrix.cmake_generator }}" $ACTIVE_MODULES
+                  cmake --build ./build --config ${{ matrix.cmake_preset }} --parallel
+                  ;;
+                *)
+                  export CXXFLAGS="-Wno-elaborated-enum-base" # glfw module fails due to mac-os includes
+
+                  CC=clang CXX=clang++ cmake --no-warn-unused-cli -B./build -DCMAKE_OSX_ARCHITECTURES="${{ matrix.architecture_string }}" \
+                    -DCMAKE_BUILD_TYPE:STRING=${{ matrix.cmake_preset }} -DCMAKE_CXX_FLAGS="$CXXFLAGS" \
+                    -G "${{ matrix.cmake_generator }}" $ACTIVE_MODULES
+
+                  cmake --build ./build --config ${{ matrix.cmake_preset }} --parallel
+                  ;;
+              esac
+              ;;
+          esac
+
+      - name: "Build: Daslang Windows with modules"
+        if: runner.os == 'Windows'
+        run: |
+          set -eux
+          mkdir build
+          export PATH="/c/Strawberry/perl/bin:$PATH" # prepend Strawberry perl to path, so openssl will use it.
+          ACTIVE_MODULES=$(cat ci/release_modules.txt | grep -v "^#" | cut -d':' -f2 | sed 's|^|-D|' | xargs)
+          case "${{ matrix.build_system }}" in
+            cmake)
+              # Ninja is single-config: -DCMAKE_BUILD_TYPE replaces the VS
+              # generator's -T host / -A arch (cl arch comes from msvc-dev-cmd).
+              cmake --no-warn-unused-cli -B./build -G "${{ matrix.cmake_generator }}" -DCMAKE_BUILD_TYPE:STRING=${{ matrix.cmake_preset }} \
+                $ACTIVE_MODULES -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+              cmake --build ./build --config ${{ matrix.cmake_preset }} --parallel
+              ;;
+          esac
+
+      - name: "Run tests"
+        if: matrix.architecture_string != 'Win32'
+        run: |
+          if [[ "${{ matrix.target }}" == windows* ]]; then
+            cd bin
+            TEST_PATH="../tests"
+            EXEC=".exe"
+          else
+            cd bin
+            TEST_PATH="../tests"
+            EXEC=""
+          fi
+          ./daslang${EXEC} _dasroot_/dastest/dastest.das -jit -- --color --failures-only --test "$TEST_PATH"
+
+      - name: "Install binaries"
+        if: matrix.cmake_preset == 'Release'
+        shell: bash
+        run: |
+          mkdir daslang_bundle
+          mkdir artifacts
+          cmake --install ./build --prefix ./daslang_bundle --config ${{ matrix.cmake_preset }} --strip
+          7z a artifacts/daslang-bundle-${{ matrix.release_target }}-${{ matrix.release_arch }}.zip ./daslang_bundle
+      - name: "Smoke-test installed bundle"
+        if: matrix.cmake_preset == 'Release'
+        shell: bash
+        run: bash ci/smoke_test_bundle.sh ./daslang_bundle
+      - name: "Upload release asset"
+        if: github.event_name == 'release' && (github.event.action == 'published' || github.event.action == 'prereleased') && matrix.cmake_preset == 'Release'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.event.release.tag_name }}" artifacts/daslang-bundle-${{ matrix.release_target }}-${{ matrix.release_arch }}.zip --clobber

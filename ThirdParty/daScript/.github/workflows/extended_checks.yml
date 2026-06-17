@@ -1,0 +1,363 @@
+name: extended checks
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  ###########################################################
+  pre_job:
+  ###########################################################
+    runs-on: ubuntu-latest-fat
+    outputs:
+      should_skip: ${{ steps.skip_check.outputs.should_skip }}
+    steps:
+      - id: skip_check
+        uses: fkirc/skip-duplicate-actions@v5
+        with:
+          concurrent_skipping: 'same_content'
+          do_not_skip: '["pull_request", "workflow_dispatch"]'
+
+  ###########################################################
+  extended_checks:
+  ###########################################################
+    needs: pre_job
+    if: needs.pre_job.outputs.should_skip != 'true'
+    runs-on: ${{ matrix.runner }}
+    # actions: write needed for `gh cache delete` in the sccache refresh step.
+    permissions:
+      contents: read
+      actions: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [linux, darwin15, windows]
+        architecture: [64, arm64]
+
+        include:
+          - target: linux
+            runner: ubuntu-latest-fat
+            build_system: cmake
+            cmake_generator: Ninja
+
+          - target: darwin15
+            architecture: arm64
+            runner: macos-15-xlarge
+            architecture_string: arm64
+            build_system: cmake
+            cmake_generator: Ninja
+
+          - target: windows
+            runner: windows-latest-fat
+            build_system: cmake
+            cmake_generator: Ninja
+            architecture_string: x64
+
+        exclude:
+          - target: linux
+            architecture: arm64
+          - target: windows
+            architecture: arm64
+          - target: darwin15
+            architecture: 64
+
+    steps:
+    - name: "SCM Checkout"
+      uses: actions/checkout@v4
+      with:
+        # Full history so the lint step can `git diff` against the PR base branch.
+        fetch-depth: 0
+
+    - name: "Exclude workspace from Windows Defender"
+      if: runner.os == 'Windows'
+      shell: pwsh
+      continue-on-error: true
+      # Real-time Defender scans every .obj/.exe/.dll the build writes and every
+      # process + DLL load at test time; excluding the workspace cuts Windows CI
+      # wall-time. continue-on-error: a managed-Defender runner must not fail CI.
+      run: |
+        Add-MpPreference -ExclusionPath "${{ github.workspace }}"
+        Add-MpPreference -ExclusionProcess "daslang.exe"
+        Add-MpPreference -ExclusionProcess "daslang_static.exe"
+
+    - name: "Install CMake and Ninja"
+      uses: lukka/get-cmake@latest
+
+    - if: runner.os == 'Windows'
+      uses: ilammy/setup-nasm@v1
+
+    - if: runner.os == 'Windows'
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x64
+
+    - name: "Install: Required Dev Packages"
+      run: |
+        set -eux
+        case "${{ matrix.target }}" in
+          darwin15)
+            brew install bison openssl
+            echo 'export PATH="/usr/local/opt/bison/bin:$PATH"' >> ~/.bash_profile
+            export LDFLAGS="-L/usr/local/opt/bison/lib -L$(brew --prefix openssl)/lib"
+            export CPPFLAGS="-I$(brew --prefix openssl)/include"
+            ;;
+          linux)
+            echo "MARCH=64" >> $GITHUB_ENV
+            # apt.llvm.org provides LLVM 22 packages for Noble (not yet in main archive).
+            wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+              | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/llvm.gpg
+            echo 'deb http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main' \
+              | sudo tee /etc/apt/sources.list.d/llvm.list
+            sudo apt-get update -y
+            sudo apt-get install --no-install-recommends -y \
+              mesa-common-dev \
+              libglu1-mesa-dev \
+              libgl1-mesa-dev \
+              libglfw3-dev \
+              libx11-dev \
+              libxrandr-dev \
+              libxcursor-dev \
+              libxinerama-dev \
+              libxi-dev \
+              llvm-22-dev
+            ;;
+        esac
+
+    - name: "Cache vcpkg + openssl"
+      if: runner.os == 'Windows'
+      uses: actions/cache@v4
+      with:
+        # vcpkg.exe + ports/triplets/scripts + installed/<triplet>/openssl. Key is
+        # shared with build.yml so this reads build.yml's master-seeded slot.
+        path: vcpkg
+        key: vcpkg-x64-windows-v2
+
+    - name: "Install openssl (Windows)"
+      if: runner.os == 'Windows'
+      run: |
+        if [ ! -x vcpkg/vcpkg.exe ] && [ ! -x vcpkg/vcpkg ]; then
+            git clone https://github.com/microsoft/vcpkg && ./vcpkg/bootstrap-vcpkg.sh
+        fi
+        ./vcpkg/vcpkg install openssl:x64-windows --binarycaching
+        echo "VCPKG_ROOT=$(pwd)/vcpkg" >> $GITHUB_ENV
+        # Drop build intermediates so the saved cache holds only installed/ — ~1.2GiB -> ~0.1GiB.
+        rm -rf vcpkg/buildtrees vcpkg/downloads vcpkg/packages
+
+    # sccache with LOCAL-DISK backend, wrapped in ONE actions/cache entry per
+    # matrix config — mirrors build.yml. The GHA backend writes one cache item
+    # per TU (quota fragmentation, frequent concurrent-write failures); local
+    # disk keeps all objects in $SCCACHE_DIR persisted as a single tarball.
+    # Windows MSVC compiles are cacheable because daslang builds /Z7
+    # (CMakeCommon.txt) — debug info embedded in the .obj; sccache refuses /Zi.
+    - uses: mozilla-actions/sccache-action@v0.0.10
+    - run: |
+        echo "SCCACHE_DIR=${{ runner.temp }}/sccache" >> $GITHUB_ENV
+        echo "SCCACHE_GHA_ENABLED=false" >> $GITHUB_ENV
+        # Non-Windows: export the launcher via env (also wraps the GLFW/libhv
+        # ExternalProject sub-builds — harmless on gcc/clang). Windows must NOT
+        # export it: the env leaks into the sub-cmakes where sccache + MSVC /Zi
+        # (those sub-builds keep /Zi) + parallel Ninja collide on the shared
+        # glfw.pdb (C1041). Windows passes the launcher as -D on the main
+        # configure only (Build step), scoping sccache to daslang's /Z7 TUs.
+        if [ "$RUNNER_OS" != "Windows" ]; then
+          echo "CMAKE_C_COMPILER_LAUNCHER=sccache" >> $GITHUB_ENV
+          echo "CMAKE_CXX_COMPILER_LAUNCHER=sccache" >> $GITHUB_ENV
+        fi
+    # Stable per-config key in its own `sccache-extended-*` namespace so it never
+    # clobbers build.yml's slots. Restore always; save only on master (delete
+    # first — GHA caches are immutable, so a plain save under an existing key is
+    # a no-op). PRs read-only.
+    - name: "Restore sccache objects"
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ runner.temp }}/sccache
+        key: sccache-extended-${{ matrix.target }}-${{ matrix.architecture }}
+
+    - name: "Build: Daslang (Release)"
+      run: |
+        set -eux
+        ACTIVE_MODULES=$(grep -v "^#" ci/release_modules.txt | cut -d':' -f2 | sed 's|^|-D|' | xargs)
+        case "${{ matrix.target }}" in
+          windows)
+            # Ninja single-config: binaries land in ./bin (not ./bin/Release);
+            # cl.exe is on PATH via the msvc-dev-cmd step; OpenSSL comes from
+            # vcpkg so dasHV skips its perl+nmake source build.
+            echo "BIN=./bin" >> $GITHUB_ENV
+            export PATH="/c/Strawberry/perl/bin:$PATH"
+            # Launcher passed as -D here (not env) so it scopes to daslang's own
+            # /Z7 targets and does NOT leak into the GLFW/libhv /Zi sub-builds.
+            cmake --no-warn-unused-cli -B./build -G "${{ matrix.cmake_generator }}" -DCMAKE_BUILD_TYPE:STRING=Release \
+              -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
+              $ACTIVE_MODULES -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+            cmake --build ./build --config Release --target daslang das-fmt daslang_static --parallel
+            ;;
+          linux)
+            echo "BIN=./bin" >> $GITHUB_ENV
+            # dasClangBind stays OFF here — its libclang.so pulls in
+            # libLLVM-22.so.1 which collides with dasLLVM's own use of
+            # the same .so (shared LLVM pass registry → double init,
+            # breaks dasbind_example JIT-to-exe). dasClangBind is built
+            # and self-binder-checked on the mingw worker (build.yml)
+            # where it links against msys2's libclang and there is no
+            # dasLLVM in the same process.
+            CC=clang CXX=clang++ cmake --no-warn-unused-cli -B./build \
+              -DCMAKE_BUILD_TYPE:STRING=Release \
+              -DCMAKE_OSX_ARCHITECTURES="${{ matrix.architecture_string }}" \
+              -DDAS_CLANG_BIND_DISABLED=ON \
+              -DDAS_GLFW_DISABLED=OFF \
+              -G "${{ matrix.cmake_generator }}" $ACTIVE_MODULES
+            cmake --build ./build --config Release --target daslang daslang_static
+            ;;
+          *)
+            echo "BIN=./bin" >> $GITHUB_ENV
+            CC=clang CXX=clang++ cmake --no-warn-unused-cli -B./build \
+              -DCMAKE_BUILD_TYPE:STRING=Release \
+              -DCMAKE_OSX_ARCHITECTURES="${{ matrix.architecture_string }}" \
+              -DDAS_GLFW_DISABLED=OFF \
+              -G "${{ matrix.cmake_generator }}" $ACTIVE_MODULES
+            cmake --build ./build --config Release --target daslang daslang_static
+            ;;
+        esac
+
+    - name: "Refresh sccache slot"
+      if: github.ref == 'refs/heads/master'
+      env:
+        GH_TOKEN: ${{ github.token }}
+        SCKEY: sccache-extended-${{ matrix.target }}-${{ matrix.architecture }}
+      run: gh cache delete "$SCKEY" -R ${{ github.repository }} || true
+    - name: "Save sccache objects"
+      if: github.ref == 'refs/heads/master'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ runner.temp }}/sccache
+        key: sccache-extended-${{ matrix.target }}-${{ matrix.architecture }}
+
+    - name: "Install ast-grep"
+      run: npm install -g @ast-grep/cli
+
+    - name: "Run dasgen and check generated files are up to date"
+      run: |
+        set -eux
+        $BIN/daslang dasgen/gen_bind.das
+        git diff --exit-code -- include/daScript/builtin/ \
+          || (echo "ERROR: Generated .inc files are out of date. Run './bin/daslang dasgen/gen_bind.das' locally and commit the result." && exit 1)
+
+    - name: "Run examples from modules"
+      run: cmake --build ./build --config Release --target run_examples
+
+    - name: "Run utils tests"
+      run: cmake --build ./build --config Release --target run_utils_tests
+
+    - name: "Run tutorial dry-runs"
+      run: cmake --build ./build --config Release --target dry_run_tutorials
+
+    - name: "Build standalone executables"
+      run: |
+        set -eux
+        cmake --build ./build --config Release --target all_utils_exe
+        $BIN/daslang -exe -output ./bin/das-fmt ./utils/das-fmt/dasfmt.das
+        $BIN/daslang -exe -output ./bin/das-lint ./utils/lint/main.das
+
+    - name: "Sequence release smoke test"
+      # Full daspkg install -> release -> launch cycle on the in-tree sequence
+      # game. Exercises release_include_dll + the loader fixes (Windows
+      # LoadLibraryEx, POSIX rpath $ORIGIN / @loader_path) end-to-end.
+      # Lives in extended_checks (not build.yml) because sequence transitively
+      # requires dasHV, which is DAS_HV_DISABLED=ON by default and only flipped
+      # ON via ci/release_modules.txt in this workflow.
+      run: |
+        set -eux
+        # The main extended_checks build only targets daslang/das-fmt/daslang_static.
+        # Sequence loads dasGlfw + dasLiveHost + dasHV + dasAudio + dasPUGIXML +
+        # dasStbImage at runtime; build their dynamic-module targets first.
+        # No `cmake --install` -- the source tree already IS a usable daslang
+        # root after build (bin/daslang via EXECUTABLE_OUTPUT_PATH; modules/<X>/
+        # .shared_module via ADD_DAS_SHARED_MODULE_LIB output dirs; utils/daspkg
+        # lives in the source tree). cmake --install would also try to install
+        # daslang-live which extended_checks doesn't build.
+        cmake --build ./build --config Release --target \
+          dasModuleGlfw dasModuleLiveHost dasModuleHV dasModuleAudio \
+          dasModulePUGIXML dasModuleStbImage --parallel
+        case "${{ matrix.target }}" in
+          windows)
+            pwsh examples/games/sequence/ci_smoke_test.ps1 "$(pwd)"
+            ;;
+          linux)
+            sudo apt-get install -y xvfb
+            xvfb-run -a bash examples/games/sequence/ci_smoke_test.sh "$(pwd)"
+            ;;
+          *)
+            bash examples/games/sequence/ci_smoke_test.sh "$(pwd)"
+            ;;
+        esac
+
+    - name: "Run formatter"
+      run: |
+        set -eux
+        $BIN/daslang ./utils/das-fmt/dasfmt.das -- --path ./ --verify
+        $BIN/das-fmt.exe --path ./ --verify
+
+    - name: "Run lint on changed .das files"
+      if: matrix.target == 'linux'
+      run: |
+        set -eux
+        BASE_REF="${{ github.event.pull_request.base.ref }}"
+        BASE_REF="${BASE_REF:-master}"
+        mapfile -t CHANGED < <(git diff --name-only --diff-filter=AM "origin/${BASE_REF}...HEAD" -- '*.das')
+        if [ ${#CHANGED[@]} -eq 0 ]; then
+          echo "no .das files changed; skipping lint"
+          exit 0
+        fi
+        echo "linting: ${CHANGED[*]}"
+        $BIN/daslang ./utils/lint/main.das -- "${CHANGED[@]}" --quiet
+        $BIN/das-lint.exe "${CHANGED[@]}" --quiet
+
+    - name: "Test daslang_static"
+      run: |
+        set -eux
+        $BIN/daslang_static _dasroot_/dastest/dastest.das -- --color --failures-only --test ./tests
+    - name: "Test ser/deser"
+      run: |
+        $BIN/daslang _dasroot_/dastest/dastest.das -- --color --failures-only --test ./tests --ser serialized.bin
+        $BIN/daslang _dasroot_/dastest/dastest.das -- --color --failures-only --test ./tests --deser serialized.bin
+
+    - name: "Test MCP tools"
+      if: matrix.target == 'linux'
+      run: |
+        set -eux
+        $BIN/daslang _dasroot_/dastest/dastest.das -- --color --failures-only --test ./utils/mcp/test_tools.das
+
+    # Self-binders for dasClangBind + dasLLVM bindings live on the mingw
+    # worker (build.yml build_windows_mingw) — see comment on the linux
+    # build step above for why dasClangBind can't be enabled here.
+
+    - name: "Install dasImgui (daspkg)"
+      run: |
+        set -eux
+        $BIN/daslang utils/daspkg/main.das -- install dasImgui --branch master
+
+    # Disabled — dasImgui will land its own self-binder freshness check inside its own repo's CI.
+    # - name: "Run self-binder (bind_imgui.das)"
+    #   if: matrix.target == 'linux'
+    #   run: |
+    #     set -eux
+    #     $BIN/daslang modules/dasImgui/bind/bind_imgui.das
+    #     cd modules/dasImgui && git diff --exit-code -- src/ \
+    #       || (echo "ERROR: dasImgui generated files are out of date. Run './bin/daslang modules/dasImgui/bind/bind_imgui.das' locally and commit the result." && exit 1)
+
+    - name: "Coverage"
+      if: matrix.target == 'linux'
+      run: |
+        $BIN/daslang dastest/dastest.das -- --cov-path coverage.lcov --color --test ./tests/language --timeout 1800
+        $BIN/dascov.exe -- coverage.lcov --exclude tests/language
+

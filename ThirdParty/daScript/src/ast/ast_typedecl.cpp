@@ -1,0 +1,4365 @@
+#include "daScript/misc/platform.h"
+
+#include "daScript/ast/ast_visitor.h"
+#include "daScript/ast/ast.h"
+#include "daScript/misc/enums.h"
+
+#include <inttypes.h>
+
+#ifndef DAS_TRACK_LOST_POINTER
+#define DAS_TRACK_LOST_POINTER 0
+#endif
+
+namespace das
+{
+#ifdef DAS_TRACK_LOST_POINTER
+    // this one tracks very specific pointer, and calls breakpoint every time its found
+    class TypeDeclVisitor : public Visitor {
+    public:
+        TypeDeclVisitor ( TypeDecl * td ) : tracedType(td) {}
+        virtual void preVisit ( TypeDecl * td ) override {
+            Visitor::preVisit(td);
+            if ( td==tracedType ) {
+                os_debug_break(); // C++ stack contains the location (breakpoint goes here too)
+            }
+        }
+        virtual bool canVisitStructure ( Structure * ) override { return true; }
+        virtual bool canVisitGlobalVariable ( Variable * ) override { return true; }
+        virtual bool canVisitFunction ( Function * ) override { return true; }
+        virtual bool canVisitEnumeration ( Enumeration * ) override { return true; }
+        virtual bool canVisitStructureFieldInit ( Structure * ) override { return true; }
+        virtual bool canVisitIfSubexpr ( ExprIfThenElse * ) override { return true; }
+        virtual bool canVisitExpr ( ExprTypeInfo *, Expression * ) override { return true; }
+        virtual bool canVisitMakeStructureBlock ( ExprMakeStruct *, Expression * ) override { return true; }
+        virtual bool canVisitMakeStructureBody ( ExprMakeStruct * ) override { return true; }
+        virtual bool canVisitArgumentInit ( Function *, const VariablePtr &, Expression * ) override { return true; }
+        virtual bool canVisitQuoteSubexpression ( ExprQuote * ) override { return true; }
+        virtual bool canVisitWithAliasSubexpression ( ExprAssume * ) override { return true; }
+        virtual bool canVisitMakeBlockBody ( ExprMakeBlock * ) override { return true; }
+        virtual bool canVisitCall ( ExprCall * ) override { return true; }
+    protected:
+        TypeDecl * tracedType = nullptr;
+    };
+
+    void trackLostPointer ( TypeDecl * td ) {
+        TypeDeclVisitor vis(td);
+        daScriptEnvironment::getBound()->g_Program->visitModulesInOrder(vis,true);
+    }
+#endif
+
+    TypeDeclPtr makeHandleType(const ModuleLibrary & library, const char * typeName) {
+        return library.makeHandleType(typeName);
+    }
+
+    Annotation * TypeDecl::isPointerToAnnotation() const {
+        if ( baseType!=Type::tPointer || !firstType || firstType->baseType!=Type::tHandle ) {
+            return nullptr;
+        } else {
+            return firstType->annotation;
+        }
+    }
+
+    // auto or generic type conversion
+
+    TypeDecl::TypeDecl(Enumeration * ep)
+        : baseType(ep->getEnumType()), enumType(ep)
+    {
+        gc_magic = GC_MAGIC_TYPEDECL;
+    }
+
+    LineInfo TypeDecl::getDeclarationLocation() const {
+        if ( !at.empty() ) return at;
+        switch ( baseType ) {
+            case Type::tStructure:
+                if ( structType ) return structType->at;
+                break;
+            case Type::tEnumeration:
+            case Type::tEnumeration8:
+            case Type::tEnumeration16:
+            case Type::tEnumeration64:
+                if ( enumType ) return enumType->at;
+                break;
+            default:
+                break;
+        }
+        return LineInfo();
+    }
+
+    int TypeDecl::maxBitfieldBits() const {
+        switch ( baseType ) {
+            case Type::tBitfield:    return 32;
+            case Type::tBitfield8:   return 8;
+            case Type::tBitfield16:  return 16;
+            case Type::tBitfield64:  return 64;
+            default:                 return 0;
+        }
+        return 0;
+    }
+
+    Type TypeDecl::getR2VType() const {
+        if ( baseType==Type::tHandle ) {
+            auto valueType = annotation->makeValueType();
+            DAS_ASSERTF(valueType, "internal integration error. handle type %s has no value type", annotation->name.c_str());
+            return valueType->baseType;
+        } else {
+            return baseType;
+        }
+    }
+
+    bool TypeDecl::isClass() const { // CANT BE INLINED DUE TO STRUCT TYPE
+        return isStructure() && structType && structType->isClass;
+    }
+
+    bool TypeDecl::isExprTypeAnywhere() const {
+        das_set<Structure*> dep;
+        return isExprTypeAnywhere(dep);
+    }
+
+    bool TypeDecl::isExprTypeAnywhere(das_set<Structure*> & dep) const {
+        if ( baseType==Type::tFixedArray && fixedDim==TypeDecl::dimConst ) {
+            return true;
+        }
+        if ( baseType==Type::tStructure ) {
+            if (structType) {
+                if (dep.find(structType) != dep.end()) return false;
+                dep.insert(structType);
+                return structType->isExprTypeAnywhere(dep);
+            }
+        }
+        if ( firstType && firstType->isExprTypeAnywhere(dep) ) return true;
+        if ( secondType && secondType->isExprTypeAnywhere(dep) ) return true;
+        for ( auto & arg : argTypes ) {
+            if ( arg->isExprTypeAnywhere(dep) ) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool TypeDecl::isExprType() const {
+        if ( baseType==Type::tFixedArray && fixedDim==TypeDecl::dimConst ) {
+            return true;
+        }
+        if ( firstType && firstType->isExprType() ) return true;
+        if ( secondType && secondType->isExprType() ) return true;
+        for ( auto & arg : argTypes ) {
+            if ( arg->isExprType() ) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    TypeDeclPtr TypeDecl::visit ( Visitor & vis ) {
+        if ( baseType==Type::typeDecl || baseType==Type::typeMacro ) {
+            for ( size_t i=0, is=typeMacroExpr.size(); i!=is; ++i ) {
+                if ( typeMacroExpr[i] ) {
+                    typeMacroExpr[i] = typeMacroExpr[i]->visit(vis);
+                }
+            }
+        } else if ( baseType==Type::tFixedArray ) {
+            if ( fixedDim==TypeDecl::dimConst && fixedDimExpr ) {
+                fixedDimExpr = fixedDimExpr->visit(vis);
+            }
+        }
+        if ( firstType ) {
+            vis.preVisit(firstType);
+            firstType = firstType->visit(vis);
+        }
+        if ( secondType ) {
+            vis.preVisit(secondType);
+            secondType = secondType->visit(vis);
+        }
+        for ( auto & argType : argTypes ) {
+            vis.preVisit(argType);
+            argType = argType->visit(vis);
+        }
+        return this;
+    }
+
+    void TypeDecl::applyRefToRef ( const TypeDeclPtr & TT, bool topLevel ) {
+        if ( topLevel && TT->ref && TT->isRefType() ) {
+            TT->ref = false;
+        }
+        if ( TT->isPointer() ) {
+            if ( TT->firstType ) {
+                applyRefToRef(TT->firstType);
+            }
+        } else if ( TT->baseType==Type::tIterator ) {
+            applyRefToRef(TT->firstType);
+        } else if ( TT->baseType==Type::tArray || TT->baseType==Type::tFixedArray ) {
+            applyRefToRef(TT->firstType);
+        } else if ( TT->baseType==Type::tTable ) {
+            applyRefToRef(TT->firstType);
+            applyRefToRef(TT->secondType);
+        } else if ( TT->baseType==Type::tBlock || TT->baseType==Type::tFunction || TT->baseType==Type::tLambda ) {
+            if ( TT->firstType ) {
+                applyRefToRef(TT->firstType);
+            }
+            for ( auto & arg : TT->argTypes ) {
+                applyRefToRef(arg, true);
+            }
+        } else if ( TT->baseType==Type::tTuple || TT->baseType==Type::tVariant ) {
+            for ( auto & arg : TT->argTypes ) {
+                applyRefToRef(arg);
+            }
+        }
+    }
+
+    void TypeDecl::applyAutoContracts ( const TypeDeclPtr & TT, const TypeDeclPtr & autoT ) {
+        if ( !TT || !autoT ) return;
+        if ( !autoT->isAuto() ) return;
+        TT->ref = (TT->ref || autoT->ref) && !autoT->removeRef && !TT->removeRef;
+        TT->constant = (TT->constant || autoT->constant) && !autoT->removeConstant && !TT->removeConstant;
+        TT->temporary = (TT->temporary || autoT->temporary) && !autoT->removeTemporary && !TT->removeTemporary;
+        TT->safeWhenUninitialized = TT->safeWhenUninitialized || autoT->safeWhenUninitialized;
+        TT->removeConstant = false;
+        TT->removeDim = false;
+        TT->removeRef = false;
+        if ( autoT->isPointer() ) {
+            if ( TT->firstType ) {
+                applyAutoContracts(TT->firstType, autoT->firstType);
+            }
+        } else if ( autoT->baseType==Type::tFixedArray ) {
+            if ( TT->firstType && autoT->firstType ) {
+                applyAutoContracts(TT->firstType, autoT->firstType);
+            }
+        } else if ( autoT->baseType==Type::tIterator ) {
+            applyAutoContracts(TT->firstType, autoT->firstType);
+        } else if ( autoT->baseType==Type::tArray ) {
+            applyAutoContracts(TT->firstType, autoT->firstType);
+        } else if ( autoT->baseType==Type::tTable ) {
+            applyAutoContracts(TT->firstType, autoT->firstType);
+            applyAutoContracts(TT->secondType, autoT->secondType);
+        } else if ( autoT->baseType==Type::tBlock || autoT->baseType==Type::tFunction ||
+                   autoT->baseType==Type::tLambda || autoT->baseType==Type::tTuple ||
+                   autoT->baseType==Type::tVariant ) {
+            if ( TT->firstType ) {
+                applyAutoContracts(TT->firstType, autoT->firstType);
+            }
+            for ( size_t i=0, is=min(TT->argTypes.size(),autoT->argTypes.size()); i!=is; ++i ) {
+                applyAutoContracts(TT->argTypes[i], autoT->argTypes[i]);
+            }
+        }
+    }
+
+    void TypeDecl::updateAliasMap ( const TypeDeclPtr & decl, const TypeDeclPtr & pass, AliasMap & aliases, OptionsMap & options ) {
+        if ( !pass ) {
+            return;
+        } else if ( decl->baseType==Type::option ) {
+            auto it = options.find(decl);
+            DAS_VERIFYF(it!=options.end(),"internal error, option not found for the optional type");
+            return updateAliasMap(decl->argTypes[it->second], pass, aliases, options);
+        } else if ( decl->baseType==Type::autoinfer ) {
+            if ( !decl->alias.empty() && aliases.find(decl->alias)==aliases.end() ) {
+                auto TT = new TypeDecl(*pass);
+                TT->alias = decl->alias;
+                TT->constant = false;
+                TT->temporary = false;
+                TT->ref = false;
+                TT->explicitConst = false;
+                aliases[decl->alias] = TT;
+            }
+        } else if ( pass->baseType==Type::autoinfer ) {
+            if ( !pass->alias.empty() && aliases.find(pass->alias)==aliases.end() ) {
+                auto TT = new TypeDecl(*decl);
+                TT->alias = pass->alias;
+                TT->constant = false;
+                TT->temporary = false;
+                TT->ref = false;
+                TT->explicitConst = false;
+                aliases[pass->alias] = TT;
+            }
+        } else {
+            if ( decl->firstType ) updateAliasMap(decl->firstType, pass->firstType, aliases, options);
+            if ( decl->secondType ) updateAliasMap(decl->secondType, pass->secondType, aliases, options);
+            for ( size_t iA=0, iAs = min(decl->argTypes.size(), pass->argTypes.size()); iA!=iAs; ++iA ) {
+                updateAliasMap(decl->argTypes[iA], pass->argTypes[iA], aliases, options);
+            }
+        }
+    }
+
+    TypeDeclPtr TypeDecl::inferGenericInitType ( const TypeDeclPtr & autoT, const TypeDeclPtr & initT ) {
+        if ( autoT->ref ) {
+            autoT->ref = false;
+            auto resT = inferGenericType(autoT, initT, true, false, nullptr);
+            if ( resT ) resT->ref = true;
+            autoT->ref = true;
+            return resT;
+        } else {
+            return inferGenericType(autoT, initT, true, false, nullptr);
+        }
+    }
+
+    TypeDeclPtr TypeDecl::inferGenericType ( const TypeDeclPtr & autoT, const TypeDeclPtr & initT, bool topLevel, bool passType, OptionsMap * options ) {
+        // for option type, we go through all the options in order. first matching is good
+        if ( autoT->baseType==Type::option ) {
+            for ( size_t i=0, is=autoT->argTypes.size(); i!=is; ++i ) {
+                // we copy type qualifiers for each option
+                auto & TT = autoT->argTypes[i];
+                TT->ref = TT->ref || autoT->ref;
+                TT->constant = TT->constant || autoT->constant;
+                TT->temporary = TT->temporary || autoT->temporary;
+                TT->removeConstant = TT->removeConstant || autoT->removeConstant;
+                TT->removeDim = TT->removeDim || autoT->removeDim;
+                TT->removeRef = TT->removeRef || autoT->removeRef;
+                TT->explicitConst = TT->explicitConst || autoT->explicitConst;
+                TT->explicitRef = TT->explicitRef || autoT->explicitRef;
+                TT->implicit = TT->implicit || autoT->implicit;
+                // now we infer type
+                if ( auto resT = inferGenericType(TT,initT,topLevel,passType,options) ) {
+                    if ( options!=nullptr ) (*options)[autoT] = int(i);
+                    return resT;
+                }
+            }
+            return nullptr;
+        }
+        // explicit const mast match
+        if ( autoT->explicitConst && (autoT->constant != initT->constant) ) {
+            return nullptr;
+        }
+        // explicit ref match
+        if ( autoT->explicitRef && (autoT->ref != initT->ref) ) {
+            return nullptr;
+        }
+        // can't infer from the type, which is already 'auto'
+        if ( initT->isAuto() ) {
+            if (!autoT->isAuto()) {
+                return new TypeDecl(*autoT);
+            } else if (autoT->baseType == Type::tBlock || autoT->baseType == Type::tFunction
+                || autoT->baseType == Type::tLambda || autoT->baseType == Type::tTuple
+                || autoT->baseType == Type::tVariant ) {
+                /* two-sided infer */
+            } else {
+                /*
+                if ( aliases && !autoT->alias.empty() ) {
+                    auto it = aliases->find(autoT->alias);
+                    if ( it != aliases->end() ) {
+                        return new TypeDecl(*it->second);
+                    }
+                }
+                */
+                return nullptr;
+            }
+        }
+        // if its not an auto type, return as is
+        if ( !autoT->isAuto() ) {
+            auto rm = RefMatters::yes;
+            auto cm = ConstMatters::yes;
+            if ( topLevel ) {
+                if ( (!autoT->ref && !autoT->explicitRef) || autoT->isRefType()  ) {
+                    rm = RefMatters::no;
+                }
+                if ( autoT->constant && !autoT->explicitConst ) {
+                    cm = ConstMatters::no;
+                }
+            }
+            if ( autoT->isSameType(*initT, rm,cm, TemporaryMatters::yes, AllowSubstitute::yes, true, passType ) ) {
+                return new TypeDecl(*autoT);
+            } else {
+                return nullptr;
+            }
+        } else if ( autoT->baseType != Type::autoinfer ) {
+            // if we are matching to strong type, with dim only, then it has to match
+            if ( autoT->baseType != initT->baseType ) {
+                return nullptr;
+            }
+        }
+        // auto & can't be inferred from non-ref
+        if ( autoT->ref && !initT->isRef() )
+            return nullptr;
+        // auto[] has to match a fixed array of the same outer size (dimAuto = wildcard)
+        if ( autoT->baseType==Type::tFixedArray ) {
+            if ( initT->baseType!=Type::tFixedArray || !initT->firstType )
+                return nullptr;
+            if ( autoT->fixedDim!=TypeDecl::dimAuto && autoT->fixedDim!=initT->fixedDim )
+                return nullptr;
+        }
+        // non-implicit temp can't be inferred from non-temp, and non-temp from temp
+        if ( autoT->baseType!=autoinfer && !autoT->implicit && !initT->implicit ) {
+            if ( autoT->temporary != initT->temporary )
+                return nullptr;
+        }
+        // auto? can't be inferred from non-pointer
+        if ( autoT->isPointer() ) {
+            if ( !initT->isPointer() || !initT->firstType ) {
+                return nullptr;
+            }
+            if ( autoT->smartPtr != initT->smartPtr ) {
+                return nullptr;
+            }
+        }
+        // array has to match array
+        if ( autoT->baseType==Type::tArray && (initT->baseType!=Type::tArray || !initT->firstType) )
+            return nullptr;
+        // table has to match table
+        if ( autoT->baseType==Type::tTable && (initT->baseType!=Type::tTable || !initT->firstType || !initT->secondType) )
+            return nullptr;
+        // block has to match block, function to function, lambda to lambda
+        if ( autoT->baseType==Type::tBlock || autoT->baseType==Type::tFunction
+            || autoT->baseType==Type::tLambda || autoT->baseType==Type::tTuple
+            || autoT->baseType==Type::tVariant ) {
+            if ( initT->baseType!=autoT->baseType )
+                return nullptr;
+            if ( (autoT->firstType!=nullptr) != (initT->firstType!=nullptr) )   // both do or don't have return type
+                return nullptr;
+            if ( autoT->argTypes.size() != initT->argTypes.size() )             // both have same number of arguments
+                return nullptr;
+        }
+        // now, lets make the type
+        auto TT = new TypeDecl(*initT);
+        TT->at = autoT->at;
+        TT->aotAlias = autoT->aotAlias;
+        TT->alias = autoT->alias;
+        TT->removeRef = false;
+        TT->removeConstant = false;
+        TT->removeTemporary = false;
+        TT->removeDim = false;
+        TT->implicit |= autoT->implicit;
+        TT->explicitConst |= autoT->explicitConst;
+        TT->explicitRef |= autoT->explicitRef;
+        if ( autoT->isPointer() ) {
+            // if it's a pointer, infer pointer-to separately
+            TT->firstType = inferGenericType(autoT->firstType, initT->firstType, false, false, options);
+            if ( !TT->firstType ) return nullptr;
+        } else if ( autoT->baseType==Type::tFixedArray ) {
+            // fixed array peels one level; elements are bare per the canonical form
+            TT->firstType = inferGenericType(autoT->firstType, initT->firstType, false, false, options);
+            if ( !TT->firstType ) return nullptr;
+        } else if ( autoT->baseType==Type::tIterator ) {
+            // if it's a iterator, infer iterator-ofo separately
+            TT->firstType = inferGenericType(autoT->firstType, initT->firstType, false, false, options);
+            if ( !TT->firstType ) return nullptr;
+        } else if ( autoT->baseType==Type::tArray ) {
+            // if it's an array, infer array type separately
+            TT->firstType = inferGenericType(autoT->firstType, initT->firstType, false, false, options);
+            if ( !TT->firstType ) return nullptr;
+        } else if ( autoT->baseType==Type::tTable ) {
+            // if it's a table, infer table keys and values types separately
+            TT->firstType = inferGenericType(autoT->firstType, initT->firstType, false, false, options);
+            if ( !TT->firstType ) return nullptr;
+            if ( !TT->firstType->isTableKeyType() ) return nullptr;            // table key has to be hashable too
+            TT->secondType = inferGenericType(autoT->secondType, initT->secondType, false, false, options);
+            if ( !TT->secondType ) return nullptr;
+        } else if ( autoT->baseType==Type::tBlock || autoT->baseType==Type::tFunction
+                   || autoT->baseType==Type::tLambda || autoT->baseType==Type::tTuple
+                   || autoT->baseType==Type::tVariant ) {
+            // if it's a block or function, infer argument and return types
+            if ( autoT->firstType ) {
+                TT->firstType = inferGenericType(autoT->firstType, initT->firstType, false, false, options);
+                if ( !TT->firstType ) return nullptr;
+            }
+            for ( size_t i=0, is=autoT->argTypes.size(); i!=is; ++i ) {
+                TT->argTypes[i] = inferGenericType(autoT->argTypes[i], initT->argTypes[i], false, false, options);
+                if ( !TT->argTypes[i] ) return nullptr;
+            }
+            if ( TT->argNames.size()==0 && !autoT->argNames.empty() ) {
+                TT->argNames = autoT->argNames;
+            }
+        }
+        return TT;
+    }
+
+    // semantic hash
+
+    __forceinline uint64_t hashmix ( uint64_t hash, uint64_t key ) {
+        hash ^= key;
+        hash *= UINT64_C(0x9e3779b97f4a7c15);
+        hash ^= rotr64_c(hash,31);
+        hash *= UINT64_C(0x9e3779b97f4a7c15);
+        hash ^= rotr64_c(hash, 28);
+        return hash;
+    }
+
+    // Save/clear/restore the lazy findAlias cache bits (PR #2849) so they don't
+    // enter the lookup/semantic hash. The bits reflect runtime cache state, not
+    // type identity; two compiles of the same source can leave them differently
+    // set depending on findAlias lifecycle, and we don't want that to leak.
+    static __forceinline uint32_t flagsWithoutAliasCache(const TypeDecl * td) {
+        TypeDecl * mut = const_cast<TypeDecl*>(td);
+        const bool savedV = mut->aliasCacheValid;
+        const bool savedH = mut->aliasCacheHasAlias;
+        mut->aliasCacheValid = false;
+        mut->aliasCacheHasAlias = false;
+        const uint32_t result = mut->flags;
+        mut->aliasCacheValid = savedV;
+        mut->aliasCacheHasAlias = savedH;
+        return result;
+    }
+
+    void TypeDecl::getLookupHash(uint64_t & hash) const {
+        hash = hashmix(hash, baseType);
+        hash = hashmix(hash, flagsWithoutAliasCache(this));
+        if ( baseType==Type::tFixedArray ) {
+            hash = hashmix(hash, fixedDim);
+        }
+        if ( structType ) {
+            hash = hashmix(hash, intptr_t(structType));
+        } else if ( enumType ) {
+            hash = hashmix(hash, intptr_t(enumType));
+        } else if ( annotation ) {
+            hash = hashmix(hash, intptr_t(annotation));
+        }
+        if ( firstType ) {
+            firstType->getLookupHash(hash);
+        }
+        if ( secondType ) {
+            secondType->getLookupHash(hash);
+        }
+        if (baseType == Type::tBitfield || baseType == Type::tBitfield8 ||
+            baseType == Type::tBitfield16 || baseType == Type::tBitfield64 ||
+            baseType == Type::tVariant || baseType == Type::tTuple
+        ) {
+            for ( const auto & name : argNames ) {
+                hash = hashmix(hash, hash_block64(reinterpret_cast<const uint8_t *>(name.c_str()), name.size()));
+            }
+        }
+        for ( auto & argT : argTypes ) {
+            argT->getLookupHash(hash);
+        }
+    }
+
+    uint64_t TypeDecl::getSemanticHash() const {
+        HashBuilder hb;
+        return getSemanticHash(hb);
+    }
+
+    uint64_t TypeDecl::getSemanticHash(HashBuilder & hb) const {
+        TextWriter wr;
+        hb.update(baseType);
+        if ( structType ) {
+            DAS_ASSERT(structType->ownSemanticHash!=0);
+            hb.update(structType->ownSemanticHash);
+        } else if ( enumType ) {
+            hb.updateString(enumType->getMangledName());
+            hb.update(enumType->baseType);
+            for ( auto & e : enumType->list ) {
+                hb.updateString(e.name);
+                wr << *(e.value);
+            }
+        } else if ( annotation ) {
+            DAS_ASSERT(annotation->ownSemanticHash!=0);
+            hb.update(annotation->ownSemanticHash);
+        }
+        if ( firstType ) {
+            firstType->getSemanticHash(hb);
+        }
+        if ( secondType ) {
+            secondType->getSemanticHash(hb);
+        }
+        for ( auto & argT : argTypes ) {
+            argT->getSemanticHash(hb);
+        }
+        for ( auto & argN : argNames ) {
+            hb.updateString(argN);
+        }
+        if ( baseType==Type::tFixedArray ) {
+            hb.update(fixedDim);
+            hb.update(fixedDimExpr != nullptr);
+            if ( fixedDimExpr ) {
+                wr << *fixedDimExpr;
+            }
+        }
+        for ( auto & de : typeMacroExpr ) {
+            hb.update(de != nullptr);
+            if ( de ) {
+                wr << *(de);
+            }
+        }
+        hb.update(flagsWithoutAliasCache(this));
+        hb.updateString(wr.str());
+        return hb.getHash();
+    }
+
+    uint64_t TypeDecl::getOwnSemanticHash() const {
+        HashBuilder hb;
+        das_set<Structure *> dep;
+        das_set<Annotation *> adep;
+        return getOwnSemanticHash(hb, dep, adep);
+    }
+
+    uint64_t TypeDecl::getOwnSemanticHash(HashBuilder & hb,das_set<Structure *> & dep, das_set<Annotation *> & adep) const {
+        TextWriter wr;
+        hb.update(baseType);
+        if ( structType ) {
+            if ( dep.find(structType) == dep.end() ) {
+                dep.insert(structType);
+                structType->getOwnSemanticHash(hb, dep, adep);
+            }
+        } else if ( enumType ) {
+            hb.updateString(enumType->getMangledName());
+            hb.update(enumType->baseType);
+            for ( auto & e : enumType->list ) {
+                hb.updateString(e.name);
+                wr << *(e.value);
+            }
+        } else if ( annotation ) {
+            if ( adep.find(annotation) == adep.end() ) {
+                adep.insert(annotation);
+                annotation->getOwnSemanticHash(hb, dep, adep);
+            }
+        }
+        if ( firstType ) {
+            firstType->getOwnSemanticHash(hb, dep, adep);
+        }
+        if ( secondType ) {
+            secondType->getOwnSemanticHash(hb, dep, adep);
+        }
+        for ( auto & argT : argTypes ) {
+            argT->getOwnSemanticHash(hb, dep, adep);
+        }
+        for ( auto & argN : argNames ) {
+            hb.updateString(argN);
+        }
+        if ( baseType==Type::tFixedArray ) {
+            hb.update(fixedDim);
+            hb.update(fixedDimExpr != nullptr);
+            if ( fixedDimExpr ) {
+                wr << *fixedDimExpr;
+            }
+        }
+        for ( auto & de : typeMacroExpr ) {
+            hb.update(de != nullptr);
+            if ( de ) {
+                wr << *(de);
+            }
+        }
+        hb.update(flagsWithoutAliasCache(this));
+        hb.updateString(wr.str());
+        return hb.getHash();
+    }
+
+    // TypeDecl
+
+    string TypeDecl::describe ( DescribeExtra extra, DescribeContracts contracts, DescribeModule dmodule, AliasDefs * aliasDefs, bool topAlias ) const {
+        TextWriter stream;
+        if ( autoToAlias ) {
+            stream << "type<";
+        }
+        if ( aliasDefs && topAlias && extra==DescribeExtra::yes && baseType!=Type::alias
+                && baseType!=Type::autoinfer && !alias.empty() ) {
+            bool known = false;
+            for ( auto & kv : *aliasDefs ) { if ( kv.first==alias ) { known = true; break; } }
+            if ( !known ) {
+                aliasDefs->emplace_back(alias, string());           // reserve slot, break recursion cycles
+                string def = describe(extra, contracts, dmodule, aliasDefs, false); // expand this node structurally
+                for ( auto & kv : *aliasDefs ) { if ( kv.first==alias ) { kv.second = def; break; } }
+            }
+            stream << alias;
+        } else if ( baseType==Type::alias ) {
+            if ( isTag ) {
+                if ( firstType) {
+                    stream << "$$(";
+                    if ( firstType->typeMacroExpr.size()==1 ) {
+                        stream << *(firstType->typeMacroExpr[0]);
+                    }
+                    stream << ")";
+                } else {
+                    stream << "$$()";
+                }
+            } else {
+                stream << alias;
+            }
+        } else if ( baseType==Type::autoinfer ) {
+            stream << "auto";
+            if ( !alias.empty() ) {
+                stream << "(" << alias << ")";
+            }
+        } else if ( baseType==Type::option ) {
+            for ( auto & argT : argTypes ) {
+                stream << argT->describe(extra, contracts, dmodule, aliasDefs);
+                if ( argT != argTypes.back() ) {
+                    stream << "|";
+                }
+            }
+        } else if ( baseType==Type::typeDecl ) {
+            if ( typeMacroExpr.size()==1 ) {
+                stream << "typedecl(" << (*typeMacroExpr[0]) << ")";
+            } else {
+                stream << "typedecl(/*invalid expression*/)";
+            }
+        } else if ( baseType==Type::typeMacro ) {
+            stream << "$" << typeMacroName() << "(";
+            for ( size_t i=1; i!=typeMacroExpr.size(); ++i ) {
+                if ( i!=1 ) stream << ",";
+                if ( typeMacroExpr[i] ) {
+                    stream << *(typeMacroExpr[i]);
+                } else {
+                    stream << "/*invalid expression*/";
+                }
+            }
+            stream << ")";
+        } else if ( baseType==Type::tFixedArray ) {
+            // element-first flattened text ("float[3][4][4]"), byte-matching the old
+            // dim-vector output; the chain's dims print in the suffix section below
+            const TypeDecl * elem = this;
+            while ( elem->baseType==Type::tFixedArray && elem->firstType ) {
+                elem = elem->firstType;
+            }
+            if ( elem->baseType==Type::tFixedArray ) {
+                stream << "fixed array";   // malformed chain (no element)
+            } else {
+                stream << elem->describe(extra, contracts, dmodule, aliasDefs);
+            }
+        } else if ( baseType==Type::tHandle ) {
+            if ( annotation ) {
+                if (dmodule == DescribeModule::yes && annotation->module && !annotation->module->name.empty()) {
+                    stream << annotation->module->name << "::";
+                }
+                stream << annotation->name;
+            } else {
+                stream << "unspecified annotation";
+            }
+        } else if ( baseType==Type::tArray ) {
+            if ( firstType ) {
+                stream << "array<" << firstType->describe(extra, contracts, dmodule, aliasDefs) << ">";
+            } else {
+                stream << "array";
+            }
+        } else if ( baseType==Type::tTable ) {
+            if ( firstType && secondType ) {
+                stream << "table<" << firstType->describe(extra, contracts, dmodule, aliasDefs) << ";" << secondType->describe(extra, contracts, dmodule, aliasDefs) << ">";
+            } else {
+                stream << "table";
+            }
+        } else if ( baseType==Type::tStructure ) {
+            if ( structType ) {
+                if (dmodule == DescribeModule::yes && structType->module && !structType->module->name.empty()) {
+                    stream << structType->module->name << "::";
+                }
+                stream << structType->name;
+            } else {
+                stream << "unspecified structure";
+            }
+        } else if ( baseType==Type::tPointer ) {
+            if ( smartPtr ) stream << "smart_ptr<";
+            if ( firstType ) {
+                stream << firstType->describe(extra, contracts, dmodule, aliasDefs);
+            } else {
+                stream << "void";
+            }
+            stream << (smartPtr ? ">" : "?");
+        } else if ( isEnumT() ) {
+            if ( enumType ) {
+                if (dmodule == DescribeModule::yes && enumType->module && !enumType->module->name.empty()) {
+                    stream << enumType->module->name << "::";
+                }
+                stream << enumType->describe();
+            } else {
+                stream << "unspecified enumeration";
+            }
+        } else if ( baseType==Type::tIterator ) {
+            if ( firstType ) {
+                stream << "iterator<" << firstType->describe(extra, contracts, dmodule, aliasDefs) << ">";
+            } else {
+                stream << "iterator";
+            }
+        } else if ( baseType==Type::tBlock || baseType==Type::tFunction || baseType==Type::tLambda ) {
+            stream << das_to_string(baseType) << "<";
+            if ( argTypes.size() ) {
+                stream << "(";
+                for ( size_t ai=0, ais=argTypes.size(); ai!=ais; ++ ai ) {
+                    if ( ai!=0 ) stream << ";";
+                    if (!argTypes[ai]->isConst()) {
+                        stream << "var ";
+                    }
+                    if ( argNames.size()==argTypes.size() ) {
+                        stream << argNames[ai] << ":";
+                    } else {
+                        stream << "arg" << ai << ":";
+                    }
+                    stream << argTypes[ai]->describe(extra, contracts, dmodule, aliasDefs);
+                }
+                stream << ")";
+            }
+            if ( firstType ) {
+                if ( argTypes.size() ) {
+                    stream << ":";
+                }
+                stream << firstType->describe(extra, contracts, dmodule, aliasDefs);
+            }
+            stream << ">";
+            if ( argNames.size() && argNames.size()!=argTypes.size() ) {
+                stream << " DAS_COMMENT(malformed) ";
+            }
+        } else if ( baseType==Type::tTuple ) {
+            stream << das_to_string(baseType) << "<";
+            if ( argTypes.size() ) {
+                int ai = 0;
+                for ( const auto & arg : argTypes ) {
+                    if ( argNames.size()==argTypes.size() ) {
+                        const auto & argName = argNames[ai];
+                        if ( !argName.empty() ) stream << argName << ":";
+                    }
+                    stream << arg->describe(extra, contracts, dmodule, aliasDefs);
+                    if ( arg != argTypes.back() ) {
+                        stream << ";";
+                    }
+                    ai ++;
+                }
+            }
+            stream << ">";
+        } else if ( baseType==Type::tVariant ) {
+            stream << das_to_string(baseType) << "<";
+            if ( argTypes.size() ) {
+                int ai = 0;
+                for ( const auto & arg : argTypes ) {
+                    if ( argNames.size()==argTypes.size() ) {
+                        const auto & argName = argNames[ai];
+                        if ( !argName.empty() ) stream << argName << ":";
+                    }
+                    stream << arg->describe(extra, contracts, dmodule, aliasDefs);
+                    if ( arg != argTypes.back() ) {
+                        stream << ";";
+                    }
+                    ai ++;
+                }
+            }
+            stream << ">";
+        } else if ( baseType==Type::tBitfield || baseType==Type::tBitfield8 ||
+                    baseType==Type::tBitfield16 || baseType==Type::tBitfield64 ) {
+            stream << das_to_string(baseType);
+            switch ( baseType ) {
+                case Type::tBitfield8 : stream << ":uint8"; break;
+                case Type::tBitfield16 : stream << ":uint16"; break;
+                case Type::tBitfield64 : stream << ":uint64"; break;
+                default: break;
+            }
+            if ( argNames.size() || baseType!=Type::tBitfield ) {
+                stream << "<";
+                int ai = 0;
+                for ( const auto & arg : argNames ) {
+                    if ( ai !=0 ) stream << ";";
+                    stream << arg;
+                    ai ++;
+                }
+                stream << ">";
+            }
+        }else {
+            stream << das_to_string(baseType);
+        }
+        if ( !aliasDefs && extra==DescribeExtra::yes && baseType!=Type::autoinfer && baseType!=Type::alias && !alias.empty() ) {
+            stream << " aka " << alias;
+        }
+        if ( constant ) {
+            stream << " const";
+        }
+        if ( baseType==Type::tFixedArray ) {
+            for ( const TypeDecl * t = this; t && t->baseType==Type::tFixedArray; t = t->firstType ) {
+                if ( t->fixedDim==TypeDecl::dimAuto ) {
+                    stream << "[]";
+                } else {
+                    stream << "[" << t->fixedDim << "]";
+                }
+            }
+        }
+        if ( ref ) {
+            stream << "&";
+        }
+        if ( temporary ) {
+            stream << "#";
+        }
+        if ( implicit ) {
+            stream << " implicit";
+        }
+        if ( contracts==DescribeContracts::yes && isExplicit ) {
+            stream << " explicit";
+        }
+        if ( explicitConst ) {
+            stream << " ==const";
+        }
+        if ( explicitRef ) {
+            stream << " ==&";
+        }
+        if (contracts == DescribeContracts::yes) {
+            if (removeConstant || removeRef || removeDim || removeTemporary) {
+                if (removeConstant) {
+                    stream << " -const";
+                }
+                if (removeRef) {
+                    stream << " -&";
+                }
+                if (removeDim ) {
+                    stream << " -[]";
+                }
+                if (removeTemporary) {
+                    stream << " -#";
+                }
+            }
+        }
+        if ( autoToAlias ) {
+            stream << ">";
+        }
+        return stream.str();
+    }
+
+    StringWriter& operator<< (StringWriter& stream, const TypeDecl & decl) {
+        stream << decl.describe();
+        return stream;
+    }
+
+    TypeDecl::TypeDecl(const TypeDecl & decl) {
+        gc_magic = GC_MAGIC_TYPEDECL;
+        baseType = decl.baseType;
+        structType = decl.structType;
+        enumType = decl.enumType;
+        annotation = decl.annotation;
+        fixedDim = decl.fixedDim;
+        if ( decl.fixedDimExpr ) {
+            fixedDimExpr = decl.fixedDimExpr->clone();
+        }
+        typeMacroExpr.reserve(decl.typeMacroExpr.size());
+        for ( auto & de : decl.typeMacroExpr ) {
+            if ( de ) {
+                typeMacroExpr.push_back(de->clone());
+            } else {
+                typeMacroExpr.push_back(nullptr);
+            }
+        }
+        flags = decl.flags;
+        aliasCacheValid = false;            // not cloned — recompute lazily
+        aliasCacheHasAlias = false;
+        alias = decl.alias;
+        at = decl.at;
+        module = decl.module;
+        if ( decl.firstType )
+            firstType = new TypeDecl(*decl.firstType);
+        if ( decl.secondType )
+            secondType = new TypeDecl(*decl.secondType);
+        for ( const auto & arg : decl.argTypes ) {
+            argTypes.push_back(new TypeDecl(*arg) );
+        }
+        argNames = decl.argNames;
+    }
+
+    void TypeDecl::clone ( TypeDeclPtr & dest, const TypeDeclPtr & src ) {
+        // this only works when there are no duplicated types whatsoever
+        // there is CodeOfPolicies::validate_ast that checks for that, but its off by default (slow)
+        // if you suspect this is whats causing a problem, disable the optimization, enable the validation and find the duplicated type
+#if 0
+        dest = new TypeDecl(*src);
+#else
+        if ( src==nullptr ) {
+            dest = nullptr;
+            return;
+        }
+        if ( !dest ) {
+            dest = new TypeDecl(*src);
+            return;
+        }
+        dest->baseType = src->baseType;
+        dest->structType = src->structType;
+        dest->enumType = src->enumType;
+        dest->annotation = src->annotation;
+        dest->fixedDim = src->fixedDim;
+        dest->fixedDimExpr = src->fixedDimExpr ? src->fixedDimExpr->clone() : nullptr;
+        dest->typeMacroExpr.resize(src->typeMacroExpr.size());
+        for ( size_t i=0; i!=src->typeMacroExpr.size(); ++i ) {
+            if ( src->typeMacroExpr[i] ) {
+                dest->typeMacroExpr[i] = src->typeMacroExpr[i]->clone();
+            } else {
+                dest->typeMacroExpr[i] = nullptr;
+            }
+        }
+        dest->flags = src->flags;
+        dest->aliasCacheValid = false;      // not cloned — recompute lazily
+        dest->aliasCacheHasAlias = false;
+        dest->alias = src->alias;
+        dest->at = src->at;
+        dest->module = src->module;
+        clone(dest->firstType, src->firstType);
+        clone(dest->secondType, src->secondType);
+        dest->argTypes.resize(src->argTypes.size());
+        for ( size_t i=0; i!=src->argTypes.size(); ++i ) {
+            clone(dest->argTypes[i], src->argTypes[i]);
+        }
+        dest->argNames = src->argNames;
+#endif
+    }
+
+    void TypeDecl::gc_collect ( gc_root * target, gc_root * from ) {
+        if ( gc_owner == target ) return;                           // already collected
+        if ( from && gc_owner != from ) return;                     // not from our scope
+        if ( !from && gc_owner == nullptr ) return;                 // detached
+        gc_assign(target);
+        if ( firstType ) firstType->gc_collect(target, from);
+        if ( secondType ) secondType->gc_collect(target, from);
+        for ( auto t : argTypes ) if ( t ) t->gc_collect(target, from);
+        if ( fixedDimExpr ) fixedDimExpr->gc_collect(target, from);
+        for ( auto & de : typeMacroExpr ) if ( de ) de->gc_collect(target, from);
+        // this??
+        if ( structType ) structType->gc_collect(target, from);
+        if ( enumType ) enumType->gc_collect(target, from);
+        if ( annotation ) annotation->gc_collect(target, from);
+    }
+
+    bool TypeDecl::computeAliasCache() {
+        // Eager full walk independent of name/allowAuto. Sets aliasCache* on every visited node.
+        // alias-type subtrees are dead ends for findAlias, so treated as NoAlias.
+        if (aliasCacheValid) return aliasCacheHasAlias;
+        if (baseType == Type::alias) {
+            aliasCacheValid = true;
+            aliasCacheHasAlias = false;
+            return false;
+        }
+        bool hasAny = !alias.empty();
+        if (firstType && firstType->computeAliasCache()) hasAny = true;
+        if (secondType && secondType->computeAliasCache()) hasAny = true;
+        for (auto & arg : argTypes) {
+            if (arg && arg->computeAliasCache()) hasAny = true;
+        }
+        aliasCacheValid = true;
+        aliasCacheHasAlias = hasAny;
+        return hasAny;
+    }
+    TypeDecl * TypeDecl::findAlias ( const string & name, bool allowAuto, bool * constUnderDim ) {
+        if (!aliasCacheValid) computeAliasCache();
+        if (!aliasCacheHasAlias) return nullptr;        // proven no aliases anywhere
+        if (baseType == Type::alias) {
+            return nullptr; // if it is another alias, can't find it
+        } else if (baseType == Type::autoinfer && !allowAuto) {
+            return nullptr; // if it has not been inferred yet, can't find it
+        } else if (alias == name) {
+            return this;
+        }
+        if ( firstType ) {
+            if ( auto k = firstType->findAlias(name,allowAuto,constUnderDim) ) {
+                // a binding peeled off a fixed-array chain (auto(TT)[]) inherits the head's
+                // constness - canonical form keeps inner nodes bare, but the flattened world
+                // kept label+const+dims on one node. only the pure FA chain transfers;
+                // a container boundary (array<TT> etc) binds bare, as always.
+                if ( constUnderDim && constant && baseType==Type::tFixedArray ) {
+                    for ( auto t = firstType; t; t = t->firstType ) {
+                        if ( t == k ) { *constUnderDim = true; break; }
+                        if ( t->baseType != Type::tFixedArray ) break;
+                    }
+                }
+                return k;
+            }
+        }
+        if ( secondType ) {
+            if ( auto k = secondType->findAlias(name,allowAuto) ) {
+                return k;
+            }
+        }
+        for ( auto & arg : argTypes ) {
+            if ( auto att = arg->findAlias(name,allowAuto) ) {
+                return att;
+            }
+        }
+        return nullptr;
+    }
+
+    bool TypeDecl::canDelete() const {
+        if ( baseType==Type::tFixedArray ) {
+            // fixed-array dims are transparent to classification, same as the old dim vector
+            return firstType ? firstType->canDelete() : false;
+        } else if ( baseType==Type::tHandle ) {
+            return annotation->canDelete();
+        } else if ( baseType==Type::tPointer ) {
+            // peel fixed-array levels — delete of `new Foo[4]` classifies by the element
+            auto pointee = firstType;
+            while ( pointee && pointee->baseType==Type::tFixedArray ) {
+                pointee = pointee->firstType;
+            }
+            if ( !pointee ) {
+                return false;
+            } else if (pointee->baseType==Type::tHandle ) {
+                return pointee->annotation->canDeletePtr();
+            } else if ( pointee->baseType==Type::tStructure ) {
+                return true;
+            } else if ( pointee->baseType==Type::tTuple ) {
+                return true;
+            } else if ( pointee->baseType==Type::tVariant ) {
+                return true;
+            } else {
+                return false;
+            }
+        } else if ( baseType==Type::tArray || baseType==Type::tTable ) {
+            return true;
+        } else if ( baseType==Type::tString ) {
+            return false;
+        } else if ( baseType==Type::tStructure ) {
+            return true;
+        } else if ( baseType==Type::tLambda ) {
+            return true;
+        } else if ( baseType==Type::tIterator ) {
+            return true;
+        } else if ( baseType==Type::tTuple || baseType==Type::tVariant ) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    bool TypeDecl::canDeletePtr() const {
+        if ( baseType==Type::tFixedArray ) {
+            return firstType ? firstType->canDeletePtr() : false;
+        } else if ( baseType==Type::tHandle ) {
+            return annotation->canDeletePtr();
+        } else if ( baseType==Type::tStructure ) {
+            return true;
+        } else if ( baseType==Type::tTuple || baseType==Type::tVariant ) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    bool TypeDecl::canNew() const {
+        if ( baseType==Type::tFixedArray ) {
+            return firstType ? firstType->canNew() : false;
+        } else if ( baseType==Type::tHandle ) {
+            return annotation->canNew();
+        } else if ( baseType==Type::tStructure ) {
+            return true;
+        } else if ( baseType==Type::tTuple || baseType==Type::tVariant ) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    bool TypeDecl::needDelete() const {
+        if ( baseType==Type::tFixedArray ) {
+            return firstType ? firstType->needDelete() : false;
+        } else if ( baseType==Type::tHandle ) {
+            return annotation->needDelete();
+        } else if ( baseType==Type::tPointer ) {
+            return canDelete();
+        } else if ( baseType==Type::tArray || baseType==Type::tTable ) {
+            return true;
+        } else if ( baseType==Type::tString ) {
+            return false;
+        } else if ( baseType==Type::tStructure ) {
+            return true;
+        } else if ( baseType==Type::tLambda ) {
+            return true;
+        } else if ( baseType==Type::tIterator ) {
+            return true;
+        } else if ( baseType==Type::tTuple || baseType==Type::tVariant ) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    bool TypeDecl::canAot() const {
+        das_set<Structure *> recAot;
+        return canAot(recAot);
+    }
+
+    bool TypeDecl::canAot( das_set<Structure *> & recAot) const {
+        if ( annotation && !annotation->canAot(recAot) ) return false;
+        if ( firstType && !firstType->canAot(recAot) ) return false;
+        if ( secondType && !secondType->canAot(recAot) ) return false;
+        for ( auto & arg : argTypes ) {
+            if ( !arg->canAot(recAot) ) return false;
+        }
+        if ( structType ) {
+            if ( recAot.find(structType)==recAot.end() ) {
+                recAot.insert(structType);
+                return structType->canAot(recAot);
+            }
+        }
+        return true;
+    }
+
+    bool TypeDecl::canMove() const {
+        if (baseType == Type::tFixedArray) {
+            return firstType ? firstType->canMove() : true;
+        } else if (baseType == Type::tHandle) {
+            return annotation->canMove();
+        } else if (baseType == Type::tBlock) {
+            return false;
+        } else if (baseType == Type::tStructure && structType) {
+            return !structType->circular ? structType->canMove() : false;
+        } else if (baseType == Type::tTuple || baseType == Type::tVariant || baseType == Type::option ) {
+            for (const auto & arg : argTypes) {
+                if (!arg->canMove()) return false;
+            }
+            return true;
+        } else {
+            return true;
+        }
+    }
+
+    bool TypeDecl::canCloneFromConst() const {
+        if (baseType == Type::tFixedArray) {
+            return firstType ? firstType->canCloneFromConst() : true;
+        } else if (baseType == Type::tHandle) {
+            return annotation->canClone();
+        } else if (baseType == Type::tStructure && structType) {
+            return !structType->circular ? structType->canCloneFromConst() : false;
+        } else if (baseType == Type::tTuple || baseType == Type::tVariant  || baseType == Type::option) {
+            for (const auto & arg : argTypes) {
+                if (!arg->canCloneFromConst()) return false;
+            }
+            return true;
+        } else if ( baseType == Type::tPointer ) {
+            if ( smartPtr || smartPtrNative ) return true;                // TODO: fix this
+            if ( !firstType ) return true;              // void pointer can always be cloned
+            if ( firstType->isVoid() ) return true;     // void pointer can always be cloned
+            if ( firstType->constant ) return true;     // can clone to const pointer, i.e. Foo const?
+            return false;
+        } else if (baseType == Type::tBlock) {
+            return true;
+        } else if (baseType == Type::tIterator) {
+            return true;
+        } else if ( baseType == Type::tLambda ) {
+            return true;
+        } else {
+            return true;
+        }
+    }
+
+    bool TypeDecl::canClone() const {
+        if (baseType == Type::tFixedArray) {
+            return firstType ? firstType->canClone() : true;
+        } else if (baseType == Type::tHandle) {
+            return annotation->canClone();
+        } else if (baseType == Type::tStructure && structType) {
+            return !structType->circular ? structType->canClone() : false;
+        } else if (baseType == Type::tTuple || baseType == Type::tVariant  || baseType == Type::option) {
+            for (const auto & arg : argTypes) {
+                if (!arg->canClone()) return false;
+            }
+            return true;
+        } else if (baseType == Type::tBlock) {
+            return false;
+        } else if (baseType == Type::tIterator) {
+            return false;
+        } else if (baseType == Type::tPointer) {
+            return true;
+        } else if ( baseType == Type::tLambda ) {
+            return false;
+        } else {
+            return true;
+        }
+    }
+
+    bool TypeDecl::canCopy(bool tempMatters) const {
+        if ( baseType == Type::tFixedArray ) {
+            return firstType ? firstType->canCopy(tempMatters) : true;
+        } else if ( baseType == Type::tHandle ) {
+            return annotation->canCopy();
+        } else if (baseType == Type::tArray || baseType == Type::tTable || baseType == Type::tBlock || baseType == Type::tIterator) {
+            return false;
+        } else if (baseType == Type::tStructure && structType) {
+            return !structType->circular ? structType->canCopy(tempMatters) : false;
+        } else if (baseType == Type::tTuple || baseType == Type::tVariant || baseType == Type::option) {
+            for (const auto & arg : argTypes) {
+                if (!arg->canCopy(tempMatters)) return false;
+            }
+            return true;
+        } else if (baseType == Type::tPointer) {
+            return !smartPtr;
+        } else if ( baseType == Type::tLambda ) {
+            return true;
+        } else if ( baseType == Type::tString ) {
+            return tempMatters ? false : true;
+        } else {
+            return true;
+        }
+    }
+
+        bool TypeDecl::isNoHeapType() const {
+            if ( baseType==Type::tFixedArray )
+                return firstType ? firstType->isNoHeapType() : true;
+            if ( baseType==Type::tArray || baseType==Type::tTable
+                    || baseType==Type::tBlock || baseType==Type::tLambda )
+                return false;
+            if ( baseType==Type::tStructure && structType )
+                return !structType->circular ? structType->isNoHeapType() : false;
+            if ( baseType==Type::tHandle )
+                return annotation->isPod();
+            if ( baseType==Type::tTuple || baseType==Type::tVariant || baseType == Type::option ) {
+                for ( auto & arg : argTypes ) {
+                    if ( !arg->isNoHeapType() ) {
+                        return false;
+                    }
+                }
+            }
+            if ( baseType==Type::tPointer ) return false;   // pointer can point to heap
+            return true;
+        }
+
+    bool TypeDecl::isPod() const {
+        if ( baseType==Type::tFixedArray )
+            return firstType ? firstType->isPod() : true;
+        if ( baseType==Type::tArray || baseType==Type::tTable || baseType==Type::tString
+                || baseType==Type::tBlock || baseType==Type::tLambda )
+            return false;
+        if ( baseType==Type::tStructure && structType )
+            return !structType->circular ? structType->isPod() : false;
+        if ( baseType==Type::tHandle )
+            return annotation->isPod();
+        if ( baseType==Type::tPointer )
+            return !smartPtr;
+        if ( baseType==Type::tTuple || baseType==Type::tVariant || baseType == Type::option ) {
+            for ( auto & arg : argTypes ) {
+                if ( !arg->isPod() ) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    bool TypeDecl::isRawPod() const {
+        if ( baseType==Type::tFixedArray )
+            return firstType ? firstType->isRawPod() : true;
+        if ( baseType==Type::tArray || baseType==Type::tTable || baseType==Type::tString
+            || baseType==Type::tBlock || baseType==Type::tLambda || baseType==Type::tFunction )
+            return false;
+        if ( baseType==Type::tStructure && structType )
+            return !structType->circular ? structType->isRawPod() : false;
+        if ( baseType==Type::tHandle )
+            return annotation->isRawPod();
+        if ( baseType==Type::tPointer )
+            return false;
+        if ( baseType==Type::tTuple || baseType==Type::tVariant || baseType == Type::option ) {
+            for ( auto & arg : argTypes ) {
+                if ( !arg->isRawPod() ) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    bool TypeDecl::hasStringData() const {
+        das_set<void *> dep;
+        return hasStringData(dep);
+    }
+
+    bool TypeDecl::hasStringData( das_set<void*> & dep ) const {
+        if ( baseType==Type::tString ) {
+            return true;
+        } else if ( baseType==Type::tHandle ) {
+            if(dep.find(annotation) != dep.end()) return false;
+            dep.insert(annotation);
+            return annotation->hasStringData(dep);
+        } else if ( baseType==Type::tStructure ) {
+            if (structType) {
+                if (dep.find(structType) != dep.end()) return false;
+                dep.insert(structType);
+                return structType->hasStringData(dep);
+            }
+        } else if ( baseType==Type::tTuple || baseType==Type::tVariant || baseType == Type::option ) {
+            for ( const auto & arg : argTypes ) {
+                if ( arg->hasStringData(dep) ) {
+                    return true;
+                }
+            }
+            return false;
+        } else if ( baseType==Type::tArray || baseType==Type::tTable || baseType==Type::tFixedArray ) {
+            if ( firstType && firstType->hasStringData(dep) ) return true;
+            if ( secondType && secondType->hasStringData(dep) ) return true;
+        } else if ( baseType==Type::tPointer) {
+            return firstType && firstType->hasStringData(dep);
+        }
+        return false;
+    }
+
+
+    bool TypeDecl::unsafeInit() const {
+        das_set<Structure *> dep;
+        return unsafeInit(dep);
+    }
+
+    bool TypeDecl::unsafeInit( das_set<Structure*> & dep ) const {
+        if ( safeWhenUninitialized ) return false;
+        if ( baseType==Type::tFixedArray ) {
+            return firstType ? firstType->unsafeInit(dep) : false;
+        }
+        if ( baseType==Type::tHandle ) {
+            return  annotation->hasNonTrivialCtor();
+        } if ( baseType==Type::tStructure ) {
+            if (structType) {
+                if (dep.find(structType) != dep.end()) return false;
+                dep.insert(structType);
+                return structType->unsafeInit(dep);
+            }
+        } else if ( baseType==Type::tTuple || baseType==Type::tVariant ) {
+            for ( const auto & arg : argTypes ) {
+                if ( arg->unsafeInit(dep) ) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        return false;
+    }
+
+    bool TypeDecl::needInScope() const {
+        das_set<Structure *> dep;
+        return needInScope(dep);
+    }
+
+    bool TypeDecl::needInScope( das_set<Structure*> & dep ) const {
+        if ( baseType==Type::tHandle ) {
+            return annotation->needInScope();
+        } else if ( baseType==Type::tStructure ) {
+            if (structType) {
+                if (dep.find(structType) != dep.end()) return false;
+                dep.insert(structType);
+                return structType->needInScope(dep);
+            }
+        } else if ( baseType==Type::tTuple || baseType==Type::tVariant || baseType == Type::option ) {
+            for ( const auto & arg : argTypes ) {
+                if ( arg->needInScope(dep) ) {
+                    return true;
+                }
+            }
+            return false;
+        } else if ( baseType==Type::tArray || baseType==Type::tTable || baseType==Type::tFixedArray ) {
+            if ( firstType && firstType->needInScope(dep) ) return true;
+            if ( secondType && secondType->needInScope(dep) ) return true;
+        } else if ( baseType==Type::tPointer) {
+            return smartPtr;
+        }
+        return false;
+    }
+
+    bool TypeDecl::canBePlacedInContainer() const {
+        das_set<Structure *> dep;
+        return canBePlacedInContainer(dep);
+    }
+
+    bool TypeDecl::canBePlacedInContainer(das_set<Structure *> & dep) const {
+        if ( baseType==Type::tHandle ) {
+            return annotation->canBePlacedInContainer();
+        } else if ( baseType==Type::tStructure ) {
+            if (structType) {
+                if (dep.find(structType) != dep.end()) return true;
+                dep.insert(structType);
+                return structType->canBePlacedInContainer(dep);
+            }
+        } else if ( baseType==Type::tTuple || baseType==Type::tVariant || baseType == Type::option ) {
+            for ( const auto & arg : argTypes ) {
+                if ( !arg->canBePlacedInContainer(dep) ) {
+                    return false;
+                }
+            }
+            return true;
+        } else if ( baseType==Type::tBlock ) {
+            return false;
+        } else if ( baseType==Type::tArray || baseType==Type::tTable || baseType==Type::tFixedArray ) {
+            if ( firstType && !firstType->canBePlacedInContainer(dep) ) return false;
+            if ( secondType && !secondType->canBePlacedInContainer(dep) ) return false;
+        }
+        return true;
+    }
+
+    bool TypeDecl::hasNonTrivialCtor() const {
+        das_set<Structure *> dep;
+        return hasNonTrivialCtor(dep);
+    }
+
+    bool TypeDecl::hasNonTrivialCtor(das_set<Structure *> & dep) const {
+        if ( baseType==Type::tFixedArray ) {
+            // unlike tArray (excluded below — an empty array<T> stays uninitialized), a
+            // fixed array's elements are live at init, so the element's ctor-ness counts
+            return firstType ? firstType->hasNonTrivialCtor(dep) : false;
+        } else if ( baseType==Type::tHandle ) {
+            return annotation->hasNonTrivialCtor();
+        } else if ( baseType==Type::tStructure ) {
+            if (structType) {
+                if (dep.find(structType) != dep.end()) return false;
+                dep.insert(structType);
+                return structType->hasNonTrivialCtor(dep);
+            }
+        } else if ( baseType==Type::tTuple || baseType==Type::tVariant || baseType == Type::option ) {
+            for ( const auto & arg : argTypes ) {
+                if ( arg->hasNonTrivialCtor(dep) ) {
+                    return true;
+                }
+            }
+        }
+        /*
+            // NOT REALLY. array<FancyClass> can stay uninitialized
+            else if ( baseType==Type::tArray || baseType==Type::tTable ) {
+            if ( firstType && firstType->hasNonTrivialCtor(dep) ) return true;
+            if ( secondType && secondType->hasNonTrivialCtor(dep) ) return true;
+        } */
+        return false;
+    }
+
+    bool TypeDecl::hasNonTrivialDtor() const {
+        das_set<Structure *> dep;
+        return hasNonTrivialDtor(dep);
+    }
+
+    bool TypeDecl::hasNonTrivialDtor(das_set<Structure *> & dep) const {
+        if ( baseType==Type::tHandle ) {
+            return annotation->hasNonTrivialDtor();
+        } else if ( baseType==Type::tStructure ) {
+            if (structType) {
+                if (dep.find(structType) != dep.end()) return false;
+                dep.insert(structType);
+                return structType->hasNonTrivialDtor(dep);
+            }
+        } else if ( baseType==Type::tTuple || baseType==Type::tVariant || baseType == Type::option ) {
+            for ( const auto & arg : argTypes ) {
+                if ( arg->hasNonTrivialDtor(dep) ) {
+                    return true;
+                }
+            }
+        } else if ( baseType==Type::tArray || baseType==Type::tTable || baseType==Type::tFixedArray ) {
+            if ( firstType && firstType->hasNonTrivialDtor(dep) ) return true;
+            if ( secondType && secondType->hasNonTrivialDtor(dep) ) return true;
+        }
+        return false;
+    }
+
+    bool TypeDecl::hasNonTrivialCopy() const {
+        das_set<Structure *> dep;
+        return hasNonTrivialCopy(dep);
+    }
+
+    bool TypeDecl::hasNonTrivialCopy(das_set<Structure *> & dep) const {
+        if ( baseType==Type::tHandle ) {
+            return annotation->hasNonTrivialCopy();
+        } else if ( baseType==Type::tStructure ) {
+            if (structType) {
+                if (dep.find(structType) != dep.end()) return false;
+                dep.insert(structType);
+                return structType->hasNonTrivialCopy(dep);
+            }
+        } else if ( baseType==Type::tTuple || baseType==Type::tVariant || baseType == Type::option ) {
+            for ( const auto & arg : argTypes ) {
+                if ( arg->hasNonTrivialCopy(dep) ) {
+                    return true;
+                }
+            }
+        } else if ( baseType==Type::tArray || baseType==Type::tTable || baseType==Type::tFixedArray ) {
+            if ( firstType && firstType->hasNonTrivialCopy(dep) ) return true;
+            if ( secondType && secondType->hasNonTrivialCopy(dep) ) return true;
+        }
+        return false;
+    }
+
+    bool TypeDecl::hasClasses() const {
+        das_set<Structure *> dep;
+        return hasClasses(dep);
+    }
+
+    bool TypeDecl::hasClasses(das_set<Structure *> & dep) const {
+        if ( baseType==Type::tStructure ) {
+            if (structType) {
+                if (dep.find(structType) != dep.end()) return false;
+                dep.insert(structType);
+                return structType->hasClasses(dep);
+            }
+        } else if ( baseType==Type::tTuple || baseType==Type::tVariant || baseType == Type::option ) {
+            for ( const auto & arg : argTypes ) {
+                if ( arg->hasClasses(dep) ) {
+                    return true;
+                }
+            }
+        } else if ( baseType==Type::tArray || baseType==Type::tTable || baseType==Type::tFixedArray ) {
+            if ( firstType && firstType->hasClasses(dep) ) return true;
+            if ( secondType && secondType->hasClasses(dep) ) return true;
+        }
+        return false;
+    }
+
+    int32_t TypeDecl::gcFlags() const {
+        das_set<Structure *> dep;
+        das_set<Annotation *> depA;
+        return gcFlags(dep,depA);
+    }
+
+    int32_t TypeDecl::gcFlags(das_set<Structure *> & dep, das_set<Annotation *> & depA) const {
+        int32_t gcf = 0;
+        if ( baseType==Type::tStructure ) {
+            if ( structType ) {
+                if (dep.find(structType) != dep.end()) return 0;
+                dep.insert(structType);
+                if ( structType->isLambda || structType->isClass ) gcf |= gcFlag_heap | gcFlag_stringHeap;
+                for ( auto fld : structType->fields ) {
+                    gcf |= fld.type->gcFlags(dep,depA);
+                }
+            }
+        } else if ( baseType==Type::tTuple || baseType==Type::tVariant || baseType == Type::option ) {
+            for ( const auto & arg : argTypes ) {
+                gcf |= arg->gcFlags(dep,depA);
+            }
+        } else if ( baseType==Type::tArray || baseType==Type::tTable ) {
+            gcf |= gcFlag_heap;
+            if ( firstType ) gcf |= firstType->gcFlags(dep,depA);
+            if ( secondType ) gcf |= secondType->gcFlags(dep,depA);
+        } else if ( baseType==Type::tFixedArray ) {
+            // inline storage — element flags only, no gcFlag_heap (matches the old
+            // dim-vector behavior where dims never added heap-ness)
+            if ( firstType ) gcf |= firstType->gcFlags(dep,depA);
+        } else if ( baseType==Type::tHandle ) {
+            if (depA.find(annotation) != depA.end()) return 0;
+            depA.insert(annotation);
+            auto ann = static_cast<TypeAnnotation *>(annotation);
+            gcf |= ann->getGcFlags(dep,depA);
+        } else if ( baseType==Type::tString ) {
+            gcf |= gcFlag_stringHeap;
+        } else if ( baseType==Type::tPointer ) {
+            gcf |= gcFlag_heap;
+            if ( firstType ) gcf |= firstType->gcFlags(dep,depA);
+        } else if ( baseType==Type::tLambda || baseType==Type::tIterator ) {
+            gcf |= gcFlag_heap;
+            gcf |= gcFlag_stringHeap;
+        }
+        return gcf;
+    }
+
+    bool TypeDecl::isSafeToDelete() const {
+        das_set<Structure *> dep;
+        return isSafeToDelete(dep);
+    }
+
+    bool TypeDecl::isSafeToDelete ( das_set<Structure*> & dep) const {
+        if ( baseType==Type::tPointer ) {
+            if ( smartPtr ) return true;
+            return !firstType || firstType->baseType==Type::tVoid;
+        } else if ( baseType==Type::tHandle ) {
+            return !annotation->hasNonTrivialDtor() || annotation->canDelete();
+        } else  if ( baseType==Type::tStructure ) {
+            if (structType) {
+                if (dep.find(structType) != dep.end()) return true;
+                dep.insert(structType);
+                return structType->isSafeToDelete(dep);
+            } else {
+                return true;
+            }
+        } else if ( baseType==Type::tTuple || baseType==Type::tVariant || baseType == Type::option ) {
+            for ( const auto & arg : argTypes ) {
+                if ( !arg->isSafeToDelete(dep) ) {
+                    return false;
+                }
+            }
+            return true;
+        } else if ( baseType==Type::tBlock ) {
+            return false;
+        } else if ( baseType==Type::tLambda ) {
+            return false;
+        } else if ( baseType==Type::tTable ) {
+            if ( secondType && !secondType->isSafeToDelete(dep) ) return false;
+        } else if ( baseType==Type::tArray || baseType==Type::tFixedArray ) {
+            if ( firstType && !firstType->isSafeToDelete(dep) ) return false;
+        }
+        return true;
+    }
+
+
+    bool TypeDecl::isLocal() const {
+        das_set<Structure *> dep;
+        return isLocal(dep);
+    }
+
+    bool TypeDecl::isLocal(das_set<Structure *> & dep) const {
+        if ( baseType==Type::tHandle ) {
+            return annotation->isLocal();
+        } else  if ( baseType==Type::tStructure ) {
+            if (structType) {
+                if (dep.find(structType) != dep.end()) return true;
+                dep.insert(structType);
+                return structType->isLocal(dep);
+            } else {
+                return true;
+            }
+        } else if ( baseType==Type::tTuple || baseType==Type::tVariant || baseType == Type::option ) {
+            for ( const auto & arg : argTypes ) {
+                if ( !arg->isLocal(dep) ) {
+                    return false;
+                }
+            }
+            return true;
+        } else if ( baseType==Type::tBlock ) {
+            return false;
+        } else if ( baseType==Type::tArray || baseType==Type::tTable || baseType==Type::tFixedArray ) {
+            if ( firstType && !firstType->isLocal(dep) ) return false;
+            if ( secondType && !secondType->isLocal(dep) ) return false;
+        }
+        return true;
+    }
+
+    void TypeDecl::sanitize ( ) {
+        isExplicit = false;
+        explicitConst = false;
+        if ( firstType ) firstType->sanitize();
+        if ( secondType ) secondType->sanitize();
+        for ( auto & argT : argTypes ) argT->sanitize();
+    }
+
+    bool isSameExactNullType ( const TypeDeclPtr & a, const TypeDeclPtr & b ) {
+        if ( a && b ) {
+            return a->isSameExactType(*b);
+        } else if ( a && !b ) {
+            return false;
+        } else if ( !a && b ) {
+            return false;
+        } else {
+            return true;
+        }
+    }
+
+    bool TypeDecl::isSameExactType ( const TypeDecl & decl ) const {
+        if (    baseType!=decl.baseType || structType!=decl.structType || enumType!=decl.enumType
+            ||  annotation!=decl.annotation || flags!=decl.flags || alias!=decl.alias ) {
+                return false;
+            }
+        if ( fixedDim != decl.fixedDim ) return false;
+        if ( !isSameExactNullType(firstType,decl.firstType) ) return false;
+        if ( !isSameExactNullType(secondType,decl.secondType) ) return false;
+        if ( argTypes.size() != decl.argTypes.size() ) return false;
+        for ( size_t i=0, is=argTypes.size(); i!=is; ++i ) {
+            if ( !argTypes[i]->isSameExactType(*(decl.argTypes[i])) ) {
+                return false;
+            }
+        }
+        if ( argNames.size() != decl.argNames.size() ) return false;
+        for ( size_t i=0, is=argNames.size(); i!=is; ++i ) {
+            if ( argNames[i]!=decl.argNames[i] ) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool TypeDecl::isSameType ( const TypeDecl & decl,
+             RefMatters refMatters,
+             ConstMatters constMatters,
+             TemporaryMatters temporaryMatters,
+             AllowSubstitute allowSubstitute,
+             bool topLevel,
+             bool isPassType ) const {
+        if ( baseType!=decl.baseType ) {
+            return false;
+        }
+        if ( topLevel && !isPointer() && !isRef()  ) {
+            constMatters = ConstMatters::no;
+        }
+        if ( topLevel && !isTempType() ) {
+            temporaryMatters = TemporaryMatters::no;
+        }
+        if ( refMatters == RefMatters::yes ) {
+            if ( ref!=decl.ref ) {
+                return false;
+            }
+        }
+        if ( constMatters == ConstMatters::yes ) {
+            if ( constant!=decl.constant ) {
+                return false;
+            }
+        }
+        if ( temporaryMatters == TemporaryMatters::yes ) {
+            if ( temporary != decl.temporary ) {
+                return false;
+            }
+        }
+        switch ( baseType ) {
+        case Type::tHandle:
+            if ( annotation!=decl.annotation ) {
+                if ( !isExplicit && (allowSubstitute == AllowSubstitute::yes) ) {
+                    if ( annotation->canSubstitute(decl.annotation) ) {
+                        return true;
+                    } else if ( decl.annotation->canBeSubstituted(annotation) ) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            break;
+        case Type::tStructure:
+            if (structType!=decl.structType ) {
+                if ( !isExplicit && (allowSubstitute == AllowSubstitute::yes) ) {
+                    if ( structType && decl.structType && structType->isCompatibleCast(*(decl.structType)) ){
+                        return true;
+                    }
+                }
+                return false;
+            }
+            break;
+        case Type::tPointer:
+        case Type::tIterator:
+            {
+                if ( smartPtr != decl.smartPtr ) {
+                    return false;
+                }
+                bool iAmVoid = !firstType || firstType->isVoid();
+                bool heIsVoid = !decl.firstType || decl.firstType->isVoid();
+                TemporaryMatters tpm = implicit ? TemporaryMatters::no : TemporaryMatters::yes;
+                if ( topLevel ) {
+                    ConstMatters pcm = ConstMatters::yes;
+                    if ( isPassType && firstType && firstType->constant ) {
+                        pcm = ConstMatters::no;
+                    }
+                    if ( !iAmVoid && !heIsVoid &&
+                            !firstType->isSameType(*decl.firstType,RefMatters::yes,pcm,
+                                tpm, isExplicit ? AllowSubstitute::no : allowSubstitute,false) ) {
+                        return false;
+                    }
+                } else {
+                    if ( !iAmVoid && !heIsVoid ) {
+                        if ( !firstType->isSameType(*decl.firstType,RefMatters::yes,ConstMatters::yes,
+                                    tpm, isExplicit ? AllowSubstitute::no : allowSubstitute,false) ) {
+                            return false;
+                        }
+                    } else {
+                        if ( iAmVoid != heIsVoid ) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            break;
+        case Type::tEnumeration:
+        case Type::tEnumeration8:
+        case Type::tEnumeration16:
+        case Type::tEnumeration64:
+            if ( baseType != decl.baseType ) {
+                return false;
+            }
+            if ( enumType && decl.enumType && enumType!=decl.enumType ) {
+                return false;
+            }
+            // Stub-binding parameters are signedness-typed for 8/16/64-bit enums (see
+            // typeFactory<EnumStub8/16/64> and typeFactory<EnumStub*u>). When the binding side carries
+            // the marker, only match a concrete enum whose underlying signedness lines up — so that
+            // `int(uint8Enum)` dispatches to enum8u_to_int (zero-extending) rather than enum8_to_int.
+            // Either side may be the binding (isSameType callers swap argType<->passType depending on
+            // direction), so check both. Falls through unchanged for user-typed enum params and for
+            // generic AST-side TypeDecls (no enumType, no binding marker).
+            if ( baseType==Type::tEnumeration8 || baseType==Type::tEnumeration16 || baseType==Type::tEnumeration64 ) {
+                auto signednessMismatch = [](const TypeDecl & stub, const TypeDecl & concrete) -> bool {
+                    if ( !stub.enumStubBinding || !concrete.enumType ) return false;
+                    bool concreteIsUnsigned = concrete.enumType->baseType==Type::tUInt8
+                                           || concrete.enumType->baseType==Type::tUInt16
+                                           || concrete.enumType->baseType==Type::tUInt64;
+                    return stub.enumStubIsUnsigned != concreteIsUnsigned;
+                };
+                if ( signednessMismatch(*this, decl) ) return false;
+                if ( signednessMismatch(decl, *this) ) return false;
+            }
+            break;
+        case Type::tArray:
+            if ( firstType && decl.firstType && !firstType->isSameType(*decl.firstType,RefMatters::yes,ConstMatters::yes,
+                    TemporaryMatters::yes,AllowSubstitute::no,false) ) {
+                return false;
+            }
+            break;
+        case Type::tFixedArray:
+            // canonical form: ref/const/temporary live on the outermost FA node only
+            DAS_ASSERT(!firstType || (!firstType->ref && !firstType->constant && !firstType->temporary));
+            DAS_ASSERT(!decl.firstType || (!decl.firstType->ref && !decl.firstType->constant && !decl.firstType->temporary));
+            if ( fixedDim != decl.fixedDim ) {
+                return false;
+            }
+            if ( firstType && decl.firstType && !firstType->isSameType(*decl.firstType,RefMatters::yes,ConstMatters::yes,
+                    TemporaryMatters::yes,AllowSubstitute::no,false) ) {
+                return false;
+            }
+            break;
+        case Type::tTable:
+            if ( firstType && decl.firstType && !firstType->isSameType(*decl.firstType,RefMatters::yes,ConstMatters::yes,
+                    TemporaryMatters::yes,AllowSubstitute::no,false) ) {
+                return false;
+            }
+            if ( secondType && decl.secondType && !secondType->isSameType(*decl.secondType,RefMatters::yes,ConstMatters::yes,
+                    TemporaryMatters::yes,AllowSubstitute::no,false) ) {
+                return false;
+            }
+            break;
+        case Type::tTuple:
+        case Type::tVariant:
+        case Type::option:
+            if ( firstType && decl.firstType && !firstType->isSameType(*decl.firstType,RefMatters::yes,ConstMatters::yes,
+                    TemporaryMatters::yes,AllowSubstitute::no,true) ) {
+                return false;
+            }
+            if ( firstType || argTypes.size() ) {    // if not any block or any function
+                if ( argTypes.size() != decl.argTypes.size() ) {
+                    return false;
+                }
+                if (baseType == Type::tVariant || baseType == Type::tTuple) {
+                    if (argNames.size() != decl.argNames.size()) {
+                        return false;
+                    }
+                    for ( size_t i=0, is=argNames.size(); i!=is; ++i ) {
+                        const auto & arg = argNames[i];
+                        const auto & declArg = decl.argNames[i];
+                        if ( arg != declArg ) {
+                            return false;
+                        }
+                    }
+                }
+                auto isPass = baseType==Type::tTuple ? isPassType : false;
+                for ( size_t i=0, is=argTypes.size(); i!=is; ++i ) {
+                    const auto & arg = argTypes[i];
+                    const auto & declArg = decl.argTypes[i];
+                    if ( !arg->isSameType(*declArg, RefMatters::yes, ConstMatters::yes,
+                            TemporaryMatters::yes,AllowSubstitute::no,true,isPass ) ) {
+                        return false;
+                    }
+                }
+            }
+            break;
+        case Type::tBlock:
+        case Type::tFunction:
+        case Type::tLambda:
+            if ( firstType && decl.firstType && !firstType->isSameType(*decl.firstType,RefMatters::yes,ConstMatters::yes,
+                    TemporaryMatters::yes,AllowSubstitute::no,true) ) {
+                return false;
+            }
+            if ( firstType || argTypes.size() ) {    // if not any block or any function
+                if ( argTypes.size() != decl.argTypes.size() ) {
+                    return false;
+                }
+                for ( size_t i=0, is=argTypes.size(); i!=is; ++i ) {
+                    const auto & argType = argTypes[i];
+                    const auto & passType = decl.argTypes[i];
+                    auto rMat = argType->isRefType() ? RefMatters::no : RefMatters::yes;
+                    if ( !argType->isSameType(*passType, rMat, ConstMatters::yes,
+                            TemporaryMatters::yes,AllowSubstitute::no,true ) ) {
+                        return false;
+                    }
+                }
+            }
+            break;
+        case Type::tBitfield:
+        case Type::tBitfield8:
+        case Type::tBitfield16:
+        case Type::tBitfield64:
+            {
+                bool iAmAnyBitfield = argNames.size()==0;
+                bool heIsAnyBitfield = decl.argNames.size()==0;
+                bool compareArgs = false;
+                if ( topLevel ) {
+                    if ( !iAmAnyBitfield && !heIsAnyBitfield ) {
+                        compareArgs = true;
+                    }
+                } else {
+                    if ( !iAmAnyBitfield && !heIsAnyBitfield ) {
+                        compareArgs = true;
+                    }
+                    if ( iAmAnyBitfield != heIsAnyBitfield ) {
+                        return false;
+                    }
+                }
+                if ( compareArgs ) {
+                    if (argNames.size() != decl.argNames.size()) {
+                        return false;
+                    }
+                    for ( size_t i=0, is=argNames.size(); i!=is; ++i ) {
+                        const auto & arg = argNames[i];
+                        const auto & declArg = decl.argNames[i];
+                        if ( arg != declArg ) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            break;
+        case Type::alias:
+        case Type::autoinfer:
+            if ( alias!=decl.alias ) {
+                return false;
+            }
+            break;
+        default: ;  // nothing to dos
+        }
+        return true;
+    }
+
+    bool TypeDecl::canWrite() const {
+        bool cw = baseType==Type::tPointer || baseType==Type::anyArgument || isRef();
+        if ( baseType!=Type::tPointer ) {
+            cw &= !constant;
+        } else if ( firstType ) {
+            cw &= !firstType->constant;
+        }
+        return cw;
+    }
+
+    // validate swizzle mask and build mask type
+
+    bool TypeDecl::isSequencialMask ( const vector<uint8_t> & fields ) {
+        for ( size_t i=1, is=fields.size(); i<is; ++i ) {
+            if ( (fields[i-1]+1)!=fields[i] ) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    int TypeDecl::getMaskFieldIndex ( char ch ) {
+        switch ( ch ) {
+            case 'x':   case 'X':   case 'r':   case 'R':   return 0;
+            case 'y':   case 'Y':   case 'g':   case 'G':   return 1;
+            case 'z':   case 'Z':   case 'b':   case 'B':   return 2;
+            case 'w':   case 'W':   case 'a':   case 'A':   return 3;
+            default:    return -1;
+        }
+    }
+
+    bool TypeDecl::buildSwizzleMask ( const string & mask, int dim, vector<uint8_t> & fields ) {
+        fields.clear();
+        for ( auto ch : mask ) {
+            int field = getMaskFieldIndex(ch);
+            if ( field==-1 || field>=dim ) {
+                return false;
+            }
+            fields.push_back(uint8_t(field));
+        }
+        return fields.size()>=1 && fields.size()<=4;
+    }
+
+    bool TypeDecl::isBaseVectorType() const {
+        switch (baseType) {
+            case tInt2:
+            case tInt3:
+            case tInt4:
+            case tUInt2:
+            case tUInt3:
+            case tUInt4:
+            case tFloat2:
+            case tFloat3:
+            case tFloat4:
+            case tRange:
+            case tURange:
+            case tRange64:
+            case tURange64:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    int TypeDecl::getVectorDim() const {
+        switch (baseType) {
+            case tInt2:
+            case tUInt2:
+            case tFloat2:
+            case tRange:
+            case tURange:
+            case tRange64:
+            case tURange64:
+                return 2;
+            case tInt3:
+            case tUInt3:
+            case tFloat3:
+                return 3;
+            case tInt4:
+            case tUInt4:
+            case tFloat4:
+                return 4;
+            default:
+                DAS_ASSERTF(0,
+                        "we should not even be here. we are calling getVectorDim on an unsupported baseType."
+                        "likely new vector type been added.");
+                return 0;
+        }
+    }
+
+    Type TypeDecl::getVectorBaseType() const {
+        switch (baseType) {
+            case tInt2:
+            case tInt3:
+            case tInt4:     return Type::tInt;
+            case tUInt2:
+            case tUInt3:
+            case tUInt4:    return Type::tUInt;
+            case tFloat2:
+            case tFloat3:
+            case tFloat4:   return Type::tFloat;
+            case tRange:    return Type::tInt;
+            case tURange:   return Type::tUInt;
+            case tRange64:  return Type::tInt64;
+            case tURange64: return Type::tUInt64;
+            default:
+                DAS_ASSERTF(0,
+                       "we should not even be here. we are calling getVectorBaseType on an unsuppored baseType."
+                       "likely new vector type been added.");
+                return Type::none;
+        }
+    }
+
+    Type TypeDecl::getVectorType ( Type bt, int dim ) {
+        if ( dim==1 ) return bt;
+        if ( bt==Type::tFloat ) {
+            switch ( dim ) {
+                case 2:     return Type::tFloat2;
+                case 3:     return Type::tFloat3;
+                case 4:     return Type::tFloat4;
+                default:    DAS_ASSERTF(0, "we should not be herewe are calling getVectorType on an unsuppored baseType."
+                                   "likely new vector type been added.");
+                            return Type::none;
+            }
+        } else if ( bt==Type::tInt ) {
+            switch ( dim ) {
+                case 2:     return Type::tInt2;
+                case 3:     return Type::tInt3;
+                case 4:     return Type::tInt4;
+                default:    DAS_ASSERTF(0, "we should not be here. we are calling getVectorType on an unsuppored baseType."
+                                   "likely new vector type been added.");
+                    return Type::none;
+            }
+        } else if ( bt==Type::tUInt ) {
+            switch ( dim ) {
+                case 2:     return Type::tUInt2;
+                case 3:     return Type::tUInt3;
+                case 4:     return Type::tUInt4;
+                default:    DAS_ASSERTF(0, "we should not be here. we are calling getVectorType on an unsuppored baseType."
+                                   "likely new vector type been added.");
+                    return Type::none;
+            }
+        } else {
+            DAS_ASSERTF(0, "we should not be here. we are calling getVectorType on an unsuppored baseType."
+                   "likely new vector type been added.");
+            return Type::none;
+        }
+    }
+
+    Type TypeDecl::getRangeType ( Type bt, int dim ) {
+        if ( dim==1 ) return bt;
+        switch ( bt ) {
+            case Type::tInt:    return Type::tRange;
+            case Type::tUInt:   return Type::tURange;
+            case Type::tInt64:  return Type::tRange64;
+            case Type::tUInt64: return Type::tURange64;
+            default: DAS_ASSERTF(0, "we should not be here. we are calling getRangeType on an unsuppored baseType."
+                "likely new range type been added.");
+                return Type::none;
+        }
+    }
+
+    void TypeDecl::collectAliasList(vector<string> & aliases) const {
+        // auto is auto.... or auto....?
+        if ( baseType==Type::alias ) {
+            aliases.push_back(alias);
+        } else  if ( baseType==Type::tPointer ) {
+            if ( firstType )
+                firstType->collectAliasList(aliases);
+        } else  if ( baseType==Type::tIterator ) {
+            if ( firstType )
+                firstType->collectAliasList(aliases);
+        } else if ( baseType==Type::tArray || baseType==Type::tFixedArray ) {
+            if ( firstType )
+                firstType->collectAliasList(aliases);
+        } else if ( baseType==Type::tTable ) {
+            if ( firstType )
+                firstType->collectAliasList(aliases);
+            if ( secondType )
+                secondType->collectAliasList(aliases);
+        } else if ( baseType==Type::tBlock || baseType==Type::tFunction ||
+                   baseType==Type::tLambda || baseType==Type::tTuple ||
+                   baseType==Type::tVariant  || baseType == Type::option ) {
+            if ( firstType )
+                firstType->collectAliasList(aliases);
+            for ( auto & arg : argTypes )
+                arg->collectAliasList(aliases);
+        }
+    }
+
+    bool TypeDecl::isAotAlias () const {
+        if ( aotAlias ) {
+            return true;
+        } else  if ( baseType==Type::tPointer ) {
+            if ( firstType )
+                return firstType->isAotAlias();
+        } else  if ( baseType==Type::tIterator ) {
+            if ( firstType )
+                return firstType->isAotAlias();
+        } else if ( baseType==Type::tArray || baseType==Type::tFixedArray ) {
+            if ( firstType )
+                return firstType->isAotAlias();
+        } else if ( baseType==Type::tTable ) {
+            bool any = false;
+            if ( firstType )
+                any |= firstType->isAotAlias();
+            if ( secondType )
+                any |= secondType->isAotAlias();
+            return any;
+        } else if ( baseType==Type::tBlock || baseType==Type::tFunction ||
+                   baseType==Type::tLambda || baseType==Type::tTuple ||
+                   baseType==Type::tVariant || baseType == Type::option ) {
+            bool any = false;
+            if ( firstType )
+                any |= firstType->isAotAlias();
+            for ( auto & arg : argTypes )
+                any |= arg->isAotAlias();
+            return any;
+        }
+        return false;
+    }
+
+    bool TypeDecl::isAlias() const {
+        return isAliasOrA2A(false);
+    }
+
+    bool TypeDecl::isAliasOrA2A(bool a2a) const {
+        a2a |= autoToAlias;
+        // auto is auto.... or auto....?
+        if ( baseType==Type::typeDecl ) {
+            return true;
+        } else if ( baseType==Type::typeMacro ) {
+            return true;
+        } else if ( baseType==Type::autoinfer && a2a ) {
+            return true;
+        } else if ( baseType==Type::alias ) {
+            return true;
+        } else  if ( baseType==Type::tPointer ) {
+            if ( firstType )
+                return firstType->isAliasOrA2A(a2a);
+        } else  if ( baseType==Type::tIterator ) {
+            if ( firstType )
+                return firstType->isAliasOrA2A(a2a);
+        } else if ( baseType==Type::tArray || baseType==Type::tFixedArray ) {
+            if ( firstType )
+                return firstType->isAliasOrA2A(a2a);
+        } else if ( baseType==Type::tTable ) {
+            bool any = false;
+            if ( firstType )
+                any |= firstType->isAliasOrA2A(a2a);
+            if ( secondType )
+                any |= secondType->isAliasOrA2A(a2a);
+            return any;
+        } else if ( baseType==Type::tBlock || baseType==Type::tFunction ||
+                   baseType==Type::tLambda || baseType==Type::tTuple ||
+                   baseType==Type::tVariant || baseType==Type::option ) {
+            bool any = false;
+            if ( firstType )
+                any |= firstType->isAliasOrA2A(a2a);
+            for ( auto & arg : argTypes )
+                any |= arg->isAliasOrA2A(a2a);
+            return any;
+        }
+        return false;
+    }
+
+    bool TypeDecl::isAliasOrExpr() const {
+        // auto is auto.... or auto....?
+        if ( baseType==Type::typeMacro ) {
+            return true;
+        } else if ( baseType==Type::typeDecl ) {
+            return true;
+        } else if ( baseType==Type::alias ) {
+            return true;
+        } else  if ( baseType==Type::tPointer ) {
+            if ( firstType )
+                return firstType->isAliasOrExpr();
+        } else  if ( baseType==Type::tIterator ) {
+            if ( firstType )
+                return firstType->isAliasOrExpr();
+        } else if ( baseType==Type::tArray ) {
+            if ( firstType )
+                return firstType->isAliasOrExpr();
+        } else if ( baseType==Type::tFixedArray ) {
+            if ( fixedDim==TypeDecl::dimConst )
+                return true;
+            if ( firstType )
+                return firstType->isAliasOrExpr();
+        } else if ( baseType==Type::tTable ) {
+            bool any = false;
+            if ( firstType )
+                any |= firstType->isAliasOrExpr();
+            if ( secondType )
+                any |= secondType->isAliasOrExpr();
+            return any;
+        } else if ( baseType==Type::tBlock || baseType==Type::tFunction ||
+                   baseType==Type::tLambda || baseType==Type::tTuple ||
+                   baseType==Type::tVariant|| baseType==Type::option ) {
+            bool any = false;
+            if ( firstType )
+                any |= firstType->isAliasOrExpr();
+            for ( auto & arg : argTypes )
+                any |= arg->isAliasOrExpr();
+            return any;
+        }
+        return false;
+    }
+
+    bool TypeDecl::isAutoArrayResolved() const {
+        for ( const TypeDecl * t = this; t && t->baseType==Type::tFixedArray; t = t->firstType ) {
+            if ( t->fixedDim==TypeDecl::dimAuto || t->fixedDim==TypeDecl::dimConst ) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool TypeDecl::isAuto() const {
+        // auto is auto.... or auto....?5
+        switch ( baseType ) {
+        case Type::typeMacro:
+        case Type::typeDecl:
+        case Type::autoinfer:
+        case Type::option:
+            return true;
+        case Type::tPointer:
+        case Type::tIterator:
+        case Type::tArray:
+            return firstType ? firstType->isAuto() : false;
+        case Type::tFixedArray:
+            if ( fixedDim==TypeDecl::dimAuto ) {
+                return true;
+            }
+            return firstType ? firstType->isAuto() : false;
+        case Type::tTable:
+            if ( firstType && firstType->isAuto() ) {
+                return true;
+            }
+            return secondType ? secondType->isAuto() : false;
+        case Type::tBlock:
+        case Type::tFunction:
+        case Type::tLambda:
+        case Type::tTuple:
+        case Type::tVariant:
+            if (firstType && firstType->isAuto() ) {
+                return true;
+            }
+            for (auto& arg : argTypes) {
+                if ( arg->isAuto() ) {
+                    return true;
+                }
+            }
+            return false;
+        default:
+            return false;
+        }
+    }
+
+    bool TypeDecl::isAutoWithoutOptions(bool & hasOptions) const {
+        // auto is auto.... or auto....?
+        if ( baseType==Type::typeMacro ) {
+            return true;
+        } else if ( baseType==Type::typeDecl ) {
+            return true;
+        } else if ( baseType==Type::autoinfer ) {
+            return true;
+        } else if ( baseType==Type::tPointer ) {
+            if ( firstType )
+                return firstType->isAutoWithoutOptions(hasOptions);
+        } else if ( baseType==Type::tIterator ) {
+            if ( firstType )
+                return firstType->isAutoWithoutOptions(hasOptions);
+        } else if ( baseType==Type::tArray ) {
+            if ( firstType )
+                return firstType->isAutoWithoutOptions(hasOptions);
+        } else if ( baseType==Type::tFixedArray ) {
+            if ( fixedDim==TypeDecl::dimAuto )
+                return true;
+            if ( firstType )
+                return firstType->isAutoWithoutOptions(hasOptions);
+        } else if ( baseType==Type::tTable ) {
+            bool any = false;
+            if ( firstType )
+                any |= firstType->isAutoWithoutOptions(hasOptions);
+            if ( secondType )
+                any |= secondType->isAutoWithoutOptions(hasOptions);
+            return any;
+        } else if ( baseType==Type::tBlock || baseType==Type::tFunction ||
+                   baseType==Type::tLambda || baseType==Type::tTuple ||
+                   baseType==Type::tVariant || baseType==Type::option ) {
+            if ( baseType==Type::option ) hasOptions = true;
+            bool any = false;
+            if ( firstType )
+                any |= firstType->isAutoWithoutOptions(hasOptions);
+            for ( auto & arg : argTypes )
+                any |= arg->isAutoWithoutOptions(hasOptions);
+            return any;
+        }
+        return false;
+    }
+
+
+    bool TypeDecl::isAutoOrAlias() const {
+        // auto is auto.... or auto....?
+        switch ( baseType ) {
+        case Type::typeMacro:
+        case Type::typeDecl:
+        case Type::autoinfer:
+        case Type::option:
+        case Type::alias:
+            return true;
+        case Type::tPointer:
+        case Type::tIterator:
+        case Type::tArray:
+            return firstType ? firstType->isAutoOrAlias() : false;
+        case Type::tFixedArray:
+            if ( fixedDim==TypeDecl::dimAuto ) {
+                return true;
+            }
+            return firstType ? firstType->isAutoOrAlias() : false;
+        case Type::tTable:
+            if ( firstType && firstType->isAutoOrAlias() ) {
+                return true;
+            }
+            return secondType ? secondType->isAutoOrAlias() : false;
+        case Type::tBlock:
+        case Type::tFunction:
+        case Type::tLambda:
+        case Type::tTuple:
+        case Type::tVariant:
+            if (firstType && firstType->isAutoOrAlias() ) {
+                return true;
+            }
+            for (auto& arg : argTypes) {
+                if ( arg->isAutoOrAlias() ) {
+                    return true;
+                }
+            }
+            return false;
+        default:
+            return false;
+        }
+    }
+
+    bool TypeDecl::isFoldable() const {
+        if ( ref )
+            return false;
+        switch ( baseType ) {
+            case Type::tBool:
+            case Type::tInt:
+            case Type::tInt2:
+            case Type::tInt3:
+            case Type::tInt4:
+            case Type::tInt8:
+            case Type::tInt16:
+            case Type::tInt64:
+            case Type::tUInt:
+            case Type::tBitfield:
+            case Type::tBitfield8:
+            case Type::tBitfield16:
+            case Type::tBitfield64:
+            case Type::tUInt2:
+            case Type::tUInt3:
+            case Type::tUInt4:
+            case Type::tUInt8:
+            case Type::tUInt16:
+            case Type::tUInt64:
+            case Type::tFloat:
+            case Type::tFloat2:
+            case Type::tFloat3:
+            case Type::tFloat4:
+            case Type::tString:
+            case Type::tDouble:
+            case Type::tEnumeration:
+            case Type::tEnumeration8:
+            case Type::tEnumeration16:
+            case Type::tEnumeration64:
+            case Type::tRange:
+            case Type::tURange:
+            case Type::tRange64:
+            case Type::tURange64:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    bool TypeDecl::isCtorType() const {
+        switch ( baseType ) {
+            // case Type::tBool:
+            case Type::tInt8:
+            case Type::tUInt8:
+            case Type::tInt16:
+            case Type::tUInt16:
+            case Type::tInt64:
+            case Type::tUInt64:
+            case Type::tInt:
+            case Type::tInt2:
+            case Type::tInt3:
+            case Type::tInt4:
+            case Type::tUInt:
+            case Type::tBitfield:
+            case Type::tBitfield8:
+            case Type::tBitfield16:
+            case Type::tBitfield64:
+            case Type::tUInt2:
+            case Type::tUInt3:
+            case Type::tUInt4:
+            case Type::tFloat:
+            case Type::tFloat2:
+            case Type::tFloat3:
+            case Type::tFloat4:
+            case Type::tRange:
+            case Type::tURange:
+            case Type::tRange64:
+            case Type::tURange64:
+            case Type::tString:
+            case Type::tDouble:
+            // case Type::tPointer:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    bool TypeDecl::isTableKeyType() const {
+        if ( isWorkhorseType() ) {
+            return true;
+        } else if ( baseType==Type::tHandle && annotation->isRefType()==false ) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    bool TypeDecl::isWorkhorseType() const {
+        switch ( baseType ) {
+            case Type::tBool:
+            case Type::tInt8:
+            case Type::tUInt8:
+            case Type::tInt16:
+            case Type::tUInt16:
+            case Type::tInt64:
+            case Type::tUInt64:
+            case Type::tEnumeration:
+            case Type::tEnumeration8:
+            case Type::tEnumeration16:
+            case Type::tEnumeration64:
+            case Type::tInt:
+            case Type::tInt2:
+            case Type::tInt3:
+            case Type::tInt4:
+            case Type::tUInt:
+            case Type::tBitfield:
+            case Type::tBitfield8:
+            case Type::tBitfield16:
+            case Type::tBitfield64:
+            case Type::tUInt2:
+            case Type::tUInt3:
+            case Type::tUInt4:
+            case Type::tFloat:
+            case Type::tFloat2:
+            case Type::tFloat3:
+            case Type::tFloat4:
+            case Type::tRange:
+            case Type::tURange:
+            case Type::tRange64:
+            case Type::tURange64:
+            case Type::tString:
+            case Type::tDouble:
+                return true;
+            case Type::tPointer:
+                return !smartPtr;
+            default:
+                return false;
+        }
+    }
+
+    bool TypeDecl::canInitWithZero() const {
+        if ( isVectorType() )
+            return true;
+        switch ( baseType ) {
+            case Type::tBool:
+            case Type::tInt8:
+            case Type::tUInt8:
+            case Type::tInt16:
+            case Type::tUInt16:
+            case Type::tInt64:
+            case Type::tUInt64:
+            case Type::tInt:
+            case Type::tUInt:
+            case Type::tBitfield:
+            case Type::tBitfield8:
+            case Type::tBitfield16:
+            case Type::tBitfield64:
+            case Type::tFloat:
+            case Type::tDouble:
+            case Type::tString:
+                return true;
+            case Type::tPointer:
+                return !smartPtr;
+            default:
+                return false;
+        }
+    }
+
+    bool TypeDecl::isPolicyType() const {
+        switch ( baseType ) {
+            case Type::tVoid:
+            case Type::tEnumeration:
+            case Type::tEnumeration8:
+            case Type::tEnumeration16:
+            case Type::tEnumeration64:
+            case Type::tBool:
+                /*
+            case Type::tInt8:
+            case Type::tUInt8:
+            case Type::tInt16:
+            case Type::tUInt16:
+                 */
+            case Type::tInt64:
+            case Type::tUInt64:
+            case Type::tInt:
+            case Type::tUInt:
+            case Type::tBitfield:
+            case Type::tBitfield8:
+            case Type::tBitfield16:
+            case Type::tBitfield64:
+            case Type::tFloat:
+            case Type::tDouble:
+            case Type::tPointer:
+            case Type::tFunction:
+            case Type::tLambda:
+                return false;
+            default:
+                return true;
+        }
+    }
+
+    bool TypeDecl::isVecPolicyType() const {
+        if ( baseType==Type::tFixedArray )
+            return false;
+        if ( baseType==Type::tString ) {
+            return false;
+        }
+        return isPolicyType();
+    }
+
+    bool TypeDecl::isReturnType() const {
+        if ( isGoodBlockType() ) {
+            return false;
+        }
+        return true;
+    }
+
+    Type TypeDecl::getRangeBaseType() const {
+        switch ( baseType ) {
+            case Type::tRange:  return Type::tInt;
+            case Type::tURange: return Type::tUInt;
+            case Type::tRange64:  return Type::tInt64;
+            case Type::tURange64: return Type::tUInt64;
+            default:
+                DAS_ASSERTF(0, "we should not even be here. we are calling getRangeBaseType on an unsuppored baseType."
+                       "likely new range type been added.");
+                return Type::none;
+        }
+    }
+
+    bool TypeDecl::isRefType() const {
+        if ( baseType==Type::tHandle ) return annotation->isRefType();
+        return baseType==Type::tTuple || baseType==Type::tVariant ||
+                baseType==Type::tStructure || baseType==Type::tArray ||
+                baseType==Type::tTable || baseType==Type::tBlock ||
+                baseType==Type::tIterator || baseType==Type::tFixedArray;
+    }
+
+    bool TypeDecl::isTemp( bool topLevel, bool refMatters ) const {
+        das_set<Structure *> dep;
+        return isTemp(topLevel, refMatters, dep);
+    }
+
+    bool TypeDecl::isTemp( bool topLevel, bool refMatters, das_set<Structure *> & dep ) const {
+        if ( topLevel && !isTempType(refMatters) ) {
+            return false;
+        } else if ( temporary ) {
+            return true;
+        } else if ( baseType==Type::tStructure ) {
+            if (structType) {
+                if (dep.find(structType) != dep.end()) return false;
+                dep.insert(structType);
+                return structType->isTemp(dep);
+            } else {
+                return false;
+            }
+        } else if ( baseType==Type::tPointer || baseType==Type::tIterator ) {
+            return firstType ? firstType->isTemp(false, true, dep) : false;
+        } else if ( baseType==Type::tArray || baseType==Type::tFixedArray ) {
+            return firstType ? firstType->isTemp(false, true, dep) : false;
+        } else if ( baseType==Type::tTable ) {
+            if ( firstType && firstType->isTemp(false, true, dep) ) {
+                return true;
+            } else if ( secondType && secondType->isTemp(false, true, dep) ) {
+                return true;
+            }
+        } else if ( /* baseType==Type::tBlock || baseType==Type::tFunction || baseType==Type::tLambda || */
+                   baseType==Type::tTuple || baseType==Type::tVariant || baseType == Type::option ) {
+            if ( firstType && firstType->isTemp(true, true, dep) ) {
+                return true;
+            }
+            for ( const auto & argT : argTypes ) {
+                if ( argT->isTemp(true, true, dep) ) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // WARNING: this is really really slow, use faster tests when u can isAutoOrAlias for one
+    // type chain is fully resolved, and not aliased \ auto
+    bool TypeDecl::isFullySealed(das_set<const Structure *> & all ) const {
+        if (baseType==Type::autoinfer || baseType==Type::alias) return false;
+        if ( baseType==Type::tFixedArray && fixedDim==TypeDecl::dimAuto ) {
+            return false;
+        }
+        if ( baseType==Type::tStructure ) {
+            if ( structType ) {
+                if ( all.find(structType)!=all.end() ) return true;
+                all.insert(structType);
+                for ( auto & fd : structType->fields ) {
+                    if ( !fd.type->isFullySealed(all) ) return false;
+                }
+
+            }
+        }
+        if (firstType && !firstType->isFullySealed(all)) return false;
+        if (secondType && !secondType->isFullySealed(all)) return false;
+        for (auto & argT : argTypes) {
+            if (argT && !argT->isFullySealed(all)) return false;
+        }
+        return true;
+    }
+    bool TypeDecl::isFullySealed() const {
+        das_set<const Structure *> all;
+        return isFullySealed(all);
+    }
+
+    bool TypeDecl::isFullyInferred() const {
+        das_set<Structure *> dep;
+        return isFullyInferred(dep);
+    }
+
+    bool TypeDecl::isFullyInferred( das_set<Structure *> & dep ) const {
+        if ( isAutoOrAlias() ) {
+            return false;
+        } else if ( baseType==Type::tStructure ) {
+            if ( structType ) {
+                if (dep.find(structType) != dep.end()) return true;
+                dep.insert(structType);
+                for ( auto & fd : structType->fields ) {
+                    if ( !fd.type ) return false;
+                    if ( !fd.type->isFullyInferred(dep) ) return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    bool TypeDecl::isShareable() const {
+        das_set<Structure *> dep;
+        return isShareable(dep);
+    }
+
+    bool TypeDecl::isShareable( das_set<Structure *> & dep ) const {
+        if ( baseType==Type::tIterator || baseType==Type::tBlock || baseType==Type::tLambda ) {
+            return false;
+        } else if ( baseType==Type::tHandle ) {
+            return annotation ? annotation->isShareable() : true;
+        } else if ( baseType==Type::tStructure ) {
+            if (structType) {
+                if (dep.find(structType) != dep.end()) return true;
+                dep.insert(structType);
+                return structType->isShareable(dep);
+            } else {
+                return true;
+            }
+        } else if ( baseType==Type::tArray || baseType==Type::tFixedArray ) {
+            return firstType ? firstType->isShareable(dep) : true;
+        } else if ( baseType==Type::tTable ) {
+            if ( firstType && !firstType->isShareable(dep) ) {
+                return false;
+            } else if ( secondType && !secondType->isShareable(dep) ) {
+                return false;
+            } else {
+                return true;
+            }
+        } else if ( baseType==Type::tTuple || baseType==Type::tVariant || baseType == Type::option ) {
+            for ( const auto & argT : argTypes ) {
+                if ( !argT->isShareable(dep) ) {
+                    return false;
+                }
+            }
+            return true;
+        } else {
+            return true;
+        }
+    }
+
+    bool TypeDecl::isFloatOrDouble() const {
+        switch (baseType) {
+        case Type::tFloat:
+        case Type::tDouble:
+            return true;
+        default:;
+        }
+        return false;
+    }
+
+    bool TypeDecl::isBool() const {
+        return baseType==Type::tBool;
+    }
+
+    bool TypeDecl::isInteger() const {
+        switch (baseType) {
+        case Type::tInt:
+        case Type::tUInt:
+        case Type::tBitfield:
+        case Type::tBitfield8:
+        case Type::tBitfield16:
+        case Type::tBitfield64:
+        case Type::tInt8:
+        case Type::tUInt8:
+        case Type::tInt16:
+        case Type::tUInt16:
+        case Type::tInt64:
+        case Type::tUInt64:
+            return true;
+        default:;
+        }
+        return false;
+    }
+
+    bool TypeDecl::isSignedInteger() const {
+        switch (baseType) {
+        case Type::tInt:
+        case Type::tInt8:
+        case Type::tInt16:
+        case Type::tInt64:
+            return true;
+        default:;
+        }
+        return false;
+    }
+
+    bool TypeDecl::isUnsignedInteger() const {
+        switch (baseType) {
+        case Type::tUInt:
+        case Type::tBitfield:
+        case Type::tBitfield8:
+        case Type::tBitfield16:
+        case Type::tBitfield64:
+        case Type::tUInt8:
+        case Type::tUInt16:
+        case Type::tUInt64:
+            return true;
+        default:;
+        }
+        return false;
+    }
+
+    bool TypeDecl::isSignedIntegerOrIntVec() const {
+        switch (baseType) {
+        case Type::tInt:
+        case Type::tInt8:
+        case Type::tInt16:
+        case Type::tInt64:
+        case Type::tInt2:
+        case Type::tInt3:
+        case Type::tInt4:
+            return true;
+        default:;
+        }
+        return false;
+    }
+
+    bool TypeDecl::isUnsignedIntegerOrIntVec() const {
+        switch (baseType) {
+        case Type::tUInt:
+        case Type::tBitfield:
+        case Type::tBitfield8:
+        case Type::tBitfield16:
+        case Type::tBitfield64:
+        case Type::tUInt8:
+        case Type::tUInt16:
+        case Type::tUInt64:
+        case Type::tUInt2:
+        case Type::tUInt3:
+        case Type::tUInt4:
+            return true;
+        default:;
+        }
+        return false;
+    }
+
+
+    bool TypeDecl::isNumeric() const {
+        switch (baseType) {
+        case Type::tInt:
+        case Type::tUInt:
+        case Type::tBitfield:
+        case Type::tBitfield8:
+        case Type::tBitfield16:
+        case Type::tBitfield64:
+        case Type::tInt8:
+        case Type::tUInt8:
+        case Type::tInt16:
+        case Type::tUInt16:
+        case Type::tInt64:
+        case Type::tUInt64:
+        case Type::tFloat:
+        case Type::tDouble:
+            return true;
+        default:;
+        }
+        return false;
+    }
+
+    bool TypeDecl::isNumericStorage() const {
+        switch (baseType) {
+        case Type::tInt8:
+        case Type::tUInt8:
+        case Type::tInt16:
+        case Type::tUInt16:
+            return true;
+        default:;
+        }
+        return false;
+    }
+
+    bool TypeDecl::isNumericComparable() const {
+        switch (baseType) {
+        case Type::tInt:
+        case Type::tUInt:
+        case Type::tBitfield:
+        case Type::tBitfield8:
+        case Type::tBitfield16:
+        case Type::tBitfield64:
+        case Type::tInt64:
+        case Type::tUInt64:
+        case Type::tFloat:
+        case Type::tDouble:
+            return true;
+        default:;
+        }
+        return false;
+    }
+
+    bool TypeDecl::isIndex() const {
+        return baseType==Type::tInt || baseType==Type::tUInt;
+    }
+
+    bool TypeDecl::isIndexExt() const {
+        return baseType==Type::tInt || baseType==Type::tUInt || baseType==Type::tInt64 || baseType==Type::tUInt64;
+    }
+
+    int TypeDecl::getTupleFieldOffset ( int index ) const {
+        DAS_ASSERT(baseType==Type::tTuple);
+        DAS_ASSERT(index>=0 && index<int(argTypes.size()));
+        int size = 0, idx = 0;
+        for ( const auto & argT : argTypes ) {
+            int al = argT->getAlignOf() - 1;
+            size = (size + al) & ~al;
+            if ( idx==index ) {
+                return size;
+            }
+            size += argT->getSizeOf();
+            idx ++;
+        }
+        DAS_ASSERT(0 && "we should not even be here. field index out of range somehow???");
+        return -1;
+    }
+
+    int TypeDecl::getTupleSize() const {
+        uint64_t size = getTupleSize64();
+        DAS_ASSERTF(size<=0x7fffffff,"tuple size is too big %lu",(unsigned long)size);
+        return (int) (size<=0x7fffffff ? size : 1);
+    }
+
+    uint64_t TypeDecl::getTupleSize64() const {
+        DAS_ASSERT(baseType==Type::tTuple);
+        uint64_t size = 0;
+        for ( const auto & argT : argTypes ) {
+            int al = argT->getAlignOf() - 1;
+            size = (size + al) & ~al;
+            size += argT->getSizeOf64();
+        }
+        int al = getTupleAlign() - 1;
+        size = (size + al) & ~al;
+        return size;
+    }
+
+    uint64_t TypeDecl::getTupleSize64(bool & failed) const {
+        DAS_ASSERT(baseType==Type::tTuple);
+        uint64_t size = 0;
+        for ( const auto & argT : argTypes ) {
+            int al = argT->getAlignOfFailed(failed) - 1;
+            size = (size + al) & ~al;
+            size += argT->getSizeOf64(failed);
+        }
+        int al = getTupleAlignFailed(failed) - 1;
+        size = (size + al) & ~al;
+        return size;
+    }
+
+    int TypeDecl::getTupleAlign() const {
+        DAS_ASSERT(baseType==Type::tTuple);
+        int align = 1;
+        for ( const auto & argT : argTypes ) {
+            align = das::max ( argT->getAlignOf(), align );
+        }
+        return align;
+    }
+
+    int TypeDecl::getTupleAlignFailed(bool & failed) const {
+        DAS_ASSERT(baseType==Type::tTuple);
+        int align = 1;
+        for ( const auto & argT : argTypes ) {
+            align = das::max ( argT->getAlignOfFailed(failed), align );
+        }
+        return align;
+    }
+
+    int TypeDecl::getVariantFieldOffset ( int index ) const {
+        index;
+        DAS_ASSERT(baseType==Type::tVariant);
+        DAS_ASSERT(index>=0 && index<int(argTypes.size()));
+        int al = getVariantAlign() - 1;
+        int offset = (getTypeBaseSize(Type::tInt) + al) & ~al;
+        return offset;
+    }
+
+    int TypeDecl::getVariantUniqueFieldIndex ( const TypeDeclPtr & uniqueType ) const {
+        int index = -1;
+        int idx = 0;
+        for ( const auto & argT : argTypes ) {
+            if ( argT->isSameType(*uniqueType, RefMatters::no, ConstMatters::no, TemporaryMatters::no, AllowSubstitute::yes) ) {
+                if ( index != -1 ) {
+                    return -1;
+                } else {
+                    index = idx;
+                }
+            }
+            idx ++;
+        }
+        return index;
+    }
+
+    int TypeDecl::getVariantSize() const {
+        uint64_t size = getVariantSize64();
+        DAS_ASSERTF(size<=0x7fffffff,"variant size is too big %lu",(unsigned long)size);
+        return (int) (size<=0x7fffffff ? size : 1);
+    }
+
+    uint64_t TypeDecl::getVariantSize64() const {
+        DAS_ASSERT(baseType==Type::tVariant);
+        uint64_t maxSize = 0;
+        int al = getVariantAlign() - 1;
+        for ( const auto & argT : argTypes ) {
+            uint64_t size = (getTypeBaseSize(Type::tInt) + al) & ~al;
+            size += argT->getSizeOf64();
+            maxSize = das::max(size, maxSize);
+        }
+        maxSize = (maxSize + al) & ~al;
+        return maxSize;
+    }
+
+    uint64_t TypeDecl::getVariantSize64(bool & failed) const {
+        DAS_ASSERT(baseType==Type::tVariant);
+        uint64_t maxSize = 0;
+        int al = getVariantAlignFailed(failed) - 1;
+        for ( const auto & argT : argTypes ) {
+            uint64_t size = (getTypeBaseSize(Type::tInt) + al) & ~al;
+            size += argT->getSizeOf64(failed);
+            maxSize = das::max(size, maxSize);
+        }
+        maxSize = (maxSize + al) & ~al;
+        return maxSize;
+    }
+
+    int TypeDecl::getVariantAlign() const {
+        DAS_ASSERT(baseType==Type::tVariant);
+        int align = getTypeBaseAlign(Type::tInt);
+        for ( const auto & argT : argTypes ) {
+            align = das::max ( argT->getAlignOf(), align );
+        }
+        return align;
+    }
+
+    int TypeDecl::getVariantAlignFailed(bool & failed) const {
+        DAS_ASSERT(baseType==Type::tVariant);
+        int align = getTypeBaseAlign(Type::tInt);
+        for ( const auto & argT : argTypes ) {
+            align = das::max ( argT->getAlignOfFailed(failed), align );
+        }
+        return align;
+    }
+
+    int TypeDecl::getVectorFieldOffset ( int index ) const {
+        DAS_ASSERT(index>=0 && index<=3);
+        switch ( baseType ) {
+            case Type::tRange64:
+            case Type::tURange64:
+                return index * 8;
+            case Type::tInt2:
+            case Type::tUInt2:
+            case Type::tInt3:
+            case Type::tUInt3:
+            case Type::tInt4:
+            case Type::tUInt4:
+            case Type::tFloat2:
+            case Type::tFloat3:
+            case Type::tFloat4:
+            case Type::tRange:
+            case Type::tURange:
+                return index * 4;
+            default:
+                return -1;
+        }
+    }
+
+    int TypeDecl::getBaseSizeOf() const {
+        uint64_t size = getBaseSizeOf64();
+        DAS_ASSERTF(size<=0x7fffffff,"base size %" PRIu64 " is too big", size);
+        return int(size<=0x7fffffff ? size : 1);
+    }
+
+    uint64_t TypeDecl::getBaseSizeOf64() const {
+        if ( baseType==Type::tFixedArray ) {
+            // size of the chain-end element, dims excluded — the dim-vector meaning
+            return firstType ? firstType->getBaseSizeOf64() : 0;
+        }
+        if ( baseType==Type::tHandle ) {
+            return annotation->getSizeOf();
+        } else if ( baseType==Type::tStructure ) {
+            return !structType->circular ? structType->getSizeOf64() : 0;
+        } else if ( baseType==Type::tTuple ) {
+            return getTupleSize64();
+        } else if ( baseType==Type::tVariant ) {
+            return getVariantSize64();
+        } else if ( isEnumT() ) {
+            return enumType ? getTypeBaseSize(enumType->baseType) : getTypeBaseSize(Type::tInt);
+        } else {
+           return getTypeBaseSize(baseType);
+        }
+    }
+
+    uint64_t TypeDecl::getBaseSizeOf64(bool & failed) const {
+        if ( baseType==Type::tFixedArray ) {
+            if ( !firstType ) {
+                failed = true;
+                return 0;
+            }
+            return firstType->getBaseSizeOf64(failed);
+        }
+        if ( baseType==Type::tHandle ) {
+            return annotation->getSizeOf();
+        } else if ( baseType==Type::tStructure ) {
+            return !structType->circular ? structType->getSizeOf64(failed) : 0;
+        } else if ( baseType==Type::tTuple ) {
+            return getTupleSize64(failed);
+        } else if ( baseType==Type::tVariant ) {
+            return getVariantSize64(failed);
+        } else if ( isEnumT() ) {
+            return enumType ? getTypeBaseSize(enumType->baseType) : getTypeBaseSize(Type::tInt);
+        } else {
+            if ( baseType==Type::alias || baseType==Type::autoinfer || baseType==Type::option || baseType==Type::typeMacro ) {
+                failed = true;
+                return 0;
+            }
+            return getTypeBaseSize(baseType);
+        }
+    }
+
+    int TypeDecl::getAlignOf() const {
+        if ( baseType==Type::tFixedArray ) {
+            return firstType ? firstType->getAlignOf() : 1;
+        }
+        if ( baseType==Type::tHandle ) {
+            return int(annotation->getAlignOf());
+        } else if ( baseType==Type::tStructure ) {
+            return !structType->circular ? structType->getAlignOf() : 0;
+        } else if ( baseType==Type::tTuple ) {
+            return getTupleAlign();
+        } else if ( baseType==Type::tVariant ) {
+            return getVariantAlign();
+        } else if ( isEnumT() ) {
+            return enumType ? getTypeBaseAlign(enumType->baseType) : getTypeBaseAlign(Type::tInt);
+        } else {
+            return getTypeBaseAlign(baseType);
+        }
+    }
+
+    int TypeDecl::getAlignOfFailed(bool &failed) const {
+        if ( baseType==Type::tFixedArray ) {
+            if ( !firstType ) {
+                failed = true;
+                return 1;
+            }
+            return firstType->getAlignOfFailed(failed);
+        }
+        if ( baseType==Type::tHandle ) {
+            return int(annotation->getAlignOf());
+        } else if ( baseType==Type::tStructure ) {
+            return !structType->circular ? structType->getAlignOfFailed(failed) : 0;
+        } else if ( baseType==Type::tTuple ) {
+            return getTupleAlignFailed(failed);
+        } else if ( baseType==Type::tVariant ) {
+            return getVariantAlignFailed(failed);
+        } else if ( isEnumT() ) {
+            return enumType ? getTypeBaseAlign(enumType->baseType) : getTypeBaseAlign(Type::tInt);
+        } else {
+            if ( baseType==Type::alias || baseType==Type::autoinfer || baseType==Type::option || baseType==Type::typeMacro ) {
+                failed = true;
+                return 0;
+            }
+            return getTypeBaseAlign(baseType);
+        }
+    }
+
+    int TypeDecl::getCountOf() const {
+        uint64_t count = getCountOf64();
+        DAS_ASSERTF(count <= 0x7fffffff, "count too big %lu", (unsigned long)count);
+        return int(count <= 0x7fffffff ? count : 1);
+    }
+
+    uint64_t TypeDecl::getCountOf64() const {
+        uint64_t size = 1;
+        for ( const TypeDecl * t = this; t && t->baseType==Type::tFixedArray; t = t->firstType ) {
+            size *= uint64_t(t->fixedDim);
+        }
+        return size;
+    }
+
+    int TypeDecl::getSizeOf() const {
+        uint64_t size = getSizeOf64();
+        DAS_ASSERTF(size <= 0x7fffffff, "size too big %lu", (unsigned long)size);
+        return int(size <= 0x7fffffff ? size : 1);
+    }
+
+    uint64_t TypeDecl::getSizeOf64() const {
+        return getBaseSizeOf64() * getCountOf64();
+    }
+
+    uint64_t TypeDecl::getSizeOf64(bool & failed) const {
+        for ( const TypeDecl * t = this; t && t->baseType==Type::tFixedArray; t = t->firstType ) {
+            if ( t->fixedDim==TypeDecl::dimAuto || t->fixedDim==TypeDecl::dimConst ) {
+                failed = true;
+                return 0;
+            }
+        }
+        return getBaseSizeOf64(failed) * getCountOf64();
+    }
+
+    int TypeDecl::getStride() const {
+        uint64_t stride = getStride64();
+        DAS_ASSERTF(stride <= 0x7fffffff, "stride too big %lu", (unsigned long)stride);
+        return int(stride <= 0x7fffffff ? stride : 1);
+    }
+
+    uint64_t TypeDecl::getStride64() const {
+        if ( baseType==Type::tFixedArray ) {
+            // size of one outer-level element, same meaning the dim-vector form had
+            return firstType ? firstType->getSizeOf64() : 0;
+        }
+        return getBaseSizeOf64();
+    }
+
+    int TypeDecl::findArgumentIndex( const string & name ) const {
+        for (size_t index=0, indexs=argNames.size(); index!=indexs; ++index) {
+            if (argNames[index] == name) return int(index);
+        }
+        return -1;
+    }
+
+    string TypeDecl::findBitfieldName ( uint64_t val ) const {
+       if ( argNames.size() ) {
+            if ( val && (val & (val-1))==0 ) {  // if bit is set, and only one bit
+                int index = int(63 - das_clz64(val));
+                if ( index < int(argNames.size()) ) {
+                    return argNames[index];
+                }
+            }
+        }
+        return "";
+    }
+
+    bool isCircularType ( const TypeDeclPtr & type, vector<const TypeDecl *> & all ) {
+        if ( type->baseType==Type::tPointer ) {
+            return false;
+        }
+        // if ( type->firstType && isCircularType(type->firstType, all) ) return true;
+        // if ( type->secondType && isCircularType(type->secondType, all) ) return true;
+        auto pt = type;
+        for (auto it : all) {
+            if ( it == pt ) return true;
+        }
+        all.push_back(pt);
+        if ( type->baseType==Type::tStructure ) {
+            if ( type->structType ) {
+                for ( auto & fd : type->structType->fields ) {
+                    if ( isCircularType(fd.type, all) ) return true;
+                }
+            }
+        }  else if ( type->baseType==Type::tTuple || type->baseType==Type::tVariant || type->baseType == Type::option ) {
+            for ( auto & arg : type->argTypes ) {
+                if ( isCircularType(arg, all) ) return true;
+            }
+        } else if ( type->baseType==Type::tFixedArray ) {
+            // inline storage — no heap indirection to break the cycle, must descend
+            if ( type->firstType && isCircularType(type->firstType, all) ) return true;
+        }
+        all.pop_back();
+        return false;
+    }
+
+    bool isCircularType ( const TypeDeclPtr & type ) {
+        vector<const TypeDecl *> all;
+        return isCircularType(type, all);
+    }
+
+    void TypeDecl::addVariant(const string & name, const TypeDeclPtr & tt) {
+        DAS_ASSERT(find(argNames.begin(), argNames.end(), name) == argNames.end() && "duplicate variant");
+        argNames.push_back(name);
+        argTypes.push_back(tt);
+    }
+
+    string TypeDecl::getMangledName ( bool fullName ) const {
+        TextWriter ss;
+        getMangledName(ss, fullName);
+        return ss.str();
+    }
+
+    void TypeDecl::getMangledName ( TextWriter & ss, bool fullName ) const {
+        if ( constant )     ss << "C";
+        if ( ref )          ss << "&";
+        if ( temporary )    ss << "#";
+        if ( implicit )     ss << "I";
+        if ( explicitConst )ss << "=";
+        if ( explicitRef )  ss << "R";
+        if ( isExplicit )   ss << "X";
+        if ( aotAlias )     ss << "F";
+        if ( baseType==Type::tFixedArray ) {
+            // natural recursion: this node's [d] + alias, then the element directly (no 1<>
+            // wrapper) — unaliased chains stay byte-identical to the old dim-vector text
+            ss << "[" << fixedDim << "]";
+            if ( fullName ) {
+                if ( removeDim )        ss << "-[]";
+                if ( removeConstant )   ss << "-C";
+                if ( removeRef )        ss << "-&";
+                if ( removeTemporary )  ss << "-#";
+            }
+            if ( !alias.empty() ) {
+                ss << "Y<" << alias << ">";
+            }
+            if ( firstType ) {
+                firstType->getMangledName(ss, fullName);
+            }
+            return;
+        }
+        if ( fullName ) {
+            if ( removeDim )        ss << "-[]";
+            if ( removeConstant )   ss << "-C";
+            if ( removeRef )        ss << "-&";
+            if ( removeTemporary )  ss << "-#";
+        }
+        if ( !alias.empty() ) {
+            ss << "Y<" << alias << ">";
+        }
+        if ( argNames.size() ) {
+            ss << "N<";
+            bool first = true;
+            for ( auto & arg : argNames ) {
+                if ( first ) first = false; else ss << ";";
+                ss << arg;
+            }
+            ss << ">";
+        }
+        if ( argTypes.size() ) {
+            ss << "0<";
+            bool first = true;
+            for ( auto & arg : argTypes ) {
+                if ( first ) first = false; else ss << ";";
+                arg->getMangledName(ss, fullName);
+            }
+            ss << ">";
+        }
+        if ( firstType ) {
+            ss << "1<";
+            firstType->getMangledName(ss, fullName);
+            ss << ">";
+        }
+        if ( secondType ) {
+            ss << "2<";
+            secondType->getMangledName(ss, fullName);
+            ss << ">";
+        }
+        if ( baseType==Type::tHandle ) {
+            ss << "H<";
+            if ( !annotation->module->name.empty() ) {
+                ss << annotation->module->name << "::";
+             }
+             ss << annotation->name << ">";
+        } else if ( baseType==Type::tStructure ) {
+            ss << "S<";
+            if ( structType->module && !structType->module->name.empty() ) {
+                ss << structType->module->name << "::";
+            }
+            ss << structType->name << ">";
+        } else if ( baseType==Type::tEnumeration || baseType==Type::tEnumeration8 || baseType==Type::tEnumeration16 || baseType==Type::tEnumeration64 ) {
+            ss << "E";
+            if ( baseType==Type::tEnumeration8 ) ss << "8";
+            else if ( baseType==Type::tEnumeration16 ) ss << "16";
+            else if ( baseType==Type::tEnumeration64 ) ss << "64";
+            // EnumStub binding marker + signedness — distinguishes enum8u_to_int(EnumStub8u) from
+            // enum8_to_int(EnumStub8) at function-mangling time so both bindings coexist in the same module.
+            if ( enumStubBinding )    ss << "b";
+            if ( enumStubIsUnsigned ) ss << "u";
+            if ( enumType ) {
+                ss << "<" << enumType->getMangledName() << ">";
+            }
+        } else if ( baseType==Type::tPointer ) {
+            ss << "?";
+            if ( smartPtr ) {
+                ss << (smartPtrNative ? "W" : "M");
+            }
+        } else if ( baseType==Type::typeMacro ) {
+            TextWriter tw;
+            for ( size_t i=1; i<typeMacroExpr.size(); ++i ) {
+                if ( i!=1 ) tw << ",";
+                tw << *typeMacroExpr[i];
+            }
+            ss << "^<" << typeMacroName() << ";" << hash64z(tw.str().c_str()) << ">";
+        } else {
+            switch ( baseType ) {
+                case Type::anyArgument:     ss << "*"; break;
+                case Type::fakeContext:     ss << "_c"; break;
+                case Type::fakeLineInfo:    ss << "_l"; break;
+                case Type::autoinfer:       ss << "."; break;
+                case Type::option:          ss << "|"; break;
+                case Type::typeDecl:        ss << "D"; break;
+                case Type::alias:           ss << "L"; break;
+                case Type::tIterator:       ss << "G"; break;
+                case Type::tArray:          ss << "A"; break;
+                case Type::tTable:          ss << "T"; break;
+                case Type::tBlock:          ss << "$"; break;
+                case Type::tFunction:       ss << "@@"; break;
+                case Type::tLambda:         ss << "@"; break;
+                case Type::tTuple:          ss << "U"; break;
+                case Type::tVariant:        ss << "V"; break;
+                case Type::tBitfield:       ss << "t"; break;
+                case Type::tBitfield8:      ss << "t8"; break;
+                case Type::tBitfield16:     ss << "t16"; break;
+                case Type::tBitfield64:     ss << "t64"; break;
+                case Type::tInt:            ss << "i"; break;
+                case Type::tInt2:           ss << "i2"; break;
+                case Type::tInt3:           ss << "i3"; break;
+                case Type::tInt4:           ss << "i4"; break;
+                case Type::tInt8:           ss << "i8"; break;
+                case Type::tInt16:          ss << "i16"; break;
+                case Type::tInt64:          ss << "i64"; break;
+                case Type::tUInt:           ss << "u"; break;
+                case Type::tUInt2:          ss << "u2"; break;
+                case Type::tUInt3:          ss << "u3"; break;
+                case Type::tUInt4:          ss << "u4"; break;
+                case Type::tUInt8:          ss << "u8"; break;
+                case Type::tUInt16:         ss << "u16"; break;
+                case Type::tUInt64:         ss << "u64"; break;
+                case Type::tFloat:          ss << "f"; break;
+                case Type::tFloat2:         ss << "f2"; break;
+                case Type::tFloat3:         ss << "f3"; break;
+                case Type::tFloat4:         ss << "f4"; break;
+                case Type::tRange:          ss << "r"; break;
+                case Type::tURange:         ss << "z"; break;
+                case Type::tRange64:        ss << "r64"; break;
+                case Type::tURange64:       ss << "z64"; break;
+                case Type::tDouble:         ss << "d"; break;
+                case Type::tString:         ss << "s"; break;
+                case Type::tVoid:           ss << "v"; break;
+                case Type::tBool:           ss << "b"; break;
+                case Type::none:
+                    if ( isTag ) {
+                        ss << "``TAG``";
+                    } else {
+                        LOG(LogLevel::error) << "unexpected type none in mangled name\n";
+                        DAS_ASSERT(0 && "we should not be here");
+                    }
+                    break;
+                default:
+                    LOG(LogLevel::error) << das_to_string(baseType) << "\n";
+                    DAS_ASSERT(0 && "we should not be here");
+                    break;
+            }
+        }
+    }
+
+    void append ( TypeAliasMap & aliases, const TypeDeclPtr & td, bool viaPointer ) {
+        auto mname = td->getMangledName();
+        auto & aMain = aliases[mname];
+        aMain.first = td;
+        aMain.second |= viaPointer;
+        if ( td->isBaseVectorType() ) {
+            auto bt = new TypeDecl(td->getVectorBaseType());
+            auto & aSub = aliases[bt->getMangledName()];
+            aSub.first = bt;
+            aSub.second |= viaPointer;
+        }
+    }
+
+    void TypeDecl::collectAliasing ( TypeAliasMap & aliases, das_set<Structure *> & dep, bool viaPointer ) const {
+        append(aliases, (TypeDecl *) this, viaPointer);
+        if ( temporary ) return;    // temporary types never alias
+        if ( baseType==Type::tArray || baseType==Type::tFixedArray ) {
+            // for tFixedArray this is slightly more conservative than the old dim-vector
+            // form (the recursion also appends the bare element); conservative == safe
+            if ( firstType  ) {
+                firstType->collectAliasing(aliases, dep, viaPointer);
+            }
+        } else if ( baseType==Type::tTable ) {
+            if ( secondType ) {
+                secondType->collectAliasing(aliases, dep, viaPointer);
+            }
+        } else if ( baseType==Type::tStructure ) {
+            if ( structType ) {
+                if (dep.find(structType) != dep.end()) return;
+                dep.insert(structType);
+                for ( auto & fld : structType->fields ) {
+                    fld.type->collectAliasing(aliases, dep, viaPointer);
+                }
+            }
+        } else if ( baseType==Type::tTuple || baseType==Type::tVariant ) {
+            for ( auto & argT : argTypes ) {
+                argT->collectAliasing(aliases, dep, viaPointer);
+            }
+        } else if ( baseType==Type::tPointer ) {
+            if ( firstType ) {
+                firstType->collectAliasing(aliases, dep, true);
+            }
+        }
+    }
+
+    void TypeDecl::collectContainerAliasing ( TypeAliasMap & aliases, das_set<Structure *> & dep, bool viaPointer ) const {
+        if ( constant ) return;
+        if ( baseType==Type::tFixedArray ) {
+            // dispatch as the element would — dims were transparent qualifiers before the
+            // rework, so no element append here (parity with the dim-vector behavior)
+            if ( firstType && !firstType->constant ) {
+                firstType->collectContainerAliasing(aliases, dep, viaPointer);
+            }
+        } else if ( baseType==Type::tArray ) {
+            if ( firstType && !firstType->constant ) {
+                append(aliases, firstType, viaPointer);
+                firstType->collectContainerAliasing(aliases, dep, viaPointer);
+            }
+        } else if ( baseType==Type::tTable ) {
+            if ( secondType && !secondType->constant ) {
+                append(aliases, secondType, viaPointer);
+                secondType->collectContainerAliasing(aliases, dep, viaPointer);
+            }
+        } else if ( baseType==Type::tStructure ) {
+            if ( structType ) {
+                if (dep.find(structType) != dep.end()) return;
+                dep.insert(structType);
+                for ( auto & fld : structType->fields ) {
+                    if ( !fld.type->constant ) {
+                        fld.type->collectContainerAliasing(aliases, dep, viaPointer);
+                    }
+                }
+            }
+        } else if ( baseType==Type::tTuple || baseType==Type::tVariant ) {
+            for ( auto & argT : argTypes ) {
+                argT->collectContainerAliasing(aliases, dep, viaPointer);
+            }
+        } else if ( baseType==Type::tPointer ) {
+            if ( firstType ) {
+                firstType->collectContainerAliasing(aliases, dep, viaPointer);
+            }
+        }
+    }
+
+    int TypeDecl::tupleFieldIndex( const string & name ) const {
+        int index = 0;
+        if ( sscanf(name.c_str(),"_%d",&index)==1 ) {
+            return index;
+        } else {
+            auto vT = isPointer() ? firstType : this;
+            if (!vT) return -1;
+            if ( name=="_first" ) {
+                return 0;
+            } else if ( name=="_last" ) {
+                return int(vT->argTypes.size())-1;
+            } else {
+                return vT->findArgumentIndex(name);
+            }
+            return -1;
+        }
+    }
+
+    int TypeDecl::variantFieldIndex ( const string & name ) const {
+        auto vT = isPointer() ? firstType : this;
+        if (!vT) return -1;
+        return vT->findArgumentIndex(name);
+    }
+
+    uint64_t TypeDecl::getMangledNameHash() const { return hash_blockz64((uint8_t *)getMangledName().c_str()); }
+
+    // Name dumper
+
+    Enum<Type> g_cppCTypeTable = {
+        {   Type::autoinfer,    "autoinfer"  },
+        {   Type::alias,        "alias"  },
+        {   Type::anyArgument,  "anyArgument"  },
+        {   Type::tVoid,        "tVoid"  },
+        {   Type::tStructure,   "tStructure" },
+        {   Type::tPointer,     "tPointer" },
+        {   Type::tBool,        "tBool"  },
+        {   Type::tInt8,        "tInt8"  },
+        {   Type::tUInt8,       "tUInt8"  },
+        {   Type::tInt16,       "tInt16"  },
+        {   Type::tUInt16,      "tUInt16"  },
+        {   Type::tInt64,       "tInt64"  },
+        {   Type::tUInt64,      "tUInt64"  },
+        {   Type::tString,      "tString" },
+        {   Type::tPointer,     "tPointer" },
+        {   Type::tEnumeration,   "tEnumeration" },
+        {   Type::tEnumeration8,  "tEnumeration8" },
+        {   Type::tEnumeration16, "tEnumeration16" },
+        {   Type::tEnumeration64, "tEnumeration64" },
+        {   Type::tBitfield,    "tBitfield" },
+        {   Type::tBitfield8,    "tBitfield8" },
+        {   Type::tBitfield16,    "tBitfield16" },
+        {   Type::tBitfield64,    "tBitfield64" },
+        {   Type::tIterator,    "tIterator" },
+        {   Type::tArray,       "tArray" },
+        {   Type::tTable,       "tTable" },
+        {   Type::tInt,         "tInt"   },
+        {   Type::tInt2,        "tInt2"  },
+        {   Type::tInt3,        "tInt3"  },
+        {   Type::tInt4,        "tInt4"  },
+        {   Type::tUInt,        "tUInt"  },
+        {   Type::tUInt2,       "tUInt2" },
+        {   Type::tUInt3,       "tUInt3" },
+        {   Type::tUInt4,       "tUInt4" },
+        {   Type::tFloat,       "tFloat" },
+        {   Type::tFloat2,      "tFloat2"},
+        {   Type::tFloat3,      "tFloat3"},
+        {   Type::tFloat4,      "tFloat4"},
+        {   Type::tDouble,      "tDouble" },
+        {   Type::tRange,       "tRange" },
+        {   Type::tURange,      "tURange"},
+        {   Type::tRange64,     "tRange64" },
+        {   Type::tURange64,    "tURange64"},
+        {   Type::tBlock,       "tBlock"},
+        {   Type::tFunction,    "tFunction"},
+        {   Type::tLambda,      "tLambda"},
+        {   Type::tTuple,       "tTuple"},
+        {   Type::tVariant,     "tVariant"},
+        {   Type::tFixedArray,  "tFixedArray"},
+        {   Type::tHandle,      "tHandle"}
+    };
+
+    Enum<Type> g_cppTypeTable = {
+        {   Type::anyArgument,  "vec4f"    },
+        {   Type::tVoid,        "void"     },
+        {   Type::tBool,        "bool"     },
+        {   Type::tInt8,        "int8_t"   },
+        {   Type::tUInt8,       "uint8_t"  },
+        {   Type::tInt16,       "int16_t"  },
+        {   Type::tUInt16,      "uint16_t" },
+        {   Type::tInt64,       "int64_t"  },
+        {   Type::tUInt64,      "uint64_t" },
+        {   Type::tBitfield,    "Bitfield" },
+        {   Type::tBitfield8,   "Bitfield8" },
+        {   Type::tBitfield16,  "Bitfield16" },
+        {   Type::tBitfield64,  "Bitfield64" },
+        {   Type::tString,      "char *"   },
+        {   Type::tInt,         "int32_t"  },
+        {   Type::tInt2,        "int2"     },
+        {   Type::tInt3,        "int3"     },
+        {   Type::tInt4,        "int4"     },
+        {   Type::tUInt,        "uint32_t" },
+        {   Type::tUInt2,       "uint2"    },
+        {   Type::tUInt3,       "uint3"    },
+        {   Type::tUInt4,       "uint4"    },
+        {   Type::tFloat,       "float"    },
+        {   Type::tFloat2,      "float2"   },
+        {   Type::tFloat3,      "float3"   },
+        {   Type::tFloat4,      "float4"   },
+        {   Type::tDouble,      "double"   },
+        {   Type::tRange,       "range"    },
+        {   Type::tURange,      "urange"   },
+        {   Type::tRange64,     "range64"  },
+        {   Type::tURange64,    "urange64" },
+        {   Type::tBlock,       "Block"    },
+        {   Type::tFunction,    "Func"     },
+        {   Type::tLambda,      "Lambda"   },
+        {   Type::tTuple,       "Tuple"    },
+        {   Type::tVariant,     "Variant"  }
+    };
+
+    string aotModuleName ( Module * pm  ) {
+        if ( pm->name.empty() ) {
+            return "";
+        } else if ( pm->name=="$" ) {
+            return "_builtin_";
+        } else {
+            return pm->name;
+        }
+    }
+
+    string das_to_cppString ( Type t ) {
+        return g_cppTypeTable.find(t);
+    }
+
+    string das_to_cppCTypeString ( Type t ) {
+        return g_cppCTypeTable.find(t);
+    }
+
+    bool isConstRedundantForCpp ( const TypeDecl * type ) {
+        if ( type->baseType==Type::tFixedArray ) return false;
+        if ( type->isVectorType() ) return true;
+        switch ( type->baseType ) {
+            case Type::tBool:
+            case Type::tInt8:
+            case Type::tUInt8:
+            case Type::tInt16:
+            case Type::tUInt16:
+            case Type::tInt64:
+            case Type::tUInt64:
+            case Type::tInt:
+            case Type::tUInt:
+            case Type::tFloat:
+            case Type::tDouble:
+            case Type::tEnumeration:
+            case Type::tEnumeration8:
+            case Type::tEnumeration16:
+            case Type::tEnumeration64:
+            case Type::tBitfield:
+            case Type::tBitfield8:
+            case Type::tBitfield16:
+            case Type::tBitfield64:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    static char hex_char ( int Ch ) {
+        Ch &= 0x0f;
+        if ( Ch<=9 ) return (char)('0'+Ch);
+        else return (char)('a'+(Ch-10));
+    }
+
+    DAS_API string aotSuffixNameEx ( const string & funcName, const char * suffix ) {
+        string name;
+        bool prefix = false;
+        for ( char ch : funcName ) {
+            if ( isalnum(ch) || ch=='_' ) {
+                name += ch;
+            } else {
+                prefix = true;
+                switch ( ch ) {
+                    case '=':   name += "Equ"; break;
+                    case '+':   name += "Add"; break;
+                    case '-':   name += "Sub"; break;
+                    case '*':   name += "Mul"; break;
+                    case '/':   name += "Div"; break;
+                    case '%':   name += "Mod"; break;
+                    case '&':   name += "And"; break;
+                    case '|':   name += "Or"; break;
+                    case '^':   name += "Xor"; break;
+                    case '?':   name += "Qmark"; break;
+                    case '~':   name += "Tilda"; break;
+                    case '!':   name += "Excl"; break;
+                    case '>':   name += "Greater"; break;
+                    case '<':   name += "Less"; break;
+                    case '[':   name += "Sqbl"; break;
+                    case ']':   name += "Sqbr"; break;
+                    case '.':   name += "Dot"; break;
+                    case '`':   name += "Tick"; break;
+                    case ',':   name += "Comma"; break;
+                    default:
+                        name += "_0x";
+                        name += hex_char(ch>>4);
+                        name += hex_char(ch & 0x0f);
+                        name += "_";
+                        break;
+                }
+            }
+        }
+        return prefix ? (suffix + name) : name;
+    }
+
+    static string aotStructName ( Structure * st ) {
+        return aotSuffixNameEx(st->name,"");
+    }
+
+    static string describeCppTypeEx ( const TypeDecl * type,
+                            CpptSubstitureRef substituteRef,
+                            CpptSkipRef skipRef,
+                            CpptSkipConst skipConst,
+                            CpptRedundantConst redundantConst,
+                            ChooseSmartPtr chooseSmartPtr) {
+
+        TextWriter stream;
+        auto baseType = type->baseType;
+        if ( isConstRedundantForCpp(type) && redundantConst==CpptRedundantConst::yes ) {
+            if (substituteRef == CpptSubstitureRef::yes && type->ref) {
+                // can't skip const
+            } else if ( type->ref ) {
+                // can't skip const
+            } else {
+                skipConst = CpptSkipConst::yes;
+            }
+        }
+        if ( baseType==Type::alias ) {
+            stream << "DAS_COMMENT(alias)";
+        } else if ( baseType==Type::autoinfer ) {
+            stream << "DAS_COMMENT(auto";
+            if ( !type->alias.empty() ) {
+                stream << "(" << type->alias << ")";
+            }
+            stream << ")";
+        } else if ( baseType==Type::tHandle ) {
+            if ( type->annotation->cppName.empty() ) {
+                stream << type->annotation->name;
+            } else {
+                stream << type->annotation->cppName;
+            }
+        } else if ( baseType==Type::tArray ) {
+            if ( type->firstType ) {
+                stream << "TArray<" << describeCppTypeEx(type->firstType,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::no,CpptRedundantConst::yes, chooseSmartPtr) << ">";
+            } else {
+                stream << "Array";
+            }
+        } else if ( baseType==Type::tFixedArray ) {
+            // natural recursion reproduces the old TDim<TDim<elem,4>,3> nesting exactly
+            if ( type->firstType ) {
+                stream << "TDim<" << describeCppTypeEx(type->firstType,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::no,CpptRedundantConst::yes, chooseSmartPtr)
+                    << "," << type->fixedDim << ">";
+            } else {
+                stream << "TDim";
+            }
+        } else if ( baseType==Type::tTable ) {
+            if ( type->firstType && type->secondType ) {
+                stream << "TTable<" << describeCppTypeEx(type->firstType,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::yes,CpptRedundantConst::yes, chooseSmartPtr)
+                << "," << describeCppTypeEx(type->secondType,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::no,CpptRedundantConst::yes, chooseSmartPtr) << ">";
+            } else {
+                stream << "Table";
+            }
+        } else if ( baseType==Type::tTuple ) {
+            stream << "TTuple<" << int(type->getTupleSize());
+            for ( const auto & arg : type->argTypes ) {
+                stream << ",";
+                stream << describeCppTypeEx(arg,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::no,CpptRedundantConst::yes, chooseSmartPtr);
+            }
+            stream << ">";
+        } else if ( baseType==Type::tVariant ) {
+            stream << "TVariant<" << int(type->getVariantSize()) << "," << int(type->getVariantAlign());
+            for ( const auto & arg : type->argTypes ) {
+                stream << ",";
+                stream << describeCppTypeEx(arg,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::no,CpptRedundantConst::yes, chooseSmartPtr);
+            }
+            stream << ">";
+        } else if ( baseType==Type::tStructure ) {
+            if ( type->structType ) {
+                if ( type->structType->module->name.empty() ) {
+                    stream << aotStructName(type->structType);
+                } else {
+                    stream << aotModuleName(type->structType->module) << "::" << aotStructName(type->structType);
+                }
+            } else {
+                stream << "DAS_COMMENT(unspecified structure) ";
+            }
+        } else if ( baseType==Type::tPointer ) {
+            if ( !type->smartPtr ) {
+                if ( type->firstType ) {
+                    stream << describeCppTypeEx(type->firstType,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::no,CpptRedundantConst::no, chooseSmartPtr) << " *";
+                } else {
+                    stream << "void *";
+                }
+            } else {
+                if ( type->firstType ) {
+                    stream  << (type->smartPtrNative && chooseSmartPtr == ChooseSmartPtr::yes ? "smart_ptr<" : "smart_ptr_raw<")
+                            <<  describeCppTypeEx(type->firstType,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::no,CpptRedundantConst::no, chooseSmartPtr)
+                            << ">";
+                } else {
+                    stream  << (type->smartPtrNative && chooseSmartPtr == ChooseSmartPtr::yes ? "smart_ptr<" : "smart_ptr_raw<") << "void>";
+                }
+            }
+        } else if ( type->isEnumT() ) {
+            if ( type->enumType ) {
+                if ( type->enumType->external ) {
+                    stream << "DAS_COMMENT(bound_enum) " << type->enumType->cppName;
+                } else if ( type->enumType->module->name.empty() ) {
+                    stream << "DAS_COMMENT(enum) " << type->enumType->name;
+                } else {
+                    stream << "DAS_COMMENT(enum) " << aotModuleName(type->enumType->module) << "::" << type->enumType->name;
+                }
+            } else {
+                stream << "DAS_COMMENT(unspecified enumeration)";
+            }
+        } else if ( baseType==Type::tIterator ) {
+            if ( type->firstType ) {
+                stream << "Sequence DAS_COMMENT((" << describeCppTypeEx(type->firstType,substituteRef,skipRef,skipConst,CpptRedundantConst::yes, chooseSmartPtr) << "))";
+            } else {
+                stream << "Sequence";
+            }
+        } else if ( baseType==Type::tBlock || baseType==Type::tFunction || baseType==Type::tLambda ) {
+            if ( !type->constant && type->baseType==Type::tBlock ) {
+                stream << "const ";
+            }
+            stream << das_to_cppString(baseType) << " DAS_COMMENT((";
+            if ( type->firstType ) {
+                stream << describeCppTypeEx(type->firstType,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::no,CpptRedundantConst::yes, chooseSmartPtr);
+            } else {
+                stream << "void";
+            }
+            if ( type->argTypes.size() ) {
+                for ( const auto & arg : type->argTypes ) {
+                    stream << "," << describeCppTypeEx(arg,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::no,CpptRedundantConst::yes, chooseSmartPtr);
+                }
+            }
+            stream << "))";
+        } else {
+            stream << das_to_cppString(baseType);
+        }
+        if ( skipConst==CpptSkipConst::no ) {
+            if ( type->constant ) {
+                stream << " const ";
+            }
+        }
+        if ( type->ref && skipRef==CpptSkipRef::no ) {
+            if ( substituteRef==CpptSubstitureRef::no ) {
+                stream << " &";
+            } else {
+                stream << " *";
+            }
+        }
+        return stream.str();
+    }
+
+    string describeCppType ( const TypeDecl * type,
+                            CpptSubstitureRef substituteRef,
+                            CpptSkipRef skipRef,
+                            CpptSkipConst skipConst,
+                            CpptRedundantConst redundantConst, ChooseSmartPtr chooseSmartPtr ) {
+        return describeCppTypeEx(type, substituteRef, skipRef, skipConst, redundantConst, chooseSmartPtr);
+    }
+
+    // Mangled name parser
+
+    void MangledNameParser::error ( const string &, const char * ) {
+        DAS_VERIFY(0 && "invalid mangled name");
+    }
+
+    string MangledNameParser::parseAnyName ( const char * & ch, bool allowModule ) {
+        string name;
+        while ( isalnum(*ch) || *ch=='_' || *ch=='`' || (*ch==':' && allowModule) || (*ch=='$' && allowModule) ) {
+            char che[2] = { *ch, 0 };
+            name.append(che);
+            ch ++;
+        }
+        return name;
+    }
+
+    string MangledNameParser::parseAnyNameInBrackets ( const char * & ch, bool allowModule ) {
+        if ( *ch!='<' ) error("expecting '<'", ch);
+        ch ++;
+        auto name = parseAnyName(ch, allowModule);
+        if ( *ch!='>' ) error("expecting '>'", ch);
+        ch ++;
+        return name;
+    }
+
+    TypeDeclPtr MangledNameParser::parseTypeFromMangledName ( const char * & ch, const ModuleLibrary & library, Module * thisModule ) {
+        switch ( *ch ) {
+            case '[': {
+                ch ++;
+                string numT = "";
+                bool neg = false;
+                if ( *ch=='-' ) {
+                    ch ++;
+                    neg = true;
+                }
+                while ( isdigit(*ch) ) {
+                    numT += *ch;
+                    ch ++;
+                }
+                if ( *ch!=']' ) error("expecting ']", ch);
+                ch ++;
+                int di = atoi(numT.c_str());
+                if ( neg ) di = -di;
+                auto pt = new TypeDecl(Type::tFixedArray);
+                pt->fixedDim = di;
+                // fullName remove-suffixes emitted right after this node's [d] land back on it
+                for ( ;; ) {
+                    if ( ch[0]=='-' && ch[1]=='[' && ch[2]==']' )   { ch += 3; pt->removeDim = true; }
+                    else if ( ch[0]=='-' && ch[1]=='C' )            { ch += 2; pt->removeConstant = true; }
+                    else if ( ch[0]=='-' && ch[1]=='&' )            { ch += 2; pt->removeRef = true; }
+                    else if ( ch[0]=='-' && ch[1]=='#' )            { ch += 2; pt->removeTemporary = true; }
+                    else break;
+                }
+                // Y<name> immediately following [d] labels THIS node - the standalone case 'Y'
+                // would label one level too deep ([4]Y<M4>[4]f labels the two-dim node)
+                if ( *ch=='Y' ) {
+                    ch ++;
+                    pt->alias = parseAnyNameInBrackets(ch,false);
+                }
+                pt->firstType = parseTypeFromMangledName(ch,library,thisModule);
+                return pt;
+            }
+            case '1': {
+                ch ++;
+                if ( *ch!='<' ) error("expecting '<'", ch);
+                ch ++;
+                auto ft = parseTypeFromMangledName(ch,library,thisModule);
+                if ( *ch!='>' ) error("expecting '>'", ch);
+                ch ++;
+                auto pt = parseTypeFromMangledName(ch,library,thisModule);
+                pt->firstType = das::move(ft);
+                return pt;
+            };
+            case '2': {
+                ch ++;
+                if ( *ch!='<' ) error("expecting '<'", ch);
+                ch ++;
+                auto ft = parseTypeFromMangledName(ch,library,thisModule);
+                if ( *ch!='>' ) error("expecting '>'", ch);
+                ch ++;
+                auto pt = parseTypeFromMangledName(ch,library,thisModule);
+                pt->secondType = das::move(ft);
+                return pt;
+            };
+            case 'H': {
+                ch ++;
+                auto pt = new TypeDecl(Type::tHandle);
+                auto annName = parseAnyNameInBrackets(ch,true);
+                auto ann = library.findAnnotation(annName,thisModule);
+                if ( thisModule && ann.size()==0 ) {
+                    if ( auto tann = thisModule->findAnnotation(annName) ) {
+                        ann.push_back(tann);
+                    }
+                }
+                if ( ann.size()==0 ) {
+                    // Fallback: resolve module-qualified names globally (e.g. "rtti_core::TypeInfo")
+                    string modName, shortName;
+                    splitTypeName(annName, modName, shortName);
+                    if ( !modName.empty() ) {
+                        if ( auto mod = Module::require(modName) ) {
+                            if ( auto tann = mod->findAnnotation(shortName) ) {
+                                ann.push_back(tann);
+                            }
+                        }
+                    }
+                }
+                if ( ann.size()!=1 ) error("unresolved annotation '" + annName + "'", ch);
+                pt->annotation = (TypeAnnotation *) ann.back();
+                if ( !pt->annotation->rtti_isHandledTypeAnnotation() ) error("'" + annName + "' is not a handled type", ch);
+                return pt;
+            };
+            case 'S': {
+                ch ++;
+                auto sname = parseAnyNameInBrackets(ch,true);
+                auto pt = new TypeDecl(Type::tStructure);
+                auto stt = library.findStructure(sname, thisModule);
+                if ( thisModule && stt.size()==0 ) {
+                    if ( auto tstt = thisModule->findStructure(sname) ) {
+                        stt.push_back(tstt);
+                    }
+                }
+                if ( stt.size()==1 ) error("unknown structure '" + sname + "'", ch);
+                pt->structType = stt.back();
+                return pt;
+            }
+            case '0': {
+                ch ++;
+                vector<TypeDeclPtr> types;
+                while ( *ch!=0 && *ch!='>' ) {
+                    ch ++;
+                    auto tt = parseTypeFromMangledName(ch,library,thisModule);
+                    types.push_back(tt);
+                    if (*ch!=';' && *ch!='>') error("expecting ';' or '>'", ch);
+                }
+                if ( *ch!='>' ) error("expecting '>'", ch);
+                ch++;
+                auto pt = parseTypeFromMangledName(ch,library,thisModule);
+                pt->argTypes = das::move(types);
+                return pt;
+            };
+            case 'N': {
+                ch ++;
+                vector<string> names;
+                while ( *ch!=0 && *ch!='>' ) {
+                    ch ++;
+                    auto name = parseAnyName(ch, false);
+                    names.push_back(name);
+                }
+                if ( *ch!='>' ) error("expecting '>'", ch);
+                ch++;
+                auto pt = parseTypeFromMangledName(ch,library,thisModule);
+                pt->argNames = das::move(names);
+                return pt;
+            };
+            case 'E': {
+                ch ++;
+                TypeDeclPtr pt = nullptr;
+                if ( *ch=='8' ) {
+                    ch ++;
+                    pt = new TypeDecl(Type::tEnumeration8);
+                } else if ( ch[0]=='1' && ch[1]=='6' ) {
+                    ch += 2;
+                    pt = new TypeDecl(Type::tEnumeration16);
+                } else if ( ch[0]=='6' && ch[1]=='4' ) {
+                    ch += 2;
+                    pt = new TypeDecl(Type::tEnumeration64);
+                } else {
+                    pt = new TypeDecl(Type::tEnumeration);
+                }
+                if ( *ch=='<' ) {
+                    auto sname = parseAnyNameInBrackets(ch,true);
+                    auto stt = library.findEnum(sname, thisModule);
+                    if ( thisModule && stt.size()==0 ) {
+                        if ( auto tstt = thisModule->findEnum(sname) ) {
+                            stt.push_back(tstt);
+                        }
+                    }
+                    if ( stt.size()!=1 ) error("unresolved enumeration '" + sname + "'", ch);
+                    pt->enumType = stt.back();
+                }
+                return pt;
+            }
+            case 'Y': {
+                ch ++;
+                auto aname = parseAnyNameInBrackets(ch,false);
+                auto pt = parseTypeFromMangledName(ch,library,thisModule);
+                pt->alias = aname;
+                return pt;
+            };
+            case '_': {
+                        if ( ch[1]=='c' )                   { ch+=2; return new TypeDecl(Type::fakeContext); }
+                else    if ( ch[1]=='l' )                   { ch+=2; return new TypeDecl(Type::fakeLineInfo); }
+                else                                        { error("unsupported mangled name format - expecting fake...", ch); return new TypeDecl(); }
+            }
+            case 'i': {
+                        if ( ch[1]=='2' )                   { ch+=2; return new TypeDecl(Type::tInt2); }
+                else    if ( ch[1]=='3' )                   { ch+=2; return new TypeDecl(Type::tInt3); }
+                else    if ( ch[1]=='4' )                   { ch+=2; return new TypeDecl(Type::tInt4); }
+                else    if ( ch[1]=='8' )                   { ch+=2; return new TypeDecl(Type::tInt8); }
+                else    if ( ch[1]=='1' && ch[2]=='6' )     { ch+=3; return new TypeDecl(Type::tInt16); }
+                else    if ( ch[1]=='6' && ch[2]=='4' )     { ch+=3; return new TypeDecl(Type::tInt64); }
+                else                                        { ch+=1; return new TypeDecl(Type::tInt); }
+            }
+            case 'u': {
+                        if ( ch[1]=='2' )                   { ch+=2; return new TypeDecl(Type::tUInt2); }
+                else    if ( ch[1]=='3' )                   { ch+=2; return new TypeDecl(Type::tUInt3); }
+                else    if ( ch[1]=='4' )                   { ch+=2; return new TypeDecl(Type::tUInt4); }
+                else    if ( ch[1]=='8' )                   { ch+=2; return new TypeDecl(Type::tUInt8); }
+                else    if ( ch[1]=='1' && ch[2]=='6' )     { ch+=3; return new TypeDecl(Type::tUInt16); }
+                else    if ( ch[1]=='6' && ch[2]=='4' )     { ch+=3; return new TypeDecl(Type::tUInt64); }
+                else                                        { ch+=1; return new TypeDecl(Type::tUInt); }
+            }
+            case 'f': {
+                        if ( ch[1]=='2' )                   { ch+=2; return new TypeDecl(Type::tFloat2); }
+                else    if ( ch[1]=='3' )                   { ch+=2; return new TypeDecl(Type::tFloat3); }
+                else    if ( ch[1]=='4' )                   { ch+=2; return new TypeDecl(Type::tFloat4); }
+                else                                        { ch+=1; return new TypeDecl(Type::tFloat); }
+            case '.':   ch++; return new TypeDecl(Type::autoinfer);
+            case '|':   ch++; return new TypeDecl(Type::option);
+            case 'D':   ch++; return new TypeDecl(Type::typeDecl);
+            case '^':   ch++; return new TypeDecl(Type::typeMacro);
+            case '*':   ch++; return new TypeDecl(Type::anyArgument);
+            case 'L':   ch++; return new TypeDecl(Type::alias);
+            case 'A':   ch++; return new TypeDecl(Type::tArray);
+            case 'T':   ch++; return new TypeDecl(Type::tTable);
+            case 'G':   ch++; return new TypeDecl(Type::tIterator);
+            case '$':   ch++; return new TypeDecl(Type::tBlock);
+            case 'U':   ch++; return new TypeDecl(Type::tTuple);
+            case 'V':   ch++; return new TypeDecl(Type::tVariant);
+            case 't':   {
+                        if ( ch[1]=='8' )                   { ch+=2; return new TypeDecl(Type::tBitfield8); }
+                else    if ( ch[1]=='1' && ch[2]=='6' )     { ch+=3; return new TypeDecl(Type::tBitfield16); }
+                else    if ( ch[1]=='6' && ch[2]=='4' )     { ch+=3; return new TypeDecl(Type::tBitfield64); }
+                else                                        { ch++; return new TypeDecl(Type::tBitfield); }
+            }
+            case 'r':   {
+                        if ( ch[1]=='6' && ch[2]=='4' )     { ch+=3; return new TypeDecl(Type::tRange64); }
+                else                                        { ch+=1; return new TypeDecl(Type::tRange); }
+            }
+            case 'z':   {
+                        if ( ch[1]=='6' && ch[2]=='4' )     { ch+=3; return new TypeDecl(Type::tURange64); }
+                else                                        { ch+=1; return new TypeDecl(Type::tURange); }
+            }
+            case 'd':   ch++; return new TypeDecl(Type::tDouble);
+            case 's':   ch++; return new TypeDecl(Type::tString);
+            case 'v':   ch++; return new TypeDecl(Type::tVoid);
+            case 'b':   ch++; return new TypeDecl(Type::tBool);
+            case '?':   {
+                ch++;
+                auto pt = new TypeDecl(Type::tPointer);
+                if ( *ch=='M' ) {
+                    pt->smartPtr = true;
+                    pt->smartPtrNative = false;
+                    ch ++;
+                } else if ( *ch=='W' ) {
+                    pt->smartPtr = true;
+                    pt->smartPtrNative = true;
+                    ch ++;
+                }
+                return pt;
+            };
+            case '@':   {
+                if ( ch[1]=='@' ) {
+                    ch+=2;
+                    return new TypeDecl(Type::tFunction);
+                } else {
+                    ch++;
+                    return new TypeDecl(Type::tLambda);
+                }
+            };
+            case '&': {
+                ch ++;
+                auto pt = parseTypeFromMangledName(ch,library,thisModule);
+                pt->ref = true;
+                return pt;
+            };
+            case '#': {
+                ch ++;
+                auto pt = parseTypeFromMangledName(ch,library,thisModule);
+                pt->temporary = true;
+                return pt;
+            };
+            case 'C': {
+                ch ++;
+                auto pt = parseTypeFromMangledName(ch,library,thisModule);
+                pt->constant = true;
+                return pt;
+            };
+            case '-': {
+                switch ( ch[1] ) {
+                case '&': {
+                    ch += 2;
+                    auto pt = parseTypeFromMangledName(ch,library,thisModule);
+                    pt->ref = false;
+                    pt->removeRef = true;
+                    return pt;
+                }
+                case '#': {
+                    ch += 2;
+                    auto pt = parseTypeFromMangledName(ch,library,thisModule);
+                    pt->temporary = false;
+                    pt->removeTemporary = true;
+                    return pt;
+                }
+                case 'C': {
+                    ch += 2;
+                    auto pt = parseTypeFromMangledName(ch,library,thisModule);
+                    pt->constant = false;
+                    pt->removeConstant = true;
+                    return pt;
+                }
+                case '[': {
+                    if ( ch[2]!=']' ) error("expecting '-[]'", ch);
+                    ch += 3;
+                    auto pt = parseTypeFromMangledName(ch,library,thisModule);
+                    pt->removeDim = true;
+                    return pt;
+                }
+                }
+                error("unsupported mangled name format - expecting remove trait", ch);
+                return new TypeDecl();
+            };
+            case 'I': {
+                ch ++;
+                auto pt = parseTypeFromMangledName(ch,library,thisModule);
+                pt->implicit = true;
+                return pt;
+            };
+            case 'X': {
+                ch ++;
+                auto pt = parseTypeFromMangledName(ch,library,thisModule);
+                pt->isExplicit = true;
+                return pt;
+            };
+            case '=': {
+                ch ++;
+                auto pt = parseTypeFromMangledName(ch,library,thisModule);
+                pt->explicitConst = true;
+                return pt;
+            };
+            case 'R': {
+                ch ++;
+                auto pt = parseTypeFromMangledName(ch,library,thisModule);
+                pt->explicitRef = true;
+                return pt;
+            };
+            case 'F': {
+                ch ++;
+                auto pt = parseTypeFromMangledName(ch,library,thisModule);
+                pt->aotAlias = true;
+                return pt;
+            };
+            }
+        }
+        error("unsupported mangled name format symbol", ch);
+        return new TypeDecl();
+    }
+
+    TypeDeclPtr parseTypeFromMangledName ( const char * & ch, const ModuleLibrary & library, Module * thisModule ) {
+        MangledNameParser parser;
+        return parser.parseTypeFromMangledName(ch, library, thisModule);
+    }
+
+    bool hasImplicit ( const TypeDeclPtr & type ) {
+        if ( type->implicit ) return true;
+        if ( type->firstType && hasImplicit(type->firstType) ) return true;
+        if ( type->secondType && hasImplicit(type->secondType) ) return true;
+        for ( auto & argT : type->argTypes ) {
+            if ( hasImplicit(argT) ) return true;
+        }
+        return false;
+    }
+
+    bool isMatchingArgumentType ( const TypeDeclPtr & argType, const TypeDeclPtr & passType ) {
+        if (!passType) {
+            return false;
+        }
+        if ( argType->explicitConst && (argType->constant != passType->constant) ) {    // explicit const mast match
+            return false;
+        }
+        if ( argType->explicitRef && (argType->ref != passType->ref) ) {                // explicit ref match
+            return false;
+        }
+        if ( argType->baseType==Type::anyArgument ) {
+            return true;
+        }
+        // compare types which don't need inference
+        auto tempMatters = argType->implicit ? TemporaryMatters::no : TemporaryMatters::yes;
+        if ( !argType->isSameType(*passType, RefMatters::no, ConstMatters::no, tempMatters, AllowSubstitute::yes, true, true) ) {
+            return false;
+        }
+        // can't pass non-ref to ref
+        if ( argType->isRef() && !passType->isRef() ) {
+            return false;
+        }
+        // ref types can only add constness
+        if (argType->isRef() && !argType->constant && passType->constant) {
+            return false;
+        }
+        // pointer types can only add constant
+        if (argType->isPointer() && !argType->constant && passType->constant) {
+            return false;
+        }
+        // all good
+        return true;
+    }
+
+    void findMatchingOptions ( const TypeDeclPtr & type, vector<MatchingOptionError> & matching ) {
+        if ( type->baseType == Type::option ) {
+            // lets see if one of the argTypes is the same as the other
+            for ( size_t ai=0, as=type->argTypes.size(); ai<as; ++ai ) {
+                auto & argT = type->argTypes[ai];
+                for ( size_t bi=ai+1; bi<as; ++bi ) {
+                    auto & argB = type->argTypes[bi];
+                    if ( argT->isSameType(*argB, RefMatters::yes, ConstMatters::yes, TemporaryMatters::yes, AllowSubstitute::no, true, false) ) {
+                        matching.push_back({type,argT,argB});
+                        goto found;
+                    }
+                }
+            }
+            found:;
+        } else {
+            if ( type->firstType ) {
+                findMatchingOptions(type->firstType, matching);
+            }
+            if ( type->secondType ) {
+                findMatchingOptions(type->secondType, matching);
+            }
+            for ( auto & argT : type->argTypes ) {
+                findMatchingOptions(argT, matching);
+            }
+        }
+    }
+}

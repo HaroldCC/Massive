@@ -1,0 +1,143 @@
+options gen2
+options indenting = 4
+options strict_smart_pointers = true
+
+module ast_debug shared private
+
+//! AST-level debugger state reporting.
+//!
+//! Sends AST expression and program-structure data to the
+//! debug agent for live inspection of compilation state in
+//! the DAP variable view.
+
+require daslib/debugger
+require daslib/ast_boost
+require daslib/strings
+
+def report_to_debugger(var ctx : Context; category, name : string; value : auto(TT)) {
+    let tinfo = typeinfo rtti_typeinfo(value)
+    let pdata = unsafe(addr(value))
+    report_context_state(ctx, category, name, unsafe(addr(tinfo)), pdata)
+}
+
+def isExpressionType(_vinfo) {
+    if (_vinfo.basicType != Type.tPointer || _vinfo.firstType == null) return false
+    let vinfo = _vinfo.firstType
+    if (vinfo.basicType != Type.tHandle
+            || vinfo.annotation._module.name != "ast_core") return false
+    var result = false
+    peek(vinfo.annotation.name) $(n) {
+        result = n |> starts_with("Expr")
+    }
+    return result
+}
+
+def isModulePtrType(_vinfo; mod, what : string) {
+    if (_vinfo.basicType != Type.tPointer || _vinfo.firstType == null) return false
+    let vinfo = _vinfo.firstType
+    if (vinfo.basicType != Type.tHandle
+            || vinfo.annotation._module.name != mod) return false
+    return vinfo.annotation.name == what
+}
+
+def isAstPtrType(_vinfo; what : string) {
+    return isModulePtrType(_vinfo, "ast_core", what)
+}
+
+def isRttiPtrType(_vinfo; what : string) {
+    return isModulePtrType(_vinfo, "rtti_core", what)
+}
+
+def isRttiType(vinfo; what : string) {
+    if (vinfo.basicType != Type.tHandle
+            || vinfo.annotation._module.name != "rtti_core") return false
+    return vinfo.annotation.name == what
+}
+
+def describe_arg(var ctxid : Context; vinfo; arg : void?) : void {
+    unsafe {
+        if (isRttiType(vinfo, "AnnotationList")) {
+            report_to_debugger(ctxid, "ast_debug", vinfo.name, describe(*reinterpret<AnnotationList?> arg))
+            return
+        } elif (isRttiType(vinfo, "AnnotationArgumentList")) {
+            report_to_debugger(ctxid, "ast_debug", vinfo.name, describe(*reinterpret<AnnotationArgumentList?> arg))
+            return
+        }
+        let parg = reinterpret<void ??> arg
+        if (parg == null || *parg == null) {
+            report_to_debugger(ctxid, "ast_debug", vinfo.name, null)
+            return
+        }
+        if (isExpressionType(vinfo)) {
+            report_to_debugger(ctxid, "ast_debug", vinfo.name, describe(*reinterpret<ExpressionPtr?> arg))
+            report_to_debugger(ctxid, "ast_debug", vinfo.name + ".detailed", debug_expression(*reinterpret<ExpressionPtr?> arg))
+        } elif (isAstPtrType(vinfo, "TypeDecl")) {
+            report_to_debugger(ctxid, "ast_debug", vinfo.name, describe(*reinterpret<TypeDeclPtr?> arg))
+        } elif (isAstPtrType(vinfo, "Function")) {
+            report_to_debugger(ctxid, "ast_debug", vinfo.name, describe(*reinterpret<FunctionPtr?> arg))
+        } elif (isAstPtrType(vinfo, "Variable")) {
+            report_to_debugger(ctxid, "ast_debug", vinfo.name, describe(*reinterpret<VariablePtr?> arg))
+        } elif (isRttiPtrType(vinfo, "AnnotationDeclaration")) {
+            report_to_debugger(ctxid, "ast_debug", vinfo.name, describe(**reinterpret<AnnotationDeclarationPtr?> arg))
+        }
+    }
+}
+
+class SampleStackWalker : DapiStackWalker {
+    //! Sample stack walker that prints call stack to the log.
+    ctxid : Context?
+    def override onArgument(info : FuncInfo; index : int; vinfo : VarInfo; arg : float4) : void {
+        if (vinfo.flags.ref || vinfo.flags.refType) {
+            describe_arg(*ctxid, vinfo, *unsafe(reinterpret<void ??>(unsafe(addr(arg)))))
+        } else {
+            describe_arg(*ctxid, vinfo, unsafe(addr(arg)))
+        }
+    }
+    def override onVariable(inf : FuncInfo; vinfo : LocalVariableInfo; arg : void?; inScope : bool) : void {
+        if (!inScope) return
+        if (vinfo.flags.ref || vinfo.flags.refType) {
+            describe_arg(*ctxid, vinfo, *unsafe(reinterpret<void ??>(arg)))
+        } else {
+            describe_arg(*ctxid, vinfo, arg)
+        }
+    }
+    def override onAfterCall(pp : Prologue) : bool {
+        return false    // only stack top
+    }
+}
+
+class ContextStateAgent : DapiDebugAgent {
+    //! Debug agent that installs context-level stack walkers.
+    walker : SampleStackWalker?
+    def ContextStateAgent {
+        walker = new SampleStackWalker()
+    }
+    def operator delete {
+        unsafe {
+            delete walker
+        }
+    }
+    def override onCollect(var ctx : Context; at : LineInfo) {
+        walker.ctxid = unsafe(addr(ctx))
+        make_stack_walker(walker) $(adapter) {
+            walk_stack(adapter, ctx, at)
+        }
+    }
+}
+
+
+[unused_argument(ctx)]
+def state_agent(ctx : Context) {
+    install_new_debug_agent(new ContextStateAgent(), "ast_debug")
+}
+
+[_macro]
+def private auto_start_state() {
+    if (is_compiling_macros_in_module("ast_debug")) {
+        if (!is_in_debug_agent_creation()) {
+            if (!has_debug_agent_context("ast_debug")) {
+                fork_debug_agent_context(@@state_agent)
+            }
+        }
+    }
+}
