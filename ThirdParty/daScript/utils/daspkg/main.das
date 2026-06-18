@@ -1,6 +1,8 @@
 options gen2
 options indenting = 4
 options persistent_heap
+options no_unused_block_arguments = false
+options no_unused_function_arguments = false
 options no_global_variables = false
 
 require daslib/fio
@@ -56,7 +58,7 @@ def main() {
         print_usage()
         return 1
     }
-    let parsed <- parse_r |> move_unwrap
+    var parsed <- parse_r |> move_unwrap
     apply_global_flags(parsed)
 
     let command = parsed.command ?? ""

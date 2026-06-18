@@ -1,5 +1,7 @@
 options gen2
 options indenting = 4
+options no_unused_block_arguments = false
+options no_unused_function_arguments = false
 options strict_smart_pointers = true
 
 module remove_call_args shared private
@@ -19,7 +21,9 @@ require daslib/templates_boost
 [macro_function]
 def get_remove_indices(func) {
     for (ann in func.annotations) {
-        if (ann.annotation.name == "remove_call_args") return <- get_remove_indices(ann.arguments)
+        if (ann.annotation.name == "remove_call_args") {
+            return <- get_remove_indices(ann.arguments)
+        }
     }
     return <- array<int>()
 }
@@ -27,8 +31,13 @@ def get_remove_indices(func) {
 
 [macro_function]
 def get_remove_indices(args : AnnotationArgumentList) {
-    var indices <- [for (arg in args); arg.iValue; where arg.name == "arg"]
-    if (!empty(indices)) {
+    var indices : array<int>
+    for (arg in args) {
+        if (arg.name == "arg") {
+            indices |> push(arg.iValue)
+        }
+    }
+    if (length(indices) > 0) {
         indices |> sort() <| $(a, b) => a > b
     }
     return <- indices
@@ -40,10 +49,12 @@ class RemoveCallArgsMacro : AstFunctionAnnotation {
     //! This macro removes all arguments by given indices [remove_call_args(arg=(1,2,3))]
     def override apply(var func : FunctionPtr; var group : ModuleGroup; args : AnnotationArgumentList; var errors : das_string) : bool {
         var removeIndices <- get_remove_indices(args)
-        if (empty(removeIndices)) return true
+        if (length(removeIndices) == 0) {
+            return true
+        }
 
         for (arg in func.arguments) {
-            arg.flags.marked_used = true // to disable errors: unused function argument
+            arg.flags |= VariableFlags.marked_used // to disable errors: unused function argument
         }
 
         var fn = clone_function(func)
@@ -66,7 +77,9 @@ class RemoveCallArgsMacro : AstFunctionAnnotation {
     def override transform(var call : ExprCallFunc?; var errors : das_string) : ExpressionPtr {
         var removeIndices <- get_remove_indices(call.func)
 
-        if (empty(removeIndices)) return null
+        if (length(removeIndices) == 0) {
+            return null
+        }
 
         var newCall = clone_expression(call)
         var ncall = newCall as ExprCall

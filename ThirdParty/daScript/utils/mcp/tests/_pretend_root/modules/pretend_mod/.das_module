@@ -1,8 +1,0 @@
-options gen2
-
-require daslib/fio
-
-[export]
-def initialize(project_path : string) {
-    register_native_path("pretend_mod", "greet", "{project_path}/greet.das")
-}

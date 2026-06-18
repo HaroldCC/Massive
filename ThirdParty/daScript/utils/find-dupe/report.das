@@ -64,7 +64,9 @@ struct public OutputReport {
 // Decide the high-level verdict label from groups / false_positives.
 // Empty cluster (size 0) shouldn't happen but the rule still works.
 def public classify_verdict(n_members : int; v : Verdict) : VerdictKind {
-    if (!empty(v.error)) return VerdictKind.error
+    if (!empty(v.error)) {
+        return VerdictKind.error
+    }
     var any_real_group = false
     for (g in v.groups) {
         if (length(g) >= 2) {
@@ -73,18 +75,30 @@ def public classify_verdict(n_members : int; v : Verdict) : VerdictKind {
         }
     }
     let all_false = !any_real_group && length(v.false_positives) == n_members
-    if (all_false) return VerdictKind.false_positive
+    if (all_false) {
+        return VerdictKind.false_positive
+    }
     let single_full_group = (length(v.groups) == 1 && length(v.groups[0]) == n_members && empty(v.false_positives))
-    if (single_full_group) return VerdictKind.real
+    if (single_full_group) {
+        return VerdictKind.real
+    }
     return VerdictKind.partial
 }
 
 
 def public verdict_kind_to_string(k : VerdictKind) : string {
-    if (k == VerdictKind.real) return "real"
-    if (k == VerdictKind.partial) return "partial"
-    if (k == VerdictKind.false_positive) return "false_positive"
-    if (k == VerdictKind.skipped) return "skipped"
+    if (k == VerdictKind.real) {
+        return "real"
+    }
+    if (k == VerdictKind.partial) {
+        return "partial"
+    }
+    if (k == VerdictKind.false_positive) {
+        return "false_positive"
+    }
+    if (k == VerdictKind.skipped) {
+        return "skipped"
+    }
     return "error"
 }
 
@@ -93,7 +107,9 @@ def public write_json_report(report : OutputReport; path : string) : bool {
     let body = sprint_json(report, true)
     var ok = false
     fopen(path, "wb") $(fw) {
-        if (fw == null) return
+        if (fw == null) {
+            return
+        }
         ok = true
         fw |> fprint(body)
     }
@@ -102,10 +118,18 @@ def public write_json_report(report : OutputReport; path : string) : bool {
 
 
 def private verdict_emoji(k : VerdictKind) : string {
-    if (k == VerdictKind.real) return "[REAL]"
-    if (k == VerdictKind.partial) return "[PARTIAL]"
-    if (k == VerdictKind.false_positive) return "[FALSE-POS]"
-    if (k == VerdictKind.skipped) return "[SKIP]"
+    if (k == VerdictKind.real) {
+        return "[REAL]"
+    }
+    if (k == VerdictKind.partial) {
+        return "[PARTIAL]"
+    }
+    if (k == VerdictKind.false_positive) {
+        return "[FALSE-POS]"
+    }
+    if (k == VerdictKind.skipped) {
+        return "[SKIP]"
+    }
     return "[ERR]"
 }
 
@@ -124,7 +148,9 @@ def public write_markdown_report(report : OutputReport;
                                  path : string) : bool {
     var ok = false
     fopen(path, "wb") $(fw) {
-        if (fw == null) return
+        if (fw == null) {
+            return
+        }
         ok = true
         fw |> fprint("# find-dupe verdicts\n\n")
         fw |> fprint("**Model:** `{report.model}`  \n")
@@ -206,9 +232,17 @@ def public write_markdown_report(report : OutputReport;
 
 
 def private parse_verdict_string(s : string) : VerdictKind {
-    if (s == "real") return VerdictKind.real
-    if (s == "partial") return VerdictKind.partial
-    if (s == "false_positive") return VerdictKind.false_positive
-    if (s == "skipped") return VerdictKind.skipped
+    if (s == "real") {
+        return VerdictKind.real
+    }
+    if (s == "partial") {
+        return VerdictKind.partial
+    }
+    if (s == "false_positive") {
+        return VerdictKind.false_positive
+    }
+    if (s == "skipped") {
+        return VerdictKind.skipped
+    }
     return VerdictKind.error
 }

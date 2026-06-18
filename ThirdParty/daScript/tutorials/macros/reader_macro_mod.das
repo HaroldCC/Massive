@@ -3,14 +3,12 @@ options no_aot
 
 // Tutorial macro module: reader macros (visit + suffix patterns).
 //
-// Provides three AstReaderMacro implementations:
-//   CsvReader       — [reader_macro(name=csv)]    visit pattern
-//                     Parses CSV text at compile time, returns an array expression.
-//   BasicReader     — [reader_macro(name=basic)]  suffix pattern (module level)
-//                     Transpiles BASIC-style code into daScript source, which
-//                     the parser re-parses as normal code.
-//   InlineSumReader — [reader_macro(name=sum)]    suffix pattern (expression level)
-//                     %sum! a, b, c %% rewrites to ( a + b + c ), spliced in place.
+// Provides two AstReaderMacro implementations:
+//   CsvReader    — [reader_macro(name=csv)]    visit pattern
+//                  Parses CSV text at compile time, returns an array expression.
+//   BasicReader  — [reader_macro(name=basic)]   suffix pattern
+//                  Transpiles BASIC-style code into daScript source, which
+//                  the parser re-parses as normal code.
 //
 // TIMING:
 //   accept()  — called character-by-character during PARSING
@@ -25,13 +23,8 @@ options no_aot
 //
 // Suffix pattern (BasicReader):
 //   accept() collects characters → suffix() returns daScript source → parser re-parses
-//   Used at MODULE LEVEL with the ~ form: %basic~ ... %%
+//   Used at MODULE LEVEL: %basic~ ... %%
 //   The ExprReader node is discarded; only the injected text matters.
-//
-// Suffix pattern, inline (InlineSumReader):
-//   Same suffix() text rewrite, but invoked with the ! form: %sum! ... %%
-//   Used in EXPRESSION position — the rewrite is re-parsed in place as a value.
-//   (%name~ would strand the host statement here; %name! is the inline form.)
 
 module reader_macro_mod
 
@@ -69,11 +62,13 @@ class CsvReader : AstReaderMacro {
     def override visit(prog : ProgramPtr; mod : Module?; expr : ExprReader?) : ExpressionPtr {
         //! Parse the collected CSV text at compile time and embed
         //! the resulting string array directly in the AST.
-        if (is_in_completion()) return default<ExpressionPtr>
+        if (is_in_completion()) {
+            return default<ExpressionPtr>
+        }
         let seq = string(expr.sequence)
         var items <- split(seq, ",")
-        for (item in items) {
-            item = strip(item)
+        for (i in range(length(items))) {
+            items[i] = strip(items[i])
         }
         // convert_to_expression turns any daScript value into AST nodes.
         // Here it produces an ExprMakeArray of ExprConstString values.
@@ -120,7 +115,9 @@ class BasicReader : AstReaderMacro {
         var stmts : array<string>
         for (line in lines) {
             let trimmed = strip(line)
-            if (empty(trimmed)) continue
+            if (empty(trimmed)) {
+                continue
+            }
             // DEF name — must appear first
             if (starts_with(trimmed, "DEF ")) {
                 func_name = strip(slice(trimmed, 4))
@@ -129,7 +126,9 @@ class BasicReader : AstReaderMacro {
             // Numbered lines: skip the number, parse COMMAND args
             // Find first space (after the line number)
             let sp1 = find(trimmed, " ")
-            if (sp1 < 0) continue
+            if (sp1 < 0) {
+                continue
+            }
             let after_num = strip(slice(trimmed, sp1 + 1))
             if (starts_with(after_num, "PRINT ")) {
                 let arg = strip(slice(after_num, 6))
@@ -158,44 +157,6 @@ class BasicReader : AstReaderMacro {
                 w |> write("    {stmt}\n")
             }
             w |> write("\}\n")
-        }
-    }
-}
-
-// ---- Inline sum reader (suffix pattern, EXPRESSION level) --------------------
-// %sum~ a, b, c %% would be a parse error in expression position; the ! form makes
-// the suffix rewrite land inline:  var total = %sum! 1, 2, 3 %%  →  ( 1 + 2 + 3 )
-
-[reader_macro(name=sum)]
-class InlineSumReader : AstReaderMacro {
-    //! Inline (expression-level) reader macro: ``%sum! a, b, c %%`` rewrites to ``( a + b + c )``.
-    //! Same ``suffix()`` text rewrite as BasicReader, but invoked with the ``!`` form so the result
-    //! is spliced back in expression position (the ``~`` form only works at module level).
-
-    def override accept(prog : ProgramPtr; mod : Module?; var expr : ExprReader?; ch : int; info : LineInfo) : bool {
-        append(expr.sequence, ch)
-        if (ends_with(expr.sequence, "%%")) {
-            resize(expr.sequence, length(expr.sequence) - 2)
-            return false
-        } else {
-            return true
-        }
-    }
-
-    def override suffix(prog : ProgramPtr; mod : Module?; var expr : ExprReader?; info : LineInfo;
-                        var outLine : int&; var outFile : FileInfo?&) : string {
-        // split the comma-separated body, join the terms with " + ", wrap in parens
-        return build_string() $(var w) {
-            w |> write("( ")
-            var first = true
-            for (term in split(string(expr.sequence), ",")) {
-                if (!first) {
-                    w |> write(" + ")
-                }
-                w |> write(strip(term))
-                first = false
-            }
-            w |> write(" )")
         }
     }
 }

@@ -1,4 +1,6 @@
 options gen2
+options no_unused_function_arguments = false
+options no_unused_block_arguments = false
 
 require cpp_common public
 require daslib/strings_boost public
@@ -28,8 +30,12 @@ struct CppOutlineNode {
 // full signature (return type + params + qualifiers). For classes/structs/etc.,
 // DISPLAY is the qualified name plus any template specialization args.
 def do_cpp_outline(file, glob_filter, mode : string) : string {
-    if (empty(file) && empty(glob_filter)) return make_tool_result("'file' or 'glob_filter' argument is required", true)
-    if (!empty(mode) && mode != "tree" && mode != "flat") return make_tool_result("invalid mode '{mode}' — expected '', 'tree', or 'flat'", true)
+    if (empty(file) && empty(glob_filter)) {
+        return make_tool_result("'file' or 'glob_filter' argument is required", true)
+    }
+    if (!empty(mode) && mode != "tree" && mode != "flat") {
+        return make_tool_result("invalid mode '{mode}' — expected '', 'tree', or 'flat'", true)
+    }
     var search_dirs : array<string>
     if (!empty(file)) {
         search_dirs |> push(resolve_path(file))
@@ -38,8 +44,12 @@ def do_cpp_outline(file, glob_filter, mode : string) : string {
     }
     var err : string
     let entries <- cpp_run_scan(search_dirs, glob_filter, err)
-    if (!empty(err)) return make_tool_result(err, true)
-    if (empty(entries)) return make_tool_result("No C++ declarations found")
+    if (!empty(err)) {
+        return make_tool_result(err, true)
+    }
+    if (empty(entries)) {
+        return make_tool_result("No C++ declarations found")
+    }
     // group by file, preserve discovery order
     var by_file : table<string; array<int>>
     var file_order : array<string>
@@ -84,7 +94,9 @@ def cpp_build_forest(entries : array<CppMatch>; idx_list : array<int>; var out_n
     sort(sorted) $(a, b) {
         let ea & = unsafe(entries[a])
         let eb & = unsafe(entries[b])
-        if (ea.line != eb.line) return ea.line < eb.line
+        if (ea.line != eb.line) {
+            return ea.line < eb.line
+        }
         return ea.end_line > eb.end_line
     }
     out_nodes |> reserve(length(sorted))
@@ -118,7 +130,9 @@ def cpp_build_forest(entries : array<CppMatch>; idx_list : array<int>; var out_n
 // True if any node has at least one child — i.e. tree-mode auto-trigger.
 def cpp_has_nesting(nodes : array<CppOutlineNode>) : bool {
     for (n in nodes) {
-        if (!empty(n.children)) return true
+        if (!empty(n.children)) {
+            return true
+        }
     }
     return false
 }
@@ -158,7 +172,9 @@ def cpp_format_entry(e : CppMatch; ancestors : array<int>; entries : array<CppMa
     if (e.kind == "function" && !empty(e.signature)) {
         if (!tree_mode && !empty(ancestors) && !name_qualified) {
             let prefix = cpp_ancestor_prefix(ancestors, entries)
-            if (!empty(prefix)) return cpp_inject_qualifier(e.signature, prefix)
+            if (!empty(prefix)) {
+                return cpp_inject_qualifier(e.signature, prefix)
+            }
         }
         return e.signature
     }
@@ -185,7 +201,9 @@ def cpp_ancestor_prefix(ancestors : array<int>; entries : array<CppMatch>) : str
             parts |> push("{ae.qualified}{ae.template_args}")
         }
     }
-    if (empty(parts)) return ""
+    if (empty(parts)) {
+        return ""
+    }
     return "{join(parts, "::")}::"
 }
 
@@ -195,7 +213,9 @@ def cpp_ancestor_prefix(ancestors : array<int>; entries : array<CppMatch>) : str
 // identifier chars.
 def cpp_inject_qualifier(signature : string; prefix : string) : string {
     let op = find_open_paren(signature)
-    if (op <= 0) return "{prefix}{signature}"
+    if (op <= 0) {
+        return "{prefix}{signature}"
+    }
     var nm = op - 1
     while (nm >= 0 && (character_at(signature, nm) == ' ' || character_at(signature, nm) == '\t')) { // nolint:PERF002,PERF003
         nm--

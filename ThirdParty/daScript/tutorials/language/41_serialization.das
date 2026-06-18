@@ -13,6 +13,7 @@
 // Run: daslang.exe tutorials/language/41_serialization.das
 
 options gen2
+options no_unused_function_arguments = false
 
 require daslib/archive
 require math
@@ -112,7 +113,10 @@ def demo_arrays() {
 
 def demo_tables() {
     print("\n=== table serialization ===\n")
-    var inventory <- { "sword" => 1, "potion" => 5, "arrow" => 20 }
+    var inventory : table<string; int>
+    inventory |> insert("sword", 1)
+    inventory |> insert("potion", 5)
+    inventory |> insert("arrow", 20)
 
     var data <- mem_archive_save(inventory)
     print("  serialized size: {length(data)} bytes\n")
@@ -199,10 +203,10 @@ struct GameState {
 
 def demo_nested() {
     print("\n=== nested struct serialization ===\n")
-    var state : GameState  // nolint:STYLE013 — tutorial demonstrates incremental field setup with nested table inserts
+    var state : GameState
     state.player = Player(name = "Knight", hp = 80, x = 10.0, y = 20.0)
     state.level = 3
-    state.inventory.items |> push("sword")  // nolint:STYLE012 — same incremental-setup demo
+    state.inventory.items |> push("sword")
     state.inventory.items |> push("shield")
     state.inventory.counts |> insert("sword", 1)
     state.inventory.counts |> insert("shield", 1)

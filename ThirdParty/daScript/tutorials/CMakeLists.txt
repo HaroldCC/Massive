@@ -75,22 +75,6 @@ install(FILES ${DASTRUDEL_TUTORIAL_SOURCES}
     DESTINATION ${DAS_INSTALL_TUTORIALSDIR}/daStrudel
 )
 
-# Install jsonrpc tutorial .das files
-file(GLOB JSONRPC_TUTORIAL_SOURCES
-    ${PROJECT_SOURCE_DIR}/tutorials/jsonrpc/*.das
-)
-install(FILES ${JSONRPC_TUTORIAL_SOURCES}
-    DESTINATION ${DAS_INSTALL_TUTORIALSDIR}/jsonrpc
-)
-
-# Install dasOPENAI tutorial .das files
-file(GLOB OPENAI_TUTORIAL_SOURCES
-    ${PROJECT_SOURCE_DIR}/tutorials/dasOPENAI/*.das
-)
-install(FILES ${OPENAI_TUTORIAL_SOURCES}
-    DESTINATION ${DAS_INSTALL_TUTORIALSDIR}/dasOPENAI
-)
-
 if (NOT ${DAS_TUTORIAL_DISABLED})
     include(integration/c/CMakeLists.txt)
     include(integration/cpp/CMakeLists.txt)
@@ -101,7 +85,6 @@ SET(ALL_TUTORIAL_SOURCES
     ${MACRO_TUTORIAL_SOURCES}
     ${DASPEG_TUTORIAL_SOURCES}
     ${DASTRUDEL_TUTORIAL_SOURCES}
-    ${JSONRPC_TUTORIAL_SOURCES}
 )
 
 # Modules tutorials.
@@ -116,10 +99,6 @@ IF ((NOT ${DAS_SQLITE_DISABLED}) OR (NOT DEFINED DAS_STBIMAGE_DISABLED))
 ENDIF()
 IF ((NOT ${DAS_AUDIO_DISABLED}) OR (NOT DEFINED DAS_AUDIO_DISABLED))
     list(APPEND ALL_TUTORIAL_SOURCES ${AUDIO_TUTORIAL_SOURCES})
-ENDIF()
-# dasOPENAI tutorials require dasHV (HTTP transport); only dry-run them when HV is enabled.
-IF ((NOT ${DAS_HV_DISABLED}) OR (NOT DEFINED DAS_HV_DISABLED))
-    list(APPEND ALL_TUTORIAL_SOURCES ${OPENAI_TUTORIAL_SOURCES})
 ENDIF()
 
 add_custom_target(dry_run_tutorials)

@@ -165,13 +165,13 @@ def bitfield_serialization() {
     print(xml_str)
 
     let restored = from_XML(xml_str, type<Permissions>)
-    let has_read = restored.read
+    let has_read = uint(restored & Permissions.read) != 0u
     print("read: {has_read}\n")
     // output: read: true
-    let has_write = restored.write
+    let has_write = uint(restored & Permissions.write) != 0u
     print("write: {has_write}\n")
     // output: write: false
-    let has_execute = restored.execute
+    let has_execute = uint(restored & Permissions.execute) != 0u
     print("execute: {has_execute}\n")
     // output: execute: true
 }

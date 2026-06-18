@@ -60,9 +60,6 @@ namespace das {
         const Structure *cppLayoutParent = nullptr;
         bool needRestart = false;
         bool enableInferTimeFolding = true;
-        bool savedFoldingForEnum = true;        // preVisitEnumerationValue / visitEnumerationValue save-restore
-        bool savedFoldingForStaticIf = true;    // preVisit(ExprIfThenElse) / visit(ExprIfThenElse) save-restore (block hooks skipped for static_if)
-        bool savedFoldingForStaticAssert = true; // preVisit(ExprStaticAssert) / visit(ExprStaticAssert) save-restore
         bool disableAot = false;
         bool multiContext = false;
         bool standaloneContext = false;
@@ -101,17 +98,15 @@ namespace das {
         void pushVarStack();
         void popVarStack();
         void error(const string &err, const string &extra, const string &fixme, const LineInfo &at, CompilationError cerr = CompilationError::unspecified) const;
-        void checkEmptyName(const string &name, const char *nodeKind, const LineInfo &at);
         void reportAstChanged();
         virtual void reportFolding() override;
         string describeType(const TypeDeclPtr &decl) const;
         string describeType(const TypeDecl *decl) const;
-        string describeType(const TypeDeclPtr &decl, AliasDefs * aliasDefs) const;
         string describeFunction(const FunctionPtr &fun) const;
         string describeFunction(const Function *fun) const;
 
     protected:
-        void verifyType(const TypeDeclPtr &decl, bool allowExplicit = false, bool classMethod = false, bool allowTemplate = false) const;
+        void verifyType(const TypeDeclPtr &decl, bool allowExplicit = false, bool classMethod = false) const;
 
         bool jitEnabled() const;
 
@@ -119,11 +114,11 @@ namespace das {
 
         // find type alias name, and resolve it to type
         // without one generic function
-        TypeDeclPtr findFuncAlias(const FunctionPtr &fptr, const string &name, bool *constUnderDim = nullptr) const;
+        TypeDeclPtr findFuncAlias(const FunctionPtr &fptr, const string &name) const;
 
         // find type alias name, and resolve it to type
         // within current context
-        TypeDeclPtr findAlias(const string &name, bool *constUnderDim = nullptr) const;
+        TypeDeclPtr findAlias(const string &name) const;
 
         // infer alias type
         TypeDeclPtr inferAlias(const TypeDeclPtr &decl, const FunctionPtr &fptr = nullptr, AliasMap *aliases = nullptr, OptionsMap *options = nullptr, bool autoToAlias = false) const;
@@ -175,16 +170,6 @@ namespace das {
 
         bool isFunctionCompatible(Function *pFn, const vector<TypeDeclPtr> &nonNamedTypes, const vector<MakeFieldDeclPtr> &arguments, bool inferAuto, bool inferBlock) const;
 
-        // piped-call padding: a trailing-piped argument may shift onto a later block-like parameter,
-        // padding the gap with that overload's defaults
-        bool isFunctionCompatiblePipedAt(Function *pFn, const vector<TypeDeclPtr> &types, int blockParam, bool inferAuto) const;
-
-        bool findPipedLanding(Function *pFn, const vector<TypeDeclPtr> &types, bool inferAuto, int &blockParam, int &padCount) const;
-
-        void findMatchingPipedFunctionsAndGenerics(MatchingFunctions &resultFunctions, MatchingFunctions &resultGenerics, const string &name, const vector<TypeDeclPtr> &types, bool visCheck, das_hash_map<Function *, pair<int, int>> &landing) const;
-
-        bool tryPipedCallPadding(ExprLooksLikeCall *expr, vector<TypeDeclPtr> &types, MatchingFunctions &functions, MatchingFunctions &generics, bool visCheck);
-
         string reportAliasError(const TypeDeclPtr &type) const;
 
         string describeMismatchingArgument(const string &argName, const TypeDeclPtr &passType, const TypeDeclPtr &argType, int argIndex) const;
@@ -216,8 +201,6 @@ namespace das {
         void findMatchingFunctionsAndGenerics(MatchingFunctions &resultFunctions, MatchingFunctions &resultGenerics, const string &name, const vector<TypeDeclPtr> &types, const vector<MakeFieldDeclPtr> &arguments, bool inferBlock = false) const;
 
         void findMatchingFunctionsAndGenerics(MatchingFunctions &resultFunctions, MatchingFunctions &resultGenerics, const string &name, const vector<TypeDeclPtr> &types, bool inferBlock = false, bool visCheck = true) const;
-
-        bool trySeedTupleShorthand(ExprLooksLikeCall *expr, bool visCheck);
 
         void reportDualFunctionNotFound(const string &name, const string &extra,
                                         const LineInfo &at, const MatchingFunctions &candidateFunctions,
@@ -274,8 +257,6 @@ namespace das {
         // enumeration
 
         ExpressionPtr makeEnumConstValue(Enumeration *enu, int64_t nextInt) const;
-
-        virtual void preVisitEnumerationValue(Enumeration *enu, const string &name, Expression *value, bool last) override;
 
         virtual ExpressionPtr visitEnumerationValue(Enumeration *enu, const string &name, Expression *value, bool last) override;
 
@@ -462,11 +443,6 @@ namespace das {
         bool isVoidOrNothing(const TypeDeclPtr &ptr) const;
         bool canCopyOrMoveType(const TypeDeclPtr &leftType, const TypeDeclPtr &rightType, TemporaryMatters tmatter, Expression *leftExpr,
                                const string &errorText, CompilationError errorCode, const LineInfo &at) const;
-        // Tries to promote a const integer literal (ExprConstInt / ExprConstUInt) to targetType.
-        // Returns non-null on success (new ExprConst* of targetType, with promotedFromInt=true).
-        // Sets rangeError=true and emits exceeds_constant_range when the literal exceeds the target range.
-        // Returns nullptr+rangeError=false when promotion is not applicable.
-        ExpressionPtr tryPromoteConstInt(const ExpressionPtr &expr, const TypeDeclPtr &targetType, bool &rangeError);
         string moveErrorInfo(ExprMove *expr) const;
         virtual void preVisit(ExprMove *expr) override;
         virtual ExpressionPtr visit(ExprMove *expr) override;
@@ -498,6 +474,7 @@ namespace das {
         ExpressionPtr getConstExpr(Expression *expr);
         virtual bool canVisitIfSubexpr(ExprIfThenElse *expr) override;
         virtual void preVisit(ExprIfThenElse *expr) override;
+        virtual void preVisitIfBlock(ExprIfThenElse *expr, Expression *) override;
         virtual ExpressionPtr visit(ExprIfThenElse *expr) override;
         // ExprAssume
         virtual void preVisit(ExprAssume *expr) override;
@@ -523,7 +500,6 @@ namespace das {
 
         virtual void preVisit(ExprLet *expr) override;
         virtual void preVisitLet(ExprLet *expr, const VariablePtr &var, bool last) override;
-        virtual void preVisitLetInit(ExprLet *expr, const VariablePtr &var, Expression *init) override;
         bool isEmptyInit(const VariablePtr &var) const;
         virtual VariablePtr visitLet(ExprLet *expr, const VariablePtr &var, bool last) override;
         ExpressionPtr promoteToCloneToMove(const VariablePtr &var);
@@ -622,7 +598,7 @@ namespace das {
         // make structure
         void describeLocalType(vector<string> &results, TypeDecl *tp, const string &prefix, das_set<Structure *> &dep) const;
         string describeLocalType(TypeDecl *tp) const;
-        virtual bool canVisitMakeStructure ( ExprMakeStruct * expr ) override;
+        virtual bool canVisitMakeStructure ( ExprMakeStruct * expr );
         virtual void preVisit(ExprMakeStruct *expr) override;
         bool convertCloneSemanticsToExpression(ExprMakeStruct *expr, int index, MakeFieldDecl *decl);
         virtual MakeFieldDeclPtr visitMakeStructureField(ExprMakeStruct *expr, int index, MakeFieldDecl *decl, bool last) override;
@@ -641,7 +617,4 @@ namespace das {
         virtual void preVisitArrayComprehensionWhere(ExprArrayComprehension *expr, Expression *where) override;
         virtual ExpressionPtr visit(ExprArrayComprehension *expr) override;
     };
-
-    void inferTypes ( Program * program, TextWriter & logs, ModuleGroup & libGroup );
-    void inferTypesDirty ( Program * program, TextWriter & logs, bool verbose );
 }

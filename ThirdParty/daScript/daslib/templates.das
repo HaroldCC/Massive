@@ -1,5 +1,7 @@
 options gen2
 options indenting = 4
+options no_unused_block_arguments = false
+options no_unused_function_arguments = false
 options strict_smart_pointers
 
 module templates shared private
@@ -36,7 +38,7 @@ class DecltypeMacro : AstCallMacro {
         }
         var tt = clone_type(expr.arguments[0]._type)
         if (remove_ref) {
-            tt.flags.ref = false
+            tt.flags &= ~TypeDeclFlags.ref
         }
         var mkt = new ExprTypeDecl(at = expr.at,
             typeexpr <- tt
@@ -72,14 +74,16 @@ class TemplateMacro : AstFunctionAnnotation {
         let taidx = find_index_if(each(expr.func.annotations)) $(ann) {
             return ann.annotation.name == "template"
         }
-        if (taidx == -1) return expr
+        if (taidx == -1) {
+            return expr
+        }
         var ffunc = expr.func
         // new call
         var newcall = unsafe(reinterpret<ExprCallFunc?> clone_expression(expr))
         // new func
         var fclone = clone_function(ffunc)
         fclone.fromGeneric = ffunc
-        fclone.flags.privateFunction = true
+        fclone.flags |= FunctionFlags.privateFunction
         newcall.func = null
         var inscope hashes : array<uint64>
         hashes |> reserve(length(fclone.annotations[taidx].arguments))

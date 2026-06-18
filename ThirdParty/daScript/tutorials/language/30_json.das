@@ -218,14 +218,14 @@ def modifying_json() {
     print("\n=== Modifying JSON ===\n")
 
     // Build an object by hand
-    var tab : table<string; JsonValue?>  // nolint:STYLE021 — tutorial demonstrates incremental building
+    var tab : table<string; JsonValue?>
     tab |> insert("name", JV("Alice"))
     tab |> insert("age", JV(30))
     var obj = JV(tab)
     print("built: {write_json(obj)}\n")
 
     // Build an array by hand
-    var items : array<JsonValue?>  // nolint:STYLE012 — tutorial demonstrates push API
+    var items : array<JsonValue?>
     items |> push(JV(1))
     items |> push(JV("two"))
     items |> push(JV(true))
@@ -341,7 +341,7 @@ def tuples_and_variants() {
     let s = Shape(circle = 5.0)
     var js_s = JV(s)
     print("variant: {write_json(js_s)}\n")
-    // output: variant: {"$variant":0,"circle":5}   ($variant is the active-field index)
+    // output: variant: {"circle":5}
 }
 
 // === Vector types ===

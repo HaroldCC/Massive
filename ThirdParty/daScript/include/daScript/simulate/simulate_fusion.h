@@ -124,7 +124,6 @@ namespace das {
     void createFusionEngine_at();
     void createFusionEngine_at_array();
     void createFusionEngine_tableindex();
-    void createFusionEngine_tablewithhash();
     // call
     void createFusionEngine_call1();
     void createFusionEngine_call2();

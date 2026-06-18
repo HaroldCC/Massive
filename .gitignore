@@ -34,11 +34,15 @@ test_compiler_tmp/
 # ThirdParty/*/
 # !ThirdParty/.gitignore
 
-# ===== ThirdParty 构建中间文件 + 编译产物 =====
+# ===== ThirdParty 构建中间文件 =====
 ThirdParty/Build/
 
-# libpq 是手动管理的，不忽略
-ThirdParty/Bin/*
+# openssl + libpq 二进制是手动管理并提交的（Windows vendored）
+# protobuf + dasScript 由 BuildThirdParty.py 生成，暂不提交
+ThirdParty/Bin/protobuf/
+ThirdParty/Bin/dasScript/
+ThirdParty/Bin/*/
+!ThirdParty/Bin/openssl/
 !ThirdParty/Bin/libpq/
 
 # ===== 运行时 =====

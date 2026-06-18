@@ -82,9 +82,9 @@ namespace das {
     template <>
     struct daslang_hash<SerializeNodeId, void> {
         size_t operator () ( const SerializeNodeId & s ) const noexcept {
-            const uint64_t pmix = (uint64_t(reinterpret_cast<uintptr_t>(s.ptr)) >> 4)
-                                * uint64_t(0x9E3779B97F4A7C15ull);
-            return size_t(pmix ^ (uint64_t(s.epoch) * uint64_t(0xBF58476D1CE4E5B9ull)));
+            const size_t pmix = (reinterpret_cast<size_t>(s.ptr) >> 4)
+                              * size_t(0x9E3779B97F4A7C15ull);
+            return pmix ^ (s.epoch * size_t(0xBF58476D1CE4E5B9ull));
         }
     };
 
@@ -254,17 +254,6 @@ namespace das {
 
         template <typename K, typename V, typename H, typename E>
         AstSerializer & operator << ( das_hash_map<K, V, H, E> & value );
-
-        // Guarded: under DAS_CUSTOM_HASH=0 das_insert_only_hash_map aliases to
-        // std::unordered_map (same as das_hash_map), so the regular overloads
-        // above already match insert-only args.
-#if DAS_CUSTOM_HASH
-        template <typename K, typename V, typename H, typename E>
-        void serialize_hash_map ( das_insert_only_hash_map<K, V, H, E> & value );
-
-        template <typename K, typename V, typename H, typename E>
-        AstSerializer & operator << ( das_insert_only_hash_map<K, V, H, E> & value );
-#endif
 
         template <typename V>
         AstSerializer & operator << ( safebox_map<V> & box );

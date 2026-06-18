@@ -119,7 +119,7 @@ def eval_expr_parse(input : string;
 def eval_expr(input : string; vars : table<string; double>) : double {
     eval_vars := vars
     var result = 0.0lf
-    eval_expr_parse(input) $(val; _err) {
+    eval_expr_parse(input) $(val; err) {
         result = val
     }
     return result
@@ -144,7 +144,7 @@ def eval_string_parse(input : string;
 
 def eval_string(input : string) : string {
     var result = ""
-    eval_string_parse(input) $(val; _err) {
+    eval_string_parse(input) $(val; err) {
         result = val
     }
     return result
@@ -310,14 +310,14 @@ struct BasicState {
 }
 
 def find_line(state : BasicState; target : int) : int {
-    let idx = lower_bound(state.program, target) $(a : Line; b : int) {
+    let idx = lower_bound(state.program, target) <| $(a : Line; b : int) {
         return a.number < b
     }
     return idx < length(state.program) && state.program[idx].number == target ? idx : -1
 }
 
 def store_line(var state : BasicState; var line : Line) {
-    let idx = lower_bound(state.program, line.number) $(a : Line; b : int) {
+    let idx = lower_bound(state.program, line.number) <| $(a : Line; b : int) {
         return a.number < b
     }
     if (idx < length(state.program) && state.program[idx].number == line.number) {
@@ -380,7 +380,7 @@ def exec_stmt(var state : BasicState; stmt : Stmt; var pc : int&) : bool {
         }
         return true
     } elif (stmt is return_stmt) {
-        if (empty(state.gosub_stack)) {
+        if (length(state.gosub_stack) == 0) {
             print("?RETURN WITHOUT GOSUB ERROR\n")
             state.running = false
         } else {
@@ -396,7 +396,7 @@ def exec_stmt(var state : BasicState; stmt : Stmt; var pc : int&) : bool {
         state.for_stack |> push(ForState(var_name = f._0, limit = limit, step = step, return_pc = pc))
     } elif (stmt is next_stmt) {
         let name = stmt as next_stmt
-        if (empty(state.for_stack)) {
+        if (length(state.for_stack) == 0) {
             print("?NEXT WITHOUT FOR ERROR\n")
             state.running = false
             return false
@@ -425,7 +425,9 @@ def run_program(var state : BasicState) {
     while (state.running && pc < length(state.program)) {
         let stmt = state.program[pc].stmt
         pc++
-        if (exec_stmt(state, stmt, pc)) continue
+        if (exec_stmt(state, stmt, pc)) {
+            continue
+        }
     }
 }
 

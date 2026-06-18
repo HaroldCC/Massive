@@ -129,12 +129,12 @@ class StructPrinter : DapiDataWalker {
 
     def override afterStructure(ps : void?; si : StructInfo) : void {
         indent--
-        pad()
+        self->pad()
         print("\}\n")
     }
 
     def override beforeStructureField(ps : void?; si : StructInfo; pv : void?; vi : VarInfo; last : bool) : void {
-        pad()
+        self->pad()
         print("{vi.name} = ")
     }
 
@@ -191,49 +191,49 @@ class ContainerPrinter : DapiDataWalker {
     }
 
     // --- arrays ---
-    def override beforeArrayData(ps : void?; stride : uint; count : uint64; ti : TypeInfo) : void {
-        pad()
-        print("array[{int64(count)}] = [\n")
+    def override beforeArrayData(ps : void?; stride : uint; count : uint; ti : TypeInfo) : void {
+        self->pad()
+        print("array[{int(count)}] = [\n")
         indent++
     }
 
-    def override afterArrayData(ps : void?; stride : uint; count : uint64; ti : TypeInfo) : void {
+    def override afterArrayData(ps : void?; stride : uint; count : uint; ti : TypeInfo) : void {
         indent--
-        pad()
+        self->pad()
         print("]\n")
     }
 
-    def override beforeArrayElement(ps : void?; ti : TypeInfo; pe : void?; index : uint64; last : bool) : void {
-        pad()
-        print("[{int64(index)}] = ")
+    def override beforeArrayElement(ps : void?; ti : TypeInfo; pe : void?; index : uint; last : bool) : void {
+        self->pad()
+        print("[{int(index)}] = ")
     }
 
-    def override afterArrayElement(ps : void?; ti : TypeInfo; pe : void?; index : uint64; last : bool) : void {
+    def override afterArrayElement(ps : void?; ti : TypeInfo; pe : void?; index : uint; last : bool) : void {
         print("\n")
     }
 
     // --- tables ---
     def override beforeTable(pa : DapiTable; ti : TypeInfo) : void {
-        pad()
+        self->pad()
         print("table[{int(pa.size)}] = \{\n")
         indent++
     }
 
     def override afterTable(pa : DapiTable; ti : TypeInfo) : void {
         indent--
-        pad()
+        self->pad()
         print("\}\n")
     }
 
-    def override beforeTableKey(pa : DapiTable; ti : TypeInfo; pk : void?; ki : TypeInfo; index : uint64; last : bool) : void {
-        pad()
+    def override beforeTableKey(pa : DapiTable; ti : TypeInfo; pk : void?; ki : TypeInfo; index : uint; last : bool) : void {
+        self->pad()
     }
 
-    def override afterTableKey(pa : DapiTable; ti : TypeInfo; pk : void?; ki : TypeInfo; index : uint64; last : bool) : void {
+    def override afterTableKey(pa : DapiTable; ti : TypeInfo; pk : void?; ki : TypeInfo; index : uint; last : bool) : void {
         print(" => ")
     }
 
-    def override afterTableValue(pa : DapiTable; ti : TypeInfo; pv : void?; kv : TypeInfo; index : uint64; last : bool) : void {
+    def override afterTableValue(pa : DapiTable; ti : TypeInfo; pv : void?; kv : TypeInfo; index : uint; last : bool) : void {
         print("\n")
     }
 
@@ -262,7 +262,10 @@ def demo_arrays_and_tables() {
             adapter |> walk_data(addr(nums), typeinfo rtti_typeinfo(nums))
         }
 
-        var scores <- { "Alice" => 95, "Bob" => 87, "Charlie" => 72 }
+        var scores : table<string; int>
+        scores |> insert("Alice", 95)
+        scores |> insert("Bob", 87)
+        scores |> insert("Charlie", 72)
         print("\nWalking table<string;int>:\n")
         unsafe {
             adapter |> walk_data(addr(scores), typeinfo rtti_typeinfo(scores))
@@ -295,19 +298,19 @@ class TupleVariantPrinter : DapiDataWalker {
     }
 
     def override beforeTuple(ps : void?; ti : TypeInfo) : void {
-        pad()
+        self->pad()
         print("tuple(\n")
         indent++
     }
 
     def override afterTuple(ps : void?; ti : TypeInfo) : void {
         indent--
-        pad()
+        self->pad()
         print(")\n")
     }
 
     def override beforeTupleEntry(ps : void?; ti : TypeInfo; pv : void?; idx : int; last : bool) : void {
-        pad()
+        self->pad()
         print("_{idx} = ")
     }
 
@@ -316,7 +319,7 @@ class TupleVariantPrinter : DapiDataWalker {
     }
 
     def override beforeVariant(ps : void?; ti : TypeInfo) : void {
-        pad()
+        self->pad()
         print("variant = ")
     }
 
@@ -473,7 +476,7 @@ class JsonWalker : DapiDataWalker {
     needComma : array<bool>
 
     def comma() {
-        if (!empty(needComma) && needComma[length(needComma) - 1]) {
+        if (length(needComma) > 0 && needComma[length(needComma) - 1]) {
             *writer |> write(",")
         }
     }
@@ -494,7 +497,7 @@ class JsonWalker : DapiDataWalker {
     }
 
     def markComma() {
-        if (!empty(needComma)) {
+        if (length(needComma) > 0) {
             needComma[length(needComma) - 1] = true
         }
     }
@@ -527,13 +530,13 @@ class JsonWalker : DapiDataWalker {
     }
 
     // --- arrays ---
-    def override beforeArrayData(ps : void?; stride : uint; count : uint64; ti : TypeInfo) : void {
+    def override beforeArrayData(ps : void?; stride : uint; count : uint; ti : TypeInfo) : void {
         *writer |> write("[")
         indent++
         pushComma()
     }
 
-    def override afterArrayData(ps : void?; stride : uint; count : uint64; ti : TypeInfo) : void {
+    def override afterArrayData(ps : void?; stride : uint; count : uint; ti : TypeInfo) : void {
         popComma()
         indent--
         nl()
@@ -541,12 +544,12 @@ class JsonWalker : DapiDataWalker {
         markComma()
     }
 
-    def override beforeArrayElement(ps : void?; ti : TypeInfo; pe : void?; index : uint64; last : bool) : void {
+    def override beforeArrayElement(ps : void?; ti : TypeInfo; pe : void?; index : uint; last : bool) : void {
         comma()
         nl()
     }
 
-    def override afterArrayElement(ps : void?; ti : TypeInfo; pe : void?; index : uint64; last : bool) : void {
+    def override afterArrayElement(ps : void?; ti : TypeInfo; pe : void?; index : uint; last : bool) : void {
         markComma()
     }
 
@@ -565,16 +568,16 @@ class JsonWalker : DapiDataWalker {
         markComma()
     }
 
-    def override beforeTableKey(pa : DapiTable; ti : TypeInfo; pk : void?; ki : TypeInfo; index : uint64; last : bool) : void {
+    def override beforeTableKey(pa : DapiTable; ti : TypeInfo; pk : void?; ki : TypeInfo; index : uint; last : bool) : void {
         comma()
         nl()
     }
 
-    def override afterTableKey(pa : DapiTable; ti : TypeInfo; pk : void?; ki : TypeInfo; index : uint64; last : bool) : void {
+    def override afterTableKey(pa : DapiTable; ti : TypeInfo; pk : void?; ki : TypeInfo; index : uint; last : bool) : void {
         *writer |> write(": ")
     }
 
-    def override afterTableValue(pa : DapiTable; ti : TypeInfo; pv : void?; kv : TypeInfo; index : uint64; last : bool) : void {
+    def override afterTableValue(pa : DapiTable; ti : TypeInfo; pv : void?; kv : TypeInfo; index : uint; last : bool) : void {
         markComma()
     }
 
@@ -703,12 +706,12 @@ class FilteringWalker : DapiDataWalker {
 
     def override afterStructure(ps : void?; si : StructInfo) : void {
         indent--
-        pad()
+        self->pad()
         print("\}\n")
     }
 
     def override beforeStructureField(ps : void?; si : StructInfo; pv : void?; vi : VarInfo; last : bool) : void {
-        pad()
+        self->pad()
         print("{vi.name} = ")
     }
 

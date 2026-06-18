@@ -145,9 +145,9 @@ def main {
 
     // You can also use |= with EnumName.Value to set flags
     var rwx : FilePermissions
-    rwx |= FilePermissions.read   // nolint:STYLE022 — tutorial demonstrates `|=` flag-set form
-    rwx |= FilePermissions.write  // nolint:STYLE022 — tutorial demonstrates `|=` flag-set form
-    rwx |= FilePermissions.execute  // nolint:STYLE022 — tutorial demonstrates `|=` flag-set form
+    rwx |= FilePermissions.read
+    rwx |= FilePermissions.write
+    rwx |= FilePermissions.execute
     print("rwx = {rwx}\n")
 
     // Clear a flag with dot syntax, or toggle with ^=

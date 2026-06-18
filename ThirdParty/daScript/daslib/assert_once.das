@@ -1,5 +1,7 @@
 options gen2
 options indenting = 4
+options no_unused_block_arguments = false
+options no_unused_function_arguments = false
 options strict_smart_pointers
 
 module assert_once shared private
@@ -15,7 +17,7 @@ require daslib/rtti
 require daslib/ast_boost
 require daslib/templates_boost
 
-[tag_function(asset_once_tag), unused_argument(expr)]
+[tag_function(asset_once_tag)]
 def public assert_once(expr : bool; message : string = "") {
     //! Same as assert, only the check will be not be repeated after the assertion failed the first time.
     pass

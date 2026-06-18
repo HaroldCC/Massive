@@ -28,68 +28,23 @@ namespace das {
         }
     }
 
-    static TypeDecl * makeFixedArrayNode ( Expression * dimExpr, const LineInfo & at ) {
-        auto fa = new TypeDecl(Type::tFixedArray);
-        fa->at = at;
+    void appendDimExpr ( TypeDecl * typeDecl, Expression * dimExpr ) {
         if ( dimExpr ) {
-            fa->fixedDim = TypeDecl::dimConst;
+            int32_t dI = TypeDecl::dimConst;
             if ( dimExpr->rtti_isConstant() ) {                // note: this shortcut is here so we don`t get extra infer pass on every array
                 auto cI = (ExprConst *) dimExpr;
                 auto bt = cI->baseType;
                 if ( bt==Type::tInt || bt==Type::tUInt ) {
-                    fa->fixedDim = cast<int32_t>::to(cI->value);
+                    dI = cast<int32_t>::to(cI->value);
                 }
             }
-            fa->fixedDimExpr = dimExpr;
+            typeDecl->dim.push_back(dI);
+            typeDecl->dimExpr.push_back(dimExpr);
         } else {
-            fa->fixedDim = TypeDecl::dimAuto;
+            typeDecl->dim.push_back(TypeDecl::dimAuto);
+            typeDecl->dimExpr.push_back(nullptr);
         }
-        return fa;
-    }
-
-    TypeDecl * appendDimExpr ( TypeDecl * chain, Expression * dimExpr, const LineInfo & at ) {
-        auto fa = makeFixedArrayNode(dimExpr, at);
-        if ( !chain ) return fa;
-        auto inner = chain;                                     // chain under construction - innermost firstType is null
-        while ( inner->firstType ) inner = inner->firstType;
-        inner->firstType = fa;
-        return chain;
-    }
-
-    TypeDecl * attachDimChain ( TypeDecl * chain, TypeDecl * element ) {
-        auto inner = chain;
-        while ( inner->firstType ) inner = inner->firstType;
-        inner->firstType = element;
-        // the old world fused these qualifiers onto the single dim-carrying node; canonical
-        // form keeps them on the outermost FA node only. `alias` stays on the element - at
-        // parse time it is the unresolved type name, not a label on the array
-        chain->ref |= element->ref;                     element->ref = false;
-        chain->removeRef |= element->removeRef;         element->removeRef = false;
-        chain->constant |= element->constant;           element->constant = false;
-        chain->removeConstant |= element->removeConstant; element->removeConstant = false;
-        chain->temporary |= element->temporary;         element->temporary = false;
-        chain->removeTemporary |= element->removeTemporary; element->removeTemporary = false;
-        chain->implicit |= element->implicit;           element->implicit = false;
-        chain->explicitConst |= element->explicitConst; element->explicitConst = false;
-        chain->explicitRef |= element->explicitRef;     element->explicitRef = false;
-        chain->isExplicit |= element->isExplicit;       element->isExplicit = false;
-        chain->autoToAlias |= element->autoToAlias;     element->autoToAlias = false;
-        element->removeDim = false;                     // old splice cleared it outright
-        return chain;
-    }
-
-    TypeDecl * appendAutoDim ( TypeDecl * typeDecl, const LineInfo & at ) {
-        auto fa = makeFixedArrayNode(nullptr, at);
-        if ( typeDecl->baseType==Type::tFixedArray ) {
-            // gen1 `foo[3][]` pushed the auto dim at the END - innermost position
-            auto inner = typeDecl;
-            while ( inner->firstType && inner->firstType->baseType==Type::tFixedArray ) inner = inner->firstType;
-            fa->firstType = inner->firstType;
-            inner->firstType = fa;
-            typeDecl->removeDim = false;
-            return typeDecl;
-        }
-        return attachDimChain(fa, typeDecl);
+        typeDecl->removeDim = false;
     }
 
     vector<ExpressionPtr> sequenceToList ( Expression * arguments ) {
@@ -370,10 +325,8 @@ namespace das {
                         virtfin->at, CompilationError::internal_function);
                 }
             }
-            const bool hasParent = (pStruct->parent != nullptr);
             for ( auto & ffd : pStruct->fields ) {
                 ffd.implemented = false;
-                ffd.inherited   = hasParent;
             }
             for ( auto pDecl : *list ) {
                 for ( const auto & name_at : *pDecl->pNameList ) {
@@ -433,8 +386,6 @@ namespace das {
                                 ffd.sealed = pDecl->sealed;
                                 ffd.implemented = true;
                                 ffd.classMethod = pDecl->isClassMethod;
-                                ffd._abstract = pDecl->isAbstract;
-                                ffd.inherited = false;
                             }
                         }
                     } else {
@@ -459,8 +410,6 @@ namespace das {
                             oldFd->sealed = pDecl->sealed;
                             oldFd->implemented = true;
                             oldFd->classMethod = pDecl->isClassMethod;
-                            oldFd->_abstract = false;
-                            oldFd->inherited = false;
                         } else {
                             das_yyerror(scanner,"structure field is already declared "+name_at.name
                                 +", use override to replace initial value instead",name_at.at,
@@ -724,7 +673,6 @@ namespace das {
                 );
                 decl->isPrivate = isPrivate;
                 decl->isClassMethod = true;
-                decl->isAbstract = true;
                 list->push_back(decl);
             }
         }
@@ -934,14 +882,7 @@ namespace das {
             for ( auto pDecl : *list ) {
                 if ( pDecl->pTypeDecl ) {
                     for ( const auto & name_at : *pDecl->pNameList ) {
-                        // Macro-tagged names (`$i(expr)` in block-arg position) all parse to the
-                        // literal placeholder "``MACRO``TAG``"; the actual name is resolved later
-                        // when the macro processor substitutes the tag expression. Skip the dup
-                        // check for tagged names so multi-arg lists like
-                        // `$($i(a) : T, $i(b) : T) { ... }` aren't false-positive at parse time.
-                        // After resolution, duplicate names surface as ordinary local-lookup
-                        // conflicts during type inference.
-                        if ( name_at.tag || !closure->findArgument(name_at.name) ) {
+                        if ( !closure->findArgument(name_at.name) ) {
                             VariablePtr pVar = new Variable();
                             pVar->name = name_at.name;
                             pVar->aka = name_at.aka;
@@ -1017,21 +958,12 @@ namespace das {
         pLet->inScope = inScope;
         pLet->isTupleExpansion = decl->isTupleExpansion;
         if ( decl->pTypeDecl ) {
-            size_t nameIndex = 0;
             for ( const auto & name_at : *decl->pNameList ) {
-                // tagged names (`$i(expr)`) all parse to the same literal placeholder — skip the
-                // dup check for them; post-substitution duplicates surface during type inference
-                if ( name_at.tag || !pLet->find(name_at.name) ) {
+                if ( !pLet->find(name_at.name) ) {
                     VariablePtr pVar = new Variable();
                     pVar->name = name_at.name;
                     pVar->aka = name_at.aka;
                     pVar->at = name_at.at;
-                    // the front tag travels as an ExprTag wrapper around the whole let (below);
-                    // later tagged slots carry per-variable tag+source, same as block arguments
-                    if ( name_at.tag && nameIndex>0 ) {
-                        pVar->tag = true;
-                        pVar->source = name_at.tag;
-                    }
                     if ( decl->pNameList->size()>1 ) {
                         pVar->type = new TypeDecl(*decl->pTypeDecl);
                     } else {
@@ -1056,7 +988,6 @@ namespace das {
                     das_yyerror(scanner,"local variable is already declared " + name_at.name,name_at.at,
                         CompilationError::already_declared_local);
                 }
-                nameIndex ++;
             }
         }
         if ( auto pTagExpr = decl->pNameList->front().tag ) {
@@ -1077,17 +1008,11 @@ namespace das {
         for ( auto pDecl : decl ) {
             if ( pDecl->pTypeDecl ) {
                 for ( const auto & name_at : *pDecl->pNameList ) {
-                    if ( name_at.tag || !pLet->find(name_at.name) ) {
+                    if ( !pLet->find(name_at.name) ) {
                         VariablePtr pVar = new Variable();
                         pVar->name = name_at.name;
                         pVar->aka = name_at.aka;
                         pVar->at = name_at.at;
-                        // no ExprTag wrapper in the list form — every tagged name travels
-                        // as per-variable tag+source, same as block arguments
-                        if ( name_at.tag ) {
-                            pVar->tag = true;
-                            pVar->source = name_at.tag;
-                        }
                         if ( pDecl->pNameList->size()>1 ) {
                             pVar->type = new TypeDecl(*pDecl->pTypeDecl);
                         } else {
@@ -1174,18 +1099,7 @@ namespace das {
         }
     }
 
-    void ast_requireModule ( yyscan_t scanner, string * name, string * modalias, bool pub, const LineInfo & atName, string * guard ) {
-        // Optional require `require ?guard target`: when the guard module is not available, skip the
-        // require entirely (no error). A present guard with a missing target still errors below.
-        if ( guard ) {
-            bool guardAvailable = Module::requireEx(*guard, false) != nullptr;
-            delete guard;
-            if ( !guardAvailable ) {
-                delete name;
-                if ( modalias ) delete modalias;
-                return;
-            }
-        }
+    void ast_requireModule ( yyscan_t scanner, string * name, string * modalias, bool pub, const LineInfo & atName ) {
         auto info = yyextra->g_Access->getModuleInfo(*name, yyextra->g_FileAccessStack.back()->name);
         if ( auto mod = yyextra->g_Program->addModule(info.moduleName) ) {
             yyextra->g_Program->allRequireDecl.push_back(make_tuple(mod,*name,info.fileName,pub,atName));
@@ -1213,8 +1127,7 @@ namespace das {
     }
 
     Expression * ast_forLoop ( yyscan_t,  vector<VariableNameAndPosition> * iters, Expression * srcs,
-        Expression * block, const LineInfo & locAt, const LineInfo & blockAt,
-        AnnotationArgumentList * annL ) {
+        Expression * block, const LineInfo & locAt, const LineInfo & blockAt ) {
         auto pFor = new ExprFor(locAt);
         pFor->visibility = blockAt;
         for ( const auto & np : *iters ) {
@@ -1227,7 +1140,6 @@ namespace das {
         delete iters;
         pFor->sources = sequenceToList(srcs);
         pFor->body = block;
-        if ( annL ) { pFor->annotations = move(*annL); delete annL; }
         ((ExprBlock *)block)->inTheLoop = true;
         return pFor;
     }
@@ -1247,23 +1159,17 @@ namespace das {
         return argL;
     }
 
-    Expression * ast_lpipe ( yyscan_t scanner, Expression * fncall, Expression * arg, const LineInfo & locAt, bool markPiped ) {
+    Expression * ast_lpipe ( yyscan_t scanner, Expression * fncall, Expression * arg, const LineInfo & locAt ) {
         Expression * pipeCall = fncall->tail();
         if ( pipeCall->rtti_isCallLikeExpr() ) {
             auto pCall = (ExprLooksLikeCall *) pipeCall;
             pCall->arguments.push_back(arg);
-            if ( markPiped && arg->rtti_isMakeBlock() ) {
-                pCall->pipedCallArgument = true;
-            }
             return fncall;
         } else if ( pipeCall->rtti_isVar() ) {
             // a += b <| c
             auto pVar = (ExprVar *) pipeCall;
             auto pCall = yyextra->g_Program->makeCall(pVar->at,pVar->name);
             pCall->arguments.push_back(arg);
-            if ( markPiped && arg->rtti_isMakeBlock() ) {
-                pCall->pipedCallArgument = true;
-            }
             if ( !fncall->swap_tail(pVar,pCall) ) {
                 // gc_node — don't delete Expression
                 return pCall;
@@ -1363,18 +1269,6 @@ namespace das {
         }
         *out = 0;
         return int(out - buf);
-    }
-
-    vector<string> ast_tupleCollectShorthandNames ( const vector<ExpressionPtr> & values ) {
-        vector<string> names;
-        names.reserve(values.size());
-        for ( auto val : values ) {
-            if ( !val || !val->rtti_isVar() ) return {};
-            auto ev = static_cast<ExprVar *>(val);
-            if ( ev->name.find("::") != string::npos ) return {};
-            names.push_back(ev->name);
-        }
-        return names;
     }
 
     Expression * ast_makeStructToMakeVariant ( MakeStruct * decl, const LineInfo & locAt ) {

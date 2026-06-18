@@ -9,7 +9,7 @@
 
 #include "daScript/daScript.h"
 #include "daScript/daScriptModule.h"
-#include "daScript/misc/das_common.h"
+#include "daScript/das_common.h"
 #include "daScript/simulate/fs_file_info.h"
 #include "daScript/ast/dyn_modules.h"
 #include "daScript/misc/crash_handler.h"
@@ -27,16 +27,6 @@
 #include <dlfcn.h>
 #endif
 
-#if defined(__APPLE__)
-#include <objc/objc.h>
-#include <objc/runtime.h>
-#include <objc/message.h>
-#endif
-
-#include <cstdlib>
-#include <cstdio>
-#include <cstring>
-
 using namespace das;
 
 void require_project_specific_modules();
@@ -45,16 +35,9 @@ das::FileAccessPtr get_file_access( char * pak );
 static TextPrinter tout;
 static string projectFile;
 static string project_root;
-static vector<string> load_modules;
 static bool version2syntax = true;
 static bool trackAllocations = false;
 static bool heapReportAtExit = false;
-// Resolved live-API port for the single-instance lock key. Populated from
-// the full argv via find_live_port_in_argv() before acquire_single_instance().
-// 0 means "not yet resolved"; defaults to 9090 if no --live-port was passed.
-// No env / config-file path — the .das side scans the same argv so both
-// agree without any state handoff.
-static int g_resolvedLivePort = 0;
 
 // --- DLL function pointers (loaded at runtime from dasModuleLiveHost) ---
 // All use POD types only — safe across DLL boundary.
@@ -67,17 +50,14 @@ typedef void (*SetBoolFn)(bool);
 static BoolFn  dll_exit_requested = nullptr;
 static BoolFn  dll_reload_requested = nullptr;
 static BoolFn  dll_full_reload = nullptr;
-static BoolFn  dll_reset_requested = nullptr;
 static BoolFn  dll_is_paused = nullptr;
 static BoolFn  dll_files_changed = nullptr;
 static SetFloatFn dll_set_dt = nullptr;
 static SetFloatFn dll_set_uptime = nullptr;
 static SetFloatFn dll_set_fps = nullptr;
-static SetFloatFn dll_advance_clock = nullptr;
 static SetBoolFn  dll_set_is_reload = nullptr;
 static SetBoolFn  dll_set_paused = nullptr;
 static VoidFn  dll_clear_reload_flags = nullptr;
-static VoidFn  dll_bump_reload_generation = nullptr;
 static VoidFn  dll_clear_live_vars = nullptr;
 static VoidFn  dll_clear_store = nullptr;
 static VoidFn  dll_clear_error = nullptr;
@@ -108,17 +88,14 @@ static bool load_live_host_functions() {
     dll_exit_requested    = (BoolFn)get_dll_symbol("live_host_exit_requested");
     dll_reload_requested  = (BoolFn)get_dll_symbol("live_host_reload_requested");
     dll_full_reload       = (BoolFn)get_dll_symbol("live_host_full_reload");
-    dll_reset_requested   = (BoolFn)get_dll_symbol("live_host_reset_requested");
     dll_is_paused         = (BoolFn)get_dll_symbol("live_host_is_paused");
     dll_files_changed     = (BoolFn)get_dll_symbol("live_host_files_changed");
     dll_set_dt            = (SetFloatFn)get_dll_symbol("live_host_set_dt");
     dll_set_uptime        = (SetFloatFn)get_dll_symbol("live_host_set_uptime");
     dll_set_fps           = (SetFloatFn)get_dll_symbol("live_host_set_fps");
-    dll_advance_clock     = (SetFloatFn)get_dll_symbol("live_host_advance_clock");
     dll_set_is_reload     = (SetBoolFn)get_dll_symbol("live_host_set_is_reload");
     dll_set_paused        = (SetBoolFn)get_dll_symbol("live_host_set_paused");
     dll_clear_reload_flags = (VoidFn)get_dll_symbol("live_host_clear_reload_flags");
-    dll_bump_reload_generation = (VoidFn)get_dll_symbol("live_host_bump_reload_generation");
     dll_clear_live_vars   = (VoidFn)get_dll_symbol("live_host_clear_live_vars");
     dll_clear_store       = (VoidFn)get_dll_symbol("live_host_clear_store");
     dll_clear_error       = (VoidFn)get_dll_symbol("live_host_clear_error");
@@ -181,10 +158,6 @@ static void auto_tick_agents() {
 // --- Compilation ---
 
 struct CompileResult {
-    // moduleGroup owns the non-builtin dep modules (deletes them on reset()).
-    // Program/Context hold raw Module* into it via library.modules, so it must
-    // outlive program+ctx. Declared first → destroyed last.
-    unique_ptr<ModuleGroup> moduleGroup;
     ProgramPtr program;
     ContextPtr ctx;
     FileAccessPtr access;
@@ -193,7 +166,6 @@ struct CompileResult {
 
 static CompileResult compile_script(const string & fn) {
     CompileResult result;
-    result.moduleGroup = make_unique<ModuleGroup>();
     result.access = get_file_access((char*)(projectFile.empty() ? nullptr : projectFile.c_str()));
 
     CodeOfPolicies policies;
@@ -207,7 +179,8 @@ static CompileResult compile_script(const string & fn) {
     policies.rtti = true;
     policies.track_allocations = trackAllocations;
 
-    result.program = compileDaScript(fn, result.access, tout, *result.moduleGroup, policies);
+    ModuleGroup moduleGroup;
+    result.program = compileDaScript(fn, result.access, tout, moduleGroup, policies);
     if (!result.program) {
         result.errors = "failed to compile " + fn;
         tout << "ERROR: " << result.errors << "\n";
@@ -399,19 +372,12 @@ static int run_lifecycle(const string & fn) {
     // Main loop
     while (!(dll_exit_requested && dll_exit_requested())) {
         double now = get_time_sec();
-        float wall_dt = float(now - lastTime);
+        float dt = float(now - lastTime);
+        float uptime = float(now - startTime);
         lastTime = now;
 
-        // Single source of truth for the frame clock. advance_clock applies the
-        // recorder's fixed-dt lockstep when set, wall-clock otherwise, and owns the
-        // uptime accumulator — so capture, animation, and convert share one grid.
-        // Fall back to the legacy set_dt/set_uptime pair on an older DLL.
-        if (dll_advance_clock) {
-            dll_advance_clock(wall_dt);
-        } else {
-            if (dll_set_dt) dll_set_dt(wall_dt);
-            if (dll_set_uptime) dll_set_uptime(float(now - startTime));
-        }
+        if (dll_set_dt) dll_set_dt(dt);
+        if (dll_set_uptime) dll_set_uptime(uptime);
 
         // FPS calculation
         frameCount++;
@@ -457,21 +423,11 @@ static int run_lifecycle(const string & fn) {
         // Auto-tick debug agents
         auto_tick_agents();
 
-        // Check for reload / reset. A recompile (file change / POST /reload) supersedes
-        // a reset: it produces a fresh context too, plus new code — so if both are
-        // pending in one tick, take the recompile and let the reset be absorbed.
-        // Otherwise clear_reload_flags below would drop the pending files_changed
-        // silently and leave stale code running.
-        bool reloadPending = (dll_reload_requested && dll_reload_requested())
-                          || (dll_files_changed && dll_files_changed());
-        bool isReset = !reloadPending && dll_reset_requested && dll_reset_requested();
-        bool needsReload = reloadPending || isReset;
+        // Check for reload
+        bool needsReload = (dll_reload_requested && dll_reload_requested())
+                        || (dll_files_changed && dll_files_changed());
         if (needsReload) {
-            tout << (isReset ? "daslang-live: resetting...\n" : "daslang-live: reloading...\n");
-            // reload_generation must advance on EVERY terminal outcome (success or
-            // failure) so clients polling /status get a deterministic signal even when
-            // a reload/reset fails (they then read has_error). Bump at each block exit.
-            auto bumpGen = [&]{ if (dll_bump_reload_generation) dll_bump_reload_generation(); };
+            tout << "daslang-live: reloading...\n";
 
             // Set reload flag BEFORE shutdown so is_reload() returns true
             if (dll_set_is_reload) dll_set_is_reload(true);
@@ -493,53 +449,28 @@ static int run_lifecycle(const string & fn) {
                 }
             }
 
-            // Reset (POST /reset): re-simulate the already-compiled program into a
-            // fresh context — no parse / no infer. simulate is ~1/10th of compile, so
-            // this turns a ~10s reload into ~1s; used to reset state between subtests
-            // without respawning the host. A fresh context zeroes globals; clear the
-            // live-var store too so [after_reload] can't restore prior-subtest state
-            // (clean-slate). Reload (file change / POST /reload) still recompiles below.
-            if (isReset && cr.program) {
-                tout << "daslang-live: reset (re-simulate, no recompile)\n";
-                auto newCtx = SimulateWithErrReport(cr.program, tout);
-                if (!newCtx) {
-                    tout << "daslang-live: reset FAILED (simulate), paused\n";
-                    if (dll_set_last_error) dll_set_last_error("reset: simulate failed");
-                    if (dll_set_paused) dll_set_paused(true);
-                    if (dll_clear_reload_flags) dll_clear_reload_flags();
-                    ctx_had_exception = true;
-                    bumpGen();
-                    continue;
-                }
-                if (dll_clear_live_vars) dll_clear_live_vars();
-                if (dll_clear_store) dll_clear_store();
-                cr.ctx = das::move(newCtx);   // swap only the context; program/moduleGroup/access stay alive
-                ctx = cr.ctx.get();
-            } else {
-                // Recompile
-                auto newCr = compile_script(fn);
-                if (!newCr.ctx) {
-                    tout << "daslang-live: reload FAILED, keeping old context (paused)\n";
-                    if (dll_set_last_error) dll_set_last_error(newCr.errors.c_str());
-                    if (dll_set_paused) dll_set_paused(true);
-                    if (dll_clear_reload_flags) dll_clear_reload_flags();
-                    // Re-init old context if we have one (shutdown was already called)
-                    if (ctx && !ctx_had_exception) {
-                        if (dll_set_is_reload) dll_set_is_reload(true);
-                        ctx->restart();
-                        call_annotated_list(ctx, g_annotated.after_reload);
-                        if (fnInit) {
-                            ctx->evalWithCatch(fnInit, nullptr);
-                        }
+            // Recompile
+            auto newCr = compile_script(fn);
+            if (!newCr.ctx) {
+                tout << "daslang-live: reload FAILED, keeping old context (paused)\n";
+                if (dll_set_last_error) dll_set_last_error(newCr.errors.c_str());
+                if (dll_set_paused) dll_set_paused(true);
+                if (dll_clear_reload_flags) dll_clear_reload_flags();
+                // Re-init old context if we have one (shutdown was already called)
+                if (ctx && !ctx_had_exception) {
+                    if (dll_set_is_reload) dll_set_is_reload(true);
+                    ctx->restart();
+                    call_annotated_list(ctx, g_annotated.after_reload);
+                    if (fnInit) {
+                        ctx->evalWithCatch(fnInit, nullptr);
                     }
-                    bumpGen();
-                    continue;
                 }
-
-                // Swap to new context
-                cr = das::move(newCr);
-                ctx = cr.ctx.get();
+                continue;
             }
+
+            // Swap to new context
+            cr = das::move(newCr);
+            ctx = cr.ctx.get();
 
             // Re-find functions
             fnInit = find_void_function(ctx, "init");
@@ -550,7 +481,6 @@ static int run_lifecycle(const string & fn) {
                 tout << "ERROR: reloaded script missing init() or update()\n";
                 if (dll_set_paused) dll_set_paused(true);
                 if (dll_clear_reload_flags) dll_clear_reload_flags();
-                bumpGen();
                 continue;
             }
 
@@ -585,7 +515,6 @@ static int run_lifecycle(const string & fn) {
                 if (dll_set_paused) dll_set_paused(true);
                 if (dll_clear_store) dll_clear_store();
                 ctx_had_exception = true;
-                bumpGen();
                 continue;
             }
 
@@ -600,8 +529,7 @@ static int run_lifecycle(const string & fn) {
                 ctx_had_exception = true;
             }
 
-            bumpGen();
-            tout << (isReset ? "daslang-live: reset complete\n" : "daslang-live: reload complete\n");
+            tout << "daslang-live: reload complete\n";
         }
     }
 
@@ -635,52 +563,11 @@ static int run_lifecycle(const string & fn) {
 
 // --- Arg parsing ---
 
-// Strict port parse: rejects trailing garbage (atoi would silently accept
-// "9090abc" → 9090). Returns 0 on any failure; caller treats 0 as "no override".
-// Matches the .das side's `try_to_int` semantics so both sides reject the
-// same inputs.
-static int parse_port_strict(const char * s) {
-    if (!s || !*s) return 0;
-    char * end = nullptr;
-    long v = strtol(s, &end, 10);
-    if (end == s || *end != '\0') return 0;
-    if (v <= 0 || v > 65535) return 0;
-    return int(v);
-}
-
-// Scan the FULL argv (including any post-`--` slice) for `--live-port N` /
-// `--live-port=N`. Last occurrence wins UNCONDITIONALLY — even when the
-// last occurrence's value is invalid the result becomes 0 (caller defaults).
-// This matches `daslib/clargs.find_flag_raw_value`, which returns the raw
-// value from the last occurrence regardless of validity; `parse_port_string`
-// on the .das side then maps invalid values to 0. If C++ kept "last VALID"
-// while .das kept "last RAW (then validated)", a tail like
-// `--live-port 19090 --live-port abc` would have C++ lock on 19090 and
-// .das default to 9090, reintroducing the lock-vs-bind mismatch.
-//
-// Why full-argv: daslang-live's own arg loop stops at `--` and forwards the
-// rest to the script, but `live_api`'s [init] scans the full argv. Both
-// sides MUST agree on the same source.
-static int find_live_port_in_argv(int argc, char * argv[]) {
-    int port = 0;
-    for (int i = 1; i < argc; ++i) {
-        const char * a = argv[i];
-        if (strcmp(a, "--live-port") == 0 && i + 1 < argc) {
-            port = parse_port_strict(argv[++i]);  // last-occurrence-wins, invalid → 0
-        } else if (strncmp(a, "--live-port=", 12) == 0) {
-            port = parse_port_strict(a + 12);
-        }
-    }
-    return port;
-}
-
 static void print_help() {
     tout << "daslang-live version " << DAS_VERSION_MAJOR << "." << DAS_VERSION_MINOR << "." << DAS_VERSION_PATCH << "\n";
     tout << "daslang-live - live-reloading application host for daScript\n";
     tout << "Usage: daslang-live [options] <script.das> [-- script arguments]\n";
     tout << "  -project <file>    - project file (.das_project)\n";
-    tout << "  -project_root <path> - project root (parent of modules/, default: script's dir)\n";
-    tout << "  -load_module <path> - directly load a single dynamic-module folder (the one containing .das_module); repeatable. Shadows same-basename entries from dasroot/project_root.\n";
     tout << "  -dasroot <path>    - override DAS_ROOT\n";
     tout << "  -cwd               - change working directory to script's folder\n";
     tout << "  -v1syntax          - use v1 syntax (default: v2)\n";
@@ -688,8 +575,7 @@ static void print_help() {
     tout << "  -heap-report       - dump heap contents on shutdown\n";
     tout << "  --no-dyn-modules   - skip loading dynamic modules\n";
     tout << "  --no-dump-leaks    - silence JobStatus + HandleRegistry leak dumps at exit (default: dump)\n";
-    tout << "  --live-port <N>    - port for the REST API (default 9090, range 1-65535); recognized pre or post `--`\n";
-    tout << "  --                 - separator; everything after is forwarded to the script (get_user_args)\n";
+    tout << "  --                 - separator for script arguments\n";
     tout << "  -h, --help         - this help\n";
 }
 
@@ -700,18 +586,12 @@ static HANDLE g_singleInstanceMutex = nullptr;
 #else
 #include <sys/file.h>
 #include <unistd.h>
-#include <cerrno>
 static int g_lockFd = -1;
 #endif
 
-static bool acquire_single_instance(int port) {
-    // Lock key includes the port so two daslang-live instances on different ports
-    // can coexist. Same port still serializes — port conflict on bind would
-    // fail anyway, so the lock just gives a cleaner error.
+static bool acquire_single_instance() {
 #ifdef _WIN32
-    char mutexName[64];
-    snprintf(mutexName, sizeof(mutexName), "daslang-live-single-instance-%d", port);
-    g_singleInstanceMutex = CreateMutexA(nullptr, TRUE, mutexName);
+    g_singleInstanceMutex = CreateMutexA(nullptr, TRUE, "daslang-live-single-instance");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         if (g_singleInstanceMutex) {
             CloseHandle(g_singleInstanceMutex);
@@ -721,8 +601,7 @@ static bool acquire_single_instance(int port) {
     }
     return g_singleInstanceMutex != nullptr;
 #else
-    char lockPath[64];
-    snprintf(lockPath, sizeof(lockPath), "/tmp/daslang-live-%d.lock", port);
+    const char * lockPath = "/tmp/daslang-live.lock";
     g_lockFd = open(lockPath, O_CREAT | O_RDWR, 0600);
     if (g_lockFd < 0) return true;  // can't create lock file — allow running
     if (flock(g_lockFd, LOCK_EX | LOCK_NB) != 0) {
@@ -752,36 +631,6 @@ static void release_single_instance() {
 
 // --- Entry point ---
 
-#if defined(__APPLE__)
-// Disable macOS App Nap for this process. On a headless / offscreen CI runner the
-// daslang-live window is unfocused, so macOS throttles the process during input-less
-// recording holds — the render loop stalls and frame capture flatlines (dasImgui #190).
-// beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep keeps the process
-// at full scheduling for its lifetime (idle *system* sleep is still permitted). Driven via
-// the objc runtime so main.cpp stays plain C++ (no .mm); Foundation is linked on Apple in
-// CMakeLists. No-op if Foundation / NSProcessInfo can't be resolved.
-static void disable_app_nap_macos() {
-    Class piClass = objc_getClass("NSProcessInfo");
-    if (!piClass) return;
-    id processInfo = ((id(*)(Class, SEL))objc_msgSend)(piClass, sel_registerName("processInfo"));
-    if (!processInfo) return;
-    Class strClass = objc_getClass("NSString");
-    if (!strClass) return;
-    id reason = ((id(*)(Class, SEL, const char*))objc_msgSend)(
-        strClass, sel_registerName("stringWithUTF8String:"),
-        "daslang-live: continuous render for recording capture (#190)");
-    const unsigned long long NSActivityUserInitiatedAllowingIdleSystemSleep = 0x00FFFFFFULL;
-    id activity = ((id(*)(id, SEL, unsigned long long, id))objc_msgSend)(
-        processInfo, sel_registerName("beginActivityWithOptions:reason:"),
-        NSActivityUserInitiatedAllowingIdleSystemSleep, reason);
-    if (activity) {
-        // Retain for the process lifetime (no ARC); intentionally never released.
-        ((id(*)(id, SEL))objc_msgSend)(activity, sel_registerName("retain"));
-        tout << "daslang-live: macOS App Nap disabled (NSActivityUserInitiatedAllowingIdleSystemSleep)\n";
-    }
-}
-#endif
-
 int main(int argc, char * argv[]) {
 #if defined(_WIN32) && defined(_DEBUG)
     _CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
@@ -789,15 +638,6 @@ int main(int argc, char * argv[]) {
 
     install_das_crash_handler();
     das::arm_alloc_tracking();
-
-#if defined(__APPLE__)
-    disable_app_nap_macos();
-#endif
-
-    // Forward full argv so scripts can read get_user_args() (post-`--` slice).
-    // Matches daslang.exe's behavior — daslang-live ignores everything after
-    // `--` itself, but the script still gets the slice via get_cli_arguments().
-    setCommandLineArguments(argc, argv);
 
     string scriptFile;
     bool noDynamicModules = false;
@@ -809,10 +649,6 @@ int main(int argc, char * argv[]) {
         string arg = argv[i];
         if (arg == "-project" && i + 1 < argc) {
             projectFile = argv[++i];
-        } else if ((arg == "-project_root" || arg == "-project-root") && i + 1 < argc) {
-            project_root = argv[++i];
-        } else if ((arg == "-load_module" || arg == "-load-module") && i + 1 < argc) {
-            load_modules.push_back(argv[++i]);
         } else if (arg == "-dasroot" && i + 1 < argc) {
             setDasRoot(argv[++i]);
         } else if (arg == "-cwd") {
@@ -829,14 +665,6 @@ int main(int argc, char * argv[]) {
             dumpLeaks = true;
         } else if (arg == "--no-dump-leaks") {
             dumpLeaks = false;
-        } else if (arg == "--live-port" && i + 1 < argc) {
-            // Consume both flag and value here so the unknown-option branch
-            // doesn't reject them. Real parsing happens in
-            // find_live_port_in_argv() after the loop — that scan also covers
-            // post-`--` occurrences which this loop never sees.
-            ++i;
-        } else if (arg.compare(0, 12, "--live-port=") == 0) {
-            // Consume `--live-port=N` for the same reason; value parsed below.
         } else if (arg == "-h" || arg == "--help") {
             print_help();
             return 0;
@@ -860,35 +688,18 @@ int main(int argc, char * argv[]) {
     if (changeCwd && !scriptFile.empty()) {
         auto slash = scriptFile.find_last_of("\\/");
         if (slash != string::npos) {
-            // Keep the separator for root-level paths so the directory stays valid:
-            // POSIX "/foo.das" -> "/", Windows drive root "C:\foo.das" -> "C:\".
-            size_t cut = (slash == 0 || (slash == 2 && scriptFile[1] == ':')) ? slash + 1 : slash;
-            string dir = scriptFile.substr(0, cut);
+            string dir = scriptFile.substr(0, slash);
             scriptFile = scriptFile.substr(slash + 1);
 #ifdef _WIN32
-            if (!SetCurrentDirectoryA(dir.c_str())) {
-                fprintf(stderr, "ERROR: -cwd failed to change directory to %s (error %lu)\n",
-                        dir.c_str(), (unsigned long)GetLastError());
-                return 1;
-            }
+            SetCurrentDirectoryA(dir.c_str());
 #else
-            if (chdir(dir.c_str()) != 0) {
-                fprintf(stderr, "ERROR: -cwd failed to change directory to %s: %s\n",
-                        dir.c_str(), strerror(errno));
-                return 1;
-            }
+            chdir(dir.c_str());
 #endif
         }
     }
 
-    // Resolve port from full argv (pre AND post `--`) so the lock key here
-    // and the HTTP bind on the .das side both see the same source. No env,
-    // no config file — keep this stateless. Default to 9090 if no override.
-    g_resolvedLivePort = find_live_port_in_argv(argc, argv);
-    if (g_resolvedLivePort == 0) g_resolvedLivePort = 9090;
-
-    if (!acquire_single_instance(g_resolvedLivePort)) {
-        fprintf(stderr, "ERROR: another instance of daslang-live is already running on port %d\n", g_resolvedLivePort);
+    if (!acquire_single_instance()) {
+        fprintf(stderr, "ERROR: another instance of daslang-live is already running\n");
         return 1;
     }
 
@@ -908,7 +719,7 @@ int main(int argc, char * argv[]) {
             project_root = (slash != string::npos) ? scriptFile.substr(0, slash) : "./";
         }
         auto access = get_file_access((char*)(projectFile.empty() ? nullptr : projectFile.c_str()));
-        require_dynamic_modules(access, getDasRoot(), project_root, load_modules, tout);
+        require_dynamic_modules(access, getDasRoot(), project_root, tout);
     }
 #endif
     Module::Initialize();

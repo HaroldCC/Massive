@@ -29,7 +29,7 @@ namespace das {
     class DAS_API FsFileAccess : public das::ModuleFileAccess {
     public:
         FsFileAccess();
-        FsFileAccess ( const string & pak, const smart_ptr<Program> & program );
+        FsFileAccess ( const string & pak, const FileAccessPtr & access );
         virtual ~FsFileAccess();
         virtual void createFileSystems();
         void addFileSystem ( AnyFileSystem * fs, bool firstToTry, bool sharedFs );

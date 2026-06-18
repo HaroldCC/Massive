@@ -294,7 +294,6 @@ namespace das
     ,   invalid_with_type                                           =   30293    // 1 site(s)
     ,   invalid_yield                                               =   30294    // 1 site(s)
     ,   invalid_yield_in_block                                      =   30295    // 1 site(s)
-    ,   invalid_empty_name                                          =   30296    // AST node with empty name; usually a macro emission bug
 
 // missing_*
 
@@ -320,7 +319,6 @@ namespace das
     ,   missing_result                                              =   30319    // 1 site(s)
     ,   missing_structure_field                                     =   30320    // 1 site(s)
     ,   missing_typeinfo_subexpression                              =   30321    // 4 site(s)
-    ,   missing_super_call                                          =   30322    // class ctor must call super(); or parent ctor missing default
 
 // mismatching_*
 
@@ -353,7 +351,6 @@ namespace das
     ,   exceeds_type                                                =   30512    // 2 site(s)
     ,   exceeds_type_alias                                          =   30513    // 1 site(s)
     ,   exceeds_typeinfo_sizeof                                     =   30514    // 1 site(s)
-    ,   exceeds_constant_range                                      =   30515    // 1 site(s)
 
 // ambiguous_*
 

@@ -7,12 +7,14 @@ require daslib/ast_boost
 require daslib/fio
 require daslib/jobque_boost
 require daslib/strings_boost
+require math
 require strings
+require canonical
+require minhash
 require cluster
 require report
 require exchange
 require pipeline
-require ../common/parallel_workers.das
 
 
 [CommandLineArgs]
@@ -98,7 +100,10 @@ struct Config {
 def resolve_against_files(against : array<string>; from_stdin : bool;
                           var out_set : table<string; void?>) {
     var raw : array<string>
-    raw |> push_from(against)
+    raw |> reserve(length(against))
+    for (p in against) {
+        raw |> push(p)
+    }
     if (from_stdin) {
         read_path_lines(fstdin(), raw)
     }
@@ -138,7 +143,9 @@ def mark_records_as_candidates(var records : array<FuncRecord>;
 def tag_baseline_new_members(var records : array<FuncRecord>;
                              baseline_members : table<string; void?>) {
     for (r in records) {
-        if (r.is_candidate) continue
+        if (r.is_candidate) {
+            continue
+        }
         // Path-normalize so a Windows-recorded baseline (`a\b.das`) and a
         // Unix-runner record (`a/b.das`) collide instead of mass-tagging
         // every file as new.
@@ -158,10 +165,64 @@ def strict_drop_baseline_clusters(var clusters : array<Cluster>;
     var kept : array<Cluster>
     kept |> reserve(length(clusters))
     for (c in clusters) {
-        if (key_exists(baseline_canonicals, c.canonical_sample)) continue
+        if (key_exists(baseline_canonicals, c.canonical_sample)) {
+            continue
+        }
         kept |> push_clone(c)
     }
     clusters <- kept
+}
+
+
+// Below this many input files, parallel export is a loss — each child
+// pays a daslang startup cost (a few hundred ms), so 16 files split 8
+// ways is slower than running sequentially in one process. Tune by
+// re-timing daslib (~80 files) and tests/language (~600 files) if the
+// startup cost shifts materially.
+let PARALLEL_THRESHOLD = 16
+
+
+def should_parallelize(n_files : int; workers_setting : int) : bool {
+    if (workers_setting == 1) {
+        return false
+    }
+    return n_files >= PARALLEL_THRESHOLD
+}
+
+
+def compute_worker_count(n_files : int; workers_setting : int) : int {
+    var w = workers_setting
+    if (w == 0) {
+        w = get_total_hw_threads()
+        if (w < 1) {
+            w = 1
+        }
+    }
+    if (w > n_files) {
+        w = n_files
+    }
+    if (w < 1) {
+        w = 1
+    }
+    return w
+}
+
+
+// One pre-built work item per chunk. argv is the full popen_argv
+// vector (including the daslang exe + main.das path) so workers don't
+// have to know anything about the parent's invocation.
+struct ShardInput {
+    index : int
+    chunk_path : string
+    shard_path : string
+    argv : array<string>
+}
+
+
+struct ShardResult {
+    index : int
+    exit_code : int
+    stdout : string
 }
 
 
@@ -176,28 +237,32 @@ def shard_path_for(out_path : string; tag : string; kind : string; index : int) 
 def run_parallel_export(files : array<string>; cfg : Config) {
     let workers = compute_worker_count(length(files), cfg.workers)
     let total = length(files)
-    let spawn_prefix <- spawn_argv_prefix()
-    if (length(spawn_prefix) < 2) {
-        to_log(LOG_ERROR, "error: --workers requires `daslang main.das` invocation ({length(spawn_prefix)} argv entries)\n")
+    let raw_args <- get_command_line_arguments()
+    if (length(raw_args) < 2) {
+        to_log(LOG_ERROR, "error: --workers requires `daslang main.das` invocation (raw_args has {length(raw_args)} entries)\n")
         panic("detect-dupe parallel export failed: cannot self-spawn")
     }
+    let exe = raw_args[0]
+    let script = raw_args[1]
     let tag = "{ref_time_ticks()}"
 
     let chunks <- chunk_files(files, workers)
     let n_chunks = length(chunks)
 
+    var inputs : array<ShardInput>
+    inputs |> reserve(n_chunks)
     var chunk_paths : array<string>
     chunk_paths |> reserve(n_chunks)
     var shard_paths : array<string>
     shard_paths |> reserve(n_chunks)
-    var argvs : array<array<string>>
-    argvs |> reserve(n_chunks)
     for (k in range(n_chunks)) {
         let cp = shard_path_for(cfg.export_functions, tag, "chunk", k) + ".txt"
         let sp = shard_path_for(cfg.export_functions, tag, "shard", k) + ".json"
         var write_ok = false
         fopen(cp, "wb") $(fw) {
-            if (fw == null) return
+            if (fw == null) {
+                return
+            }
             write_ok = true
             for (entry in chunks[k]) {
                 fw |> fprint("{entry}\n")
@@ -213,8 +278,9 @@ def run_parallel_export(files : array<string>; cfg : Config) {
         chunk_paths |> push(cp)
         shard_paths |> push(sp)
         var argv : array<string>
-        argv |> reserve(length(spawn_prefix) + 12)
-        argv |> push_from(spawn_prefix)
+        argv |> reserve(12)
+        argv |> push(exe)
+        argv |> push(script)
         argv |> push("--")
         argv |> push("--paths-from")
         argv |> push(cp)
@@ -230,12 +296,60 @@ def run_parallel_export(files : array<string>; cfg : Config) {
         if (cfg.no_fuzzy) {
             argv |> push("--no-fuzzy")
         }
-        argvs |> emplace(argv)
+        inputs |> emplace(ShardInput(
+            index = k,
+            chunk_path = cp,
+            shard_path = sp,
+            argv <- argv))
     }
 
     to_log(LOG_INFO, "parallel export: {n_chunks} worker(s) over {total} file(s)\n")
 
-    let results <- run_chunk_workers(argvs)
+    var results : array<ShardResult>
+    results |> resize(n_chunks)
+    for (i in range(n_chunks)) {
+        results[i].index = i
+        results[i].exit_code = -1
+    }
+
+    with_channel(n_chunks) $(inCh) {
+        with_channel(n_chunks) $(outCh) {
+            with_job_status(n_chunks) $(done) {
+                for (_t in range(n_chunks)) {
+                    new_thread <| @ {
+                        for_each_clone(inCh) $(input : ShardInput#) {
+                            var output : string
+                            let exit_code = unsafe(popen_argv(input.argv, 0.0, $(f) {
+                                if (f != null) {
+                                    output := unsafe(fread_to_eof(f))
+                                }
+                            }))
+                            outCh |> push_clone(ShardResult(
+                                index = input.index,
+                                exit_code = exit_code,
+                                stdout = output))
+                            outCh |> notify()
+                        }
+                        inCh |> release()
+                        outCh |> release()
+                        done |> notify_and_release()
+                    }
+                }
+                for (inp in inputs) {
+                    inCh |> push_clone(inp)
+                    inCh |> notify()
+                }
+                for (r in each_clone(outCh, type<ShardResult>)) {
+                    if (r.index >= 0 && r.index < length(results)) {
+                        results[r.index].index = r.index
+                        results[r.index].exit_code = r.exit_code
+                        results[r.index].stdout := r.stdout
+                    }
+                }
+                done |> join()
+            }
+        }
+    }
 
     var any_failed = false
     for (k in range(n_chunks)) {
@@ -292,9 +406,9 @@ def main() {
     }
     let importing = !empty(cfg.import_functions)
     let exporting = !empty(cfg.export_functions)
-    let has_against = !empty(cfg.against) || cfg.against_from_stdin
+    let has_against = length(cfg.against) > 0 || cfg.against_from_stdin
     let has_baseline = !empty(cfg.baseline)
-    let has_paths_input = (!empty(cfg.path)
+    let has_paths_input = (length(cfg.path) > 0
         || !empty(cfg.paths_from)
         || cfg.paths_stdin)
     if (importing && has_paths_input) {
@@ -355,7 +469,7 @@ def main() {
     var against_files : table<string; void?>
     if (has_against) {
         resolve_against_files(cfg.against, cfg.against_from_stdin, against_files)
-        if (empty(against_files)) {
+        if (length(against_files) == 0) {
             to_log(LOG_ERROR, "error: --against (or stdin) yielded no .das files\n")
             return
         }
@@ -380,7 +494,10 @@ def main() {
         }
     } else {
         var seeds : array<string>
-        seeds |> push_from(cfg.path)
+        seeds |> reserve(length(cfg.path))
+        for (p in cfg.path) {
+            seeds |> push(p)
+        }
         if (!empty(cfg.paths_from)) {
             var perr : string
             if (!read_path_lines_from_file(cfg.paths_from, seeds, perr)) {
@@ -397,7 +514,7 @@ def main() {
         for (p in seeds) {
             scan_das_files(p, files, cache)
         }
-        if (empty(files) && !has_against) {
+        if (length(files) == 0 && !has_against) {
             to_log(LOG_ERROR, "error: no .das files found under given paths\n")
             return
         }
@@ -436,7 +553,7 @@ def main() {
         // entirely. Workers see the pre-filtered list, so they don't
         // waste startup cost on fixtures.
         if (exporting && should_parallelize(length(compile_files), cfg.workers)) {
-            if (empty(compile_files)) {
+            if (length(compile_files) == 0) {
                 to_log(LOG_ERROR, "error: every input file contains an `expect` directive; nothing to export\n")
                 panic("detect-dupe export failed: no compilable files")
             }
@@ -444,7 +561,7 @@ def main() {
             return
         }
 
-        if (!empty(compile_files)) {
+        if (length(compile_files) > 0) {
             to_log(LOG_INFO, "scanning {length(compile_files)} file(s)...\n")
         }
 
@@ -495,7 +612,10 @@ def main() {
         // deterministic across runs — `keys(table)` iteration order is
         // unspecified, which would make the per-candidate output (and the
         // exit-code-driven CI behavior of `--check`) non-reproducible.
-        var against_files_sorted <- [for (k in keys(against_files)); k]
+        var against_files_sorted : array<string>
+        for (k in keys(against_files)) {
+            against_files_sorted |> push(k)
+        }
         sort(against_files_sorted)
         for (af in against_files_sorted) {
             // Skip files already extracted (either via `-p` or, post-drop,
@@ -508,7 +628,9 @@ def main() {
                     break
                 }
             }
-            if (already_have) continue
+            if (already_have) {
+                continue
+            }
             if (has_expect_directive(af)) {
                 n_against_skipped++
                 continue
@@ -564,7 +686,7 @@ def main() {
         }
     }
     let skip_counts <- apply_pattern_filter(records, kept_set, keep_all, cfg.verbose)
-    if (!empty(skip_counts)) {
+    if (length(skip_counts) > 0) {
         var skip_pairs : array<tuple<string; int>>
         skip_pairs |> reserve(length(skip_counts))
         for (k, v in keys(skip_counts), values(skip_counts)) {
@@ -626,7 +748,9 @@ def main() {
             let cand_refs <- collect_candidate_refs(records)
             let body = write_per_candidate_report(rep, cand_refs, top)
             fopen(cfg.json, "wb") $(fw) {
-                if (fw == null) return
+                if (fw == null) {
+                    return
+                }
                 json_ok = true
                 fw |> fprint(body)
             }
@@ -640,7 +764,7 @@ def main() {
         }
     }
 
-    if (cfg.check && (!empty(rep.exact_clusters) || !empty(rep.fuzzy_pairs))) {
+    if (cfg.check && (length(rep.exact_clusters) > 0 || length(rep.fuzzy_pairs) > 0)) {
         // --check turns the post-filter report into a CI gate. Use
         // `panic` to surface a non-zero exit code (same pattern as the
         // export-failure path above).

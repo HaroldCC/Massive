@@ -20,6 +20,7 @@
 #include "daScript/misc/gc_node.h"
 #include "daScript/ast/ast_typedecl.h"
 #include <inttypes.h>
+#include <filesystem>
 #include "daScript/simulate/debug_print.h"
 #include "../parser/parser_impl.h"
 
@@ -76,17 +77,6 @@ namespace das
         MacroFnFunctionAnnotation() : MarkFunctionAnnotation("macro_function") { }
         virtual bool apply(const FunctionPtr & func, ModuleGroup &, const AnnotationArgumentList &, string &) override {
             func->macroFunction = true;
-            return true;
-        };
-    };
-
-    // [clone(paramName1, paramName2, ...)] — marker for daslang-side PERF024 lint.
-    // Declares that the callee unconditionally clones the named parameters internally,
-    // so callers passing clone_expression(X) at those positions are redundantly cloning.
-    // Pure metadata; args stored in func->annotations for lint consumption.
-    struct CloneFunctionAnnotation : MarkFunctionAnnotation {
-        CloneFunctionAnnotation() : MarkFunctionAnnotation("clone") { }
-        virtual bool apply(const FunctionPtr &, ModuleGroup &, const AnnotationArgumentList &, string &) override {
             return true;
         };
     };
@@ -407,8 +397,8 @@ namespace das
             for ( size_t ai=0; ai!=maxIndex; ++ ai) {
                 if ( decl.arguments.find(fn->arguments[ai]->name, Type::tBool) ) {
                     const auto & argT = types[ai];
-                    if ( argT->baseType != Type::tFixedArray ) {
-                        err = "argument " + fn->arguments[ai]->name + " is expected to be a fixed size array";
+                    if ( argT->dim.size() == 0 ) {
+                        err = "argument " + fn->arguments[ai]->name + " is expected to be a dim []";
                         return false;
                     }
                 }
@@ -810,27 +800,11 @@ namespace das
     }
 
     int builtin_table_size ( const Table & arr ) {
-        DAS_VERIFYF(arr.size <= uint64_t(INT32_MAX), "table size %llu exceeds INT_MAX; use long_length() instead", (unsigned long long)arr.size);
-        return int(arr.size);
-    }
-
-    bool builtin_table_empty ( const Table & arr ) {
-        return arr.size == 0;
+        return arr.size;
     }
 
     int builtin_table_capacity ( const Table & arr ) {
-        DAS_VERIFYF(arr.capacity <= uint64_t(INT32_MAX), "table capacity %llu exceeds INT_MAX; use long_capacity() instead", (unsigned long long)arr.capacity);
-        return int(arr.capacity);
-    }
-
-    int64_t builtin_table_long_size ( const Table & arr ) {
-        DAS_VERIFYF(arr.size <= uint64_t(INT64_MAX), "table size %llu exceeds INT64_MAX", (unsigned long long)arr.size);
-        return int64_t(arr.size);
-    }
-
-    int64_t builtin_table_long_capacity ( const Table & arr ) {
-        DAS_VERIFYF(arr.capacity <= uint64_t(INT64_MAX), "table capacity %llu exceeds INT64_MAX", (unsigned long long)arr.capacity);
-        return int64_t(arr.capacity);
+        return arr.capacity;
     }
 
     void builtin_table_clear ( Table & arr, Context * context, LineInfoArg * at ) {
@@ -849,7 +823,7 @@ namespace das
         Type baseType = call->types[0]->firstType->type;
         uint32_t valueTypeSize = call->types[0]->secondType->size;
         Table & tab = cast<Table&>::to(args[0]);
-        uint64_t newCapacity = cast<uint64_t>::to(args[1]);
+        uint32_t newCapacity = cast<uint32_t>::to(args[1]);
         table_reserve_impl(context, tab, baseType, newCapacity, valueTypeSize, &call->debugInfo);
         return v_zero();
     }
@@ -1074,11 +1048,9 @@ namespace das
         result = { (Iterator *) iter };
     }
 
-    void builtin_make_fixed_array_iterator ( Sequence & result, void * data, int64_t size, int stride, Context * context, LineInfoArg * at ) {
-        // Negative size would underflow into a huge uint64 and the iterator would run past
-        // the array bounds — clamp to empty instead. Same pattern as builtin_make_temp_array_i64.
+    void builtin_make_fixed_array_iterator ( Sequence & result, void * data, int size, int stride, Context * context, LineInfoArg * at ) {
         char * iter = context->allocateIterator(sizeof(FixedArrayIterator), "fixed array iterator", at);
-        new (iter) FixedArrayIterator((char *)data, size < 0 ? uint64_t(0) : uint64_t(size), uint32_t(stride), at);
+        new (iter) FixedArrayIterator((char *)data, size, stride, at);
         result = { (Iterator *) iter };
     }
 
@@ -1242,7 +1214,7 @@ namespace das
     void builtin_array_free ( Array & dim, int szt, Context * __context__, LineInfoArg * at ) {
         if ( dim.data ) {
             if ( !dim.isLocked() || dim.hopeless ) {
-                uint64_t oldSize = dim.capacity*uint64_t(szt);
+                uint32_t oldSize = dim.capacity*szt;
                 __context__->free(dim.data, oldSize, at);
             } else {
                 __context__->throw_error_at(at, "can't delete locked array");
@@ -1259,7 +1231,7 @@ namespace das
     void builtin_table_free ( Table & tab, int szk, int szv, Context * __context__, LineInfoArg * at ) {
         if ( tab.data ) {
             if ( !tab.isLocked() || tab.hopeless ) {
-                uint64_t oldSize = tab.capacity*(uint64_t(szk)+uint64_t(szv)) + tab.capacity*tableHashSlotBytes(tab);
+                uint32_t oldSize = tab.capacity*(szk+szv+sizeof(TableHashKey));
                 __context__->free(tab.data, oldSize, at);
             } else {
                 __context__->throw_error_at(at, "can't delete locked table");
@@ -1366,14 +1338,6 @@ namespace das
 
     bool is_standalone_exe ( ) {
         return false;
-    }
-
-    // DAS_SAFE_HASH of the host binary (anyhash.h). When 0, string hashing uses the
-    // fast 16-bit-over-read load; the JIT can then inline a matching hash. When 1
-    // (e.g. ASAN), the runtime reads byte-by-byte and the JIT must not over-read, so
-    // it falls back to the runtime call instead of emitting the fast intrinsic.
-    bool is_safe_hash ( ) {
-        return DAS_SAFE_HASH != 0;
     }
 
     DAS_API uint64_t get_context_share_counter ( Context * context ) {
@@ -1568,6 +1532,81 @@ namespace das
         return context->allocateString(getDasRoot(), at);
     }
 
+    // 3-tier directory resolver mirroring the shared-module resolution policy
+    // from PR #2579 (module_jit.cpp::resolve_dynamic_module_path), but for
+    // source-side asset directories.  Given a baked source-file path captured
+    // at macro expansion (e.g. ".../modules/das-cards/cards/card_mesh.das"),
+    // returns the directory where that module's runtime assets currently live:
+    //   1. <exe_dir>/<rel>            — daspkg-release standalone bundle
+    //   2. <das_root>/<rel>           — SDK / cmake install layout
+    //   3. dir_name(baked_path)       — dev (interpreted from source tree)
+    // <rel> is the substring of dir_name(baked) starting at the last
+    // "/modules/" segment.  Tiers 1+2 are skipped when baked has no /modules/
+    // segment (e.g. project-local code outside the package layout); when the
+    // baked dir has also gone missing on the target machine (relocated bundle),
+    // tier 3's fallback is <exe_dir> rather than the dead dev path.
+    char * builtin_resolve_this_module_dir ( const char * baked_path, Context * context ) {
+        namespace fs = std::filesystem;
+        if ( !baked_path || !*baked_path ) return context->allocateString("", nullptr);
+        // generic_string() (here and at every other path-to-string conversion
+        // in this function) emits forward-slash separators on every platform,
+        // matching getDasRoot() and the rest of daslang's path conventions.
+        // Without it Windows would return native backslashes that break string
+        // compares against `/`-formed paths from script-side daslang code.
+        fs::path baked(baked_path);
+        fs::path baked_dir = baked.parent_path();
+        std::string baked_dir_str = baked_dir.generic_string();
+        // Find the last "/modules/" boundary; everything from that segment
+        // onward is the bundle/SDK-relative suffix (e.g.
+        // "modules/das-cards/cards"). rfind, not find — for nested layouts
+        // like "<root>/modules/A/modules/B/x.das" the right answer is "B"'s
+        // package, not "A". Mirrors compute_modules_relative_suffix in
+        // modules/dasLLVM/daslib/llvm_exe.das.
+        const std::string sep = "/modules/";
+        std::string canon = baked_dir_str;
+        for ( char & c : canon ) if ( c == '\\' ) c = '/';
+        std::string rel;
+        size_t pos = canon.rfind(sep);
+        if ( pos != std::string::npos ) {
+            rel = canon.substr(pos + 1);  // drop leading '/' to keep it relative
+        }
+        // Tier 1 — exe_dir
+        if ( !rel.empty() ) {
+            das::string exeFile = das::getExecutableFileName();
+            if ( !exeFile.empty() ) {
+                fs::path exeDir = fs::path(exeFile.c_str()).parent_path();
+                if ( exeDir.empty() ) exeDir = ".";
+                fs::path candidate = exeDir / rel;
+                std::error_code ec;
+                if ( fs::is_directory(candidate, ec) ) {
+                    return context->allocateString(candidate.generic_string().c_str(), nullptr);
+                }
+            }
+            // Tier 2 — das_root
+            fs::path candidate = fs::path(das::getDasRoot().c_str()) / rel;
+            std::error_code ec;
+            if ( fs::is_directory(candidate, ec) ) {
+                return context->allocateString(candidate.generic_string().c_str(), nullptr);
+            }
+        }
+        // Tier 3 — baked dir as fallback. Special case: project-local code
+        // (rel empty so tiers 1+2 were skipped) running from a relocated
+        // bundle where the dev-time baked dir no longer exists — fall back
+        // to <exe_dir> so assets shipped next to the exe are findable.
+        if ( rel.empty() ) {
+            std::error_code ec;
+            if ( !fs::is_directory(baked_dir, ec) ) {
+                das::string exeFile = das::getExecutableFileName();
+                if ( !exeFile.empty() ) {
+                    fs::path exeDir = fs::path(exeFile.c_str()).parent_path();
+                    if ( exeDir.empty() ) exeDir = ".";
+                    return context->allocateString(exeDir.generic_string().c_str(), nullptr);
+                }
+            }
+        }
+        return context->allocateString(baked_dir_str.c_str(), nullptr);
+    }
+
     char * builtin_shared_module_extension ( Context * context, LineInfoArg * at ) {
 #ifdef NDEBUG
         return context->allocateString(".shared_module", at);
@@ -1618,21 +1657,14 @@ namespace das
 
     void builtin_temp_array ( void * data, int size, const Block & block, Context * context, LineInfoArg * at ) {
         Array arr;
-        // Negative size would wrap into a huge uint capacity; clamp to empty array instead.
-        array_mark_locked(arr, (char *)data, size < 0 ? uint64_t(0) : uint64_t(size));
+        array_mark_locked(arr, (char *)data, uint32_t(size));
         vec4f args[1];
         args[0] = cast<Array &>::from(arr);
         context->invoke(block, args, nullptr, at);
     }
 
     void builtin_make_temp_array ( Array & arr, void * data, int size ) {
-        // Negative size would underflow to huge uint64 — clamp to empty array instead.
-        array_mark_locked(arr, (char *)data, size < 0 ? uint64_t(0) : uint64_t(size));
-    }
-
-    void builtin_make_temp_array_i64 ( Array & arr, void * data, int64_t size ) {
-        // Negative size would underflow to huge uint64 — clamp to empty array instead.
-        array_mark_locked(arr, (char *)data, size < 0 ? uint64_t(0) : uint64_t(size));
+        array_mark_locked(arr, (char *)data, uint32_t(size));
     }
 
     void toLog ( int level, const char * text, Context * context, LineInfoArg * at ) {
@@ -1841,7 +1873,6 @@ namespace das
         addAnnotation(new GenericFunctionAnnotation());
         addAnnotation(new MacroFunctionAnnotation());
         addAnnotation(new MacroFnFunctionAnnotation());
-        addAnnotation(new CloneFunctionAnnotation());
         addAnnotation(new HintFunctionAnnotation());
         addAnnotation(new RequestJitFunctionAnnotation());
         addAnnotation(new RequestNoJitFunctionAnnotation());
@@ -1889,6 +1920,9 @@ namespace das
         addExtern<DAS_BIND_FUN(builtin_das_root)>(*this, lib, "get_das_root",
             SideEffects::accessExternal,"builtin_das_root")
                 ->args({"context","at"});
+        addExtern<DAS_BIND_FUN(builtin_resolve_this_module_dir)>(*this, lib, "__builtin_resolve_this_module_dir",
+            SideEffects::accessExternal,"builtin_resolve_this_module_dir")
+                ->args({"baked_path","context"});
         addExtern<DAS_BIND_FUN(builtin_shared_module_extension)>(*this, lib, "shared_module_extension",
             SideEffects::none,"builtin_shared_module_extension")
                 ->args({"context","at"});
@@ -1900,8 +1934,6 @@ namespace das
                 ->arg("arguments");
         addExtern<DAS_BIND_FUN(is_standalone_exe)>(*this, lib, "is_standalone_exe",
             SideEffects::accessExternal, "is_standalone_exe");
-        addExtern<DAS_BIND_FUN(is_safe_hash)>(*this, lib, "is_safe_hash",
-            SideEffects::none, "is_safe_hash");
         addExtern<DAS_BIND_FUN(withCommandLineArguments)>(*this, lib,  "with_argv",
             SideEffects::invoke, "withArgv")
                 ->args({"new_arguments", "block","context","line"});
@@ -2118,17 +2150,8 @@ namespace das
         addExtern<DAS_BIND_FUN(builtin_table_size)>(*this, lib, "length",
             SideEffects::none, "builtin_table_size")
                 ->arg("table");
-        addExtern<DAS_BIND_FUN(builtin_table_empty)>(*this, lib, "empty",
-            SideEffects::none, "builtin_table_empty")
-                ->arg("table");
         addExtern<DAS_BIND_FUN(builtin_table_capacity)>(*this, lib, "capacity",
             SideEffects::none, "builtin_table_capacity")
-                ->arg("table");
-        addExtern<DAS_BIND_FUN(builtin_table_long_size)>(*this, lib, "long_length",
-            SideEffects::none, "builtin_table_long_size")
-                ->arg("table");
-        addExtern<DAS_BIND_FUN(builtin_table_long_capacity)>(*this, lib, "long_capacity",
-            SideEffects::none, "builtin_table_long_capacity")
                 ->arg("table");
         addExtern<DAS_BIND_FUN(builtin_table_lock)>(*this, lib, "__builtin_table_lock",
             SideEffects::modifyArgumentAndExternal, "builtin_table_lock")
@@ -2157,7 +2180,7 @@ namespace das
         addExtern<DAS_BIND_FUN(builtin_table_get_key)>(*this, lib, "__builtin_table_get_key",
             SideEffects::modifyExternal, "builtin_table_get_key")
                 ->args({"result","table","value_ptr","value_stride","key_stride","context","at"});
-        addInterop<builtin_table_reserve,void,vec4f,uint64_t>(*this, lib, "__builtin_table_reserve",
+        addInterop<builtin_table_reserve,void,vec4f,uint32_t>(*this, lib, "__builtin_table_reserve",
             SideEffects::modifyArgumentAndExternal, "builtin_table_reserve")
                 ->args({"table","size"});
         // array and table free
@@ -2171,9 +2194,6 @@ namespace das
         addInterop<builtin_collect_local_and_zero,void,vec4f,uint32_t>(*this, lib, "builtin_collect_local_and_zero",
             SideEffects::modifyArgumentAndExternal, "builtin_collect_local_and_zero")
                 ->args({"anything","sizeOfAnything"})->unsafeOperation = true;
-        addInterop<builtin_scope_free,void,vec4f,uint32_t>(*this, lib, "builtin_scope_free",
-            SideEffects::modifyArgumentAndExternal, "builtin_scope_free")
-                ->args({"pointer","sizeOfPointee"})->unsafeOperation = true;
         // table expressions
         addCall<ExprErase>("__builtin_table_erase");
         addCall<ExprSetInsert>("__builtin_table_set_insert");
@@ -2335,10 +2355,6 @@ namespace das
             SideEffects::modifyArgument, "builtin_make_temp_array")
                 ->args({"array","data","size"});
         bmta->unsafeOperation = true;
-        auto bmta64 = addExtern<DAS_BIND_FUN(builtin_make_temp_array_i64)>(*this, lib, "_builtin_make_temp_array_i64",
-            SideEffects::modifyArgument, "builtin_make_temp_array_i64")
-                ->args({"array","data","size"});
-        bmta64->unsafeOperation = true;
         // migrate data
         addExtern<DAS_BIND_FUN(das_is_dll_build)>(*this, lib, "das_is_dll_build",
             SideEffects::worstDefault, "das_is_dll_build");
@@ -2408,23 +2424,16 @@ namespace das
             SideEffects::none, "das_aot_enabled")
                 ->args({"context","at"});
         // bitfield
-        // `__bit_set` has additional raw-integer overloads in aot.h (for handle-bound
-        // bitfield fields like Function::flags, which is uint32_t on the C++ side) —
-        // disambiguate the runtime binding to the Bitfield& variant explicitly.
-        using BitSetFn   = void(*)(Bitfield&,   Bitfield,   bool);
-        using BitSet8Fn  = void(*)(Bitfield8&,  Bitfield8,  bool);
-        using BitSet16Fn = void(*)(Bitfield16&, Bitfield16, bool);
-        using BitSet64Fn = void(*)(Bitfield64&, Bitfield64, bool);
-        addExtern<BitSetFn, static_cast<BitSetFn>(__bit_set)>(*this, lib, "__bit_set",
+        addExtern<DAS_BIND_FUN(__bit_set)>(*this, lib, "__bit_set",
             SideEffects::modifyArgument, "__bit_set")
                 ->args({"value","mask","on"});
-        addExtern<BitSet8Fn, static_cast<BitSet8Fn>(__bit_set8)>(*this, lib, "__bit_set",
+        addExtern<DAS_BIND_FUN(__bit_set8)>(*this, lib, "__bit_set",
             SideEffects::modifyArgument, "__bit_set8")
                 ->args({"value","mask","on"});
-        addExtern<BitSet16Fn, static_cast<BitSet16Fn>(__bit_set16)>(*this, lib, "__bit_set",
+        addExtern<DAS_BIND_FUN(__bit_set16)>(*this, lib, "__bit_set",
             SideEffects::modifyArgument, "__bit_set16")
                 ->args({"value","mask","on"});
-        addExtern<BitSet64Fn, static_cast<BitSet64Fn>(__bit_set64)>(*this, lib, "__bit_set",
+        addExtern<DAS_BIND_FUN(__bit_set64)>(*this, lib, "__bit_set",
             SideEffects::modifyArgument, "__bit_set64")
                 ->args({"value","mask","on"});
         // platform and architecture

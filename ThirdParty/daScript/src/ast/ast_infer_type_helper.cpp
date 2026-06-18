@@ -46,12 +46,6 @@ namespace das {
             program->error(err, extra, fixme, at, cerr);
         }
     }
-    void InferTypes::checkEmptyName(const string &name, const char *nodeKind, const LineInfo &at) {
-        if (!name.empty()) return;
-        string msg = string(nodeKind) + " has empty name";
-        error(msg, "", "this is usually caused by a macro emitting an AST node without a name (e.g. $i(\"\") or `field := value` in a named-arg ctor)",
-              at, CompilationError::invalid_empty_name);
-    }
     void InferTypes::reportAstChanged() {
         needRestart = true;
         if (func)
@@ -69,23 +63,38 @@ namespace das {
     string InferTypes::describeType(const TypeDecl *decl) const {
         return verbose ? decl->describe() : "";
     }
-    string InferTypes::describeType(const TypeDeclPtr &decl, AliasDefs * aliasDefs) const {
-        return verbose ? decl->describe(TypeDecl::DescribeExtra::yes, TypeDecl::DescribeContracts::yes,
-                                        TypeDecl::DescribeModule::yes, aliasDefs) : "";
-    }
     string InferTypes::describeFunction(const FunctionPtr &fun) const {
         return verbose ? fun->describe() : "";
     }
     string InferTypes::describeFunction(const Function *fun) const {
         return verbose ? fun->describe() : "";
     }
-    void InferTypes::verifyType(const TypeDeclPtr &decl, bool allowExplicit, bool classMethod, bool allowTemplate) const {
+    void InferTypes::verifyType(const TypeDeclPtr &decl, bool allowExplicit, bool classMethod) const {
         // TODO: enable and cleanup
         if (decl->isExplicit && !allowExplicit) {
             /*
             error("expression can't be explicit here " + describeType(decl), "", "",
                   decl->at,CompilationError::invalid_type);
             */
+        }
+        /*
+        if ( decl->dim.size() && decl->ref ) {
+            error("can't declare an array of references, " + describeType(decl), "", "",
+                  decl->at,CompilationError::invalid_type);
+        }
+        */
+        uint64_t size = 1;
+        for (auto di : decl->dim) {
+            if (di <= 0) {
+                error("array dimension can't be 0 or less: '" + describeType(decl) + "'", "", "",
+                      decl->at, CompilationError::invalid_array_dimension);
+            }
+            size *= di;
+            if (size > 0x7fffffff) {
+                error("array is too big: '" + describeType(decl) + "'", "", "",
+                      decl->at, CompilationError::exceeds_array);
+                break;
+            }
         }
         if (decl->baseType == Type::tFunction || decl->baseType == Type::tLambda || decl->baseType == Type::tBlock || decl->baseType == Type::tVariant ||
             decl->baseType == Type::tTuple) {
@@ -99,6 +108,10 @@ namespace das {
             }
         }
         if (decl->baseType == Type::tVoid) {
+            if (decl->dim.size()) {
+                error("can't declare an array of void: '" + describeType(decl) + "'", "", "",
+                      decl->at, CompilationError::invalid_array);
+            }
             if (decl->ref) {
                 error("can't declare a void reference: '" + describeType(decl) + "'", "", "",
                       decl->at, CompilationError::invalid_type);
@@ -118,7 +131,7 @@ namespace das {
                               ptrType->at, CompilationError::invalid_annotation_type);
                     }
                 }
-                verifyType(ptrType, false, false, allowTemplate);
+                verifyType(ptrType);
             } else {
                 if (decl->smartPtr) {
                     error("can't declare a void smart pointer", "", "",
@@ -127,35 +140,7 @@ namespace das {
             }
         } else if (decl->baseType == Type::tIterator) {
             if (auto ptrType = decl->firstType) {
-                verifyType(ptrType, false, false, allowTemplate);
-            }
-        } else if (decl->baseType == Type::tFixedArray) {
-            if (decl->fixedDim <= 0) {
-                error("array dimension can't be 0 or less: '" + describeType(decl) + "'", "", "",
-                      decl->at, CompilationError::invalid_array_dimension);
-            } else {
-                // master parity: the infer-time limit is the flattened ELEMENT COUNT, not bytes;
-                // byte-size limits are enforced later by lint with site-specific errors
-                uint64_t count = 1;
-                for (auto t = decl; t->baseType == Type::tFixedArray && t->firstType; t = t->firstType) {
-                    if (t->fixedDim > 0) count *= uint64_t(t->fixedDim);
-                    if (count > 0x7fffffff) {
-                        error("array is too big: '" + describeType(decl) + "'", "", "",
-                              decl->at, CompilationError::exceeds_array);
-                        break;
-                    }
-                }
-            }
-            if (auto elemType = decl->firstType) {
-                if (elemType->ref) {
-                    error("can't declare an array of references: '" + describeType(elemType) + "'", "", "",
-                          elemType->at, CompilationError::invalid_array);
-                }
-                if (elemType->baseType == Type::tVoid) {
-                    error("can't declare an array of void: '" + describeType(decl) + "'", "", "",
-                          decl->at, CompilationError::invalid_array);
-                }
-                verifyType(elemType, false, false, allowTemplate);
+                verifyType(ptrType);
             }
         } else if (decl->baseType == Type::tArray) {
             if (auto arrayType = decl->firstType) {
@@ -175,7 +160,7 @@ namespace das {
                     error("can't have array of non-trivial type: '" + describeType(arrayType) + "'", "", "",
                           arrayType->at, CompilationError::invalid_array_type);
                 }
-                verifyType(arrayType, false, false, allowTemplate);
+                verifyType(arrayType);
             }
         } else if (decl->baseType == Type::tTable) {
             if (auto keyType = decl->firstType) {
@@ -191,7 +176,7 @@ namespace das {
                     error("table key has to be declared as a basic 'hashable' type: '" + describeType(keyType) + "'", "", "",
                           keyType->at, CompilationError::invalid_table_type);
                 }
-                verifyType(keyType, false, false, allowTemplate);
+                verifyType(keyType);
             }
             if (auto valueType = decl->secondType) {
                 if (valueType->isAutoOrAlias()) {
@@ -206,7 +191,7 @@ namespace das {
                     error("can't have table value of non-trivial type: '" + describeType(valueType) + "'", "", "",
                           valueType->at, CompilationError::invalid_table_type);
                 }
-                verifyType(valueType, false, false, allowTemplate);
+                verifyType(valueType);
             }
         } else if (decl->baseType == Type::tBlock || decl->baseType == Type::tFunction || decl->baseType == Type::tLambda) {
             if (auto resultType = decl->firstType) {
@@ -214,14 +199,14 @@ namespace das {
                     error("not a valid return type: '" + describeType(resultType) + "'", "", "",
                           resultType->at, CompilationError::invalid_result_type);
                 }
-                verifyType(resultType, false, false, allowTemplate);
+                verifyType(resultType);
             }
             for (auto &argType : decl->argTypes) {
                 if (!classMethod && (argType->ref && argType->isRefType())) {
                     error("can't pass a boxed type by a reference: '" + describeType(argType) + "'", "", "",
                           argType->at, CompilationError::invalid_argument_type);
                 }
-                verifyType(argType, true, false, allowTemplate);
+                verifyType(argType, true);
             }
         } else if (decl->baseType == Type::tTuple) {
             for (auto &argType : decl->argTypes) {
@@ -237,7 +222,7 @@ namespace das {
                     error("invalid tuple element type: '" + describeType(argType) + "'", "", "",
                           argType->at, CompilationError::invalid_tuple_type);
                 }
-                verifyType(argType, false, false, allowTemplate);
+                verifyType(argType);
             }
         } else if (decl->baseType == Type::tVariant) {
             for (auto &argType : decl->argTypes) {
@@ -253,16 +238,7 @@ namespace das {
                     error("invalid variant element type: '" + describeType(argType) + "'", "", "",
                           argType->at, CompilationError::invalid_variant_type);
                 }
-                verifyType(argType, false, false, allowTemplate);
-            }
-        } else if (decl->baseType == Type::tStructure) {
-            // A template structure has no concrete layout, so it can't be used where
-            // a real value would live (parameter, variable, field, result). It IS legal
-            // inside type<>/typeinfo introspection, which is how the typemacro machinery
-            // reads a template's fields to instantiate it -- those sites pass allowTemplate.
-            if (!allowTemplate && decl->structType && decl->structType->isTemplate) {
-                error("can't use template structure " + decl->structType->name + " without instantiation", "", "",
-                        decl->at, CompilationError::invalid_structure_template);
+                verifyType(argType);
             }
         }
     }
@@ -277,13 +253,13 @@ namespace das {
             subexprType->temporary = false; // array<int#> -> int
         }
     }
-    TypeDeclPtr InferTypes::findFuncAlias(const FunctionPtr &fptr, const string &name, bool *constUnderDim) const {
+    TypeDeclPtr InferTypes::findFuncAlias(const FunctionPtr &fptr, const string &name) const {
         for (auto &arg : fptr->arguments) {
-            if (auto aT = arg->type->findAlias(name, true, constUnderDim)) {
+            if (auto aT = arg->type->findAlias(name, true)) {
                 return aT;
             }
         }
-        if (auto rT = fptr->result->findAlias(name, true, constUnderDim)) {
+        if (auto rT = fptr->result->findAlias(name, true)) {
             return rT;
         }
         TypeDeclPtr rT = nullptr;
@@ -298,7 +274,7 @@ namespace das {
         TypeDeclPtr mtd = program->makeTypeDeclaration(LineInfo(), name);
         return (!mtd || mtd->isAlias()) ? nullptr : mtd;
     }
-    TypeDeclPtr InferTypes::findAlias(const string &name, bool *constUnderDim) const {
+    TypeDeclPtr InferTypes::findAlias(const string &name) const {
         if (func) {
             for (auto &ast : assumeType) {
                 if (ast->alias == name) {
@@ -307,16 +283,16 @@ namespace das {
             }
             for (auto it = local.rbegin(), its = local.rend(); it != its; ++it) {
                 auto &var = *it;
-                if (auto vT = var->type->findAlias(name, false, constUnderDim)) {
+                if (auto vT = var->type->findAlias(name)) {
                     return vT;
                 }
             }
             for (auto &arg : func->arguments) {
-                if (auto aT = arg->type->findAlias(name, false, constUnderDim)) {
+                if (auto aT = arg->type->findAlias(name)) {
                     return aT;
                 }
             }
-            if (auto rT = func->result->findAlias(name, true, constUnderDim)) {
+            if (auto rT = func->result->findAlias(name, true)) {
                 return rT;
             }
         }
@@ -379,7 +355,6 @@ namespace das {
             if (decl->isTag)
                 return nullptr; // we can never infer a tag type
             TypeDeclPtr aT = nullptr;
-            bool constUnderDim = false;
             if (aliases) {
                 auto it = aliases->find(decl->alias);
                 if (it != aliases->end()) {
@@ -387,7 +362,7 @@ namespace das {
                 }
             }
             if (!aT) {
-                aT = fptr ? findFuncAlias(fptr, decl->alias, &constUnderDim) : findAlias(decl->alias, &constUnderDim);
+                aT = fptr ? findFuncAlias(fptr, decl->alias) : findAlias(decl->alias);
             }
             if (!aT) {
                 auto bT = nameToBasicType(decl->alias);
@@ -396,25 +371,14 @@ namespace das {
                 }
             }
             if (aT) {
-                // a generic alias binds the WHOLE matched type - int[4] passed to auto(TT)
-                // makes TT = int[4]; use-site FA wraps then nest naturally (TT[2] = int[2][4]).
-                // (The flattened world stripped the bound dims here; that wart is gone.)
                 auto resT = new TypeDecl(*aT);
                 resT->at = decl->at;
                 resT->ref = (resT->ref || decl->ref) && !decl->removeRef;
-                resT->constant = (resT->constant || constUnderDim || decl->constant) && !decl->removeConstant;
+                resT->constant = (resT->constant || decl->constant) && !decl->removeConstant;
                 resT->temporary = (resT->temporary || decl->temporary) && !decl->removeTemporary;
+                resT->dim = decl->dim;
                 resT->aotAlias = false;
                 resT->alias.clear();
-                if ( decl->removeDim && resT->baseType==Type::tFixedArray && resT->firstType ) {
-                    // TT -[] unwraps one fixed-array level; qualifiers ride to the new head
-                    auto peeled = new TypeDecl(*resT->firstType);
-                    peeled->at = resT->at;
-                    peeled->ref = resT->ref;
-                    peeled->constant = resT->constant;
-                    peeled->temporary = resT->temporary;
-                    resT = peeled;
-                }
                 return resT;
             } else {
                 return nullptr;
@@ -433,31 +397,11 @@ namespace das {
                 if (!resT->firstType)
                     return nullptr;
             }
-        } else if (decl->baseType == Type::tArray || decl->baseType == Type::tFixedArray) {
+        } else if (decl->baseType == Type::tArray) {
             if (decl->firstType) {
                 resT->firstType = inferAlias(decl->firstType, fptr, aliases, options, autoToAlias);
                 if (!resT->firstType)
                     return nullptr;
-            }
-            if (decl->baseType == Type::tFixedArray) {
-                if (resT->firstType) {
-                    // canonical form: qualifiers live on the chain head only - hoist whatever
-                    // the resolved element brought in (e.g. the constness of an alias binding)
-                    resT->ref = resT->ref || resT->firstType->ref;
-                    resT->constant = resT->constant || resT->firstType->constant;
-                    resT->temporary = resT->temporary || resT->firstType->temporary;
-                    resT->firstType->ref = false;
-                    resT->firstType->constant = false;
-                    resT->firstType->temporary = false;
-                }
-                // the chain head carries the hoisted qualifiers+contracts the dim'd alias leaf used to;
-                // apply and clear them here the way the dim'd alias leaf case does
-                resT->ref = resT->ref && !decl->removeRef;
-                resT->constant = resT->constant && !decl->removeConstant;
-                resT->temporary = resT->temporary && !decl->removeTemporary;
-                resT->removeRef = false;
-                resT->removeConstant = false;
-                resT->removeTemporary = false;
             }
         } else if (decl->baseType == Type::tTable) {
             if (decl->firstType) {
@@ -499,7 +443,7 @@ namespace das {
     TypeDeclPtr InferTypes::inferPartialAliases(const TypeDeclPtr &decl, const TypeDeclPtr &passType, const FunctionPtr &fptr, AliasMap *aliases) const {
         if (decl->baseType == Type::typeDecl || decl->baseType == Type::typeMacro) {
             auto resT = new TypeDecl(*decl);
-            for (auto &de : resT->typeMacroExpr) {
+            for (auto &de : resT->dimExpr) {
                 if (de && de->rtti_isTypeDecl()) {
                     auto td = static_cast<ExprTypeDecl*>(de);
                     // since we don't have passType in typeexpr(3), we pass what we have
@@ -529,7 +473,6 @@ namespace das {
         }
         if (decl->baseType == Type::alias) {
             TypeDeclPtr aT = nullptr;
-            bool constUnderDim = false;
             if (aliases) {
                 auto it = aliases->find(decl->alias);
                 if (it != aliases->end()) {
@@ -537,27 +480,19 @@ namespace das {
                 }
             }
             if (!aT) {
-                aT = fptr ? findFuncAlias(fptr, decl->alias, &constUnderDim) : findAlias(decl->alias, &constUnderDim);
+                aT = fptr ? findFuncAlias(fptr, decl->alias) : findAlias(decl->alias);
             }
             if (aT) {
                 auto resT = new TypeDecl(*aT);
                 resT->at = decl->at;
                 resT->ref = (resT->ref || decl->ref) && !decl->removeRef;
-                resT->constant = (resT->constant || constUnderDim || decl->constant) && !decl->removeConstant;
+                resT->constant = (resT->constant || decl->constant) && !decl->removeConstant;
                 resT->temporary = (resT->temporary || decl->temporary) && !decl->removeTemporary;
                 resT->implicit = (resT->implicit || decl->implicit);
                 resT->explicitConst = (resT->explicitConst || decl->explicitConst);
+                resT->dim = decl->dim;
                 resT->aotAlias = false;
                 // resT->alias.clear(); // this may speed things up, but it breaks typemacro-based aliases
-                if ( decl->removeDim && resT->baseType==Type::tFixedArray && resT->firstType ) {
-                    // TT -[] unwraps one fixed-array level; qualifiers ride to the new head
-                    auto peeled = new TypeDecl(*resT->firstType);
-                    peeled->at = resT->at;
-                    peeled->ref = resT->ref;
-                    peeled->constant = resT->constant;
-                    peeled->temporary = resT->temporary;
-                    resT = peeled;
-                }
                 return resT;
             } else {
                 return decl;
@@ -584,8 +519,8 @@ namespace das {
             if (decl->firstType) {
                 resT->firstType = inferPartialAliases(decl->firstType, passT->firstType, fptr, aliases);
             }
-        } else if (decl->baseType == Type::tArray || decl->baseType == Type::tFixedArray) {
-            if (decl->firstType && passT->firstType) {
+        } else if (decl->baseType == Type::tArray) {
+            if (decl->firstType) {
                 resT->firstType = inferPartialAliases(decl->firstType, passT->firstType, fptr, aliases);
             }
         } else if (decl->baseType == Type::tTable) {
@@ -699,39 +634,42 @@ namespace das {
     }
     bool InferTypes::inferTypeExpr(TypeDeclPtr &type) {
         bool any = false;
-        if (type->baseType == Type::tFixedArray && type->fixedDim == TypeDecl::dimConst) {
-            if (type->fixedDimExpr) {
-                if (auto constExpr = getConstExpr(type->fixedDimExpr)) {
-                    if (constExpr->type->isIndex()) {
-                        auto cI = static_cast<ExprConstInt*>(constExpr);
-                        auto dI = cI->getValue();
-                        if (dI > 0) {
-                            type->fixedDim = dI;
-                            any = true;
+        if (type->baseType != Type::typeDecl && type->baseType != Type::typeMacro) {
+            for (size_t i = 0, is = type->dim.size(); i != is; ++i) {
+                if (type->dim[i] == TypeDecl::dimConst) {
+                    if (type->dimExpr[i]) {
+                        if (auto constExpr = getConstExpr(type->dimExpr[i])) {
+                            if (constExpr->type->isIndex()) {
+                                auto cI = static_cast<ExprConstInt*>(constExpr);
+                                auto dI = cI->getValue();
+                                if (dI > 0) {
+                                    type->dim[i] = dI;
+                                    any = true;
+                                } else {
+                                    error("array dimension can't be 0 or less", "", "",
+                                          type->at, CompilationError::invalid_array_dimension);
+                                }
+                            } else {
+                                error("array dimension must be int32 or uint32", "", "",
+                                      type->at, CompilationError::invalid_array_dimension_type);
+                            }
                         } else {
-                            error("array dimension can't be 0 or less", "", "",
+                            error("array dimension must be constant", "", "",
                                   type->at, CompilationError::invalid_array_dimension);
                         }
                     } else {
-                        error("array dimension must be int32 or uint32", "", "",
-                              type->at, CompilationError::invalid_array_dimension_type);
+                        error("can't deduce array dimension", "", "",
+                              type->at, CompilationError::invalid_array_dimension);
                     }
-                } else {
-                    error("array dimension must be constant", "", "",
-                          type->at, CompilationError::invalid_array_dimension);
                 }
-            } else {
-                error("can't deduce array dimension", "", "",
-                      type->at, CompilationError::invalid_array_dimension);
             }
-        }
-        if (type->baseType == Type::typeDecl) {
-            if (type->typeMacroExpr.size() != 1) {
+        } else if (type->baseType == Type::typeDecl) {
+            if (type->dimExpr.size() != 1) {
                 error("typeDecl must have exactly one dimension", "", "",
                       type->at, CompilationError::invalid_type_dimension);
-            } else if (type->typeMacroExpr[0]->type) {
-                if (!type->typeMacroExpr[0]->type->isAutoOrAlias()) {
-                    auto resType = new TypeDecl(*type->typeMacroExpr[0]->type);
+            } else if (type->dimExpr[0]->type) {
+                if (!type->dimExpr[0]->type->isAutoOrAlias()) {
+                    auto resType = new TypeDecl(*type->dimExpr[0]->type);
                     resType->ref = false;
                     TypeDecl::applyAutoContracts(resType, type);
                     type = resType;
@@ -1062,17 +1000,6 @@ namespace das {
                 error("expecting a return value", "", "",
                       expr->at, CompilationError::missing_result);
             } else {
-                {
-                    bool rangeError = false;
-                    if (auto promoted = tryPromoteConstInt(expr->subexpr, resType, rangeError)) {
-                        reportAstChanged();
-                        expr->subexpr = promoted;
-                        return false; // next pass re-checks with promoted type
-                    }
-                    if (rangeError) {
-                        return false; // suppress downstream invalid_return_type
-                    }
-                }
                 if (!canCopyOrMoveType(resType, expr->subexpr->type, TemporaryMatters::yes, expr->subexpr,
                                        "incompatible return type", CompilationError::invalid_return_type, expr->at)) {
                 }

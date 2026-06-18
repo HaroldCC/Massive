@@ -93,9 +93,6 @@ namespace das {
         virtual bool canVisitFunction ( Function * fun ) override {
             return !fun->stub && !fun->isTemplate;    // we don't do a thing with templates
         }
-        virtual bool canVisitStructure ( Structure * st ) override {
-            return !st->isTemplate;    // we don't do a thing with templates
-        }
         // virtual bool canVisitStructureFieldInit ( Structure * ) override { return false; }
         // virtual bool canVisitArgumentInit ( Function * , const VariablePtr &, Expression * ) override { return false; }
         // virtual bool canVisitQuoteSubexpression ( ExprQuote * ) override { return false; }
@@ -505,16 +502,12 @@ namespace das {
      */
     class ConstFolding : public FoldingVisitor {
     public:
-        using PassVisitor::visit;
         ConstFolding( const ProgramPtr & prog, int32_t round ) : FoldingVisitor(prog, round) {}
     public:
         vector<Function *> needRun;
     protected:
         virtual bool canVisitFunction ( Function * fun ) override {
             return !fun->stub && !fun->isTemplate && funcIsDirty(fun);    // we don't do a thing with templates
-        }
-        virtual bool canVisitStructure ( Structure * st ) override {
-            return !st->isTemplate;    // we don't do a thing with templates
         }
         // function which is fully a nop
         bool isNop ( const FunctionPtr & func ) {
@@ -767,7 +760,7 @@ namespace das {
     // ExprInvoke
         virtual ExpressionPtr visit ( ExprInvoke * expr ) override {
             auto what = expr->arguments[0];
-            if ( what->type && what->type->baseType==Type::tFunction && what->rtti_isAddr() ) {
+            if ( what->type->baseType==Type::tFunction && what->rtti_isAddr() ) {
                 auto pAddr = static_cast<ExprAddr*>(what);
                 auto funcC = pAddr->func;
                 auto pCall = new ExprCall(expr->at, funcC->name);
@@ -920,7 +913,6 @@ namespace das {
 
     class RunFolding : public FoldingVisitor {
     public:
-        using PassVisitor::visit;
         RunFolding( const ProgramPtr & prog, vector<Function *> & _needRun ) : FoldingVisitor(prog),
             runProgram(prog.get()), needRun(_needRun) {
         }
@@ -931,9 +923,6 @@ namespace das {
     protected:
         virtual bool canVisitFunction ( Function * fun ) override {
             return !fun->stub && !fun->isTemplate;    // we don't do a thing with templates
-        }
-        virtual bool canVisitStructure ( Structure * str ) override {
-            return !str->isTemplate;    // we don't do a thing with template structures
         }
         // ExprCall
         virtual ExpressionPtr visit ( ExprCall * expr ) override {

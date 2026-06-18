@@ -1,5 +1,7 @@
 options gen2
 options indenting = 4
+options no_unused_block_arguments = false
+options no_unused_function_arguments = false
 options strict_smart_pointers = true
 
 module defer shared private
@@ -16,7 +18,7 @@ require daslib/ast_boost
 require daslib/templates_boost
 require daslib/macro_boost
 
-[tag_function(defer_tag), unused_argument(blk)]
+[tag_function(defer_tag)]
 def public defer(blk : block<() : void>) {
     //! defer a block of code. For example::
     //!
@@ -43,7 +45,7 @@ class DeferMacro : AstFunctionAnnotation {
             if (!valid) {
                 compiling_program() |> macro_error(call.at, "can't get valid program context")
                 success = false
-            } elif (empty(astc.scopes)) {
+            } elif (astc.scopes |> length == 0) {
                 compiling_program() |> macro_error(call.at, "defer needs to be in the scope")
                 success = false
             } else {
@@ -76,7 +78,7 @@ class DeferDeleteMacro : AstCallMacro {
             if (!valid) {
                 compiling_program() |> macro_error(call.at, "can't get valid program context")
                 success = false
-            } elif (empty(astc.scopes)) {
+            } elif (astc.scopes |> length == 0) {
                 compiling_program() |> macro_error(call.at, "defer_delete needs to be in the scope")
                 success = false
             } else {

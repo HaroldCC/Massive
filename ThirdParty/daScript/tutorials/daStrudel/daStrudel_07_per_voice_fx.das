@@ -7,10 +7,10 @@
 //   - chunk(pat, n, fn)  : apply fn to every n-th chunk in turn
 //
 // It also introduces daslang's *per-voice FX* (phaser, tremolo, compressor,
-// shape). Like strudel.cc, daslang applies these per event: each playing voice
-// carries its own FX chain, run BEFORE the voices are mixed into the orbit, so
-// two simultaneous notes can carry different settings without bleeding into each
-// other. (Only room/delay/chorus are shared per-orbit send buses — see tut 08.)
+// shape) which differ from typical live-coding systems where these effects
+// are placed on a shared bus. In daslang each playing voice carries its own
+// FX chain — the FX run BEFORE the voices are mixed into the orbit, so
+// per-note timbral variation is possible.
 //
 // Run: daslang.exe tutorials/daStrudel/daStrudel_07_per_voice_fx.das
 
@@ -93,16 +93,10 @@ def example_chunk_fast() {
 // ──────────────────────────────────────────────────────────────────────────
 //
 // Per-voice FX — phaser, tremolo, compressor, shape — are baked into each
-// playing voice (as in strudel.cc). Because the FX live with the voice, two
-// simultaneous notes in a single stack can carry DIFFERENT phaser rates without
-// leaking into each other. (room/delay/chorus differ — those are per-orbit
-// send buses; see tutorial 08.)
-//
-// The full split (shared with tutorial 08):
-//   Per-voice  (independent per note): gain, pan, speed, lpf, hpf, bpf,
-//              phaser, tremolo, compressor, shape, crush, coarse, djf, fm, vowel
-//   Per-orbit  (one shared bus instance per orbit): room/roomsize,
-//              delay/delaytime/delayfeedback, chorus
+// playing voice. This is a daslang divergence from systems where these are
+// global bus effects. Because the FX live with the voice, two simultaneous
+// notes in a single stack can carry DIFFERENT phaser rates without leaking
+// into each other.
 
 def example_per_voice_phaser() {
     print("\n=== Section 4: per-voice phaser at two different rates ===\n")
@@ -113,72 +107,6 @@ def example_per_voice_phaser() {
     play(pat, 0.5lf, 6.0lf)
 }
 
-// ──────────────────────────────────────────────────────────────────────────
-// Section 5 — probabilistic combinators: sometimes, degradeBy
-// ──────────────────────────────────────────────────────────────────────────
-//
-// sometimes(pat, fn) applies fn to a random ~50% of events; degradeBy(prob)
-// randomly DROPS events with the given probability. Both are how you turn a
-// rigid loop into something that breathes — humanised fills and thinning.
-
-def example_sometimes() {
-    print("\n=== Section 5a: sometimes — half the hits play twice as fast ===\n")
-    let pat <- sometimes(s("bd sd hh cp"), @(x) => fast(x, 2.0lf))
-    play(pat, 0.5lf, 6.0lf)
-}
-
-def example_degrade() {
-    print("\n=== Section 5b: degradeBy(0.4) — randomly drop 40% of a hi-hat run ===\n")
-    let pat <- s("hh*8") |> degradeBy(0.4)
-    play(pat, 0.5lf, 6.0lf)
-}
-
-// ──────────────────────────────────────────────────────────────────────────
-// Section 6 — cycle-conditional: every, when_cycle
-// ──────────────────────────────────────────────────────────────────────────
-//
-// every(n, pat_on, pat_off) plays pat_on on cycles 0, n, 2n, ... and pat_off
-// otherwise — note daslang's every takes two PATTERNS, not a transform.
-// when_cycle(pat, cond, fn) applies fn only on cycles where cond(cycle) is true.
-
-def example_every() {
-    print("\n=== Section 6a: every 4th cycle, the line reverses ===\n")
-    // every() moves both patterns into its closure, so build the line twice
-    // (an independent copy for each branch) rather than aliasing one.
-    let pat <- every(4, note("c4 e4 g4 c5", "sine") |> sustain(0.4) |> rev(),
-                        note("c4 e4 g4 c5", "sine") |> sustain(0.4))
-    play(pat, 0.5lf, 8.0lf)
-}
-
-def example_when_cycle() {
-    print("\n=== Section 6b: when_cycle — speed up on even cycles only ===\n")
-    let pat <- when_cycle(note("c4 e4 g4 c5", "sine") |> sustain(0.4),
-                          @(c) => c % 2 == 0, @(x) => fast(x, 2.0lf))
-    play(pat, 0.5lf, 8.0lf)
-}
-
-// ──────────────────────────────────────────────────────────────────────────
-// Section 7 — reordering & gating: shuffle, scramble, mask
-// ──────────────────────────────────────────────────────────────────────────
-//
-// shuffle(n) cuts the cycle into n slices and plays them in a shuffled order
-// (a permutation — every slice once); scramble(n) picks n slices at random
-// (repeats allowed). mask(pat, bool_pat) gates events through a 1/~ pattern.
-
-def example_shuffle_scramble() {
-    print("\n=== Section 7a: shuffle vs scramble of an 8-note scale ===\n")
-    let shuf <- note("c4 d4 e4 f4 g4 a4 b4 c5", "sine") |> sustain(0.4) |> shuffle(8)
-    play(shuf, 0.5lf, 4.0lf)
-    let scrm <- note("c4 d4 e4 f4 g4 a4 b4 c5", "sine") |> sustain(0.4) |> scramble(8)
-    play(scrm, 0.5lf, 4.0lf)
-}
-
-def example_mask() {
-    print("\n=== Section 7b: mask — gate a melody through \"1 ~ 1 ~\" ===\n")
-    let pat <- note("c4 d4 e4 f4", "sine") |> sustain(0.4) |> mask(s("1 ~ 1 ~"))
-    play(pat, 0.5lf)
-}
-
 [export]
 def main() {
     print("DASTRUDEL-07: Per-Voice FX & Combinators\n")
@@ -187,11 +115,5 @@ def main() {
     example_off_canon()
     example_chunk_fast()
     example_per_voice_phaser()
-    example_sometimes()
-    example_degrade()
-    example_every()
-    example_when_cycle()
-    example_shuffle_scramble()
-    example_mask()
     print("\nDone.\n")
 }

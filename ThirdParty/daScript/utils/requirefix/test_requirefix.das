@@ -17,7 +17,9 @@ def run_analysis(target : string) : ModuleAnalysisResult {
         },
         read_file_fn <- @(filename : string) : string {
             let f = fopen(filename, "r")
-            if (f == null) return ""
+            if (f == null) {
+                return ""
+            }
             let s = fread(f)
             fclose(f)
             return s
@@ -28,7 +30,9 @@ def run_analysis(target : string) : ModuleAnalysisResult {
 
 def find_module_tag(var result : ModuleAnalysisResult; name : string) : string {
     for (mod in result.modules) {
-        if (mod.name == name) return mod.tag
+        if (mod.name == name) {
+            return mod.tag
+        }
     }
     return ""
 }
@@ -49,7 +53,9 @@ def find_module_refs(var result : ModuleAnalysisResult; name : string) : array<s
 
 def find_module_is_public(var result : ModuleAnalysisResult; name : string) : bool {
     for (mod in result.modules) {
-        if (mod.name == name) return mod.is_public
+        if (mod.name == name) {
+            return mod.is_public
+        }
     }
     return false
 }
@@ -154,7 +160,7 @@ def test_err_missing_file(t : T?) {
                 return ""
             },
         )
-        let result = analyze_module_usages(config)
+        var result = analyze_module_usages(config)
         t |> success(result.err != "", "should set error for missing file")
         t |> equal(length(result.modules), 0)
     }

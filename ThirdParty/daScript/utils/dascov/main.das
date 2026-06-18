@@ -38,14 +38,19 @@ def main() {
     let sep = find_index(args, "--") + 1
     let numArgs = args |> length() - sep
     // Collect --exclude prefixes.
-    let excludes <- [for (i in range(sep, args |> length() - 1)); args[i + 1]; where args[i] == "--exclude"]
+    var excludes : array<string>
+    for (i in range(sep, args |> length() - 1)) {
+        if (args[i] == "--exclude") {
+            excludes |> push(args[i + 1])
+        }
+    }
     if (numArgs == 1 || (numArgs >= 2 && args[sep + 1] == "--exclude")) {
         // LCOV summary mode: parse existing LCOV file and print summary.
         print(coverage::summary_from_lcov_file(args[sep], excludes))
         return
     }
-    let coverage_file = args[sep]
-    let input_file = args[sep + 1]
+    var coverage_file = args[sep]
+    var input_file = args[sep + 1]
     var new_args = array<string>()
     for (i in range(args |> length())) {
         if (i == 1) {
@@ -62,7 +67,7 @@ def main() {
             cop.threadlock_context = true
             access |> add_extra_module("coverage", "{get_das_root()}/daslib/coverage.das")
             var report : string
-            compile_and_simulate(input_file, access, unsafe(addr(mg)), cop) $(_program : ProgramPtr; var pctx : smart_ptr<Context>) {
+            compile_and_simulate(input_file, access, unsafe(addr(mg)), cop) $(program : ProgramPtr; var pctx : smart_ptr<Context>) {
                 with_argv(new_args) {
                     unsafe(invoke_in_context(pctx, "main"))
                 }

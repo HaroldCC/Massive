@@ -1,5 +1,7 @@
 options gen2
 options indenting = 2
+options no_unused_block_arguments = false
+options no_unused_function_arguments = false
 options strict_smart_pointers
 
 module apply_in_context shared private
@@ -37,7 +39,9 @@ class AppendCondAnnotation : AstFunctionAnnotation {
 
     for (ann in func.annotations) {
       if (ann.annotation.name == "apply_in_context") {
-        if (!(find_arg(ann.arguments, "patched") is nothing)) return true
+        if (!(find_arg(ann.arguments, "patched") is nothing)) {
+          return true
+        }
       }
     }
 
@@ -85,7 +89,7 @@ class AppendCondAnnotation : AstFunctionAnnotation {
     }
     if (!func.result.isVoid) {
       var resType = clone_type(func.result)
-      resType.flags.constant = false
+      resType.flags &= ~TypeDeclFlags.constant
       ctxFnArguments |> emplace_new <| qmacro_variable(resName, type<$t(resType)?>)
       ctxFnBlockList |> push(qmacro_expr(${*$i(resName) = $c(ctxCloneFnName)($a(callInCtxArguments)); }))
     } else {
@@ -98,7 +102,7 @@ class AppendCondAnnotation : AstFunctionAnnotation {
         $b(ctxFnBlockList)
       }
     }
-    ctxFn.moreFlags.pinvoke = true
+    ctxFn.moreFlags |= MoreFunctionFlags.pinvoke
     compiling_module() |> add_function(ctxFn)
 
     var fn = clone_function(func)

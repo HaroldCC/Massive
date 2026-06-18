@@ -14,8 +14,7 @@ DAS_BASE_BIND_ENUM(das::Type, Type,
     tDouble,    tRange,    tURange,    tRange64,    tURange64,    tString,    tStructure,
     tHandle,    tEnumeration,    tEnumeration8,    tEnumeration16,    tEnumeration64,
     tBitfield,  tBitfield8, tBitfield16, tBitfield64,   tPointer,    tFunction,
-    tLambda,    tIterator,    tArray,    tTable,    tBlock,    tTuple,    tVariant,
-    tFixedArray
+    tLambda,    tIterator,    tArray,    tTable,    tBlock,    tTuple,    tVariant
 )
 
 DAS_BASE_BIND_ENUM(das::RefMatters,   RefMatters,   no, yes)
@@ -37,8 +36,6 @@ MAKE_EXTERNAL_TYPE_FACTORY(VarInfo, das::VarInfo)
 MAKE_EXTERNAL_TYPE_FACTORY(LocalVariableInfo, das::LocalVariableInfo)
 MAKE_EXTERNAL_TYPE_FACTORY(FuncInfo, das::FuncInfo)
 MAKE_EXTERNAL_TYPE_FACTORY(AnnotationArgument, das::AnnotationArgument)
-MAKE_EXTERNAL_TYPE_FACTORY(AnnotationArgumentInfo, das::AnnotationArgumentInfo)
-MAKE_EXTERNAL_TYPE_FACTORY(AnnotationInfo, das::AnnotationInfo)
 MAKE_EXTERNAL_TYPE_FACTORY(AnnotationArguments, das::AnnotationArguments)
 MAKE_EXTERNAL_TYPE_FACTORY(AnnotationArgumentList, das::AnnotationArgumentList)
 MAKE_EXTERNAL_TYPE_FACTORY(AnnotationDeclaration, das::AnnotationDeclaration)

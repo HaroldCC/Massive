@@ -120,18 +120,6 @@ namespace das
         }
     };
 
-    // Const-string table key: bake the key bytes (into the const-string heap) and their hash
-    // at simulate time so the runtime node skips the per-lookup hash_blockz64 walk. Returns the
-    // baked key char* (and sets outHash) when keyType is string and keyExpr is an ExprConstString;
-    // nullptr otherwise (caller falls back to the regular hashing node).
-    static __forceinline char * bakeConstStringKey ( Context & context, Expression * keyExpr,
-            const TypeDecl * keyType, uint64_t & outHash ) {
-        if ( keyType->baseType != Type::tString || !keyExpr->rtti_isStringConstant() ) return nullptr;
-        char * keyStr = context.constStringHeap->impl_allocateString(static_cast<ExprConstString*>(keyExpr)->getValue());
-        outHash = hash_blockz64((uint8_t *)keyStr);
-        return keyStr;
-    }
-
     struct SimulateVisitor : Visitor {
         Context & context;
         das_hash_map<const Expression*, SimNode*> e2v;
@@ -682,12 +670,51 @@ namespace das
         }
     }
 
+    void ExprMakeLocal::setRefSp ( bool ref, bool cmres, uint32_t sp, uint32_t off ) {
+        useStackRef = ref;
+        useCMRES = cmres;
+        doesNotNeedSp = true;
+        doesNotNeedInit = true;
+        stackTop = sp;
+        extraOffset = off;
+    }
+
+    // variant
+
+    void ExprMakeVariant::setRefSp ( bool ref, bool cmres, uint32_t sp, uint32_t off ) {
+        ExprMakeLocal::setRefSp(ref, cmres, sp, off);
+        int stride = makeType->getStride();
+        // we go through all fields, and if its [[ ]] field
+        // we tell it to piggy-back on our current sp, with appropriate offset
+        int index = 0;
+        for ( const auto & decl : variants ) {
+            auto fieldVariant = makeType->findArgumentIndex(decl->name);
+            DAS_ASSERT(fieldVariant!=-1 && "should have failed in type infer otherwise");
+            if ( decl->value->rtti_isMakeLocal() ) {
+                auto fieldOffset = makeType->getVariantFieldOffset(fieldVariant);
+                uint32_t offset =  extraOffset + index*stride + fieldOffset;
+                auto mkl = static_cast<ExprMakeLocal*>(decl->value);
+                mkl->setRefSp(ref, cmres, sp, offset);
+                mkl->doesNotNeedInit = false;
+            } else if ( decl->value->rtti_isCall() ) {
+                auto cll = static_cast<ExprCall*>(decl->value);
+                if ( cll->allowCmresSkip() ) {
+                    cll->doesNotNeedSp = true;
+                }
+            } else if ( decl->value->rtti_isInvoke() ) {
+                auto cll = static_cast<ExprInvoke*>(decl->value);
+                if ( cll->allowCmresSkip() ) {
+                    cll->doesNotNeedSp = true;
+                }
+            }
+            index++;
+        }
+    }
+
     vector<SimNode *> SimulateVisitor::simulateExprMakeVariant(const ExprMakeVariant *mkv) {
         gc_guard gc_scope;
         vector<SimNode *> simlist;
         int index = 0;
-        auto mkBaseT = mkv->makeType;   // element view - makeType may be a fixed-array chain
-        while ( mkBaseT->baseType==Type::tFixedArray && mkBaseT->firstType ) mkBaseT = mkBaseT->firstType;
         int stride = mkv->makeType->getStride();
         // init with 0 it its 'default' initialization
         if ( stride && mkv->variants.empty() ) {
@@ -710,7 +737,7 @@ namespace das
         }
         // now fields
         for ( const auto & decl : mkv->variants ) {
-            auto fieldVariant = mkBaseT->findArgumentIndex(decl->name);
+            auto fieldVariant = mkv->makeType->findArgumentIndex(decl->name);
             DAS_ASSERT(fieldVariant!=-1 && "should have failed in type infer otherwise");
             // lets set variant index
             uint32_t voffset = mkv->extraOffset + index*stride;
@@ -727,7 +754,7 @@ namespace das
             }
             simlist.push_back(svi);
             // field itself
-            auto fieldOffset = mkBaseT->getVariantFieldOffset(fieldVariant);
+            auto fieldOffset = mkv->makeType->getVariantFieldOffset(fieldVariant);
             uint32_t offset =  voffset + fieldOffset;
             SimNode * cpy = nullptr;
             if ( decl->value->rtti_isMakeLocal() ) {
@@ -777,21 +804,51 @@ namespace das
         return expr;
     }
 
+    // structure
+
+    void ExprMakeStruct::setRefSp ( bool ref, bool cmres, uint32_t sp, uint32_t off ) {
+        ExprMakeLocal::setRefSp(ref, cmres, sp, off);
+        // if it's a handle type, we can't reuse the make-local chain
+        if ( makeType->baseType == Type::tHandle ) return;
+        // we go through all fields, and if its [[ ]] field
+        // we tell it to piggy-back on our current sp, with appropriate offset
+        int total = int(structs.size());
+        int stride = makeType->getStride();
+        for ( int index=0; index != total; ++index ) {
+            auto & fields = structs[index];
+            for ( const auto & decl : *fields ) {
+                auto field = makeType->structType->findField(decl->name);
+                DAS_ASSERT(field && "should have failed in type infer otherwise");
+                if ( decl->value->rtti_isMakeLocal() ) {
+                    uint32_t offset =  extraOffset + index*stride + field->offset;
+                    auto mkl = static_cast<ExprMakeLocal*>(decl->value);
+                    mkl->setRefSp(ref, cmres, sp, offset);
+                } else if ( decl->value->rtti_isCall() ) {
+                    auto cll = static_cast<ExprCall*>(decl->value);
+                    if ( cll->allowCmresSkip() ) {
+                        cll->doesNotNeedSp = true;
+                    }
+                } else if ( decl->value->rtti_isInvoke() ) {
+                    auto cll = static_cast<ExprInvoke*>(decl->value);
+                    if ( cll->allowCmresSkip() ) {
+                        cll->doesNotNeedSp = true;
+                    }
+                }
+            }
+        }
+    }
+
     vector<SimNode *> SimulateVisitor::simulateExprMakeStruct(const ExprMakeStruct *mks) {
         gc_guard gc_scope;
         vector<SimNode *> simlist;
         // init with 0
         int total = int(mks->structs.size());
-        auto mkBaseT = mks->makeType;   // element view - makeType may be a fixed-array chain
-        while ( mkBaseT->baseType==Type::tFixedArray && mkBaseT->firstType ) mkBaseT = mkBaseT->firstType;
         int stride = mks->makeType->getStride();
         // note: if its an empty tuple init, like [[tuple<int;float>]] and its embedded - we need to zero it out
-        bool emptyEmbeddedTuple = ( mkBaseT->baseType==Type::tTuple && total==0);
+        bool emptyEmbeddedTuple = ( mks->makeType->baseType==Type::tTuple && total==0);
         bool partialyInitStruct = !mks->doesNotNeedInit && !mks->initAllFields;
         if ( (emptyEmbeddedTuple || partialyInitStruct) && stride ) {
-            // zero provided elements means zero-init the WHOLE declared shape (default<T[N]>) -
-            // stride is one outer element, which under-counts fixed-array makeTypes
-            int bytes = total ? total * stride : int(mks->makeType->getSizeOf());
+            int bytes = das::max(total,1) * stride;
             SimNode * init0;
             if ( mks->useCMRES ) {
                 if ( bytes==0 ) {
@@ -808,7 +865,7 @@ namespace das
             }
             if (init0) simlist.push_back(init0);
         }
-        if ( mkBaseT->baseType == Type::tStructure ) {
+        if ( mks->makeType->baseType == Type::tStructure ) {
             for ( int index=0; index != total; ++index ) {
                 if ( mks->constructor ) {
                     uint32_t offset = mks->extraOffset + index*stride;
@@ -826,7 +883,7 @@ namespace das
                 }
                 auto & fields = mks->structs[index];
                 for ( const auto & decl : *fields ) {
-                    auto field = mkBaseT->structType->findField(decl->name);
+                    auto field = mks->makeType->structType->findField(decl->name);
                     DAS_ASSERT(field && "should have failed in type infer otherwise");
                     uint32_t offset = mks->extraOffset + index*stride + field->offset;
                     SimNode * cpy;
@@ -862,7 +919,7 @@ namespace das
                 }
             }
         } else {
-            auto ann = mkBaseT->annotation;
+            auto ann = mks->makeType->annotation;
             // making fake variable, which points to out field
             string fakeName = "__makelocal";
             auto fakeVariable = new Variable();
@@ -877,8 +934,7 @@ namespace das
                 fakeVariable->extraLocalOffset = mks->extraOffset;
                 fakeVariable->type->ref = true;
                 if ( total != 1 ) {
-                    // wrap hoists ref onto the fixed-array head (canonical form)
-                    fakeVariable->type = makeFixedArrayTypeDecl(total, fakeVariable->type);
+                    fakeVariable->type->dim.push_back(total);
                 }
             }
             fakeVariable->generated = true;
@@ -986,6 +1042,31 @@ namespace das
         return expr;
     }
 
+    // make array
+
+    void ExprMakeArray::setRefSp ( bool ref, bool cmres, uint32_t sp, uint32_t off ) {
+        ExprMakeLocal::setRefSp(ref, cmres, sp, off);
+        int total = int(values.size());
+        uint32_t stride = recordType->getSizeOf();
+        for ( int index=0; index != total; ++index ) {
+            auto & val = values[index];
+            if ( val->rtti_isMakeLocal() ) {
+                uint32_t offset =  extraOffset + index*stride;
+                auto mkl = static_cast<ExprMakeLocal*>(val);
+                mkl->setRefSp(ref, cmres, sp, offset);
+            } else if ( val->rtti_isCall() ) {
+                auto cll = static_cast<ExprCall*>(val);
+                if ( cll->allowCmresSkip() ) {
+                    cll->doesNotNeedSp = true;
+                }
+            } else if ( val->rtti_isInvoke() ) {
+                auto cll = static_cast<ExprInvoke*>(val);
+                if ( cll->allowCmresSkip() ) {
+                    cll->doesNotNeedSp = true;
+                }
+            }
+        }
+    }
 
     vector<SimNode *> SimulateVisitor::simulateExprMakeArray(const ExprMakeArray *mka) {
         vector<SimNode *> simlist;
@@ -1062,6 +1143,31 @@ namespace das
             block->list[i] = simlist[i];
         setE(expr, block);
         return expr;
+    }
+
+    // make tuple
+
+    void ExprMakeTuple::setRefSp ( bool ref, bool cmres, uint32_t sp, uint32_t off ) {
+        ExprMakeLocal::setRefSp(ref, cmres, sp, off);
+        int total = int(values.size());
+        for ( int index=0; index != total; ++index ) {
+            auto & val = values[index];
+            if ( val->rtti_isMakeLocal() ) {
+                uint32_t offset =  extraOffset + makeType->getTupleFieldOffset(index);
+                auto mkl = static_cast<ExprMakeLocal*>(val);
+                mkl->setRefSp(ref, cmres, sp, offset);
+            } else if ( val->rtti_isCall() ) {
+                auto cll = static_cast<ExprCall*>(val);
+                if ( cll->allowCmresSkip() ) {
+                    cll->doesNotNeedSp = true;
+                }
+            } else if ( val->rtti_isInvoke() ) {
+                auto cll = static_cast<ExprInvoke*>(val);
+                if ( cll->allowCmresSkip() ) {
+                    cll->doesNotNeedSp = true;
+                }
+            }
+        }
     }
 
     vector<SimNode *> SimulateVisitor::simulateExprMakeTuple(const ExprMakeTuple *mkt) {
@@ -1513,24 +1619,18 @@ namespace das
     ExpressionPtr SimulateVisitor::visit(ExprFind * expr) {
         const auto &at = expr->at;
         auto cont = getE(expr->arguments[0]);
+        auto val = getE(expr->arguments[1]);
         if ( expr->arguments[0]->type->isGoodTableType() ) {
             uint32_t valueTypeSize = expr->arguments[0]->type->secondType->getSizeOf();
-            const auto & keyT = expr->arguments[0]->type->firstType;
-            uint64_t keyHash = 0u;
-            if ( char * keyStr = bakeConstStringKey(context, expr->arguments[1], keyT, keyHash) ) {
-                setE(expr, context.code->makeNode<SimNode_TableFind_WithHash>(at, cont, keyStr, keyHash, valueTypeSize));
+            Type valueType;
+            if ( expr->arguments[0]->type->firstType->isWorkhorseType() ) {
+                valueType = expr->arguments[0]->type->firstType->baseType;
             } else {
-                auto val = getE(expr->arguments[1]);
-                Type valueType;
-                if ( keyT->isWorkhorseType() ) {
-                    valueType = keyT->baseType;
-                } else {
-                    auto valueT = keyT->annotation->makeValueType();
-                    valueType = valueT->baseType;
-                    val = context.code->makeNode<SimNode_CastToWorkhorse>(at, val);
-                }
-                setE(expr, context.code->makeValueNode<SimNode_TableFind>(valueType, at, cont, val, valueTypeSize));
+                auto valueT = expr->arguments[0]->type->firstType->annotation->makeValueType();
+                valueType = valueT->baseType;
+                val = context.code->makeNode<SimNode_CastToWorkhorse>(at, val);
             }
+            setE(expr, context.code->makeValueNode<SimNode_TableFind>(valueType, at, cont, val, valueTypeSize));
         } else {
             DAS_ASSERTF(0, "we should not even be here. find can only accept tables. infer type should have failed.");
             context.thisProgram->error("internal compilation error, generating find for non-table type", "", "", at, CompilationError::internal_table);
@@ -1542,24 +1642,18 @@ namespace das
     ExpressionPtr SimulateVisitor::visit(ExprKeyExists * expr) {
         const auto &at = expr->at;
         auto cont = getE(expr->arguments[0]);
+        auto val = getE(expr->arguments[1]);
         if ( expr->arguments[0]->type->isGoodTableType() ) {
             uint32_t valueTypeSize = expr->arguments[0]->type->secondType->getSizeOf();
-            const auto & keyT = expr->arguments[0]->type->firstType;
-            uint64_t keyHash = 0u;
-            if ( char * keyStr = bakeConstStringKey(context, expr->arguments[1], keyT, keyHash) ) {
-                setE(expr, context.code->makeNode<SimNode_KeyExists_WithHash>(at, cont, keyStr, keyHash, valueTypeSize));
+            Type valueType;
+            if ( expr->arguments[0]->type->firstType->isWorkhorseType() ) {
+                valueType = expr->arguments[0]->type->firstType->baseType;
             } else {
-                auto val = getE(expr->arguments[1]);
-                Type valueType;
-                if ( keyT->isWorkhorseType() ) {
-                    valueType = keyT->baseType;
-                } else {
-                    auto valueT = keyT->annotation->makeValueType();
-                    valueType = valueT->baseType;
-                    val = context.code->makeNode<SimNode_CastToWorkhorse>(at, val);
-                }
-                setE(expr, context.code->makeValueNode<SimNode_KeyExists>(valueType, at, cont, val, valueTypeSize));
+                auto valueT = expr->arguments[0]->type->firstType->annotation->makeValueType();
+                valueType = valueT->baseType;
+                val = context.code->makeNode<SimNode_CastToWorkhorse>(at, val);
             }
+            setE(expr, context.code->makeValueNode<SimNode_KeyExists>(valueType, at, cont, val, valueTypeSize));
         } else {
             DAS_ASSERTF(0, "we should not even be here. find can only accept tables. infer type should have failed.");
             context.thisProgram->error("internal compilation error, generating find for non-table type", "", "", at, CompilationError::internal_table);
@@ -1679,27 +1773,20 @@ namespace das
     ExpressionPtr SimulateVisitor::visit(ExprAscend * expr) {
         const auto &at = expr->at;
         auto se = getE(expr->subexpr);
-        if ( expr->allocate_on_stack && !expr->needTypeInfo ) {
-            // the make-local sub-expression already builds into the frame slot and returns sp+stackTop
-            setE(expr, se);
-            return expr;
-        }
         auto bytes = expr->subexpr->type->getSizeOf();
         TypeInfo * typeInfo = nullptr;
         if ( expr->needTypeInfo ) {
             typeInfo = context.thisHelper->makeTypeInfo(nullptr, expr->subexpr->type);
         }
         SimNode * result;
-        auto ascBaseT = expr->subexpr->type;    // element view - may be a fixed-array chain
-        while ( ascBaseT->baseType==Type::tFixedArray && ascBaseT->firstType ) ascBaseT = ascBaseT->firstType;
-        if ( ascBaseT->baseType==Type::tHandle ) {
+        if ( expr->subexpr->type->baseType==Type::tHandle ) {
             DAS_ASSERTF(expr->useStackRef,"new of handled type should always be over stackref");
-            auto ne = ascBaseT->annotation->simulateGetNew(context, at);
+            auto ne = expr->subexpr->type->annotation->simulateGetNew(context, at);
             result = context.code->makeNode<SimNode_AscendNewHandleAndRef>(at, se, ne, bytes, expr->stackTop);
         } else {
             bool persistent = false;
-            if ( ascBaseT->baseType==Type::tStructure ) {
-                persistent = ascBaseT->structType->persistent;
+            if ( expr->subexpr->type->baseType==Type::tStructure ) {
+                persistent = expr->subexpr->type->structType->persistent;
             }
             if ( expr->useStackRef ) {
                 result = context.code->makeNode<SimNode_AscendAndRef>(at, se, bytes, expr->stackTop, typeInfo, persistent);
@@ -1714,14 +1801,12 @@ namespace das
     ExpressionPtr SimulateVisitor::visit(ExprNew * expr) {
         const auto &at = expr->at;
         SimNode * newNode;
-        auto newBaseT = expr->typeexpr;     // element view - may be a fixed-array chain
-        while ( newBaseT->baseType==Type::tFixedArray && newBaseT->firstType ) newBaseT = newBaseT->firstType;
-        if ( newBaseT->baseType == Type::tHandle ) {
-            DAS_ASSERT(newBaseT->annotation->canNew() && "how???");
+        if ( expr->typeexpr->baseType == Type::tHandle ) {
+            DAS_ASSERT(expr->typeexpr->annotation->canNew() && "how???");
             if ( expr->initializer ) {
                 auto pCall = static_cast<SimNode_CallBase *>(expr->func->makeSimNode(context, expr->arguments));
                 sv_simulateCall(expr->func, expr, pCall);
-                pCall->cmresEval = newBaseT->annotation->simulateGetNew(context, at);
+                pCall->cmresEval = expr->typeexpr->annotation->simulateGetNew(context, at);
                 if ( !pCall->cmresEval ) {
                     context.thisProgram->error("integration error, simulateGetNew returned null", "", "",
                                             at, CompilationError::internal_expression );
@@ -1729,7 +1814,7 @@ namespace das
                 setE(expr, pCall);
                 return expr;
             } else {
-                newNode = newBaseT->annotation->simulateGetNew(context, at);
+                newNode = expr->typeexpr->annotation->simulateGetNew(context, at);
                 if ( !newNode ) {
                     context.thisProgram->error("integration error, simulateGetNew returned null", "", "",
                                             at, CompilationError::internal_expression );
@@ -1737,26 +1822,21 @@ namespace das
             }
         } else {
             bool persistent = false;
-            if ( newBaseT->baseType == Type::tStructure ) {
-                persistent = newBaseT->structType->persistent;
+            if ( expr->typeexpr->baseType == Type::tStructure ) {
+                persistent = expr->typeexpr->structType->persistent;
             }
-            // expr->type is FA(...,ptr) for `new T[N]` - walk to the pointer node for the pointee size
-            auto ptrT = expr->type;
-            while ( ptrT->baseType==Type::tFixedArray && ptrT->firstType ) ptrT = ptrT->firstType;
-            int32_t bytes = ptrT->firstType->getBaseSizeOf();
+            int32_t bytes = expr->type->firstType->getBaseSizeOf();
             if ( expr->initializer ) {
                 auto pCall = (SimNode_CallBase *) context.code->makeNodeUnrollAny<SimNode_NewWithInitializer>(
                     int(expr->arguments.size()), at, bytes, persistent);
                 pCall->cmresEval = nullptr;
                 sv_simulateCall(expr->func, expr, pCall);
                 newNode = pCall;
-            } else if ( expr->allocate_on_stack ) {
-                newNode = context.code->makeNode<SimNode_NewStack>(at, expr->stackTop, uint32_t(bytes));
             } else {
                 newNode = context.code->makeNode<SimNode_New>(at, bytes, persistent);
             }
         }
-        if ( expr->type->baseType==Type::tFixedArray ) {
+        if ( expr->type->dim.size() ) {
             uint32_t count = expr->type->getCountOf();
             setE(expr, context.code->makeNode<SimNode_NewArray>(at, newNode, expr->stackTop, count));
         } else {
@@ -1792,17 +1872,9 @@ namespace das
             auto pidx = simulateExpression(expr->index);
             uint32_t stride = expr->subexpr->type->firstType->getSizeOf();
             if ( r2vType->baseType!=Type::none ) {
-                switch ( expr->index->type->baseType ) {
-                case Type::tInt64:  return context.code->makeValueNode<SimNode_ArrayAtR2V_I64>(r2vType->getR2VType(), at, prv, pidx, stride, extraOffset);
-                case Type::tUInt64: return context.code->makeValueNode<SimNode_ArrayAtR2V_U64>(r2vType->getR2VType(), at, prv, pidx, stride, extraOffset);
-                default:            return context.code->makeValueNode<SimNode_ArrayAtR2V>(r2vType->getR2VType(), at, prv, pidx, stride, extraOffset);
-                }
+                return context.code->makeValueNode<SimNode_ArrayAtR2V>(r2vType->getR2VType(), at, prv, pidx, stride, extraOffset);
             } else {
-                switch ( expr->index->type->baseType ) {
-                case Type::tInt64:  return context.code->makeNode<SimNode_ArrayAt_I64>(at, prv, pidx, stride, extraOffset);
-                case Type::tUInt64: return context.code->makeNode<SimNode_ArrayAt_U64>(at, prv, pidx, stride, extraOffset);
-                default:            return context.code->makeNode<SimNode_ArrayAt>(at, prv, pidx, stride, extraOffset);
-                }
+                return context.code->makeNode<SimNode_ArrayAt>(at, prv, pidx, stride, extraOffset);
             }
         } else if ( expr->subexpr->type->isPointer() ) {
             uint32_t stride = expr->subexpr->type->firstType->getSizeOf();
@@ -1830,41 +1902,17 @@ namespace das
                 };
             }
         } else {
-            uint32_t range = uint32_t(expr->subexpr->type->fixedDim);
+            uint32_t range = expr->subexpr->type->dim[0];
             uint32_t stride = expr->subexpr->type->getStride();
             if ( expr->index->rtti_isConstant() ) {
             // if its constant index, like a[3]..., we try to let node bellow simulate
                 auto idxCE = static_cast<ExprConst*>(expr->index);
-                auto idxBT = expr->index->type->baseType;
-                bool idxSigned = (idxBT == Type::tInt || idxBT == Type::tInt64);
-                // Read at the index's natural width so int64 / uint64 constants
-                // outside the int32 range are NOT silently truncated (e.g. an
-                // int64 const 5_000_000_000 would otherwise land as 705032704
-                // and produce a wrong "out of range" message + wrong idxC).
-                int64_t idx64;
-                if ( idxBT == Type::tInt64 ) {
-                    idx64 = cast<int64_t>::to(idxCE->value);
-                } else if ( idxBT == Type::tUInt64 ) {
-                    uint64_t u = cast<uint64_t>::to(idxCE->value);
-                    // Anything beyond INT64_MAX is far out of range; clamp into a
-                    // representable form for the "out of range" diagnostic only.
-                    idx64 = (u > uint64_t(INT64_MAX)) ? INT64_MAX : int64_t(u);
-                } else if ( idxBT == Type::tUInt ) {
-                    idx64 = int64_t(cast<uint32_t>::to(idxCE->value));
-                } else {
-                    // tInt and any other narrow integer fall-through
-                    idx64 = int64_t(cast<int32_t>::to(idxCE->value));
-                }
-                if ( (idxSigned && idx64<0) || uint64_t(idx64) >= uint64_t(range) ) {
-                    string idxStr;
-                    if ( idxBT == Type::tUInt64 )      idxStr = to_string(cast<uint64_t>::to(idxCE->value));
-                    else if ( idxBT == Type::tUInt )   idxStr = to_string(uint32_t(idx64));
-                    else                               idxStr = to_string(idx64);
-                    context.thisProgram->error("index out of range " + idxStr + " of " + to_string(range) + ", " + expr->describe(), "", "",
+                uint32_t idxC = cast<uint32_t>::to(idxCE->value);
+                if ( idxC >= range ) {
+                    context.thisProgram->error("index out of range " + to_string(idxC) + " of " + to_string(range) + ", " + expr->describe(), "", "",
                         at, CompilationError::exceeds_array);
                     return nullptr;
                 }
-                uint32_t idxC = uint32_t(idx64);
                 auto tnode = sv_trySimulate(expr->subexpr, extraOffset + idxC*stride, r2vType);
                 if ( tnode ) {
                     return tnode;
@@ -1916,24 +1964,17 @@ namespace das
             }
         } else if ( expr->subexpr->type->isGoodTableType() ) {
             auto prv = getE(expr->subexpr);
+            auto pidx = getE(expr->index);
             uint32_t valueTypeSize = expr->subexpr->type->secondType->getSizeOf();
-            const auto & keyT = expr->subexpr->type->firstType;
-            SimNode * res = nullptr;
-            uint64_t keyHash = 0u;
-            if ( char * keyStr = bakeConstStringKey(context, expr->index, keyT, keyHash) ) {
-                res = context.code->makeNode<SimNode_TableIndex_WithHash>(at, prv, keyStr, keyHash, valueTypeSize, 0);
+            Type keyType;
+            if ( expr->subexpr->type->firstType->isWorkhorseType() ) {
+                keyType = expr->subexpr->type->firstType->baseType;
             } else {
-                auto pidx = getE(expr->index);
-                Type keyType;
-                if ( keyT->isWorkhorseType() ) {
-                    keyType = keyT->baseType;
-                } else {
-                    auto keyValueType = keyT->annotation->makeValueType();
-                    keyType = keyValueType->baseType;
-                    pidx = context.code->makeNode<SimNode_CastToWorkhorse>(at, pidx);
-                }
-                res = context.code->makeValueNode<SimNode_TableIndex>(keyType, at, prv, pidx, valueTypeSize, 0);
+                auto keyValueType = expr->subexpr->type->firstType->annotation->makeValueType();
+                keyType = keyValueType->baseType;
+                pidx = context.code->makeNode<SimNode_CastToWorkhorse>(at, pidx);
             }
+            auto res = context.code->makeValueNode<SimNode_TableIndex>(keyType, at, prv, pidx, valueTypeSize, 0);
             if ( expr->r2v ) {
                 setE(expr, GetR2V(context, at, expr->type, res));
             } else {
@@ -1958,31 +1999,22 @@ namespace das
                 auto prv = getE(expr->subexpr);
                 auto pidx = getE(expr->index);
                 uint32_t stride = seT->firstType->getSizeOf();
-                switch ( expr->index->type->baseType ) {
-                case Type::tInt64:  setE(expr, context.code->makeNode<SimNode_SafeArrayAt_I64>(at, prv, pidx, stride, 0)); break;
-                case Type::tUInt64: setE(expr, context.code->makeNode<SimNode_SafeArrayAt_U64>(at, prv, pidx, stride, 0)); break;
-                default:            setE(expr, context.code->makeNode<SimNode_SafeArrayAt>(at, prv, pidx, stride, 0)); break;
-                }
+                setE(expr, context.code->makeNode<SimNode_SafeArrayAt>(at, prv, pidx, stride, 0));
             } else if ( seT->isGoodTableType() ) {
                 auto prv = getE(expr->subexpr);
+                auto pidx = getE(expr->index);
                 uint32_t valueTypeSize = seT->secondType->getSizeOf();
-                uint64_t keyHash = 0u;
-                if ( char * keyStr = bakeConstStringKey(context, expr->index, seT->firstType, keyHash) ) {
-                    setE(expr, context.code->makeNode<SimNode_SafeTableIndex_WithHash>(at, prv, keyStr, keyHash, valueTypeSize));
+                Type valueType;
+                if ( seT->firstType->isWorkhorseType() ) {
+                    valueType = seT->firstType->baseType;
                 } else {
-                    auto pidx = getE(expr->index);
-                    Type valueType;
-                    if ( seT->firstType->isWorkhorseType() ) {
-                        valueType = seT->firstType->baseType;
-                    } else {
-                        auto valueT = seT->firstType->annotation->makeValueType();
-                        valueType = valueT->baseType;
-                        pidx = context.code->makeNode<SimNode_CastToWorkhorse>(at, pidx);
-                    }
-                    setE(expr, context.code->makeValueNode<SimNode_SafeTableIndex>(valueType, at, prv, pidx, valueTypeSize, 0));
+                    auto valueT = seT->firstType->annotation->makeValueType();
+                    valueType = valueT->baseType;
+                    pidx = context.code->makeNode<SimNode_CastToWorkhorse>(at, pidx);
                 }
-            } else if ( seT->baseType==Type::tFixedArray ) {
-                uint32_t range = uint32_t(seT->fixedDim);
+                setE(expr, context.code->makeValueNode<SimNode_SafeTableIndex>(valueType, at, prv, pidx, valueTypeSize, 0));
+            } else if ( seT->dim.size() ) {
+                uint32_t range = seT->dim[0];
                 uint32_t stride = seT->getStride();
                 auto prv = getE(expr->subexpr);
                 auto pidx = getE(expr->index);
@@ -2014,31 +2046,22 @@ namespace das
                 auto prv = getE(expr->subexpr);
                 auto pidx = getE(expr->index);
                 uint32_t stride = seT->firstType->getSizeOf();
-                switch ( expr->index->type->baseType ) {
-                case Type::tInt64:  setE(expr, context.code->makeNode<SimNode_SafeArrayAt_I64>(at, prv, pidx, stride, 0)); break;
-                case Type::tUInt64: setE(expr, context.code->makeNode<SimNode_SafeArrayAt_U64>(at, prv, pidx, stride, 0)); break;
-                default:            setE(expr, context.code->makeNode<SimNode_SafeArrayAt>(at, prv, pidx, stride, 0)); break;
-                }
+                setE(expr, context.code->makeNode<SimNode_SafeArrayAt>(at, prv, pidx, stride, 0));
             } else if ( expr->subexpr->type->isGoodTableType() ) {
                 auto prv = getE(expr->subexpr);
+                auto pidx = getE(expr->index);
                 uint32_t valueTypeSize = seT->secondType->getSizeOf();
-                uint64_t keyHash = 0u;
-                if ( char * keyStr = bakeConstStringKey(context, expr->index, seT->firstType, keyHash) ) {
-                    setE(expr, context.code->makeNode<SimNode_SafeTableIndex_WithHash>(at, prv, keyStr, keyHash, valueTypeSize));
+                Type valueType;
+                if ( seT->firstType->isWorkhorseType() ) {
+                    valueType = seT->firstType->baseType;
                 } else {
-                    auto pidx = getE(expr->index);
-                    Type valueType;
-                    if ( seT->firstType->isWorkhorseType() ) {
-                        valueType = seT->firstType->baseType;
-                    } else {
-                        auto valueT = seT->firstType->annotation->makeValueType();
-                        valueType = valueT->baseType;
-                        pidx = context.code->makeNode<SimNode_CastToWorkhorse>(at, pidx);
-                    }
-                    setE(expr, context.code->makeValueNode<SimNode_SafeTableIndex>(valueType, at, prv, pidx, valueTypeSize, 0));
+                    auto valueT = seT->firstType->annotation->makeValueType();
+                    valueType = valueT->baseType;
+                    pidx = context.code->makeNode<SimNode_CastToWorkhorse>(at, pidx);
                 }
-            } else if ( seT->baseType==Type::tFixedArray ) {
-                uint32_t range = uint32_t(seT->fixedDim);
+                setE(expr, context.code->makeValueNode<SimNode_SafeTableIndex>(valueType, at, prv, pidx, valueTypeSize, 0));
+            } else if ( seT->dim.size() ) {
+                uint32_t range = seT->dim[0];
                 uint32_t stride = seT->getStride();
                 auto prv = getE(expr->subexpr);
                 auto pidx = getE(expr->index);
@@ -2515,17 +2538,6 @@ namespace das
                 }
             }
         } else {
-            // Variables whose `used` flag stayed false get index<0 in allocateStack and no
-            // runtime slot. Inside compiled function bodies this is unreachable -- ConstFolding
-            // rewrites such refs to their literal init before simulate. But rtti-exposed ASTs
-            // (e.g. struct field defaults) bypass folding, so the original ExprVar reference
-            // survives. Re-simulating it would emit a GetSharedMnh / GetGlobalMnh that looks
-            // up a mnh not in tabGMnLookup -> crash. Emit the const init directly instead.
-            if ( expr->variable->index < 0 && expr->variable->init
-                 && expr->variable->init->rtti_isConstant() ) {
-                setE(expr, simulateExpression(expr->variable->init));
-                return expr;
-            }
             DAS_ASSERT(expr->variable->index >= 0 && "using variable which is not used. how?");
             uint64_t mnh = expr->variable->getMangledNameHash();
             if ( !expr->variable->module->isSolidContext ) {
@@ -2970,7 +2982,7 @@ namespace das
         for ( auto & src : expr->sources ) {
             if ( !src->type ) continue;
             if ( src->type->isArray() ) {
-                fixedSize = das::min(fixedSize, src->type->fixedDim);
+                fixedSize = das::min(fixedSize, src->type->dim[0]);
                 fixedArrays = true;
             } else if ( src->type->isGoodArrayType() ) {
                 dynamicArrays = true;
@@ -3048,11 +3060,11 @@ namespace das
                             expr->sources[t]
                         );
                     }
-                } else if ( expr->sources[t]->type->baseType==Type::tFixedArray ) {
+                } else if ( expr->sources[t]->type->dim.size() ) {
                     result->source_iterators[t] = context.code->makeNode<SimNode_FixedArrayIterator>(
                         expr->sources[t]->at,
                         getE(expr->sources[t]),
-                        uint32_t(expr->sources[t]->type->fixedDim),
+                        expr->sources[t]->type->dim[0],
                         expr->sources[t]->type->getStride());
                 } else {
                     DAS_ASSERTF(0, "we should not be here. we are doing iterator for on an unsupported type.");
@@ -3069,32 +3081,8 @@ namespace das
             bool NF = flagsE == 0;
             SimNode_ForBase * result;
             DAS_ASSERT(expr->body->rtti_isBlock() && "there would be internal error otherwise");
-            // Simulate the body FIRST into a scratch block to learn how many SimNodes it
-            // actually produces. A dead single statement (`var v = <const>`) is 1 AST node but
-            // 0 SimNodes, and the fused single-statement (`loop1`) for-node reads list[0]
-            // unconditionally -- so the fused/general choice must follow the SIMULATED count,
-            // not the AST count. The body is already simulated bottom-up; this only collects it.
-            SimNode_Block forBody(at);
-            sv_whileSimulateFinal(expr->body, &forBody);
-            // The fused single-statement (`loop1`) for-node reads list[0] unconditionally and
-            // its eval uses DAS_PROCESS_LOOP1_FLAGS, which has no jumpToLabel arm -- so a body
-            // carrying labels (`goto` targets) must take the general labeled node. Labels are AST
-            // nodes but not body SimNodes, so they don't show in `total`; gate on totalLabels too.
-            bool loop1 = (forBody.total == 1 && forBody.totalLabels == 0);
-            // An empty body (no statements, no labels, no finally) over side-effect-free sources is
-            // a pure no-op -- emit nothing (the enclosing block's collectExpressions skips a null
-            // node). A side-effecting source, or a label, falls through to the general node, which
-            // still evaluates the source and zero-iterates / preserves the label machinery.
-            if ( forBody.total==0 && forBody.totalFinal==0 && forBody.totalLabels==0 ) {
-                bool pureSources = true;
-                for ( auto & src : expr->sources ) {
-                    if ( !src->noSideEffects ) { pureSources = false; break; }
-                }
-                if ( pureSources ) {
-                    setE(expr, nullptr);
-                    return expr;
-                }
-            }
+            auto subB = static_cast<ExprBlock*>(expr->body);
+            bool loop1 = (subB->list.size() == 1);
 #if DAS_DEBUGGER
             if ( context.debugger ) {
                 if ( dynamicArrays ) {
@@ -3215,13 +3203,7 @@ namespace das
                 result->stackTop[t] = expr->iteratorVariables[t]->stackTop;
             }
             result->size = fixedSize;
-            // carry the already-simulated body into the chosen node (do not re-simulate)
-            result->list = forBody.list;
-            result->total = forBody.total;
-            result->labels = forBody.labels;
-            result->totalLabels = forBody.totalLabels;
-            result->finalList = forBody.finalList;
-            result->totalFinal = forBody.totalFinal;
+            sv_whileSimulateFinal(expr->body, result);
             setE(expr, result);
         }
         return expr;
@@ -3532,16 +3514,7 @@ namespace das
 
     void Program::makeMacroModule ( TextWriter & logs ) {
         isCompilingMacros = true;
-        int macroStackSize = getContextStackSize();
-        if ( policies.aot_macros || policies.jit_enabled || options.getBoolOption("aot_macros", false) ) {
-            // quote lowering (daslib/quote) is active (same triggers as its QuotePass gate,
-            // including the per-module option): a lowered quote evaluates one large
-            // construction frame per quote, and macro-called functions evaluate theirs on
-            // THIS context's stack at macro-apply time. Size only the macro context — a
-            // global policies.stack bump would leak into produced exe/wasm runtime stacks.
-            macroStackSize = das::max(macroStackSize, 1 * 1024 * 1024);
-        }
-        thisModule->macroContext = get_context(macroStackSize);
+        thisModule->macroContext = get_context(getContextStackSize());
         thisModule->macroContext->category = uint32_t(das::ContextCategory::macro_context);
         auto oldAot = policies.aot;
         auto oldHeap = policies.persistent_heap;
@@ -3632,6 +3605,7 @@ namespace das
             context.constStringHeap->setInitialSize(globalStringHeapSize);
         }
         DebugInfoHelper helper(context.debugInfo);
+        helper.rtti = options.getBoolOption("rtti",policies.rtti);
         context.thisHelper = &helper;
         context.globalVariables = (GlobalVariable *) context.code->allocate( totalVariables*sizeof(GlobalVariable) );
         context.globalsSize = 0;
@@ -4011,12 +3985,9 @@ namespace das
         if ( !options.getBoolOption("rtti",policies.rtti) ) {
             context.thisProgram = nullptr;
         }
-        if ( options.getBoolOption("log_total_compile_time",policies.log_total_compile_time)
-             || options.getBoolOption("log_module_compile_time",policies.log_module_compile_time) ) {
+        if ( options.getBoolOption("log_total_compile_time",policies.log_total_compile_time) ) {
             auto dt = get_time_usec(time0) / 1000000.;
-            logs << "simulate (including init script) took " << dt << ", ";
-            if ( !thisModule->name.empty() ) logs << thisModule->name << " (" << thisModule->fileName << ")\n";
-            else logs << thisModule->fileName << "\n";
+            logs << "simulate (including init script) took " << dt << "\n";
         }
         dapiSimulateContext(context);
         return errors.size() == 0;

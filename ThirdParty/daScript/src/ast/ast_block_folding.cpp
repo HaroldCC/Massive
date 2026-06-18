@@ -7,7 +7,6 @@ namespace das {
 
     class UnsafeFolding : public PassVisitor {
     public:
-        using PassVisitor::visit;
         UnsafeFolding() : PassVisitor(0) {}
     protected:
         virtual ExpressionPtr visit ( ExprUnsafe * expr ) {
@@ -30,7 +29,6 @@ namespace das {
     class RefFolding : public PassVisitor {
     public:
         using PassVisitor::PassVisitor;
-        using PassVisitor::visit;
 
         virtual bool canVisitStructure ( Structure * /*st*/ ) override { return false; }
         virtual bool canVisitEnumeration ( Enumeration * /*en*/ ) override { return false; }
@@ -154,7 +152,6 @@ namespace das {
     class BlockFolding : public PassVisitor {
     public:
         using PassVisitor::PassVisitor;
-        using PassVisitor::preVisit;
 
         virtual bool canVisitStructure ( Structure * /*st*/ ) override { return false; }
         virtual bool canVisitGlobalVariable ( Variable * /*fun*/ ) override { return false; }
@@ -296,7 +293,6 @@ namespace das {
     class CondFolding : public PassVisitor {
     public:
         using PassVisitor::PassVisitor;
-        using PassVisitor::visit;
 
         virtual bool canVisitStructure ( Structure * /*st*/ ) override { return false; }
         virtual bool canVisitGlobalVariable ( Variable * /*fun*/ ) override { return false; }

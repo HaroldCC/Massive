@@ -1,0 +1,95 @@
+IF (NOT DEFINED PATH_TO_LIBCLANG)
+	SET(PATH_TO_LIBCLANG "${PROJECT_SOURCE_DIR}/../libclang")
+ENDIF()
+IF ((NOT ${DAS_CLANG_BIND_DISABLED}) OR (NOT DEFINED DAS_CLANG_BIND_DISABLED))
+	find_package(Clang 16.0.6 PATHS "${PATH_TO_LIBCLANG}")
+ENDIF()
+IF ((NOT DAS_CLANG_BIND_INCLUDED) AND (${Clang_FOUND}) AND ((NOT ${DAS_CLANG_BIND_DISABLED}) OR (NOT DEFINED DAS_CLANG_BIND_DISABLED)))
+    SET(DAS_CLANG_BIND_INCLUDED TRUE)
+    MESSAGE(STATUS "dasClangBind module included.")
+
+	SET(DAS_CLANG_BIND_DIR ${PROJECT_SOURCE_DIR}/modules/dasClangBind)
+
+	MESSAGE("LIBCLANG_LIB at ${LLVM_INSTALL_PREFIX}")
+
+    LIST(APPEND CMAKE_MODULE_PATH ${DAS_CLANG_BIND_DIR})
+
+	SET(DAS_CLANG_BIND_MODULE_SRC
+		${DAS_CLANG_BIND_DIR}/src/need_dasClangBind.h
+		${DAS_CLANG_BIND_DIR}/src/dasClangBind.h
+		${DAS_CLANG_BIND_DIR}/src/dasClangBind.cpp
+	# user include
+		${DAS_CLANG_BIND_DIR}/src/dasClangBind.main.cpp
+	# generated binding includes
+		${DAS_CLANG_BIND_DIR}/src/dasClangBind.alias.add.inc
+		${DAS_CLANG_BIND_DIR}/src/dasClangBind.dummy.add.inc
+		${DAS_CLANG_BIND_DIR}/src/dasClangBind.enum.add.inc
+		${DAS_CLANG_BIND_DIR}/src/dasClangBind.enum.class.inc
+		${DAS_CLANG_BIND_DIR}/src/dasClangBind.enum.decl.inc
+		${DAS_CLANG_BIND_DIR}/src/dasClangBind.enum.decl.cast.inc
+		${DAS_CLANG_BIND_DIR}/src/dasClangBind.struct.add.inc
+		${DAS_CLANG_BIND_DIR}/src/dasClangBind.struct.postadd.inc
+		${DAS_CLANG_BIND_DIR}/src/dasClangBind.struct.class.inc
+		${DAS_CLANG_BIND_DIR}/src/dasClangBind.struct.decl.inc
+		${DAS_CLANG_BIND_DIR}/src/dasClangBind.struct.impl.inc
+		${DAS_CLANG_BIND_DIR}/src/dasClangBind.struct.cast.inc
+	# generated functions
+		${DAS_CLANG_BIND_DIR}/src/dasClangBind.func_1.cpp
+		${DAS_CLANG_BIND_DIR}/src/dasClangBind.func_2.cpp
+		${DAS_CLANG_BIND_DIR}/src/dasClangBind.func_3.cpp
+		${DAS_CLANG_BIND_DIR}/src/dasClangBind.func_4.cpp
+		${DAS_CLANG_BIND_DIR}/src/dasClangBind.func_5.cpp
+		${DAS_CLANG_BIND_DIR}/src/dasClangBind.func_6.cpp
+		${DAS_CLANG_BIND_DIR}/src/dasClangBind.func_7.cpp
+		${DAS_CLANG_BIND_DIR}/src/dasClangBind.func_8.cpp
+		${DAS_CLANG_BIND_DIR}/src/dasClangBind.func_9.cpp
+		${DAS_CLANG_BIND_DIR}/src/dasClangBind.func_10.cpp
+		${DAS_CLANG_BIND_DIR}/src/dasClangBind.func_11.cpp
+		${DAS_CLANG_BIND_DIR}/src/dasClangBind.func_12.cpp
+		${DAS_CLANG_BIND_DIR}/src/dasClangBind.func_13.cpp
+		${DAS_CLANG_BIND_DIR}/src/dasClangBind.func_14.cpp
+		${DAS_CLANG_BIND_DIR}/src/dasClangBind.func_15.cpp
+		${DAS_CLANG_BIND_DIR}/src/dasClangBind.func_16.cpp
+		${DAS_CLANG_BIND_DIR}/src/dasClangBind.func_17.cpp
+	)
+
+	ADD_MODULE_CPP(dasClangBind)
+	# ADD_MODULE_NATIVE(CLANG_BIND_boost)
+	ADD_MODULE_LIB(libDasModuleClangBind dasModuleClangBind ${DAS_CLANG_BIND_MODULE_SRC} ${DAS_CLANG_BIND_MODULE_PLATFORM_SRC})
+	IF(APPLE)
+		TARGET_LINK_LIBRARIES(libDasModuleClangBind PRIVATE ${CLANG_BIND_LIBRARIES} ${LIBCLANG_LIB}/libclang.dylib)
+		TARGET_LINK_LIBRARIES(dasModuleClangBind PRIVATE ${CLANG_BIND_LIBRARIES} ${LIBCLANG_LIB}/libclang.dylib)
+    ELSE()
+		TARGET_LINK_LIBRARIES(libDasModuleClangBind PRIVATE ${CLANG_BIND_LIBRARIES} libclang)
+		TARGET_LINK_LIBRARIES(dasModuleClangBind PRIVATE ${CLANG_BIND_LIBRARIES} libclang)
+	ENDIF()
+	# ADD_DEPENDENCIES(libDasModuleClangBind)
+	TARGET_INCLUDE_DIRECTORIES(libDasModuleClangBind PUBLIC ${CLANG_BIND_INCLUDE_DIR} ${CLANG_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS})
+	TARGET_INCLUDE_DIRECTORIES(dasModuleClangBind PUBLIC ${CLANG_BIND_INCLUDE_DIR} ${CLANG_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS})
+
+IF(WIN32)
+    set(DAS_CLANG_DLLS
+        ${LLVM_INSTALL_PREFIX}/bin/LLVM-C.dll
+        ${LLVM_INSTALL_PREFIX}/bin/LTO.dll
+        ${LLVM_INSTALL_PREFIX}/bin/Remarks.dll
+        ${LLVM_INSTALL_PREFIX}/bin/libclang.dll
+    )
+    foreach(dll ${DAS_CLANG_DLLS})
+        get_filename_component(dll_name "${dll}" NAME)
+        add_custom_command(TARGET libDasModuleClangBind POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${dll}"
+            "${PROJECT_SOURCE_DIR}/bin/$<CONFIG>/${dll_name}"
+        )
+    endforeach()
+	install(FILES ${DAS_CLANG_DLLS}
+        DESTINATION ${DAS_INSTALL_BINDIR}
+    )
+	install(FILES ${PROJECT_SOURCE_DIR}/modules/dasClangBind/LICENSE.TXT DESTINATION ${DAS_INSTALL_DOCDIR} RENAME LLVM.LICENSE)
+ENDIF()
+
+    ADD_MODULE_DAS(cbind cbind cbind_boost)
+
+	SETUP_CPP11(libDasModuleClangBind)
+	SETUP_CPP11(dasModuleClangBind)
+ENDIF()

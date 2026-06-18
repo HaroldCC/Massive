@@ -157,17 +157,17 @@ class PrintVisitor : AstVisitor {
         // let bfa : FunctionFlags = fun.flags & function_annotation_flags;
         // // todo: describe_bitfield not supported in aot yet
         // write(*writer, "{describe_bitfield(bfa,"\n")}");
-        if (!empty(fun.annotations)) {
+        if (fun.annotations |> length != 0) {
             write(*writer, "[{describe(fun.annotations)}]\n");
         }
         write(*writer, "def {fun.name}");
-        if (!empty(fun.arguments)) {
+        if (fun.arguments |> length != 0) {
             write(*writer, " ( ");
         }
     }
     def override preVisitFunctionBody(fun : FunctionPtr; expr : ExpressionPtr) {
         //! Prints the closing parenthesis of arguments and the return type.
-        if (!empty(fun.arguments)) {
+        if (fun.arguments |> length != 0) {
             write(*writer, " ) ");
         }
         if (fun.result != null && !fun.result.isVoid) {
@@ -208,7 +208,7 @@ class PrintVisitor : AstVisitor {
     def override preVisitExprBlock(blk : ExprBlock?) {
         //! Prints the opening of a block expression, including closure arguments.
         if (blk.blockFlags.isClosure) {
-            if (blk.returnType != null || !empty(blk.arguments)) {
+            if (blk.returnType != null || blk.arguments |> length != 0) {
                 write(*writer, "$(");
                 for (arg, argIndex in blk.arguments, range(blk.arguments |> length)) {
                     if (arg.annotation |> length != 0) {
@@ -1106,7 +1106,7 @@ def add(a, b : int) {
     return a + b + add_extra;
 }
 
-[sideeffects, export, no_lint]
+[sideeffects, export]
 def allExpr(arg : int) {
     //! Exercises all expression types for AST pretty-printer coverage.
     // ExprStringBuilder

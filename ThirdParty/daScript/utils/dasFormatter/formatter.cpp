@@ -62,7 +62,6 @@ namespace das::format {
         state.last = {};
         state.options = {};
         state.content_ = {};
-        state.program = nullptr;
     }
 
     void set_to(Pos info) {

@@ -34,14 +34,14 @@ def clone(var dst : GameState; src : GameState) {
 
 def make_inventory() : Inventory {
     var inv : Inventory
-    inv.items |> push("sword")  // nolint:STYLE012 — tutorial demonstrates building up then moving out
+    inv.items |> push("sword")
     inv.items |> push("shield")
     inv.weight = 15
     return <- inv     // must use <- because Inventory contains array
 }
 
 def make_numbers() : array<int> {
-    var result : array<int>  // nolint:STYLE012 — tutorial demonstrates push semantics
+    var result : array<int>
     result |> push(10)
     result |> push(20)
     result |> push(30)
@@ -81,7 +81,7 @@ def main {
     // === Clone (:=) ===
 
     // Clone creates a deep, independent copy. Both sides remain valid.
-    var original : array<int>  // nolint:STYLE012 — tutorial demonstrates push semantics
+    var original : array<int>
     original |> push(1)
     original |> push(2)
     original |> push(3)
@@ -112,7 +112,7 @@ def main {
     // === Struct field initialization ===
 
     // Each field can use a different mode in construction:
-    var weapons : array<string>  // nolint:STYLE012 — tutorial demonstrates push semantics
+    var weapons : array<string>
     weapons |> push("bow")
     weapons |> push("arrow")
 
@@ -129,7 +129,7 @@ def main {
     // string          ✓    ✓    ✓
     // array<T>        ✗    ✓    ✓
     // table<K;V>      ✗    ✓    ✓
-    // lambda          ✓*   ✓    ✗    (* = copies fat pointer; both vars alias the same capture frame)
+    // lambda          ✗    ✓    ✗
     // iterator        ✗    ✓    ✗
     // block           ✗    ✗    ✗
     // POD struct      ✓    ✓    ✓
@@ -152,7 +152,9 @@ def main {
     // Define a custom 'clone' function to control how := works.
     // The signature is: def clone(var dst : T; src : T)
 
-    let game <- GameState(name = "save1", level = 5, scores <- [100, 200])
+    var game = GameState(name = "save1", level = 5)
+    game.scores |> push(100)
+    game.scores |> push(200)
 
     let save := game    // uses our custom clone below
     print("game:  level={game.level}, scores={game.scores}\n")

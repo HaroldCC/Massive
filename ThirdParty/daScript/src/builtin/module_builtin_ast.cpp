@@ -7,21 +7,45 @@
 #include "daScript/ast/ast_expressions.h"
 #include "daScript/ast/ast_generate.h"
 #include "daScript/ast/ast_simulate.h"
-#include "daScript/misc/das_common.h"
+#include "daScript/das_common.h"
 #include "daScript/simulate/aot_builtin_ast.h"
 #include "daScript/simulate/aot_builtin_string.h"
-#include "daScript/simulate/fs_file_info.h"
 #include "daScript/misc/performance_time.h"
 #include "daScript/misc/gc_node.h"
 
 MAKE_TYPE_FACTORY(StringBuilderWriter, StringBuilderWriter)
 
 #include "module_builtin_ast.h"
-
-// get_file_access lives in the compiler lib (ast_parse.cpp); it compiles the pak.
-das::FileAccessPtr get_file_access ( char * pak );
-
 namespace das {
+
+    int adapt_field_offset ( const char * fName, const StructInfo * info ) {
+        for ( uint32_t i=0, is=info->count; i!=is; ++i ) {
+            if ( strcmp(info->fields[i]->name,fName)==0 ) {
+                return info->fields[i]->offset;
+            }
+        }
+        DAS_VERIFYF(0,"mapping %s not found. not fully implemented derived class %s", fName, info->name);
+        return 0;
+    }
+
+    int adapt_field_offset_ex ( const char * fName, const StructInfo * info, uint32_t & i ) {
+        for ( uint32_t is=info->count; i!=is; ++i ) {
+            if ( strcmp(info->fields[i]->name,fName)==0 ) {
+                return info->fields[i]->offset;
+            }
+        }
+        DAS_VERIFYF(0,"mapping %s not found. not fully implemented derived class %s", fName, info->name);
+        return 0;
+    }
+
+    char * adapt_field ( const char * fName, char * pClass, const StructInfo * info ) {
+        return pClass + adapt_field_offset(fName,info);
+    }
+
+    Func adapt ( const char * funcName, char * pClass, const StructInfo * info ) {
+        char * field = adapt_field(funcName, pClass, info);
+        return field ? *(Func*)field : Func((void *)nullptr);
+    }
 
     bool addModuleFunction ( Module * module, FunctionPtr & _func, Context * context, LineInfoArg * lineInfo ) {
         if ( !module ) context->throw_error_at(lineInfo, "expecting module, not null");
@@ -355,9 +379,8 @@ namespace das {
         if ( !tab->data ) return;
         char * values = tab->data;
         char * keys = tab->keys;
-        // counters must be 64-bit: Table::capacity is uint64_t (a 32-bit index truncates past 4G slots)
-        for ( uint64_t index=0, indexs=tab->capacity; index!=indexs; index++, keys+=keyStride, values+=valueStride ) {
-            if ( tableLiveSlot(*tab, index) ) {
+        for ( uint32_t index=0, indexs=tab->capacity; index!=indexs; index++, keys+=keyStride, values+=valueStride ) {
+            if ( tab->hashes[index] > HASH_KILLED64 ) {
                 das_invoke<void>::invoke<void *,void *>(context,at,blk,(void*)keys,(void*)values);
             }
         }
@@ -367,75 +390,22 @@ namespace das {
         auto arr = (Array *) _arr;
         if ( !arr->data ) return;
         char * values = arr->data;
-        // counters must be 64-bit: Array::size is uint64_t (a 32-bit index truncates past 4G elements)
-        for ( uint64_t index=0, indexs=arr->size; index!=indexs; index++, values+=stride ) {
+        for ( uint32_t index=0, indexs=arr->size; index!=indexs; index++, values+=stride ) {
             das_invoke<void>::invoke<void *>(context,at,blk,(void*)values);
         }
     }
 
-    // Array::size / Table::size are uint64_t. The 32-bit accessors panic past INT_MAX instead of
-    // silently truncating; callers that can handle 4G+ elements use the long_ counterparts below.
-    int32_t any_array_size ( void * _arr, Context * context, LineInfoArg * at ) {
-        uint64_t sz = ((Array *) _arr)->size;
-        if ( sz > uint64_t(INT32_MAX) ) context->throw_error_at(at, "any_array_size: array size %llu exceeds INT_MAX; use any_array_long_size", (unsigned long long)sz);
-        return int32_t(sz);
+    int32_t any_array_size ( void * _arr ) {
+        return int32_t(((Array *) _arr)->size);
     }
 
-    int32_t any_table_size ( void * _tab, Context * context, LineInfoArg * at ) {
-        uint64_t sz = ((Table *) _tab)->size;
-        if ( sz > uint64_t(INT32_MAX) ) context->throw_error_at(at, "any_table_size: table size %llu exceeds INT_MAX; use any_table_long_size", (unsigned long long)sz);
-        return int32_t(sz);
-    }
-
-    int64_t any_array_long_size ( void * _arr ) {
-        return int64_t(((Array *) _arr)->size);
-    }
-
-    int64_t any_table_long_size ( void * _tab ) {
-        return int64_t(((Table *) _tab)->size);
+    int32_t any_table_size ( void * _tab ) {
+        return int32_t(((Table *) _tab)->size);
     }
 
     void ast_gc_guard ( const TBlock<void> & block, Context * context, LineInfoArg * at ) {
         gc_guard scope;
         das_invoke<void>::invoke(context,at,block);
-    }
-
-    // Build fn->body inside `block` on a fresh scoped gc root; on exit, promote the body's
-    // subtree to the enclosing root and sweep the rest (the lowering intermediates). For
-    // macros that rebuild fn->body wholesale (e.g. [flatten]) and want their transient AST
-    // reclaimed immediately instead of waiting for the end-of-module sweep. We start the walk
-    // at fn->body, not fn: fn already lives on the enclosing root, so fn->gc_collect would hit
-    // the gc_owner==target early-out and collect nothing.
-    void ast_gc_collect_scope ( FunctionPtr fn, const TBlock<void> & block, Context * context, LineInfoArg * at ) {
-        gc_guard scope;
-        das_invoke<void>::invoke(context,at,block);
-        if ( fn && fn->body ) {
-            fn->body->gc_collect(scope.saved_thread_root, &scope.guard_root);
-        }
-    }
-
-    // Free a SINGLE orphaned AST expression node mid-compile, instead of waiting for the
-    // enclosing gc_guard to sweep it. gc nodes live flat on a root list, so this frees
-    // only `expr` itself — its children stay on the root (a caller-side reclaim walker
-    // deletes them one by one). We must NOT use gc_collect here: that traversal follows
-    // shared cross-references (ExprVar->Variable, TypeDecl->Structure/Enumeration) and
-    // would sweep live module entities. gc_unlink first so ~gc_node doesn't re-unlink
-    // (and so DAS_GC_DEBUG's "deleted outside gc_sweep" assert stays quiet).
-    // UNSAFE: the caller must own `expr` exclusively.
-    void delete_expression ( ExpressionPtr expr ) {
-        if ( !expr ) return;
-        expr->gc_unlink();
-        delete expr;
-    }
-
-    // Free a SINGLE orphaned TypeDecl node (sibling of delete_expression). Only the node
-    // itself — sub-types (firstType/argTypes/...) are separate gc_nodes a reclaim walker
-    // deletes individually. Does NOT touch shared structType/enumType (those are pointers
-    // the dtor never follows). UNSAFE: caller must own the node.
-    void delete_type ( TypeDeclPtr typ ) {
-        if ( !typ ) return;
-        typ->gc_unlink();
-        delete typ;
     }
 
     void for_each_module ( Program * prog, const TBlock<void,Module *> & block, Context * context, LineInfoArg * at ) {
@@ -526,40 +496,6 @@ namespace das {
         for ( auto & td : mod->typeMacros ) {
             das_invoke<void>::invoke<TypeMacroPtr>(context,at,block,td.second.get());
         }
-    }
-
-    void for_each_pass_macro ( Module * mod, const TBlock<void,TTemporary<char *>> & block, Context * context, LineInfoArg * at ) {
-        for ( auto * vec : { &mod->macros, &mod->inferMacros, &mod->optimizationMacros, &mod->lintMacros, &mod->globalLintMacros } ) {
-            for ( auto & td : *vec ) {
-                das_invoke<void>::invoke<const char *>(context,at,block,td->name.c_str());
-            }
-        }
-    }
-
-    void for_each_capture_macro ( Module * mod, const TBlock<void,CaptureMacroPtr> & block, Context * context, LineInfoArg * at ) {
-        for ( auto & td : mod->captureMacros ) {
-            das_invoke<void>::invoke<CaptureMacroPtr>(context,at,block,td.get());
-        }
-    }
-
-    void for_each_simulate_macro ( Module * mod, const TBlock<void,SimulateMacroPtr> & block, Context * context, LineInfoArg * at ) {
-        for ( auto & td : mod->simulateMacros ) {
-            das_invoke<void>::invoke<SimulateMacroPtr>(context,at,block,td.get());
-        }
-    }
-
-    void for_each_function_annotation ( Module * mod, const TBlock<void,TTemporary<char *>> & block, Context * context, LineInfoArg * at ) {
-        for ( auto & it : mod->handleTypes ) {
-            if ( it.second && it.second->rtti_isFunctionAnnotation() ) {
-                das_invoke<void>::invoke<const char *>(context,at,block,it.second->name.c_str());
-            }
-        }
-    }
-
-    bool module_has_comment_reader ( Module * mod ) {
-        // A [comment_reader] (AstCommentReader, e.g. daslib/rst_comment) processes
-        // //! doc-comments at compile time, leaving no symbol reference.
-        return mod != nullptr && mod->commentReader != nullptr;
     }
 
     bool isSameAstType ( TypeDeclPtr THIS,
@@ -687,21 +623,6 @@ namespace das {
         return result;
     }
 
-    float4 evalSingleExpressionInContext ( ExpressionPtr expr, smart_ptr_raw<Context> useCtxPtr, bool & ok ) {
-        // Refuse to run if the caller's context is already in a panic state -- we'd otherwise
-        // smear our eval over inconsistent state. On success or our-own-panic we leave the
-        // exception fields alone: ok=false plus the context's existing diagnostics is the
-        // honest signal, and there's no fragile save/restore of `exception` (which aliases
-        // into `exceptionMessage` and would dangle on string reassignment).
-        if ( !expr || !useCtxPtr || useCtxPtr->getException() ) { ok = false; return v_zero(); }
-        Context & useCtx = *useCtxPtr;
-        ok = true;
-        SimNode * node = simulateExpression(useCtx, expr);
-        vec4f result = useCtx.evalWithCatch(node);
-        if ( useCtx.getException() ) ok = false;
-        return result;
-    }
-
     bool builtin_isVisibleDirectly ( Module * from, Module * too ) {
         return from->isVisibleDirectly(too);
     }
@@ -757,11 +678,6 @@ namespace das {
     Structure * module_find_structure ( const Module* module, const char * name, Context * context, LineInfoArg * at ) {
         if ( !module ) context->throw_error_at(at, "expecting module");
         return module->findStructure(name);
-    }
-
-    Enumeration * module_find_enumeration ( const Module* module, const char * name, Context * context, LineInfoArg * at ) {
-        if ( !module ) context->throw_error_at(at, "expecting module");
-        return module->findEnum(name);
     }
 
     void * das_get_builtin_function_address ( Function * fn, Context * context, LineInfoArg * at ) {
@@ -822,21 +738,10 @@ namespace das {
     }
 
     template <typename F>
-    static auto apply_to_vec(void* vec, TypeDecl * type, F apply) {
-        auto tstr = type->describe();
-        if (tstr == "ast_core::MakeFieldDecl?") {
-            // MakeStruct IS-A vector<MakeFieldDeclPtr> via multiple inheritance; the vector
-            // subobject is not at offset 0, the cast chain performs the base adjustment.
-            return apply(static_cast<vector<MakeFieldDeclPtr>*>((MakeStruct*)vec));
-        }
+    static auto apply_to_vec(void* vec, string_view tstr, F apply) {
         if (tstr == "string") {
             return apply(static_cast<vector<const char *>*>(vec));
-        }
-        if (type->baseType == Type::tPointer) {
-            // post-gc_node every AST node vector is a plain vector of raw pointers
-            return apply(static_cast<vector<void*>*>(vec));
-        }
-        if (tstr == "$::das_string") {
+        } else if (tstr == "$::das_string") {
             return apply(static_cast<vector<string>*>(vec));
         } else if (tstr == "ast_core::CaptureEntry") {
             return apply(static_cast<vector<CaptureEntry>*>(vec));
@@ -850,6 +755,11 @@ namespace das {
             return apply(static_cast<vector<AnnotationArgument>*>(vec));
         } else if (tstr == "rtti_core::LineInfo") {
             return apply(static_cast<vector<LineInfo>*>(vec));
+        } else if (tstr == "ast::MakeStruct*") {
+            return apply(static_cast<vector<MakeStructPtr>*>(vec));
+        } else if (tstr == "ast::MakeFieldDecl*") {
+            auto vec2 = (MakeStruct*)(vec); // todo: hack, multiple inheritance breaks order in memory.
+            return apply(static_cast<vector<MakeFieldDeclPtr>*>(vec2));
         } else if (tstr == "ast_core::EnumEntry") {
             return apply(static_cast<vector<Enumeration::EnumEntry>*>(vec));
         }
@@ -858,17 +768,18 @@ namespace das {
     }
 
     void* getVectorPtrAtIndex(void* vec, TypeDecl *type, int idx, Context * /*context*/, LineInfoArg * /*at*/) {
+        auto tstr = type->describe();
         auto get_at = [idx](auto *vec) {
             return static_cast<void*>(&vec->at(idx));
         };
-        return apply_to_vec(vec, type, get_at);
+        return apply_to_vec(vec, tstr, get_at);
     }
 
     int32_t getVectorLength(void* vec, TypeDecl * type, Context * /*context*/, LineInfoArg * /*at*/) {
         auto get_size = [](auto *vec) {
             return vec->size();
         };
-        return (int) apply_to_vec(vec, type, get_size);
+        return (int) apply_to_vec(vec, type->describe(), get_size);
     }
 
     uint32_t getHandledTypeFieldOffset ( TypeAnnotationPtr annotation, char * name, Context * context, LineInfoArg * at ) {
@@ -1070,13 +981,26 @@ namespace das {
     }
 
     void get_file_source_line(FileInfo * info, uint32_t line, const TBlock<void,TTemporary<const char *>> & blk, Context * context, LineInfoArg * at) {
-        if ( !info ) return;
-        const char * begin = nullptr;
+        if ( !info || line == 0 ) return;
+        const char * src = nullptr;
         uint32_t len = 0;
-        if ( !info->getLine(line, begin, len) ) return;
-        char * tmp = (char *)alloca(len + 1);
-        memcpy(tmp, begin, len);
-        tmp[len] = 0;
+        info->getSourceAndLength(src, len);
+        if ( !src || len == 0 ) return;
+        uint32_t curLine = 1;
+        const char * lineStart = src;
+        const char * srcEnd = src + len;
+        while ( lineStart < srcEnd && curLine < line ) {
+            if ( *lineStart == '\n' ) curLine++;
+            lineStart++;
+        }
+        if ( curLine != line ) return;
+        const char * lineEnd = lineStart;
+        while ( lineEnd < srcEnd && *lineEnd != '\n' && *lineEnd != '\r' ) lineEnd++;
+        // make a temporary null-terminated copy on the stack
+        uint32_t lineLen = uint32_t(lineEnd - lineStart);
+        char * tmp = (char *)alloca(lineLen + 1);
+        memcpy(tmp, lineStart, lineLen);
+        tmp[lineLen] = 0;
         vec4f args[1];
         args[0] = cast<const char *>::from(tmp);
         context->invoke(blk, args, nullptr, at);
@@ -1138,102 +1062,6 @@ namespace das {
         return mod->findFunctionByMangledNameHash(mnh);
     }
 
-    // compile-from-source builtins. The impl calls the compiler entry points
-    // (parseDaScript/compileDaScript) which live in the compiler lib, so these
-    // and their bindings live here in the ast module (compiler) rather than in
-    // the rtti module (runtime).
-    void rtti_builtin_compile ( char * modName, char * str, const CodeOfPolicies & cop,
-            const TBlock<void,bool,smart_ptr<Program>,const string> & block, Context * context, LineInfoArg * at ) {
-        return rtti_builtin_compile_ex(modName, str, cop, true, block, context, at);
-    }
-
-    void rtti_builtin_compile_ex ( char * modName, char * str, const CodeOfPolicies & cop, bool exportAll,
-            const TBlock<void,bool,smart_ptr<Program>,const string> & block, Context * context, LineInfoArg * at ) {
-        str = str ? str : ((char *)"");
-        TextWriter issues;
-        uint32_t str_len = stringLengthSafe(*context, str);
-        auto access = make_smart<FileAccess>();
-        auto fileInfo = make_unique<TextFileInfo>((char *) str, uint32_t(str_len), false);
-        access->setFileInfo(modName, das::move(fileInfo));
-        ModuleGroup dummyLibGroup;
-        auto program = parseDaScript(modName, "", access, issues, dummyLibGroup, exportAll, false, cop);
-        if ( program ) {
-            if (program->failed()) {
-                for (auto & err : program->errors) {
-                    issues << reportError(err.at, err.what, err.extra, err.fixme, err.cerr);
-                }
-                string istr = issues.str();
-                vec4f args[3] = {
-                    cast<bool>::from(false),
-                    cast<smart_ptr<Program>>::from(program),
-                    cast<string *>::from(&istr)
-                };
-                context->invoke(block, args, nullptr, at);
-            } else {
-                string istr = issues.str();
-                vec4f args[3] = {
-                    cast<bool>::from(true),
-                    cast<smart_ptr<Program>>::from(program),
-                    cast<string *>::from(&istr)
-                };
-                context->invoke(block, args, nullptr, at);
-            }
-        } else {
-            context->throw_error_at(at, "rtti_compile internal error, something went wrong");
-        }
-    }
-
-#if !DAS_NO_FILEIO
-    void rtti_builtin_compile_file ( char * modName, smart_ptr<FileAccess> access, ModuleGroup* module_group, const CodeOfPolicies & cop,
-            const TBlock<void,bool,smart_ptr<Program>,const string> & block, Context * context, LineInfoArg * at ) {
-        TextWriter issues;
-        if ( !access ) access = make_smart<FsFileAccess>();
-        auto program = compileDaScript(modName, access, issues, *module_group, cop);
-        if ( program ) {
-            if (program->failed()) {
-                for (auto & err : program->errors) {
-                    issues << reportError(err.at, err.what, err.extra, err.fixme, err.cerr);
-                }
-                string istr = issues.str();
-                vec4f args[3] = {
-                    cast<bool>::from(false),
-                    cast<smart_ptr<Program>>::from(program),
-                    cast<string *>::from(&istr)
-                };
-                context->invoke(block, args, nullptr, at);
-            } else {
-                string istr = issues.str();
-                vec4f args[3] = {
-                    cast<bool>::from(true),
-                    cast<smart_ptr<Program>>::from(program),
-                    cast<string *>::from(&istr)
-                };
-                daScriptEnvironment::getBound()->g_Program = program;
-                context->invoke(block, args, nullptr, at);
-                daScriptEnvironment::getBound()->g_Program.reset();
-            }
-        } else {
-            context->throw_error_at(at, "rtti_compile internal error, something went wrong");
-        }
-    }
-#else
-    void rtti_builtin_compile_file(  char *, smart_ptr<FileAccess>, ModuleGroup*, const CodeOfPolicies &,
-            const TBlock<void, bool, smart_ptr<Program>, const string> &, Context * context, LineInfoArg * at ) {
-        context->throw_error_at(at, "not supported with DAS_NO_FILEIO");
-    }
-#endif
-
-#if !DAS_NO_FILEIO
-    smart_ptr<FileAccess> makeFileAccess( char * pak, Context *, LineInfoArg * ) {
-        return ::get_file_access(pak);
-    }
-#else
-    smart_ptr<FileAccess> makeFileAccess( char *, Context * context, LineInfoArg * at ) {
-        context->throw_error_at(at, "not supported with DAS_NO_FILEIO");
-        return nullptr;
-    }
-#endif
-
     Module_Ast::Module_Ast() : Module("ast_core") {
         DAS_PROFILE_SECTION("Module_Ast");
         ModuleLibrary lib(this);
@@ -1251,18 +1079,6 @@ namespace das {
     }
 
     void Module_Ast::registerFunctions(ModuleLibrary & lib){
-        addExtern<DAS_BIND_FUN(makeFileAccess)>(*this, lib, "make_file_access",
-            SideEffects::modifyExternal, "makeFileAccess")
-                ->args({"project","context","at"});
-        addExtern<DAS_BIND_FUN(rtti_builtin_compile)>(*this, lib, "compile",
-            SideEffects::modifyExternal, "rtti_builtin_compile")
-                ->args({"module_name","codeText","codeOfPolicies","block","context","line"});
-        addExtern<DAS_BIND_FUN(rtti_builtin_compile_ex)>(*this, lib, "compile",
-            SideEffects::modifyExternal, "rtti_builtin_compile_ex")
-                ->args({"module_name","codeText","codeOfPolicies","exportAll","block","context","line"});
-        addExtern<DAS_BIND_FUN(rtti_builtin_compile_file)>(*this, lib, "compile_file",
-            SideEffects::modifyExternal, "rtti_builtin_compile_file")
-                ->args({"module_name","fileAccess","moduleGroup","codeOfPolicies","block","context","line"});
         addExtern<DAS_BIND_FUN(thisProgram)>(*this, lib,  "this_program",
             SideEffects::accessExternal, "thisProgram")
                 ->arg("context");
@@ -1290,9 +1106,6 @@ namespace das {
         addExtern<DAS_BIND_FUN(ast_gc_guard)>(*this, lib,  "ast_gc_guard",
             SideEffects::modifyExternal, "ast_gc_guard")
                 ->args({"block","context","line"});
-        addExtern<DAS_BIND_FUN(ast_gc_collect_scope)>(*this, lib,  "ast_gc_collect_scope",
-            SideEffects::modifyExternal, "ast_gc_collect_scope")
-                ->args({"function","block","context","line"});
         addExtern<DAS_BIND_FUN(for_each_module)>(*this, lib,  "for_each_module",
             SideEffects::accessExternal, "for_each_module")
                 ->args({"program","block","context","line"});
@@ -1398,9 +1211,6 @@ namespace das {
         addExtern<DAS_BIND_FUN(get_mangled_name_t)>(*this, lib,  "get_mangled_name",
             SideEffects::none, "get_mangled_name_t")
                 ->args({"type","context","line"});
-        addExtern<DAS_BIND_FUN(das_get_builtin_function_address)>(*this, lib,  "get_builtin_function_address",
-            SideEffects::none, "das_get_builtin_function_address")
-                ->args({"fn","context","at"});
         addExtern<DAS_BIND_FUN(get_mangled_name_v)>(*this, lib,  "get_mangled_name",
             SideEffects::none, "get_mangled_name_v")
                 ->args({"variable","context","line"});
@@ -1422,12 +1232,6 @@ namespace das {
         addExtern<DAS_BIND_FUN(clone_expression)>(*this, lib,  "clone_expression",
             SideEffects::none, "clone_expression")
                 ->arg("expression");
-        addExtern<DAS_BIND_FUN(delete_expression)>(*this, lib,  "delete_expression",
-            SideEffects::modifyExternal, "delete_expression")
-                ->arg("expression")->unsafeOperation = true;
-        addExtern<DAS_BIND_FUN(delete_type)>(*this, lib,  "delete_type",
-            SideEffects::modifyExternal, "delete_type")
-                ->arg("type")->unsafeOperation = true;
         addExtern<DAS_BIND_FUN(clone_function)>(*this, lib,  "clone_function",
             SideEffects::none, "clone_function")
                 ->arg("function");
@@ -1464,15 +1268,9 @@ namespace das {
                 ->args({"array","stride","block","context","line"});
         addExtern<DAS_BIND_FUN(any_array_size)>(*this, lib,  "any_array_size",
             SideEffects::none, "any_array_size")
-                ->args({"array","context","line"});
+                ->arg("array");
         addExtern<DAS_BIND_FUN(any_table_size)>(*this, lib,  "any_table_size",
             SideEffects::none, "any_table_size")
-                ->args({"table","context","line"});
-        addExtern<DAS_BIND_FUN(any_array_long_size)>(*this, lib,  "any_array_long_size",
-            SideEffects::none, "any_array_long_size")
-                ->arg("array");
-        addExtern<DAS_BIND_FUN(any_table_long_size)>(*this, lib,  "any_table_long_size",
-            SideEffects::none, "any_table_long_size")
                 ->arg("table");
         addExtern<DAS_BIND_FUN(getUnderlyingValueType)>(*this, lib,  "get_underlying_value_type",
             SideEffects::none, "getUnderlyingValueType")
@@ -1532,21 +1330,6 @@ namespace das {
         addExtern<DAS_BIND_FUN(for_each_typemacro)>(*this, lib,  "for_each_typemacro",
             SideEffects::modifyExternal, "for_each_typemacro")
                 ->args({"module","block","context","line"});
-        addExtern<DAS_BIND_FUN(for_each_pass_macro)>(*this, lib,  "for_each_pass_macro",
-            SideEffects::modifyExternal, "for_each_pass_macro")
-                ->args({"module","block","context","line"});
-        addExtern<DAS_BIND_FUN(for_each_capture_macro)>(*this, lib,  "for_each_capture_macro",
-            SideEffects::modifyExternal, "for_each_capture_macro")
-                ->args({"module","block","context","line"});
-        addExtern<DAS_BIND_FUN(for_each_simulate_macro)>(*this, lib,  "for_each_simulate_macro",
-            SideEffects::modifyExternal, "for_each_simulate_macro")
-                ->args({"module","block","context","line"});
-        addExtern<DAS_BIND_FUN(for_each_function_annotation)>(*this, lib,  "for_each_function_annotation",
-            SideEffects::modifyExternal, "for_each_function_annotation")
-                ->args({"module","block","context","line"});
-        addExtern<DAS_BIND_FUN(module_has_comment_reader)>(*this, lib,  "module_has_comment_reader",
-            SideEffects::modifyExternal, "module_has_comment_reader")
-                ->arg("module");
         addExtern<DAS_BIND_FUN(builtin_structure_for_each_field)>(*this, lib,  "for_each_field",
             SideEffects::modifyExternal, "builtin_structure_for_each_field")
                 ->args({"annotation","block","context","line"});
@@ -1584,9 +1367,6 @@ namespace das {
         addExtern<DAS_BIND_FUN(evalSingleExpression)>(*this, lib, "eval_single_expression",
             SideEffects::modifyArgument, "evalSingleExpression")
                 ->args({"expr","ok"})->unsafeOperation = true;
-        addExtern<DAS_BIND_FUN(evalSingleExpressionInContext)>(*this, lib, "eval_single_expression",
-            SideEffects::modifyArgumentAndExternal, "evalSingleExpressionInContext")
-                ->args({"expr","ctx","ok"})->unsafeOperation = true;
         // errors
         addExtern<DAS_BIND_FUN(ast_error)>(*this, lib,  "macro_error",
             SideEffects::modifyArgumentAndExternal, "ast_error")
@@ -1616,9 +1396,6 @@ namespace das {
         addExtern<DAS_BIND_FUN(module_find_structure)>(*this, lib,  "module_find_structure",
             SideEffects::accessExternal, "module_find_structure")
                 ->args({"program","name","context","at"});
-        addExtern<DAS_BIND_FUN(module_find_enumeration)>(*this, lib,  "module_find_enumeration",
-            SideEffects::accessExternal, "module_find_enumeration")
-                ->args({"module","name","context","at"});
         // used variables and functions
         addExtern<DAS_BIND_FUN(get_use_global_variables)>(*this, lib,  "get_use_global_variables",
             SideEffects::invoke, "get_use_global_variables")

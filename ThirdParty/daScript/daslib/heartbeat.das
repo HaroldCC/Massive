@@ -1,6 +1,8 @@
 options gen2
 
 options indenting = 4
+options no_unused_block_arguments = false
+options no_unused_function_arguments = false
 options strict_smart_pointers = true
 
 module heartbeat private
@@ -21,13 +23,15 @@ var g_inHB : bool = false
 
 def public set_heartbeat(var cb : lambda<() : void>) {
     //! Sets the heartbeat callback lambda, replacing any previously set callback.
-    unsafe { delete g_hbCallback; }
+    delete g_hbCallback
     g_hbCallback <- cb
 }
 
 def public heartbeat() {
     //! Invokes the heartbeat callback if one is set, with re-entrancy protection.
-    if (g_inHB) return
+    if (g_inHB) {
+        return
+    }
     if (g_hbCallback != null) {
         g_inHB = true
         invoke(g_hbCallback)
@@ -40,8 +44,12 @@ class AddHeartbeat : AstVisitor {
     astChanged : bool = false
     @do_not_delete func : Function?
     def heartbeatBlock(var body : ExprBlock?) {
-        if (empty(body.list)
-                || ((body.list[0] is ExprCall) && (body.list[0] as ExprCall).name == "heartbeat")) return
+        if (length(body.list) == 0) {
+            return
+        }
+        if ((body.list[0] is ExprCall) && (body.list[0] as ExprCall).name == "heartbeat") {
+            return
+        }
         var expr = qmacro(heartbeat())
         body.list |> emplace(expr, 0)
         astChanged = true
@@ -60,12 +68,16 @@ class AddHeartbeat : AstVisitor {
         return <- fun
     }
     def override visitExprFor(var expr : ExprFor?) : ExpressionPtr {
-        if (expr.body == null || !(expr.body is ExprBlock)) return <- expr
+        if (expr.body == null || !(expr.body is ExprBlock)) {
+            return <- expr
+        }
         heartbeatBlock(expr.body as ExprBlock)
         return <- expr
     }
     def override visitExprWhile(var expr : ExprWhile?) : ExpressionPtr {
-        if (expr.body == null || !(expr.body is ExprBlock)) return <- expr
+        if (expr.body == null || !(expr.body is ExprBlock)) {
+            return <- expr
+        }
         heartbeatBlock(expr.body as ExprBlock)
         return <- expr
     }

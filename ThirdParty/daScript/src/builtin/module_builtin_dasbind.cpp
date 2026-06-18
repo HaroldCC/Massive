@@ -391,7 +391,7 @@ FastCallWrapper getExtraWrapper ( int nargs, int res, int perm ) {
             return true;
         }
 #if !DAS_BIND_EXTERNAL
-        virtual bool apply ( const FunctionPtr &, ModuleGroup &, const AnnotationArgumentList &, string & err )  override {
+        virtual bool apply ( const FunctionPtr & fun, ModuleGroup &, const AnnotationArgumentList &, string & err )  override {
             err = "daslang is configured with extern functions disabled";
             return false;
         }
@@ -476,7 +476,7 @@ FastCallWrapper getExtraWrapper ( int nargs, int res, int perm ) {
             bif->userScenario = true;
             bif->sideEffectFlags = fun->sideEffectFlags | uint32_t(SideEffects::accessExternal);
             // and collect it
-            bif->gc_collect(module->module_gc_root.get(), gc_root::gc_get_active_root());
+            bif->gc_collect(&module->module_gc_root, gc_root::gc_get_active_root());
             // and now try to add or replace the function in the module
             if ( !module->addFunction(bif, true) ) {
                 module->replaceFunction(bif);
@@ -584,7 +584,6 @@ FastCallWrapper getExtraWrapper ( int nargs, int res, int perm ) {
         string err;
         return getDllAddress(dm.library, dm.symbol, dm.api == ApiType::api_opengl, err);
 #else
-        (void)mangledName;
         return nullptr;
 #endif
     }

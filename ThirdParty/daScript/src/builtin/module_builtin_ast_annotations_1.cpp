@@ -35,9 +35,8 @@ namespace das {
             addField<DAS_BIND_MANAGED_FIELD(secondType)>("secondType");
             addField<DAS_BIND_MANAGED_FIELD(argTypes)>("argTypes");
             addField<DAS_BIND_MANAGED_FIELD(argNames)>("argNames");
-            addField<DAS_BIND_MANAGED_FIELD(fixedDim)>("fixedDim");
-            addField<DAS_BIND_MANAGED_FIELD(fixedDimExpr)>("fixedDimExpr");
-            addField<DAS_BIND_MANAGED_FIELD(typeMacroExpr)>("typeMacroExpr");
+            addField<DAS_BIND_MANAGED_FIELD(dim)>("dim");
+            addField<DAS_BIND_MANAGED_FIELD(dimExpr)>("dimExpr");
             addFieldEx ( "flags", "flags", offsetof(TypeDecl, flags), makeTypeDeclFlags() );
             addField<DAS_BIND_MANAGED_FIELD(alias)>("alias");
             addField<DAS_BIND_MANAGED_FIELD(at)>("at");
@@ -282,7 +281,6 @@ namespace das {
             addField<DAS_BIND_MANAGED_FIELD(initStackSize)>("initStackSize");
             addFieldEx ( "flags", "flags", offsetof(Variable, flags), makeVariableFlags() );
             addFieldEx ( "access_flags", "access_flags", offsetof(Variable, access_flags), makeVariableAccessFlags() );
-            addFieldEx ( "access_info", "access_info", offsetof(Variable, access_info), makeVariableAccessInfoFlags() );
             addField<DAS_BIND_MANAGED_FIELD(annotation)>("annotation");
             // properties
             addProperty<DAS_BIND_MANAGED_PROP(isAccessUnused)>("isAccessUnused","isAccessUnused");

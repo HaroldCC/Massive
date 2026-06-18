@@ -19,7 +19,7 @@ require daslib/templates
 require daslib/enum_trait
 require daslib/json_boost
 require daslib/static_let
-require strings   // nolint:STYLE030 — unescape() is used inside the XML(struct) apply block, invisible to the require-usage scan
+require strings
 
 // ============ Iteration helpers ============
 
@@ -128,159 +128,6 @@ def each_attribute(node : xml_node) : iterator<xml_attribute> {
     }
 }
 
-def for_each_child_reverse(node : xml_node; blk : block<(child : xml_node) : void>) {
-    //! Iterates over all child nodes of *node* (text and comments included, not
-    //! only elements) in **reverse** document order (``last_child`` /
-    //! ``previous_sibling``, both O(1) in pugixml).
-    var ch = node.last_child
-    while (ch.ok) {
-        let prev = ch.previous_sibling   // capture before block may mutate
-        invoke(blk, ch)
-        ch = prev
-    }
-}
-
-def for_each_child_reverse(node : xml_node; name : string; blk : block<(child : xml_node) : void>) {
-    //! Iterates, in reverse document order, over child elements of *node* whose tag matches *name*.
-    var ch = node.last_child
-    while (ch.ok && ch.name != name) {   // seek back to the last name-matching child
-        ch = ch.previous_sibling
-    }
-    while (ch.ok) {
-        let prev = previous_sibling(ch, name)   // capture before block may mutate
-        invoke(blk, ch)
-        ch = prev
-    }
-}
-
-[unsafe_outside_of_for]
-def each_child_reverse(node : xml_node) : iterator<xml_node> {
-    //! Returns a lazy iterator over all child nodes of *node* (text and comments
-    //! included, not only elements) in **reverse** document order. Intended for
-    //! use in ``for`` loops:
-    //!
-    //!   ``for (ch in each_child_reverse(node)) { ... }``
-    return <- generator<xml_node> {
-        var ch = node.last_child
-        while (ch.ok) {
-            var prev = ch.previous_sibling   // capture before yield (user may mutate)
-            yield ch
-            ch = prev
-        }
-        return false
-    }
-}
-
-[unsafe_outside_of_for]
-def each_child_reverse(node : xml_node; name : string) : iterator<xml_node> {
-    //! Returns a lazy iterator over child elements of *node* whose tag matches
-    //! *name*, in reverse document order. Intended for use in ``for`` loops:
-    //!
-    //!   ``for (ch in each_child_reverse(node, "item")) { ... }``
-    return <- generator<xml_node> {
-        var ch = node.last_child
-        while (ch.ok && ch.name != name) {   // seek back to the last name-matching child
-            ch = ch.previous_sibling
-        }
-        while (ch.ok) {
-            var prev = previous_sibling(ch, name)   // capture before yield
-            yield ch
-            ch = prev
-        }
-        return false
-    }
-}
-
-// ============ LINQ source — typed iteration over child elements ============
-
-def private read_xml_attr(a : xml_attribute; defv : auto(TT)) : TT {
-    return defv     // generic fallback — a field type with no specific reader keeps its default
-}
-def private read_xml_attr(a : xml_attribute; defv : int) : int { return as_int(a, defv); }
-def private read_xml_attr(a : xml_attribute; defv : uint) : uint { return as_uint(a, defv); }
-def private read_xml_attr(a : xml_attribute; defv : float) : float { return as_float(a, defv); }
-def private read_xml_attr(a : xml_attribute; defv : double) : double { return as_double(a, defv); }
-def private read_xml_attr(a : xml_attribute; defv : bool) : bool { return as_bool(a, defv); }
-def private read_xml_attr(a : xml_attribute; defv : string) : string {
-    return clone_string(as_string(a, defv))     // clone out of the document so the row survives the RAII block
-}
-
-def build_xml_row(node : xml_node; var row) {
-    //! Fills *row*'s scalar fields from same-named attributes of *node*. A missing attribute
-    //! leaves the field at its declared default. Supported field types: ``int``, ``uint``,
-    //! ``float``, ``double``, ``bool``, ``string`` — fields of other types keep their default.
-    apply(row) $(name : string; var field) {
-        field = read_xml_attr(node[name], field)
-    }
-}
-
-def read_xml_field(node : xml_node; name : string; defv : auto(TT)) : TT {
-    //! Reads one same-named attribute of *node* into a *TT*-typed value — the field-pruned
-    //! counterpart to ``build_xml_row``, emitted by linq_fold's fused XML lane. A missing
-    //! attribute keeps *defv*, so pass the struct field's declared default to match
-    //! ``build_xml_row`` semantics. Same supported field types as ``build_xml_row``.
-    return read_xml_attr(node[name], defv)
-}
-
-def peek_xml_field(node : xml_node; name : string; defv : auto(TT)) {
-    //! Like ``read_xml_field``, but a ``string`` attribute is returned as a borrowed temp ``string#`` —
-    //! a non-owning view into the document (no ``clone_string``). The ``#`` makes the borrow type-enforced:
-    //! reading / comparing the view compiles, but storing it (``push``, global assign, returning it out)
-    //! is rejected, forcing an explicit ``clone_string`` — so a view can't silently dangle past the
-    //! document's RAII scope. Scalar fields read by value, identical to ``read_xml_field``. linq_fold's
-    //! materialize-under-guard path emits this for where-gate predicate fields.
-    static_if (typeinfo is_string(defv)) {
-        unsafe {
-            return reinterpret<string#>(as_string(node[name], defv))   // borrowed view; return-of-temp needs unsafe
-        }
-    } else {
-        return read_xml_attr(node[name], defv)
-    }
-}
-
-[unsafe_outside_of_for]
-def from_xml_node(node : xml_node; t : type<auto(TT)>) : iterator<TT -const> {
-    //! Lazily walks the child *elements* of *node*, materializing each into a *TT* by reading
-    //! same-named attributes (see ``build_xml_row``). Non-element children (text/PCDATA/comments
-    //! in mixed content) are skipped. Yields owned values, so rows collected via ``to_array`` or a
-    //! comprehension stay valid past the document's RAII block.
-    //! Intended for ``for`` loops and LINQ chains:
-    //!
-    //!   ``for (car in from_xml_node(root, type<Car>)) { ... }``
-    // -const on the element: type<auto(TT)> binds TT const, so a bare iterator<TT> makes the
-    // consumer's loop var a const struct — which the AOT C++ emitter can't default-initialize.
-    return <- generator<TT -const> {
-        var ch = node.first_child
-        while (ch.ok) {
-            let next = ch.next_sibling   // capture before yield (user may mutate)
-            if (ch._type == xml_node_type.node_element) {
-                var row = default<TT -const>
-                build_xml_row(ch, row)
-                yield row
-            }
-            ch = next
-        }
-        return false
-    }
-}
-
-[unsafe_outside_of_for]
-def from_xml_node(node : xml_node; name : string; t : type<auto(TT)>) : iterator<TT -const> {
-    //! As ``from_xml_node`` above, but only walks child elements whose tag matches *name*
-    //! (``child``/``next_sibling`` by name already match elements only).
-    return <- generator<TT -const> {
-        var ch = child(node, name)
-        while (ch.ok) {
-            let next = next_sibling(ch, name)   // capture before yield
-            var row = default<TT -const>
-            build_xml_row(ch, row)
-            yield row
-            ch = next
-        }
-        return false
-    }
-}
-
 // ============ RAII document management ============
 
 def open_xml(filename : string; blk : block<(doc : xml_document?; success : bool) : void>) {
@@ -328,7 +175,9 @@ def node_text(node : xml_node; child_name : string; default_value : string = "")
     //! Returns the text content of the child element named *child_name*,
     //! or *default_value* if the child does not exist or has no text.
     let ch = child(node, child_name)
-    if (!ch.ok) return default_value
+    if (!ch.ok) {
+        return default_value
+    }
     return as_string(ch.text, default_value)
 }
 
@@ -336,7 +185,9 @@ def node_attr(node : xml_node; attr_name : string; default_value : string = "") 
     //! Returns the string value of attribute *attr_name*,
     //! or *default_value* if no such attribute exists.
     let a = attribute(node, attr_name)
-    if (!a.ok) return default_value
+    if (!a.ok) {
+        return default_value
+    }
     return as_string(a, default_value)
 }
 
@@ -653,9 +504,13 @@ def select_text(node : xml_node; xpath_query : string; default_value : string = 
     //! Runs an XPath query and returns the text content of the first
     //! matching node, or *default_value* if nothing matches.
     let result = select_node(node, xpath_query)
-    if (!result.ok) return default_value
+    if (!result.ok) {
+        return default_value
+    }
     let rn = result.node
-    if (rn.ok) return as_string(rn.text, default_value)
+    if (rn.ok) {
+        return as_string(rn.text, default_value)
+    }
     return default_value
 }
 
@@ -664,11 +519,17 @@ def select_value(node : xml_node; xpath_query : string; default_value : string =
     //! node. If the result is an attribute, returns its string value;
     //! if an element, returns its text content.
     let result = select_node(node, xpath_query)
-    if (!result.ok) return default_value
+    if (!result.ok) {
+        return default_value
+    }
     let ra = result.attribute
-    if (ra.ok) return as_string(ra, default_value)
+    if (ra.ok) {
+        return as_string(ra, default_value)
+    }
     let rn = result.node
-    if (rn.ok) return as_string(rn.text, default_value)
+    if (rn.ok) {
+        return as_string(rn.text, default_value)
+    }
     return default_value
 }
 
@@ -765,7 +626,7 @@ def from_XML(node : xml_node; anything : auto(TT)) {
     //! Struct fields become child elements; arrays become sequences of
     //! child elements. Missing elements yield default values.
     static_if (typeinfo is_dim(anything)) {
-        var ret : TT -const -&   // TT IS the matched fixed-array type
+        var ret : TT[typeinfo dim(anything)]
         var ch = node.first_child
         for (i in 0..typeinfo dim(anything)) {
             if (ch.ok) {
@@ -804,7 +665,9 @@ def from_XML(node : xml_node; anything : auto(TT)) {
     } static_elif (typeinfo is_variant(anything)) {
         var ret : TT
         let index = node_attr_int(node, "_variant", 0)
-        unsafe(set_variant_index(ret, index))
+        unsafe {
+            set_variant_index(ret, index)
+        }
         apply(ret) $(name : string; var field) {
             let ch = child(node, name)
             if (ch.ok) {
@@ -829,11 +692,15 @@ def from_XML(node : xml_node; anything : auto(TT)) {
         let txt = as_string(node.text, "")
         // Try name-based first, then int-based for @enum_as_int compatibility
         let nameResult = to_enum(type<TT -const>, txt, default<TT -const>)
-        if ("{nameResult}" == txt) return nameResult
+        if ("{nameResult}" == txt) {
+            return nameResult
+        }
         // Fall back to int-based matching
         let intVal = as_int(node.text, 0)
         for (e in type<TT -const>) {
-            if (int(e) == intVal) return e
+            if (int(e) == intVal) {
+                return e
+            }
         }
         return default<TT -const>
     } static_elif (typeinfo is_bitfield(anything)) {
@@ -957,29 +824,21 @@ def XML(var node : xml_node; value : auto(TT)) {
                     fieldState <- parse_json_annotation(name, annotations)
                     fieldStateParsed = true
                 }
-                // No `return` to replace a field: a `return` routes the whole apply walk to the slow
-                // per-field invoke fallback (PR #3008). Pivot on a static type guard with an explicit
-                // default `else` so the block stays return-free and inlines.
                 if (fieldState.enumAsInt) {
                     static_if (typeinfo is_enum(field)) {
                         var ch = append_child(node, fieldState.argName)
                         set(ch.text, int(field))
-                    } else {
-                        var ch = append_child(node, fieldState.argName)
-                        _::XML(ch, field)
+                        return
                     }
                 } elif (fieldState.unescape) {
                     static_if (typeinfo is_string(field)) {
                         var ch = append_child(node, fieldState.argName)
                         set(ch.text, unescape(field))
-                    } else {
-                        var ch = append_child(node, fieldState.argName)
-                        _::XML(ch, field)
+                        return
                     }
-                } else {
-                    var ch = append_child(node, fieldState.argName)
-                    _::XML(ch, field)
                 }
+                var ch = append_child(node, fieldState.argName)
+                _::XML(ch, field)
             }
         }
     } static_elif (typeinfo is_tuple(value)) {

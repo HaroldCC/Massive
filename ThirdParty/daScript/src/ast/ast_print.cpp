@@ -10,18 +10,6 @@
 
 namespace das {
 
-    // print flags are sticky node bits; without a wipe the output of a subtree print depends on
-    // what larger trees the node was printed inside before (describe() must be pure — CSE keys on it).
-    // opts into quote AND assume interiors — everything the Printer below descends into.
-    class ClearPrinterFlags : public Visitor {
-        virtual bool canVisitQuoteSubexpression ( ExprQuote * ) override { return true; }
-        virtual bool canVisitWithAliasSubexpression ( ExprAssume * ) override { return true; }
-        virtual void preVisitExpression ( Expression * expr ) override {
-            Visitor::preVisitExpression(expr);
-            expr->printFlags = 0;
-        }
-    };
-
     class SetPrinterFlags : public Visitor {
     // ExprBlock
         virtual void preVisitBlockExpression ( ExprBlock * block, Expression * expr ) override {
@@ -99,11 +87,8 @@ namespace das {
                 printAliases= program->options.getBoolOption("log_aliasing");
                 printUse = program->options.getBoolOption("print_use");
                 gen2 = program->policies.version_2_syntax;
-                printCStyle = program->options.getBoolOption("print_c_style");
+                printCStyle = program->options.getBoolOption("print_c_style") || gen2;
             }
-            // gen2 always implies C-style braces; keep these consistent even when
-            // there is no program (describe_function / describe_expression path).
-            printCStyle = printCStyle || gen2;
         }
         string str() const { return ss.str(); };
         bool printRef = false;
@@ -291,7 +276,6 @@ namespace das {
             if ( printVarAccess && var->access_ref ) ss << "/*ref*/";
             if ( printVarAccess && var->access_pass ) ss << "/*pass*/";
             if ( printVarAccess && var->access_get ) ss << "/*get*/";
-            if ( printVarAccess && var->access_info_pass_mutable ) ss << "/*pass_mut*/";
             ss << var->name << " : " << var->type->describe();
         }
         virtual VariablePtr visitGlobalLet ( const VariablePtr & var ) override {
@@ -421,7 +405,6 @@ namespace das {
             if ( printVarAccess && arg->access_ref ) ss << "/*ref*/";
             if ( printVarAccess && arg->access_pass ) ss << "/*pass*/";
             if ( printVarAccess && arg->access_get ) ss << "/*get*/";
-            if ( printVarAccess && arg->access_info_pass_mutable ) ss << "/*pass_mut*/";
             ss << arg->name;
             if ( !arg->aka.empty() ) ss << " aka " << arg->aka;
             ss << ":" << arg->type->describe();
@@ -622,7 +605,6 @@ namespace das {
             if ( printVarAccess && var->access_ref ) ss << "/*ref*/";
             if ( printVarAccess && var->access_pass ) ss << "/*pass*/";
             if ( printVarAccess && var->access_get ) ss << "/*get*/";
-            if ( printVarAccess && var->access_info_pass_mutable ) ss << "/*pass_mut*/";
             ss << var->name;
             if ( !var->aka.empty() ) ss << " aka " << var->aka;
             if ( printAliases && var->aliasCMRES ) ss << "/*cmres*/";
@@ -1466,8 +1448,6 @@ namespace das {
         ast_print::Standalone ctx;
         ctx.setFlags(this);
 #else
-        ClearPrinterFlags cflags;
-        visit(cflags);
         SetPrinterFlags pflags;
         visit(pflags);
 #endif
@@ -1475,8 +1455,6 @@ namespace das {
 
     template <typename TT>
     __forceinline StringWriter&  print ( StringWriter& stream, const TT & value ) {
-        ClearPrinterFlags cflags;
-        const_cast<TT&>(value).visit(cflags);
         SetPrinterFlags flags;
         const_cast<TT&>(value).visit(flags);
         Printer log(nullptr);
@@ -1496,8 +1474,6 @@ namespace das {
         }, "*");
         if (any) stream << "\n";
         bool logGenerics = program.options.getBoolOption("log_generics");
-        ClearPrinterFlags cflags;
-        const_cast<Program&>(program).visit(cflags, logGenerics);
         SetPrinterFlags flags;
         const_cast<Program&>(program).visit(flags, logGenerics);
         Printer log(&program);

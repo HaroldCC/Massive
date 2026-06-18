@@ -16,8 +16,15 @@
 
 target("OpenSSL")
     set_kind("headeronly")
-    add_includedirs("$(projectdir)/ThirdParty/Bin/openssl/include", {public = true})
-    add_linkdirs("$(projectdir)/ThirdParty/Bin/openssl/lib", {public = true})
+    if is_plat("windows") then
+        -- Windows: vendored 二进制
+        add_includedirs("$(projectdir)/ThirdParty/Bin/openssl/include", {public = true})
+        add_linkdirs("$(projectdir)/ThirdParty/Bin/openssl/Win64", {public = true})
+        add_links("libcrypto", "libssl", {public = true})
+    elseif is_plat("linux") then
+        -- Linux: 系统 libssl-dev (apt install libssl-dev)
+        add_links("ssl", "crypto", {public = true})
+    end
 
 target("Protobuf")
     set_kind("headeronly")
@@ -31,8 +38,16 @@ target("DaScript")
 
 target("LibPQ")
     set_kind("headeronly")
-    add_includedirs("$(projectdir)/ThirdParty/Bin/libpq/include", {public = true})
-    add_linkdirs("$(projectdir)/ThirdParty/Bin/libpq/lib", {public = true})
+    if is_plat("windows") then
+        -- Windows: vendored 二进制
+        add_includedirs("$(projectdir)/ThirdParty/Bin/libpq/include", {public = true})
+        add_linkdirs("$(projectdir)/ThirdParty/Bin/libpq/Win64", {public = true})
+        add_links("libpq", {public = true})
+    elseif is_plat("linux") then
+        -- Linux: 系统 libpq-dev (apt install libpq-dev)
+        add_sysincludedirs("/usr/include/postgresql", {public = true})
+        add_links("pq", {public = true})
+    end
 
 -- ==========================================
 -- B 组: xmake 内编译为静态库

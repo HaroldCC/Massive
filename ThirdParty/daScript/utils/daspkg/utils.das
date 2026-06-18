@@ -1,5 +1,7 @@
 options gen2
 options indenting = 4
+options no_unused_block_arguments = false
+options no_unused_function_arguments = false
 options no_global_variables = false
 
 module utils shared public
@@ -25,7 +27,9 @@ def log_init(root : string) {
 }
 
 def private log_to_file(msg : string) {
-    if (empty(log_file_path)) return
+    if (empty(log_file_path)) {
+        return
+    }
     fopen(log_file_path, "ab") $(f) {
         if (f != null) {
             fprint(f, msg)
@@ -65,12 +69,15 @@ def run_cmd(cmd : string; var output : string&) : int {
     if (get_platform_name() == "windows") {
         full_cmd = "\"{full_cmd}\""
     }
+    var exit_code = -1
     var pipe_output : string
-    let exit_code = unsafe(popen(full_cmd) $(f) {
-        if (f != null) {
-            pipe_output = fread(f)
+    unsafe {
+        exit_code = popen(full_cmd) $(f) {
+            if (f != null) {
+                pipe_output = fread(f)
+            }
         }
-    })
+    }
     let tmp_existed = fexist(tmp_out)
     if (tmp_existed) {
         fopen(tmp_out, "rb") $(f) {
@@ -108,7 +115,9 @@ def run_cmd(cmd : string; var output : string&) : int {
 
 // force-remove a directory tree, handling read-only files (e.g. git objects on Windows)
 def force_rmdir(path : string) {
-    if (!fexist(path)) return
+    if (!fexist(path)) {
+        return
+    }
     // rmdir_rec can't remove read-only files (git objects on Windows)
     // use shell rm -rf which handles this correctly
     var output : string
@@ -128,14 +137,23 @@ def package_name_from_source(source : string) : string {
     if (last_back > last_sep) {
         last_sep = last_back
     }
-    if (last_sep >= 0) return slice(source, last_sep + 1)
+    if (last_sep >= 0) {
+        return slice(source, last_sep + 1)
+    }
     return source
 }
 
 def is_local_path(source : string) : bool {
-    if (starts_with(source, "/") || starts_with(source, "./") || starts_with(source, "../")
-        || starts_with(source, ".\\") || starts_with(source, "..\\")) return true
-    return length(source) > 2 && character_at(source, 1) == ':'  // nolint:PERF003 — single-byte check on short prefix
+    if (starts_with(source, "/") || starts_with(source, "./") || starts_with(source, "../")) {
+        return true
+    }
+    if (starts_with(source, ".\\") || starts_with(source, "..\\")) {
+        return true
+    }
+    if (length(source) > 2 && character_at(source, 1) == ':') { // nolint:PERF003
+        return true
+    }
+    return false
 }
 
 // --- Version parsing and constraint matching ---
@@ -195,9 +213,15 @@ def parse_version(ver : string) : SemVer {
 
 // returns -1, 0, or 1
 def compare_versions(a, b : SemVer) : int {
-    if (a.major != b.major) return a.major < b.major ? -1 : 1
-    if (a.minor != b.minor) return a.minor < b.minor ? -1 : 1
-    if (a.patch != b.patch) return a.patch < b.patch ? -1 : 1
+    if (a.major != b.major) {
+        return a.major < b.major ? -1 : 1
+    }
+    if (a.minor != b.minor) {
+        return a.minor < b.minor ? -1 : 1
+    }
+    if (a.patch != b.patch) {
+        return a.patch < b.patch ? -1 : 1
+    }
     return 0
 }
 
@@ -224,7 +248,9 @@ def private check_single_constraint(version : SemVer; constraint : string) : boo
         op = "="
     }
     let target = parse_version(ver_str)
-    if (!target.valid) return false
+    if (!target.valid) {
+        return false
+    }
     let cmp = compare_versions(version, target)
     if (op == ">=") {
         return cmp >= 0
@@ -242,9 +268,13 @@ def private check_single_constraint(version : SemVer; constraint : string) : boo
 // check a version against a constraint string (comma-separated AND)
 // examples: "", ">=1.0", "1.2.3", ">=1.0,<2.0"
 def satisfies_constraint(version_str, constraint : string) : bool {
-    if (empty(constraint)) return true
+    if (empty(constraint)) {
+        return true
+    }
     let ver = parse_version(version_str)
-    if (!ver.valid) return false
+    if (!ver.valid) {
+        return false
+    }
     // split on comma
     var rest = constraint
     while (!empty(rest)) {
@@ -257,7 +287,9 @@ def satisfies_constraint(version_str, constraint : string) : bool {
             part = strip(rest)
             rest = ""
         }
-        if (!empty(part) && !check_single_constraint(ver, part)) return false
+        if (!empty(part) && !check_single_constraint(ver, part)) {
+            return false
+        }
     }
     return true
 }
@@ -266,7 +298,9 @@ def satisfies_constraint(version_str, constraint : string) : bool {
 
 def gitignore_add(root, pattern : string) {
     // skip if not a git repository
-    if (!fexist("{root}/.git")) return
+    if (!fexist("{root}/.git")) {
+        return
+    }
     let gitignore_path = "{root}/.gitignore"
     // read existing content and check for duplicates
     var content = ""
@@ -297,7 +331,9 @@ def gitignore_add(root, pattern : string) {
             break
         }
     }
-    if (found) return
+    if (found) {
+        return
+    }
     // append pattern
     fopen(gitignore_path, "ab") $(f) {
         if (f != null) {
@@ -312,7 +348,9 @@ def gitignore_add(root, pattern : string) {
 }
 
 def gitignore_remove(root, pattern : string) {
-    if (!fexist("{root}/.git")) return
+    if (!fexist("{root}/.git")) {
+        return
+    }
     let gitignore_path = "{root}/.gitignore"
     var content = ""
     fopen(gitignore_path, "rb") $(f) {
@@ -320,7 +358,9 @@ def gitignore_remove(root, pattern : string) {
             content = fread(f)
         }
     }
-    if (empty(content)) return
+    if (empty(content)) {
+        return
+    }
     // rebuild without the matching line
     var result = ""
     var removed = false
@@ -359,7 +399,9 @@ def copy_dir_rec(src, dst : string) : bool {
     mkdir(dst)
     var ok = true
     dir(src) $(name) {
-        if (name == "." || name == "..") return
+        if (name == "." || name == "..") {
+            return
+        }
         let src_child = "{src}/{name}"
         let dst_child = "{dst}/{name}"
         let st = stat(src_child)

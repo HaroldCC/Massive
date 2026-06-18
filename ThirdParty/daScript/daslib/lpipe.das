@@ -1,5 +1,7 @@
 options gen2
 options indenting = 4
+options no_unused_block_arguments = false
+options no_unused_function_arguments = false
 options strict_smart_pointers = true
 
 module lpipe shared private
@@ -47,7 +49,9 @@ def lpipe_expr(var fnCall : ExpressionPtr&; var arg : ExpressionPtr&) : Expressi
         return cLet
     } elif (fnCall |> is_expr_like_call()) {
         var pCall = unsafe(reinterpret<ExprLooksLikeCall?> fnCall)
-        if (pCall.name == "lpipe") return null  // not piping pipe into pipe
+        if (pCall.name == "lpipe") {// not piping pipe into pipe
+            return null
+        }
         pCall.arguments |> emplace(arg)
         return fnCall
     } else {
@@ -77,7 +81,7 @@ class LpipeMacro : AstCallMacro {
                 macro_error(prog, call.at, "can't get valid program context")
                 return
             }
-            if (empty(astc.scopes)) {
+            if (astc.scopes |> length <= 0) {
                 macro_error(prog, call.at, "missing scope")
                 return
             }
@@ -107,7 +111,9 @@ class LpipeMacro : AstCallMacro {
             blk.list[eidx] = null
             success = true
         }
-        if (!success) return null
+        if (!success) {
+            return null
+        }
         return quote() {
             pass
         }

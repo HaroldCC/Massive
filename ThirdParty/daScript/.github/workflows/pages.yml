@@ -26,9 +26,7 @@ jobs:
       uses: actions/checkout@v4
 
     - name: "Install Python dependencies"
-      run: |
-        pip install -r doc/requirements.txt
-        pip install markdown
+      run: pip install -r doc/requirements.txt
 
     - name: "Install CMake and Ninja"
       uses: lukka/get-cmake@latest
@@ -73,47 +71,6 @@ jobs:
         working_directory: build/latex
         continue_on_error: true
 
-    - name: Setup Emscripten
-      uses: emscripten-core/setup-emsdk@v11
-      with:
-        # Every emsdk pin snapshots LLVM main (not a release tag). 5.0.3
-        # (clang 23.0.0git, 2026-03-13 snapshot) repeatedly broke on
-        # utils/dasFormatter/ds_parser.cpp — bus-errors one run, EOF-
-        # inside-`#ifndef` parse errors the next. We pinned to 4.0.23
-        # (clang 22.0.0git, 2026-01-09 snapshot) but the same intermittent
-        # parser failures still surfaced (~1 in 4 deploys); see run
-        # https://github.com/GaijinEntertainment/daScript/actions/runs/26377946207.
-        # 5.0.7 ships clang 23.0.0git snapshot 7b58716d96c3 — same major
-        # family as the bad 5.0.3, but a different upstream snapshot.
-        # Locally compiles ds_parser.cpp + the full daslang_static target
-        # cleanly. Bump back down if 5.0.7 reintroduces the flake.
-        version: '5.0.7'
-
-    - name: "Build WASM (Emscripten) for /playground/ + /files/wasm/"
-      run: |
-        set -eux
-        cd web
-        mkdir -p build && cd build
-        emcmake cmake -DCMAKE_BUILD_TYPE=Release -G Ninja ..
-        # daslang_static.wasm playground + stage_site_playground (vendored UI
-        # + js/wasm) + stage_site_playground_wasm (cross-compiled examples).
-        ninja daslang_static stage_site_playground stage_site_playground_wasm
-
-    - name: "Fetch dasProfile per-platform benchmark JSONs"
-      # dasProfile now ships a per-platform JSON file
-      # (profile_results_<platform>.json). forge.js's bench cycler fetches
-      # each one and renders a platform-list rail. Add `linux` to the loop
-      # below when a Linux capture lands upstream. Missing-platform files
-      # don't abort the build — the cycler silently drops them client-side.
-      run: |
-        set -eux
-        for plat in darwin windows; do
-            curl -sSL -o "site/files/profile_results_${plat}.json" \
-                "https://raw.githubusercontent.com/borisbat/dasProfile/main/profile_results_${plat}.json" \
-              || echo "WARNING: missing profile_results_${plat}.json"
-        done
-      continue-on-error: true
-
     - name: "Stage site for deployment"
       run: |
         set -eux
@@ -121,8 +78,6 @@ jobs:
 
         # Static landing page and assets
         cp site/index.html _site/
-        cp site/downloads.html _site/
-        cp site/daspkg.html _site/
         cp site/robots.txt _site/
         cp -r site/files _site/files
 
@@ -132,60 +87,6 @@ jobs:
         # PDFs (referenced by index.html)
         cp build/latex/daslang.pdf _site/doc/daslang.pdf || echo "WARNING: daslang.pdf not found"
         cp build/latex/daslangstdlib.pdf _site/doc/daslangstdlib.pdf || echo "WARNING: daslangstdlib.pdf not found"
-
-        # Blog + news + changelist (regenerated each publish). Pin --site-url
-        # explicitly so feed.xml entries point at the production domain even
-        # if the default in build_blog.py drifts.
-        python3 site/blog/build_blog.py \
-            --posts site/blog/_posts \
-            --news site/_news \
-            --template site/blog/template.html \
-            --site-url https://daslang.io \
-            --out _site/
-
-        # Playground: vendor web/ui IDE + WASM artifacts.
-        # The WASM build step now fails the workflow (no continue-on-error),
-        # so under normal master deploys we always take the if-branch. The
-        # else-branch survives as defense-in-depth — if the artifacts ever
-        # go missing despite a green build, we stage a placeholder rather
-        # than 404'ing the route (actions/deploy-pages publishes _site as
-        # a complete snapshot, no layering over the prior deploy).
-        if [ -f web/output/daslang_static.js ] && [ -f web/output/daslang_static.wasm ]; then
-            mkdir -p _site/playground _site/files/wasm
-            # Copy IDE source files (CodeMirror, jQuery, main.js/css, etc.)
-            cp -r web/examples/ui/src/* _site/playground/
-            # Copy WASM artifacts — known-present after the guard above.
-            cp web/output/daslang_static.js _site/playground/
-            cp web/output/daslang_static.wasm _site/playground/
-            cp web/output/daslang_static.js _site/files/wasm/
-            cp web/output/daslang_static.wasm _site/files/wasm/
-            # Pull samples from site/playground/samples — that directory is the
-            # single staged source of truth: stage_site_playground populates
-            # the .das sources, stage_site_playground_wasm overlays the
-            # cross-compiled .wasm artifacts. The HEAD probe in main.js
-            # (updateEngineAvailability) enables the JIT radio only when the
-            # .wasm is reachable, so dropping the .wasm here permanently
-            # disables the toggle in production.
-            cp -r site/playground/samples _site/playground/samples 2>/dev/null || true
-            # Our Forge-skinned playground/index.html + skin CSS + init shim take precedence.
-            # CodeMirror bundle (codemirror.min.js/css, simple-mode.js, daslang-*.js,
-            # cm-forge.css) is served from /files/cm/ — copied via `cp -r site/files`
-            # earlier, so nothing extra to copy here.
-            cp site/playground/index.html _site/playground/index.html
-            cp site/playground/forge-skin.css _site/playground/
-            # Forge playground scripts (init shim + tabs + share + splitter).
-            # Glob so future playground-*.js additions land automatically.
-            cp site/playground/playground-*.js _site/playground/
-        else
-            # WASM artifacts missing. actions/deploy-pages publishes _site as
-            # a complete snapshot (no layering over the prior deploy), so an
-            # absent _site/playground/ would 404 the route. Stage a
-            # placeholder instead — the URL keeps resolving to something
-            # useful while we re-roll the runtime.
-            echo "WARNING: daslang_static.{js,wasm} missing under web/output — staging placeholder /playground/."
-            mkdir -p _site/playground
-            cp site/playground/placeholder.html _site/playground/index.html
-        fi
 
         # GitHub Pages control files
         touch _site/.nojekyll

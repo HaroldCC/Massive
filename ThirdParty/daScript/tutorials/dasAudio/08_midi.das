@@ -38,7 +38,7 @@ def example_parse_midi(path : string) {
 
     let midi = load_midi(path)
 
-    if (empty(midi.tracks)) {
+    if (length(midi.tracks) == 0) {
         print("  ERROR: Failed to load MIDI file\n")
         return
     }

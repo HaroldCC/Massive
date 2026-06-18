@@ -5,6 +5,35 @@
 
 namespace das {
 
+    // local or global
+
+    bool isLocalOrGlobal ( ExpressionPtr expr ) {
+        if ( expr->rtti_isVar() ) {
+            auto ev = static_cast<ExprVar*>(expr);
+            return ev->local || !(ev->argument || ev->block);
+        } else if ( expr->rtti_isAt() ) {
+            auto ea = static_cast<ExprAt*>(expr);
+            if ( ea->subexpr && ea->subexpr->type && ea->subexpr->type->dim.size() ) {
+                return isLocalOrGlobal(ea->subexpr);
+            }
+        } else if ( expr->rtti_isField() ) {
+            auto ef = static_cast<ExprField*>(expr);
+            if ( ef->value && ef->value->type && (ef->value->type->baseType!=Type::tHandle || ef->value->type->isLocal()) ) {
+                return isLocalOrGlobal(ef->value);
+            }
+        } else if ( expr->rtti_isSwizzle() ) {
+            auto sw = static_cast<ExprSwizzle*>(expr);
+            if ( sw->value ) {
+                return isLocalOrGlobal(sw->value);
+            }
+        } else if ( expr->rtti_isCallLikeExpr() ) {
+            if ( expr->type && expr->type->ref ) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // AOT
 
     AotListBase * AotListBase::head = nullptr;
@@ -258,77 +287,6 @@ namespace das {
     bool Structure::hasAnyInitializers() const {
         for ( const auto & fd : fields ) {
             if ( fd.init ) return true;
-        }
-        return false;
-    }
-
-    // True if this structure has any non-generated ctor method (Klass`Klass).
-    // Ctor methods always live in the same module as the class (parser registers
-    // them together), so we look up by name hash via functionsByName / genericsByName.
-    // The `classParent == this` identity check defends against same-named classes
-    // in other modules bleeding in through generic instantiation.
-    bool Structure::hasUserConstructor() const {
-        if ( !module ) return false;
-        string ctorName = name + "`" + name;
-        uint64_t hName = hash64z(ctorName.c_str());
-        if ( auto kv = module->functionsByName.find(hName) ) {
-            for ( auto * fn : kv->second ) {
-                if ( !fn->generated && fn->classParent == this ) return true;
-            }
-        }
-        if ( auto kv = module->genericsByName.find(hName) ) {
-            for ( auto * fn : kv->second ) {
-                if ( !fn->generated && fn->classParent == this ) return true;
-            }
-        }
-        return false;
-    }
-
-    // True if this structure has a non-generated 0-arg-callable ctor (no args, or
-    // all args default-initialized). Used by the synth-derived-ctor gate to verify
-    // the parent has a default constructor reachable as Parent`Parent(self).
-    bool Structure::hasUserDefaultConstructor() const {
-        if ( !module ) return false;
-        string ctorName = name + "`" + name;
-        uint64_t hName = hash64z(ctorName.c_str());
-        auto matches = [this]( Function * fn ) -> bool {
-            if ( fn->generated ) return false;
-            if ( fn->classParent != this ) return false;
-            // arg 0 is always 'self'; arg 1+ must be default-initialized
-            for ( size_t i=1; i<fn->arguments.size(); ++i ) {
-                if ( !fn->arguments[i]->init ) return false;
-            }
-            return true;
-        };
-        if ( auto kv = module->functionsByName.find(hName) ) {
-            for ( auto * fn : kv->second ) {
-                if ( matches(fn) ) return true;
-            }
-        }
-        if ( auto kv = module->genericsByName.find(hName) ) {
-            for ( auto * fn : kv->second ) {
-                if ( matches(fn) ) return true;
-            }
-        }
-        return false;
-    }
-
-    // True if this class has a non-generated finalizer method. Class finalizers keep
-    // the plain name "finalize" (parser: ast_structVarDef), so the registry lookup is
-    // by that name with the classParent identity check filtering out other classes'
-    // finalizers and free-function struct finalizers.
-    bool Structure::hasUserFinalizer() const {
-        if ( !module ) return false;
-        uint64_t hName = hash64z("finalize");
-        if ( auto kv = module->functionsByName.find(hName) ) {
-            for ( auto * fn : kv->second ) {
-                if ( !fn->generated && fn->classParent == this ) return true;
-            }
-        }
-        if ( auto kv = module->genericsByName.find(hName) ) {
-            for ( auto * fn : kv->second ) {
-                if ( !fn->generated && fn->classParent == this ) return true;
-            }
         }
         return false;
     }
@@ -678,7 +636,6 @@ namespace das {
         pVar->at = at;
         pVar->flags = flags;
         pVar->access_flags = access_flags;
-        pVar->access_info = access_info;
         pVar->initStackSize = initStackSize;
         pVar->annotation = annotation;
         return pVar;
@@ -1139,17 +1096,6 @@ namespace das {
         return expr;
     }
 
-    ExpressionPtr ExprConst::clone ( ExpressionPtr expr ) const {
-        Expression::clone(expr);
-        auto cexpr = static_cast<ExprConst *>(expr);
-        cexpr->baseType = baseType;
-        cexpr->value = value;
-        cexpr->foldedNonConst = foldedNonConst;
-        cexpr->promotedFromInt = promotedFromInt;
-        cexpr->inexactFloatPromotion = inexactFloatPromotion;
-        return expr;
-    }
-
     ExpressionPtr Expression::autoDereference ( ExpressionPtr expr ) {
         if ( expr->type && !expr->type->isAutoOrAlias() && expr->type->isRef() && !expr->type->isRefType() ) {
             auto ar2l = new ExprRef2Value();
@@ -1351,6 +1297,7 @@ namespace das {
         ExprConst::clone(cexpr);
         cexpr->enumType = enumType;
         cexpr->text = text;
+        cexpr->value = value;
         return cexpr;
     }
 
@@ -1367,15 +1314,16 @@ namespace das {
 
     ExpressionPtr ExprConstString::clone( ExpressionPtr expr ) const {
         auto cexpr = clonePtr<ExprConstString>(expr);
-        ExprConst::clone(cexpr);
+        Expression::clone(cexpr);
+        cexpr->value = value;
         cexpr->text = text;
         return cexpr;
     }
 
     string TypeDecl::typeMacroName() const {
-        if ( typeMacroExpr.size()<1 ) return "";
-        if ( typeMacroExpr[0]->rtti_isStringConstant() ) {
-            return ((ExprConstString *)typeMacroExpr[0])->text;
+        if ( dimExpr.size()<1 ) return "";
+        if ( dimExpr[0]->rtti_isStringConstant() ) {
+            return ((ExprConstString *)dimExpr[0])->text;
         } else {
             return "";
         }
@@ -1701,7 +1649,6 @@ namespace das {
         ExprLooksLikeCall::clone(cexpr);
         cexpr->typeexpr = new TypeDecl(*typeexpr);
         cexpr->initializer = initializer;
-        cexpr->allocate_on_stack = allocate_on_stack;
         return cexpr;
     }
 
@@ -2500,7 +2447,6 @@ namespace das {
         Expression::clone(cexpr);
         cexpr->cond = cond->clone();
         cexpr->body = body->clone();
-        cexpr->annotations = annotations;
         return cexpr;
     }
 
@@ -2548,7 +2494,6 @@ namespace das {
         }
         cexpr->allowIteratorOptimization = allowIteratorOptimization;
         cexpr->canShadow = canShadow;
-        cexpr->annotations = annotations;
         return cexpr;
     }
 
@@ -2655,7 +2600,6 @@ namespace das {
         Expression::clone(cexpr);
         cexpr->atEnclosure = atEnclosure;
         cexpr->name = name;
-        cexpr->pipedCallArgument = pipedCallArgument;
         for ( auto & arg : arguments ) {
             cexpr->arguments.push_back(arg->clone());
         }
@@ -2923,7 +2867,6 @@ namespace das {
             cexpr->values.push_back(val->clone());
         }
         cexpr->recordNames = recordNames;
-        cexpr->shorthandRecordNames = shorthandRecordNames;
         if ( makeType ) {
             cexpr->makeType = new TypeDecl(*makeType);
         }

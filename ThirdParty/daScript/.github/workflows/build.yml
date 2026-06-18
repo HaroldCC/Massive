@@ -45,10 +45,6 @@ jobs:
     needs: pre_job
     if: needs.pre_job.outputs.should_skip != 'true'
     runs-on: ${{ matrix.runner }}
-    # actions: write needed for `gh cache delete` in the sccache refresh step.
-    permissions:
-      contents: read
-      actions: write
     env:
       das_dll_build: 'NO'
       das_llvm_disabled: 'OFF'
@@ -105,6 +101,14 @@ jobs:
             archive_ext: tar.gz
 
           - target: darwin15
+            architecture: 64
+            release_target: darwin15
+            release_arch: x86_64
+            runner: macos-15-large # Intel x86_64, 12 CPU
+            architecture_string: x86_64
+            archive_ext: tar.gz
+
+          - target: darwin15
             architecture: arm64
             release_target: darwin15
             release_arch: arm64
@@ -125,7 +129,7 @@ jobs:
 
           - target: windows
             build_system: cmake
-            cmake_generator: Ninja
+            cmake_generator: Visual Studio 17 2022
 
           - target: darwin15
             build_system: cmake
@@ -156,10 +160,6 @@ jobs:
             architecture_string: x64
 
           # RelWithDebInfo only on Windows x64
-          # jit_disabled: skip the JIT prewarm + JIT test sweep here. JIT on
-          # win64-MSVC stays covered by the Release cell below and by the full
-          # clang JIT sweep in build_windows_mingw — running it on all three
-          # win64 presets just triples the slowest jobs in the matrix.
           - target: windows
             architecture: 64
             cmake_preset: RelWithDebInfo
@@ -167,24 +167,15 @@ jobs:
             runner: windows-latest-fat
             archive_ext: zip
             build_system: cmake
-            cmake_generator: Ninja
+            cmake_generator: Visual Studio 17 2022
             release_target: windows
             release_arch: x86_64
             architecture_string: x64
-            jit_disabled: 'ON'
-
-          # Debug win64 also skips JIT (same rationale as RelWithDebInfo above).
-          - target: windows
-            architecture: 64
-            cmake_preset: Debug
-            jit_disabled: 'ON'
 
         exclude:
-          # macOS Intel (darwin15 x86_64) has no prebuilt LLVM.dll (the
-          # llvm-release workflow doesn't build one) and Apple no longer makes
-          # new Intel macOS runners worth gating on. Drop entirely.
           - target: darwin15
             architecture: 64
+            cmake_preset: Debug
 
           - target: darwin15
             architecture: 32
@@ -214,54 +205,8 @@ jobs:
     - name: "SCM Checkout"
       uses: actions/checkout@v4
 
-    - name: "Exclude workspace from Windows Defender"
-      if: runner.os == 'Windows'
-      shell: pwsh
-      continue-on-error: true
-      # Real-time Defender scans every .obj/.exe/.dll the build writes and every
-      # test process/DLL load; excluding the workspace cuts Windows CI wall-time.
-      # continue-on-error: a managed-Defender runner must not fail the job.
-      run: |
-        Add-MpPreference -ExclusionPath "${{ github.workspace }}"
-        Add-MpPreference -ExclusionProcess "daslang.exe"
-        Add-MpPreference -ExclusionProcess "test_aot.exe"
-
     - name: "Install CMake and Ninja"
       uses: lukka/get-cmake@latest
-
-    - if: runner.os == 'Windows'
-      uses: ilammy/setup-nasm@v1 # need nasm for openssl
-
-    - name: "Set up MSVC environment (Windows)"
-      if: runner.os == 'Windows'
-      # cl.exe on PATH so the bash build step drives Ninja with MSVC. arch
-      # follows the matrix (x86 for the 32-bit job). MUST run BEFORE the vcpkg
-      # openssl step: msvc-dev-cmd's vcvars sets VCPKG_ROOT to the VS-bundled
-      # vcpkg, so the openssl step has to write our VCPKG_ROOT last.
-      uses: ilammy/msvc-dev-cmd@v1
-      with:
-        arch: ${{ matrix.architecture == 32 && 'x86' || 'x64' }}
-
-    - name: "Cache vcpkg + openssl"
-      if: runner.os == 'Windows'
-      uses: actions/cache@v4
-      with:
-        # vcpkg.exe + ports/triplets/scripts + installed/<triplet>/openssl. Build
-        # intermediates (buildtrees/downloads/packages) are trimmed pre-save below.
-        path: vcpkg
-        key: vcpkg-${{ matrix.architecture == 32 && 'x86' || 'x64' }}-windows-v2
-
-    - name: "Install openssl windows"
-      if: runner.os == 'Windows'
-      run: |
-        if [ ! -x vcpkg/vcpkg.exe ] && [ ! -x vcpkg/vcpkg ]; then
-            git clone https://github.com/microsoft/vcpkg && ./vcpkg/bootstrap-vcpkg.sh
-        fi
-        ./vcpkg/vcpkg install openssl:${{ matrix.architecture == 32 && 'x86' || 'x64' }}-windows --binarycaching
-        echo "VCPKG_ROOT=$(pwd)/vcpkg" >> $GITHUB_ENV
-        echo "CMAKE_TOOLCHAIN_FILE=$(pwd)/vcpkg/scripts/buildsystems/vcpkg.cmake" >> $GITHUB_ENV
-        # Drop build intermediates so the saved cache holds only installed/ — ~1.2GiB -> ~0.1GiB.
-        rm -rf vcpkg/buildtrees vcpkg/downloads vcpkg/packages
 
     - name: "Install: Required Dev Packages"
       run: |
@@ -303,45 +248,6 @@ jobs:
             ;;
         esac
 
-    # sccache with LOCAL-DISK backend, wrapped in ONE actions/cache entry per
-    # matrix config. The GHA backend writes one cache item per TU (~40k items,
-    # quota fragmentation, ~74% concurrent-write failures); local disk keeps
-    # all objects in $SCCACHE_DIR and we persist it as a single tarball.
-    # Windows is on Ninja now (honors CMAKE_*_COMPILER_LAUNCHER); its MSVC
-    # compiles are cacheable because daslang builds with /Z7 (CMakeCommon.txt) —
-    # debug info embedded in the .obj. sccache refuses to cache /Zi (separate
-    # shared PDB) output.
-    - uses: mozilla-actions/sccache-action@v0.0.10
-    - run: |
-        echo "SCCACHE_DIR=${{ runner.temp }}/sccache" >> $GITHUB_ENV
-        echo "SCCACHE_GHA_ENABLED=false" >> $GITHUB_ENV
-        # Non-Windows: export the launcher via env (also wraps the GLFW/libhv
-        # ExternalProject sub-builds — harmless on gcc/clang). Windows must NOT
-        # export it: CMake seeds CMAKE_<LANG>_COMPILER_LAUNCHER from the env
-        # into the sub-cmakes, where sccache + MSVC /Zi (those sub-builds keep
-        # /Zi) + parallel Ninja collide on the shared glfw.pdb (C1041). Windows
-        # instead passes the launcher as -D on the MAIN configure only (Build
-        # step), scoping sccache to daslang's own /Z7 TUs.
-        if [ "$RUNNER_OS" != "Windows" ]; then
-          echo "CMAKE_C_COMPILER_LAUNCHER=sccache" >> $GITHUB_ENV
-          echo "CMAKE_CXX_COMPILER_LAUNCHER=sccache" >> $GITHUB_ENV
-        fi
-    # Stable per-config key, one fixed slot. Restore always; on master,
-    # delete + re-save the same key after Build so the slot is overwritten
-    # with fresh objects (GHA caches are immutable — plain save under an
-    # existing key is a no-op, so we delete first). PRs read-only. Bounded
-    # footprint: N configs × one tarball, no run_id pileup.
-    - name: "Restore sccache objects"
-      uses: actions/cache/restore@v4
-      with:
-        path: ${{ runner.temp }}/sccache
-        key: sccache-${{ matrix.target }}-${{ matrix.architecture }}-${{ matrix.cmake_preset }}-${{ matrix.sanitizers }}
-
-    - name: "Override das_llvm_disabled for win32"
-      if: matrix.target == 'windows' && matrix.architecture == 32
-      shell: bash
-      run: echo "das_llvm_disabled=ON" >> $GITHUB_ENV
-
     - name: "Build: Daslang"
       run: |
         set -eux
@@ -356,21 +262,11 @@ jobs:
                 ninja
                 ;;
               windows32)
-                export PATH="/c/Strawberry/perl/bin:$PATH" # prepend Strawberry perl to path, so openssl will use it.
-                # Launcher passed as -D here (not env) so it scopes to daslang's
-                # own targets and does NOT leak into the GLFW/libhv sub-builds.
-                # daslang's MSVC debug info is /Z7 (CMakeCommon.txt) so sccache
-                # can cache it.
-                cmake --no-warn-unused-cli -B./build -G "${{ matrix.cmake_generator }}" -DCMAKE_BUILD_TYPE:STRING=${{ matrix.cmake_preset }} -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+                cmake --no-warn-unused-cli -B./build -G "${{ matrix.cmake_generator }}" -T host=x64 -A ${{ matrix.architecture_string }}
                 cmake --build ./build --config ${{ matrix.cmake_preset }} --parallel
                 ;;
               windows64)
-                export PATH="/c/Strawberry/perl/bin:$PATH" # prepend Strawberry perl to path, so openssl will use it.
-                # Launcher passed as -D here (not env) so it scopes to daslang's
-                # own targets and does NOT leak into the GLFW/libhv sub-builds.
-                # daslang's MSVC debug info is /Z7 (CMakeCommon.txt) so sccache
-                # can cache it.
-                cmake --no-warn-unused-cli -B./build -G "${{ matrix.cmake_generator }}" -DCMAKE_BUILD_TYPE:STRING=${{ matrix.cmake_preset }} -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DDAS_LLVM_DISABLED=${{ env.das_llvm_disabled }} -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+                cmake --no-warn-unused-cli -B./build -G "${{ matrix.cmake_generator }}" -T host=x64 -A ${{ matrix.architecture_string }} -DDAS_LLVM_DISABLED=${{ env.das_llvm_disabled }}
                 cmake --build ./build --config ${{ matrix.cmake_preset }} --parallel
                 ;;
               linux_arm*)
@@ -387,51 +283,9 @@ jobs:
             esac
             ;;
         esac
-
-    - name: "Refresh sccache slot"
-      if: github.ref == 'refs/heads/master'
-      env:
-        GH_TOKEN: ${{ github.token }}
-        SCKEY: sccache-${{ matrix.target }}-${{ matrix.architecture }}-${{ matrix.cmake_preset }}-${{ matrix.sanitizers }}
-      run: gh cache delete "$SCKEY" -R ${{ github.repository }} || true
-    - name: "Save sccache objects"
-      if: github.ref == 'refs/heads/master'
-      uses: actions/cache/save@v4
-      with:
-        path: ${{ runner.temp }}/sccache
-        key: sccache-${{ matrix.target }}-${{ matrix.architecture }}-${{ matrix.cmake_preset }}-${{ matrix.sanitizers }}
-
-    - name: "Prewarm JIT cache"
-      if: env.das_llvm_disabled != 'ON' && matrix.jit_disabled != 'ON'
-      run: |
-        set -eux
-        cmake --build ./build --config ${{ matrix.cmake_preset }} --target jit_cache_all_tests
-
     - name: "Test"
       run: |
         set -eux
-        # When daslang is sanitizer-instrumented, its JIT-emitted .dll cache
-        # link cmd needs -fsanitize=<kind> to pull the sanitizer runtime
-        # (otherwise unresolved __ubsan_*/__asan_*/__tsan_* symbols in lib.so).
-        JIT_LINKER_STRING=""
-        case "${{ matrix.sanitizers }}" in
-            ubsan) JIT_LINKER_STRING="--jit-linker-string=-fsanitize=undefined" ;;
-            asan)  JIT_LINKER_STRING="--jit-linker-string=-fsanitize=address"   ;;
-            tsan)  JIT_LINKER_STRING="--jit-linker-string=-fsanitize=thread"    ;;
-        esac
-        # daslang built with clang on sanitizer matrix — JIT-emitted .dll
-        # must link with the same compiler (incompatible asan/tsan runtimes
-        # otherwise). c++ default = g++ on Ubuntu, mismatches.
-        JIT_PATH_TO_LINKER=""
-        if [ "${{ matrix.sanitizers }}" != "none" ] && [ -n "${{ matrix.sanitizers }}" ]; then
-            JIT_PATH_TO_LINKER="--jit-path-to-linker=clang++"
-        fi
-        # Match JIT codegen opt level to build type: Debug → -O0 (fast codegen),
-        # Release/RelWithDebInfo → -O3.
-        case "${{ matrix.cmake_preset }}" in
-            Debug) JIT_OPT="--jit-opt-level=0" ;;
-            *)     JIT_OPT="--jit-opt-level=3" ;;
-        esac
         case "${{ matrix.target }}${{ matrix.architecture }}" in
            linux64)
             cd bin
@@ -442,45 +296,31 @@ jobs:
             # tracked separately, real fix is in the binding).
             printf 'leak:format_error\nleak:uriParseSingleUriA\nleak:uriMakeOwner\n' > suppressions.txt
             export LSAN_OPTIONS="suppressions=$(pwd)/suppressions.txt"
-            # Sanitizer matrix: only run language tests under JIT (full test
-            # suite under asan/tsan/ubsan adds ~10m wall-clock without proportionate
-            # coverage value). Non-sanitizer keeps the full sweep.
-            if [ "${{ matrix.sanitizers }}" != "none" ]; then
-                TEST_DIR=_dasroot_/tests/language
-            else
-                TEST_DIR=_dasroot_/tests
-            fi
             # Use more time to pass UBSAN and disable leaks in JIT mode because we exit using exit(), and do not call destructors.
-            [ "${{ env.das_llvm_disabled }}" = "ON" ] || ASAN_OPTIONS=detect_leaks=0 ./daslang _dasroot_/dastest/dastest.das -jit -- $JIT_LINKER_STRING $JIT_PATH_TO_LINKER $JIT_OPT --color --failures-only --timeout 900 --test $TEST_DIR || ASAN_OPTIONS=detect_leaks=0 ./daslang _dasroot_/dastest/dastest.das -jit -- $JIT_LINKER_STRING $JIT_PATH_TO_LINKER $JIT_OPT --color --failures-only --isolated-mode --timeout 3600 --test $TEST_DIR
-            # Interpreter sweep: non-sanitizer only.
-            if [ "${{ matrix.sanitizers }}" = "none" ]; then
-                ./daslang _dasroot_/dastest/dastest.das -- --color --failures-only --timeout 900 --test _dasroot_/tests || ./daslang _dasroot_/dastest/dastest.das -- --color --failures-only --isolated-mode --timeout 3600 --test _dasroot_/tests
-            fi
+            [ "${{ env.das_llvm_disabled }}" = "ON" ] || ASAN_OPTIONS=detect_leaks=0 ./daslang _dasroot_/dastest/dastest.das -jit -- --color --failures-only --timeout 900 --test ../tests || ASAN_OPTIONS=detect_leaks=0 ./daslang _dasroot_/dastest/dastest.das -jit -- --color --failures-only --isolated-mode --timeout 3600 --test ../tests
+            ./daslang _dasroot_/dastest/dastest.das -- --color --failures-only --timeout 900 --test ../tests || ./daslang _dasroot_/dastest/dastest.das -- --color --failures-only --isolated-mode --timeout 3600 --test ../tests
             ;;
            windows32)
-            cd bin
-            ./daslang _dasroot_/dastest/dastest.das -- --color --failures-only --timeout 900 --test _dasroot_/tests || ./daslang _dasroot_/dastest/dastest.das -- --color --failures-only --isolated-mode --timeout 3600 --test _dasroot_/tests
+            cd bin/"${{ matrix.cmake_preset }}"
+            ./daslang _dasroot_/dastest/dastest.das -- --color --failures-only --timeout 900 --test ../../tests || ./daslang _dasroot_/dastest/dastest.das -- --color --failures-only --isolated-mode --timeout 3600 --test ../../tests
             ;;
            windows*)
-            cd bin
-            [ "${{ env.das_llvm_disabled }}" = "ON" ] || [ "${{ matrix.jit_disabled }}" = "ON" ] || ./daslang _dasroot_/dastest/dastest.das -jit -- $JIT_LINKER_STRING $JIT_PATH_TO_LINKER $JIT_OPT --timeout 900 --color --failures-only --test _dasroot_/tests || ./daslang _dasroot_/dastest/dastest.das -jit -- $JIT_LINKER_STRING $JIT_PATH_TO_LINKER $JIT_OPT --color --failures-only --isolated-mode --timeout 3600 --test _dasroot_/tests
-            ./daslang _dasroot_/dastest/dastest.das -- --color --failures-only --timeout 900 --test _dasroot_/tests || ./daslang _dasroot_/dastest/dastest.das -- --color --failures-only --isolated-mode --timeout 3600 --test _dasroot_/tests
+            cd bin/"${{ matrix.cmake_preset }}"
+            [ "${{ env.das_llvm_disabled }}" = "ON" ] || ./daslang _dasroot_/dastest/dastest.das -jit -- --timeout 900 --color --failures-only --test ../../tests || ./daslang _dasroot_/dastest/dastest.das -jit -- --color --failures-only --isolated-mode --timeout 3600 --test ../../tests
+            ./daslang _dasroot_/dastest/dastest.das -- --color --failures-only --timeout 900 --test ../../tests || ./daslang _dasroot_/dastest/dastest.das -- --color --failures-only --isolated-mode --timeout 3600 --test ../../tests
             ;;
            linux_arm64)
             cd bin
-            # Skip JIT tests on the Debug cmake preset — LLVM ARM64 SelectionDAG
-            # hangs reproducibly mid-suite under Debug (different test each run,
-            # ~20 min in). Tracked separately. Release of the same matrix still
-            # runs JIT — keep --failures-only off there so PASS lines print and
-            # name the test running just before the hang if it reoccurs (see
-            # RC2 release run #25572466058).
-            [ "${{ env.das_llvm_disabled }}" = "ON" ] || [ "${{ matrix.cmake_preset }}" = "Debug" ] || ./daslang _dasroot_/dastest/dastest.das -jit -- $JIT_LINKER_STRING $JIT_PATH_TO_LINKER $JIT_OPT --color --timeout 900 --test _dasroot_/tests || ./daslang _dasroot_/dastest/dastest.das -jit -- $JIT_LINKER_STRING $JIT_PATH_TO_LINKER $JIT_OPT --color --failures-only --isolated-mode --timeout 3600 --test _dasroot_/tests
-            ./daslang _dasroot_/dastest/dastest.das -- --color --failures-only --timeout 900 --test _dasroot_/tests || ./daslang _dasroot_/dastest/dastest.das -- --color --failures-only --isolated-mode --timeout 3600 --test _dasroot_/tests
+            # Drop --failures-only on JIT so PASS lines print: when the LLVM ARM64
+            # SelectionDAG hang reoccurs (RC2 release run #25572466058), the most
+            # recent PASS line names the test that ran just before the hung one.
+            [ "${{ env.das_llvm_disabled }}" = "ON" ] || ./daslang _dasroot_/dastest/dastest.das -jit -- --color --timeout 900 --test ../tests || ./daslang _dasroot_/dastest/dastest.das -jit -- --color --failures-only --isolated-mode --timeout 3600 --test ../tests
+            ./daslang _dasroot_/dastest/dastest.das -- --color --failures-only --timeout 900 --test ../tests || ./daslang _dasroot_/dastest/dastest.das -- --color --failures-only --isolated-mode --timeout 3600 --test ../tests
             ;;
            *)
             cd bin
-            [ "${{ env.das_llvm_disabled }}" = "ON" ] || ./daslang _dasroot_/dastest/dastest.das -jit -- $JIT_LINKER_STRING $JIT_PATH_TO_LINKER $JIT_OPT --color --failures-only --timeout 900 --test _dasroot_/tests || ./daslang _dasroot_/dastest/dastest.das -jit -- $JIT_LINKER_STRING $JIT_PATH_TO_LINKER $JIT_OPT --color --failures-only --isolated-mode --timeout 3600 --test _dasroot_/tests
-            ./daslang _dasroot_/dastest/dastest.das -- --color --failures-only --timeout 900 --test _dasroot_/tests || ./daslang _dasroot_/dastest/dastest.das -- --color --failures-only --isolated-mode --timeout 3600 --test _dasroot_/tests
+            [ "${{ env.das_llvm_disabled }}" = "ON" ] || ./daslang _dasroot_/dastest/dastest.das -jit -- --color --failures-only --timeout 900 --test ../tests || ./daslang _dasroot_/dastest/dastest.das -jit -- --color --failures-only --isolated-mode --timeout 3600 --test ../tests
+            ./daslang _dasroot_/dastest/dastest.das -- --color --failures-only --timeout 900 --test ../tests || ./daslang _dasroot_/dastest/dastest.das -- --color --failures-only --isolated-mode --timeout 3600 --test ../tests
             ;;
         esac
     - name: "Small C++ Tests"
@@ -508,8 +348,8 @@ jobs:
             echo "Skipping AOT tests on 32-bit Windows"
             ;;
            windows*)
-            cd bin
-            ./test_aot -use-aot _dasroot_/dastest/dastest.das -- --use-aot --color --failures-only --timeout 900 --test _dasroot_/tests
+            cd bin/"${{ matrix.cmake_preset }}"
+            ./test_aot -use-aot _dasroot_/dastest/dastest.das -- --use-aot --color --failures-only --timeout 900 --test ../../tests
             ;;
            *)
             cd bin
@@ -517,283 +357,7 @@ jobs:
             # need them here too.
             printf 'leak:format_error\nleak:uriParseSingleUriA\nleak:uriMakeOwner\n' > suppressions.txt
             export LSAN_OPTIONS="suppressions=$(pwd)/suppressions.txt"
-            ./test_aot -use-aot _dasroot_/dastest/dastest.das -- --use-aot --color --failures-only --timeout 900 --test _dasroot_/tests
+            ./test_aot -use-aot _dasroot_/dastest/dastest.das -- --use-aot --color --failures-only --timeout 900 --test ../tests
             ;;
         esac
-
-  ###########################################################
-  bundle_smoke:
-  ###########################################################
-  # Catches release-bundle install-rule regressions at PR time on the
-  # platform that produces 95% of such bugs (Linux x86_64). Mirrors the
-  # release.yml linux64 build path: same module flags via ci/release_modules.txt,
-  # same install layout (cmake --install --prefix ./daslang_bundle), same
-  # ci/smoke_test_bundle.sh that release.yml runs. Full-matrix smoke is
-  # still gated at release-cut time in release.yml.
-  ###########################################################
-    needs: pre_job
-    if: needs.pre_job.outputs.should_skip != 'true'
-    runs-on: ubuntu-latest-fat
-    steps:
-    - name: "SCM Checkout"
-      uses: actions/checkout@v4
-
-    - name: "Install CMake and Ninja"
-      uses: lukka/get-cmake@latest
-
-    - name: "Install: Required Dev Packages"
-      run: |
-        set -eux
-        sudo apt-get update -y
-        sudo apt-get install --no-install-recommends -y \
-          libatomic-ops-dev \
-          libglu1-mesa-dev \
-          freeglut3-dev \
-          mesa-common-dev \
-          libglfw3-dev \
-          libfreetype6-dev \
-          libudev-dev \
-          libopenal-dev \
-          libvorbis-dev \
-          libflac-dev \
-          libx11-dev \
-          libxrandr-dev \
-          libxcursor-dev \
-          libxinerama-dev \
-          libxi-dev
-
-    - name: "Build: Daslang with release modules"
-      run: |
-        set -eux
-        mkdir build
-        ACTIVE_MODULES=$(cat ci/release_modules.txt | grep -v "^#" | cut -d':' -f2 | sed 's|^|-D|' | xargs)
-        CC=clang CXX=clang++ cmake --no-warn-unused-cli -B./build -DCMAKE_BUILD_TYPE:STRING=Release \
-          -G Ninja $ACTIVE_MODULES
-        cmake --build ./build --config Release --parallel
-
-    - name: "Install bundle"
-      run: |
-        set -eux
-        mkdir daslang_bundle
-        cmake --install ./build --prefix ./daslang_bundle --config Release --strip
-
-    - name: "Smoke-test installed bundle"
-      run: bash ci/smoke_test_bundle.sh ./daslang_bundle
-
-  ###########################################################
-  build_windows_mingw:
-  ###########################################################
-  # Catches clang-mingw64 toolchain regressions at PR time. The mingw path
-  # diverges from MSVC in src/hal/debug_break.cpp, src/hal/project_specific_crash_handler.cpp,
-  # and src/builtin/module_jit.cpp (PR #2838). Without this job, a Windows-touching
-  # change that compiles under MSVC but breaks mingw would only surface when a
-  # maintainer rebuilds locally. Same runner pool as the MSVC matrix
-  # (windows-latest-fat), separate top-level job so mingw churn doesn't risk
-  # the much-larger MSVC entries.
-  #
-  # dasClangBind is enabled here — find_package(Clang 22.1) matches msys2's
-  # libclang 22.1.x and POST_BUILD copies the libclang+libLLVM+libc++ chain
-  # next to daslang.exe so the .shared_module dlopen resolves at runtime.
-  ###########################################################
-    needs: pre_job
-    if: needs.pre_job.outputs.should_skip != 'true'
-    runs-on: windows-latest-fat
-    defaults:
-      run:
-        shell: msys2 {0}
-    steps:
-    - name: "SCM Checkout"
-      uses: actions/checkout@v4
-
-    - name: "Install MSYS2 + clang-mingw64 toolchain"
-      uses: msys2/setup-msys2@v2
-      with:
-        msystem: CLANG64
-        # update:false keeps the cached pkg snapshot stable+small (no per-PR full
-        # `pacman -Syu` writing a fresh ~1.65GiB cache that evicts master slots).
-        update: false
-        cache: true
-        install: >-
-          mingw-w64-clang-x86_64-toolchain
-          mingw-w64-clang-x86_64-cmake
-          mingw-w64-clang-x86_64-ninja
-          mingw-w64-clang-x86_64-openssl
-          mingw-w64-clang-x86_64-glfw
-          bison
-          git
-
-    - name: "Build: Daslang (clang-mingw64)"
-      run: |
-        set -eux
-        mkdir -p build-mingw
-        cmake --no-warn-unused-cli -B./build-mingw -G Ninja \
-          -DCMAKE_BUILD_TYPE=Release \
-          -DCMAKE_C_COMPILER=clang \
-          -DCMAKE_CXX_COMPILER=clang++ \
-          -DDAS_CLANG_BIND_DISABLED=OFF \
-          -DDAS_LLVM_DISABLED=OFF
-        cmake --build ./build-mingw --parallel
-
-    - name: "Test: interpreter sweep"
-      run: |
-        set -eux
-        cd bin
-        ./daslang _dasroot_/dastest/dastest.das -- --color --failures-only --timeout 900 --test _dasroot_/tests \
-          || ./daslang _dasroot_/dastest/dastest.das -- --color --failures-only --isolated-mode --timeout 3600 --test _dasroot_/tests
-
-    - name: "Test: JIT sweep"
-      run: |
-        set -eux
-        cd bin
-        ./daslang _dasroot_/dastest/dastest.das -jit -- --color --failures-only --timeout 900 --test _dasroot_/tests \
-          || ./daslang _dasroot_/dastest/dastest.das -jit -- --color --failures-only --isolated-mode --timeout 3600 --test _dasroot_/tests
-
-    - name: "Small C++ Tests"
-      run: |
-        set -eux
-        cd build-mingw
-        ctest -L small --output-on-failure
-
-    - name: "Slow Release Tests (AOT)"
-      run: |
-        set -eux
-        cd bin
-        ./test_aot -use-aot _dasroot_/dastest/dastest.das -- --use-aot --color --failures-only --timeout 900 --test _dasroot_/tests
-
-    # bind_clangbind self-binder lives here (not on linux extended_checks)
-    # because dasClangBind on linux pulls libclang.so → libLLVM-22.so.1,
-    # which collides with dasLLVM in the same process (shared pass
-    # registry, double-init breaks JIT). msys2 clang64 ships libclang as
-    # a separate SO chain, and the mingw worker doesn't exercise JIT-uses-
-    # dasClangBind paths, so they coexist cleanly.
-    #
-    # TODO: bind_llvm.das self-binder doesn't run on mingw — libclang as
-    # library doesn't find <cstddef> via msys2's libcxx auto-detection.
-    # Needs explicit -resource-dir / -isystem injection. Tracked as a
-    # follow-up; we lose master's previous bind_llvm.das CI coverage in
-    # the meantime.
-    - name: "Run self-binder (bind_clangbind.das)"
-      run: |
-        set -eux
-        CLANG_INCLUDE="$(cygpath -w "${MSYSTEM_PREFIX}/include")"
-        ./bin/daslang.exe modules/dasClangBind/bind/bind_clangbind.das -- --clang_path "${CLANG_INCLUDE}/"
-        git diff --exit-code -- modules/dasClangBind/src/ \
-          || (echo "ERROR: dasClangBind generated files are out of date. Run './bin/daslang modules/dasClangBind/bind/bind_clangbind.das -- --clang_path <libclang-include-path>' locally and commit the result." && exit 1)
-
-    - name: "Run cbind const-gen regression test"
-      # Exercises collectActiveDefines (preprocessor-active constant generation);
-      # main returns non-zero on failure. Lives on the mingw worker because that
-      # is where libclang/cbind is available (same reason as the self-binder).
-      run: ./bin/daslang.exe modules/dasClangBind/tests/test_const_preproc.das
-
-  build_windows_clangcl:
-  ###########################################################
-  # Catches clang-cl (Visual Studio "ClangCL" toolset) build regressions. clang-cl
-  # sets CMake's MSVC=TRUE but uses clang's resource headers, and the toolset puts
-  # that resource include dir on INCLUDE. dasHV builds OpenSSL from source with plain
-  # cl, which rejects clang's #include_next <stdint.h> (C1021) — modules/dasHV/
-  # scrub_clang_include.cmake strips the clang dir from INCLUDE so cl falls back to
-  # MSVC's stdint.h. Without this job that fix — and clang-cl buildability generally —
-  # could silently rot. Same runner pool as the MSVC matrix; separate top-level job.
-  ###########################################################
-    needs: pre_job
-    if: needs.pre_job.outputs.should_skip != 'true'
-    runs-on: windows-latest-fat
-    steps:
-    - name: "SCM Checkout"
-      uses: actions/checkout@v4
-
-    - name: "Exclude workspace from Defender"
-      shell: pwsh
-      continue-on-error: true
-      run: |
-        Add-MpPreference -ExclusionPath "${{ github.workspace }}"
-        Add-MpPreference -ExclusionProcess "daslang.exe"
-        Add-MpPreference -ExclusionProcess "test_aot.exe"
-
-    - name: "Install nasm (OpenSSL asm)"
-      uses: ilammy/setup-nasm@v1
-
-    # dasHV builds OpenSSL from source here (the path the scrub fix targets), and
-    # nmake is serial — ~7 min. Cache the install so only the first run (or a dasHV
-    # CMakeLists change) pays it; on a hit find_package(OpenSSL) finds it and the
-    # from-source ExternalProject is skipped. (sccache — the matrix's compiler cache
-    # — is not usable here: the VS generator, required for the ClangCL toolset, does
-    # not support CMAKE_CXX_COMPILER_LAUNCHER.)
-    - name: "Cache OpenSSL (clang-cl from-source build)"
-      uses: actions/cache@v4
-      with:
-        path: |
-          build-clangcl/openssl/include
-          build-clangcl/openssl/lib
-          build-clangcl/openssl/bin
-        key: openssl-clangcl-${{ runner.os }}-${{ hashFiles('modules/dasHV/CMakeLists.txt') }}
-
-    - name: "Build: Daslang (clang-cl / VS ClangCL toolset)"
-      shell: pwsh
-      run: |
-        cmake -B build-clangcl -G "Visual Studio 17 2022" -A x64 -T ClangCL -DCMAKE_BUILD_TYPE=Release
-        if ($LASTEXITCODE -ne 0) { exit 1 }
-        cmake --build build-clangcl --config Release --parallel
-        if ($LASTEXITCODE -ne 0) { exit 1 }
-
-    - name: "Test: interpreter sweep"
-      shell: pwsh
-      run: |
-        bin\Release\daslang.exe dastest\dastest.das -- --color --failures-only --timeout 900 --test tests
-        if ($LASTEXITCODE -ne 0) { exit 1 }
-
-    - name: "Test: AOT sweep"
-      shell: pwsh
-      run: |
-        cmake --build build-clangcl --config Release --target test_aot --parallel
-        if ($LASTEXITCODE -ne 0) { exit 1 }
-        bin\Release\test_aot.exe -use-aot dastest\dastest.das -- --use-aot --color --failures-only --timeout 900 --test tests
-        if ($LASTEXITCODE -ne 0) { exit 1 }
-
-    - name: "Small C++ tests"
-      shell: pwsh
-      run: |
-        cd build-clangcl
-        ctest --build-config Release -L small --output-on-failure
-        if ($LASTEXITCODE -ne 0) { exit 1 }
-
-  build_linux_gcc:
-  ###########################################################
-  # Catches gcc-only -Werror breaks at PR time. Every Linux lane in this
-  # workflow builds with CC=clang CXX=clang++, so warnings that only gcc emits
-  # (glibc warn_unused_result on chdir/etc., -Wstringop-overflow / -Warray-bounds
-  # / -Wmaybe-uninitialized false positives under -O3) are invisible to our own
-  # CI and only ever surface downstream, where external module repos build
-  # daslang from source with the default system g++ (e.g. dasImgui's
-  # ubuntu-latest job). This job closes that gap. Compile-only: the clang lanes
-  # already run the test sweeps; the point here is the strict-warning gate.
-  #
-  # Config mirrors the linux_arm lane (GLFW off, HV+SQLITE on); LLVM is left off
-  # to keep this fast — its module also goes through DAS_APPLY_STRICT_WARNINGS,
-  # but the LLVM build dominates walltime and the bulk of strict-compiled code
-  # (core + HV/SQLITE/Audio/PUGIXML/UnitTest modules) is covered without it.
-  ###########################################################
-    needs: pre_job
-    if: needs.pre_job.outputs.should_skip != 'true'
-    runs-on: ubuntu-latest-fat
-    steps:
-    - name: "SCM Checkout"
-      uses: actions/checkout@v4
-
-    # Pinned CMake + Ninja, matching the other Linux jobs (bison is preinstalled
-    # on the ubuntu runners — the matrix linux64 job relies on it the same way).
-    - name: "Get CMake + Ninja"
-      uses: lukka/get-cmake@latest
-
-    - name: "Build: Daslang (gcc -Werror)"
-      run: |
-        set -eux
-        CC=gcc CXX=g++ cmake --no-warn-unused-cli -B./build-gcc -G Ninja \
-          -DCMAKE_BUILD_TYPE=Release \
-          -DDAS_GLFW_DISABLED=ON \
-          -DDAS_HV_DISABLED=OFF \
-          -DDAS_SQLITE_DISABLED=OFF \
-          -DDAS_LLVM_DISABLED=ON
-        cmake --build ./build-gcc --parallel
 

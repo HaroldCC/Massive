@@ -1,5 +1,7 @@
 options gen2
 options indenting = 4
+options no_unused_block_arguments = false
+options no_unused_function_arguments = false
 options strict_smart_pointers = true
 
 module cpp_bind public
@@ -18,7 +20,7 @@ require daslib/strings_boost
 
 def private log_cpp_class_method(cpp_file : file; name : string; fntype : TypeDeclPtr) {
     var cft = clone_type(fntype.firstType)
-    cft.flags.smartPtrNative = true
+    cft.flags |= TypeDeclFlags.smartPtrNative
     let rettd = describe_cpp(cft)
     fwrite(cpp_file, "{rettd} {name} ( Context * __context__, Func __funcCall__")
     for (argN, argT, argI in fntype.argNames, fntype.argTypes, count()) {
@@ -37,7 +39,6 @@ def private log_cpp_class_method(cpp_file : file; name : string; fntype : TypeDe
     fwrite(cpp_file, " )")
 }
 
-[unused_argument(name)]
 def private log_cpp_class_method_call(cpp_file : file; name : string; fntype : TypeDeclPtr) {
     let rettd = describe_cpp(fntype.firstType)
     fwrite(cpp_file, "das_invoke_function<{rettd}>::invoke\n      <")
@@ -77,7 +78,9 @@ def log_cpp_class_adapter(cpp_file : file; name : string; var cinfo : TypeDeclPt
     var methods : array<tuple<name : string; index : int>>
     var types : array<TypeDeclPtr>
     for (fld, idx in cinfo.structType.fields, count()) {
-        if (!fld._type.isFunction || fld.name == "__finalize" || fld.init != null) continue
+        if (!fld._type.isFunction || fld.name == "__finalize" || fld.init != null) {
+            continue
+        }
         push(methods, (name = "{fld.name}", index = idx))
         push_clone(types, fld._type)
     }

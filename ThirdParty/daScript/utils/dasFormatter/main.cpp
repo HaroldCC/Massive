@@ -298,12 +298,9 @@ int main(int argc, char** argv) {
         tp << "no files" << "\n";
     }
     InitModules();
-    int rc;
     if (is_tests) {
-        rc = test();
+        return test();
     } else {
-        rc = das::format::run(opts, files);
+        return das::format::run(opts, files);
     }
-    Module::Shutdown();
-    return rc;
 }

@@ -490,10 +490,6 @@
         "named": true
       },
       {
-        "type": "type_witness",
-        "named": true
-      },
-      {
         "type": "typedecl_type",
         "named": true
       },
@@ -1868,28 +1864,6 @@
     "type": "for_statement",
     "named": true,
     "fields": {
-      "annotations": {
-        "multiple": true,
-        "required": false,
-        "types": [
-          {
-            "type": "[",
-            "named": false
-          },
-          {
-            "type": "]",
-            "named": false
-          },
-          {
-            "type": "annotation_argument_list",
-            "named": true
-          },
-          {
-            "type": "metadata_argument_list",
-            "named": true
-          }
-        ]
-      },
       "body": {
         "multiple": false,
         "required": true,
@@ -2108,10 +2082,6 @@
         "multiple": false,
         "required": true,
         "types": [
-          {
-            "type": "_expression",
-            "named": true
-          },
           {
             "type": "block",
             "named": true
@@ -3130,20 +3100,6 @@
           }
         ]
       },
-      "guard": {
-        "multiple": true,
-        "required": false,
-        "types": [
-          {
-            "type": "?",
-            "named": false
-          },
-          {
-            "type": "identifier",
-            "named": true
-          }
-        ]
-      },
       "module": {
         "multiple": false,
         "required": true,
@@ -3293,7 +3249,6 @@
   {
     "type": "source_file",
     "named": true,
-    "root": true,
     "fields": {},
     "children": {
       "multiple": true,
@@ -3622,10 +3577,6 @@
         "multiple": false,
         "required": false,
         "types": [
-          {
-            "type": "_expression",
-            "named": true
-          },
           {
             "type": "block",
             "named": true
@@ -4083,26 +4034,10 @@
           "named": true
         },
         {
-          "type": "type_witness",
+          "type": "_type",
           "named": true
         }
       ]
-    }
-  },
-  {
-    "type": "type_witness",
-    "named": true,
-    "fields": {
-      "type": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "_type",
-            "named": true
-          }
-        ]
-      }
     }
   },
   {
@@ -4453,28 +4388,6 @@
     "type": "while_statement",
     "named": true,
     "fields": {
-      "annotations": {
-        "multiple": true,
-        "required": false,
-        "types": [
-          {
-            "type": "[",
-            "named": false
-          },
-          {
-            "type": "]",
-            "named": false
-          },
-          {
-            "type": "annotation_argument_list",
-            "named": true
-          },
-          {
-            "type": "metadata_argument_list",
-            "named": true
-          }
-        ]
-      },
       "body": {
         "multiple": false,
         "required": true,
@@ -4824,8 +4737,7 @@
   },
   {
     "type": "block_comment",
-    "named": true,
-    "extra": true
+    "named": true
   },
   {
     "type": "bool",
@@ -5045,8 +4957,7 @@
   },
   {
     "type": "line_comment",
-    "named": true,
-    "extra": true
+    "named": true
   },
   {
     "type": "module",

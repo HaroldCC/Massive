@@ -1,5 +1,7 @@
 options gen2
 options indenting = 4
+options no_unused_block_arguments = false
+options no_unused_function_arguments = false
 options strict_smart_pointers = true
 
 module unroll shared private
@@ -37,12 +39,14 @@ class UnrollMacro : AstFunctionAnnotation {
             // In lint mode, skip unrolling — return the inner for loop as-is
             var mblk = unsafe(reinterpret<ExprMakeBlock?>(call.arguments[0]))
             var blk = unsafe(reinterpret<ExprBlock?>(mblk._block))
-            if (blk.list |> length == 1 && blk.list[0] is ExprFor) return <- clone_expression(blk.list[0])
+            if (blk.list |> length == 1 && blk.list[0] is ExprFor) {
+                return <- clone_expression(blk.list[0])
+            }
         }
         assert(call.arguments[0] is ExprMakeBlock)
         var mblk = unsafe(reinterpret<ExprMakeBlock?>(call.arguments[0]))
         var blk = unsafe(reinterpret<ExprBlock?>(mblk._block))
-        if (!empty(blk.finalList)) {
+        if (blk.finalList |> length != 0) {
             errors := "not expecting finally section in the unroll"
             return null
         }

@@ -89,7 +89,7 @@ namespace das {
     TypeDeclPtr makeExprAscendFlags() {
         auto ft = new TypeDecl(Type::tBitfield);
         ft->alias = "ExprAscendFlags";
-        ft->argNames = { "useStackRef", "needTypeInfo", "allocate_on_stack" };
+        ft->argNames = { "useStackRef", "needTypeInfo", "isMakeLambda" };
         return ft;
     }
 
@@ -157,8 +157,7 @@ namespace das {
             "removeRef", "removeConstant", "removeDim",
             "removeTemporary", "explicitConst", "aotAlias", "smartPtr",
             "smartPtrNative", "isExplicit", "isNativeDim", "isTag", "explicitRef",
-            "isPrivateAlias", "autoToAlias", "safeWhenUninitialized",
-            "enumStubBinding", "enumStubIsUnsigned" };
+            "isPrivateAlias", "autoToAlias", "safeWhenUninitialized" };
         return ft;
     }
 
@@ -167,7 +166,7 @@ namespace das {
         ft->alias = "FieldDeclarationFlags";
         ft->argNames = { "moveSemantics", "parentType", "capturedConstant",
             "generated", "capturedRef", "doNotDelete", "privateField", "_sealed",
-            "implemented", "classMethod", "_abstract", "inherited" };
+            "implemented", "classMethod" };
         return ft;
     }
 
@@ -237,13 +236,6 @@ namespace das {
         return ft;
     }
 
-    TypeDeclPtr makeVariableAccessInfoFlags() {
-        auto ft = new TypeDecl(Type::tBitfield);
-        ft->alias = "VariableAccessInfoFlags";
-        ft->argNames = { "access_info_pass_mutable" };
-        return ft;
-    }
-
     TypeDeclPtr makeExprCopyFlags() {
         auto ft = new TypeDecl(Type::tBitfield);
         ft->alias = "CopyFlags";
@@ -286,7 +278,6 @@ namespace das {
         addAlias(makeFunctionSideEffectFlags());
         addAlias(makeVariableFlags());
         addAlias(makeVariableAccessFlags());
-        addAlias(makeVariableAccessInfoFlags());
         addAlias(makeExprBlockFlags());
         addAlias(makeExprAtFlags());
         addAlias(makeExprMakeLocalFlags());

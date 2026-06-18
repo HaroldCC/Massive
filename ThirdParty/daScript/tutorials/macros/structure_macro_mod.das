@@ -107,7 +107,7 @@ class SerializableMacro : AstStructureAnnotation {
         var fn = qmacro_function(funcName) $(obj : $t(st)) {
             $b(bodyExprs)
         }
-        fn.flags.generated = true
+        fn.flags |= FunctionFlags.generated
         fn.body |> force_at(st.at)
         add_function(st._module, fn)
 
@@ -137,7 +137,9 @@ class SerializableMacro : AstStructureAnnotation {
                        var astChanged : bool&) : bool {
         // Guard: if we already patched, do nothing.
         // This prevents infinite re-inference loops.
-        if (find_arg(args, "patched") is tBool) return true
+        if (find_arg(args, "patched") is tBool) {
+            return true
+        }
 
         // Find the stub function generated in apply()
         let funcName = "describe_{st.name}"
@@ -153,10 +155,13 @@ class SerializableMacro : AstStructureAnnotation {
 
             // Append one print group per serializable field
             for (fld in st.fields) {
-                // Skip _version + non-serializable types (only known after inference)
-                if (fld.name == "_version"
-                        || fld._type.baseType == Type.tLambda
-                        || fld._type.baseType == Type.tFunction) continue
+                if (fld.name == "_version") {
+                    continue
+                }
+                // Skip non-serializable types — only known after inference
+                if (fld._type.baseType == Type.tLambda || fld._type.baseType == Type.tFunction) {
+                    continue
+                }
                 blk.list |> emplace_new <| qmacro(print($v("  {fld.name} = ")))
                 blk.list |> emplace_new <| qmacro(print("{obj.$f(fld.name)}"))
                 blk.list |> emplace_new <| qmacro(print($v("\n")))
@@ -185,7 +190,9 @@ class SerializableMacro : AstStructureAnnotation {
         var serializable = 0
         var skipped = 0
         for (fld in st.fields) {
-            if (fld.name == "_version") continue
+            if (fld.name == "_version") {
+                continue
+            }
             if (fld._type.baseType == Type.tLambda || fld._type.baseType == Type.tFunction) {
                 skipped++
             } else {

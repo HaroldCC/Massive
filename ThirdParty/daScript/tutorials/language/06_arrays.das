@@ -44,7 +44,7 @@ def main {
     // Dynamic arrays are heap-allocated and can grow.
     // They use move semantics (<-) — they cannot be copied with =.
 
-    var numbers : array<int>  // nolint:STYLE012 — tutorial demonstrates push semantics explicitly
+    var numbers : array<int>
     push(numbers, 10)
     push(numbers, 20)
     push(numbers, 30)
@@ -107,22 +107,6 @@ def main {
     clear(buf)                          // removes all elements
     print("after clear: length = {length(buf)}\n")
 
-    // === Bulk append: push_from / push_clone_from / emplace_from ===
-    // Element-at-a-time loops are noise. Use the bulk *_from overloads when
-    // copying every element of a source array — they reserve the combined
-    // capacity once.
-
-    var prefix <- [1, 2, 3]
-    var suffix <- [4, 5]
-    var combined : array<int>
-    combined |> push_from(prefix)
-    combined |> push_from(suffix)
-    print("combined: ")
-    for (c in combined) {
-        print("{c} ")
-    }
-    print("\n")
-
     // === Array comprehension ===
     // Concise syntax to build arrays from expressions.
     // [for (var in range); expression]
@@ -161,6 +145,5 @@ def main {
 // source length after move: 0
 // resized buf: 0 0 0 0 0
 // after clear: length = 0
-// combined: 1 2 3 4 5
 // squares: 0 1 4 9 16 25
 // evens: 0 2 4 6 8

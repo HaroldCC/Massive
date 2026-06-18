@@ -31,7 +31,7 @@ def main {
     print("mul_lambda(5) = {mul_lambda(5)}\n")   // 50
 
     // Changing the original variable does NOT affect the lambda (captured by copy).
-    multiplier = 999  // nolint:LINT010 — dead-by-design; lambda has its own captured copy
+    multiplier = 999
     print("mul_lambda(5) still = {mul_lambda(5)}\n")  // still 50
 
     // === Simplified => syntax ===
@@ -46,13 +46,9 @@ def main {
     print("invoke:      {invoke(doubler, 3)}\n")
 
     // === Storing lambdas ===
-    // A lambda value is a fat pointer to a capture frame.
-    // '=' copies the pointer (both bindings now alias the same capture),
-    // '<-' moves (source becomes null), '@ ...' creates a fresh capture.
-    // var alias = doubler     // OK — alias shares doubler's capture frame
-    // var moved <- doubler    // OK and doubler becomes null
-    // 'delete' on a lambda requires 'unsafe' since copies may alias it:
-    //     unsafe { delete doubler; }
+    // Lambdas MUST be moved with <- (they cannot be copied).
+    // var copy = doubler      // ERROR: lambdas can't be copied
+    // var moved <- doubler    // OK but doubler becomes null
 
     // === Storing lambdas in arrays ===
     // Lambdas can be stored in arrays using emplace (which moves them in).
@@ -70,9 +66,7 @@ def main {
         invoke(cb)
     }
     print("stored {length(callbacks)} lambdas in array\n")
-    // 'array<lambda<...>>' inherits the lambda's unsafe-delete rule, since
-    // finalizing the array would delete every element lambda.
-    unsafe { delete callbacks; }
+    delete callbacks
 
     // === Passing lambdas to functions ===
     // Functions that take lambda<> accept only @ lambdas (not @@ functions).

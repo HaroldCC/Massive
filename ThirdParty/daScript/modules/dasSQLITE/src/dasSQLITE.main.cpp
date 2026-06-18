@@ -1,0 +1,141 @@
+#include "daScript/misc/platform.h"
+
+#include "daScript/ast/ast.h"
+#include "daScript/ast/ast_interop.h"
+#include "daScript/ast/ast_typefactory_bind.h"
+#include "daScript/ast/ast_handle.h"
+
+#include "dasSQLITE.h"
+
+#include "aot_sqlite.h"
+
+namespace das {
+
+#if 0
+SQLITE_API int sqlite3_exec(
+  sqlite3*,                                  /* An open database */
+  const char *sql,                           /* SQL to be evaluated */
+  int (*callback)(void*,int,char**,char**),  /* Callback function */
+  void *,                                    /* 1st argument to callback */
+  char **errmsg                              /* Error msg written here */
+);
+#endif
+
+int sqlite3_exec(sqlite3 * db, const char * sql, char ** errmsg) {
+    return sqlite3_exec(db, sql, nullptr, nullptr, errmsg);
+}
+
+struct ExecCallback {
+    const Block * block = nullptr;
+    Context * context = nullptr;
+    LineInfoArg * at = nullptr;
+};
+
+int exec_callback ( void * arg, int argc, char ** argv, char ** colName ) {
+    ExecCallback * cb = (ExecCallback *) arg;
+    Array arrFields;
+    array_mark_locked(arrFields, (char *) argv, argc);
+    Array arrColumns;
+    array_mark_locked(arrColumns, (char *) colName, argc);
+    vec4f args[2] = {
+        cast<Array *>::from(&arrFields),
+        cast<Array *>::from(&arrColumns)
+    };
+    auto res = cb->context->invoke(*cb->block, args, nullptr, cb->at);
+    return cast<int>::to(res);
+}
+
+int sqlite3_exec_cb(sqlite3 * db, const char * sql, char ** errmsg,
+        const TBlock<int,const TTemporary<TArray<char *>>,const TTemporary<TArray<char *>>> & block,
+            Context * context, LineInfoArg * at ) {
+    ExecCallback cb;
+    cb.block = &block;
+    cb.context = context;
+    cb.at = at;
+    return sqlite3_exec(db, sql, exec_callback, &cb, errmsg);
+}
+
+int sqlite3_bind_blob_ ( sqlite3_stmt * stmt, int index, void * data, int size ) {
+    return sqlite3_bind_blob(stmt, index, data, size, SQLITE_TRANSIENT);
+}
+
+int sqlite3_bind_text_ ( sqlite3_stmt * stmt, int index, const char * data ) {
+    return sqlite3_bind_text(stmt, index, data, -1, SQLITE_TRANSIENT);
+}
+
+// pzTail-free wrapper: libsqlite3's pzTail (const char **) renders to daslang
+// as `string const?`, which the AOT codegen emits as `char * const *` instead
+// of `const char **` (the const lands on the wrong indirection level). We
+// don't use pzTail in any boost call, so dropping the parameter at the C++
+// boundary sidesteps the codegen bug entirely.
+int sqlite3_prepare_v2_no_tail ( sqlite3 * db, const char * sql, sqlite3_stmt ** stmt ) {
+    return sqlite3_prepare_v2(db, sql, -1, stmt, nullptr);
+}
+
+// vfs-free open_v2 wrapper: daslang's `string` parameter cannot represent C `NULL`,
+// so an empty daslang string passed as zVfs hits sqlite as "" and fails ("no such vfs:").
+// The schema_from macro needs READONLY-no-create open semantics, so we expose this
+// shim that always passes nullptr for the default vfs.
+int sqlite3_open_v2_no_vfs ( const char * filename, sqlite3 ** ppDb, int flags ) {
+    return sqlite3_open_v2(filename, ppDb, flags, nullptr);
+}
+
+void Module_dasSQLITE::initMain() {
+
+    addExtern<DAS_BIND_FUN(sqlite3_exec)>(*this,lib,"sqlite3_exec",
+        SideEffects::worstDefault, "sqlite3_exec")
+            ->args({"db","sql","errmsg"});
+    addExtern<DAS_BIND_FUN(sqlite3_exec_cb)>(*this,lib,"sqlite3_exec",
+        SideEffects::worstDefault, "sqlite3_exec_cb")
+            ->args({"db","sql","errmsg","block","context","at"});
+    addExtern<DAS_BIND_FUN(sqlite3_bind_blob_)>(*this,lib,"sqlite3_bind_blob",
+        SideEffects::worstDefault, "sqlite3_bind_blob_")
+            ->args({"stmt","sqlite3_bind_text_","data","size"});
+    addExtern<DAS_BIND_FUN(sqlite3_bind_text_)>(*this,lib,"sqlite3_bind_text",
+        SideEffects::worstDefault, "sqlite3_bind_text_")
+            ->args({"stmt","index","data"});
+    addExtern<DAS_BIND_FUN(sqlite3_prepare_v2_no_tail)>(*this,lib,"sqlite3_prepare_v2_no_tail",
+        SideEffects::worstDefault, "sqlite3_prepare_v2_no_tail")
+            ->args({"db","sql","stmt"});
+    addExtern<DAS_BIND_FUN(sqlite3_open_v2_no_vfs)>(*this,lib,"sqlite3_open_v2_no_vfs",
+        SideEffects::worstDefault, "sqlite3_open_v2_no_vfs")
+            ->args({"filename","ppDb","flags"});
+    addExtern<DAS_BIND_FUN(sqlite3_register_function)>(*this,lib,"sqlite3_register_function",
+        SideEffects::worstDefault, "sqlite3_register_function")
+            ->args({"db","name","fn","nArgs",
+                    "tag0","tag1","tag2","tag3",
+                    "retTag","deterministic","directonly","context","at"});
+    addExtern<DAS_BIND_FUN(sqlite3_backup_run)>(*this,lib,"sqlite3_backup_run",
+        SideEffects::worstDefault, "sqlite3_backup_run")
+            ->args({"src","dst"});
+
+    for ( auto & pfn : this->functions.each() ) {
+        // ok, lets fix up everything returning uint8? into returning string# and make it unsafe operation
+        if ( pfn->result->isPointer() && pfn->result->firstType &&
+                pfn->result->firstType->baseType==Type::tUInt8 && pfn->result->firstType->dim.size()==0 ) {
+            pfn->result = new TypeDecl(Type::tString);
+            pfn->result->constant = true;
+            pfn->result->temporary = true;
+            pfn->unsafeOperation = true;
+        }
+        // fixup module functions, so that there is a string cast
+        bool anyString = false;
+        for ( auto & arg : pfn->arguments ) {
+            if ( arg->type->isString() && !arg->type->ref ) {
+                anyString = true;
+            }
+        }
+        if ( anyString ) {
+            pfn->needStringCast = true;
+        }
+    }
+}
+
+ModuleAotType Module_dasSQLITE::aotRequire ( TextWriter & tw ) const {
+    tw << "#include \"../modules/dasSQLITE/src/aot_sqlite.h\"\n";
+    return ModuleAotType::cpp;
+}
+
+}
+
+

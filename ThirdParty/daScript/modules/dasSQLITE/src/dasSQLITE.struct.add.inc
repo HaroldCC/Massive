@@ -1,0 +1,47 @@
+// this file is generated via daScript automatic C++ binder
+// all user modifications will be lost after this file is re-generated
+
+auto ann_sqlite3_file = new sqlite3_file_GeneratedAnnotation(lib);
+addAnnotation(ann_sqlite3_file);
+auto ann_sqlite3_io_methods = new sqlite3_io_methods_GeneratedAnnotation(lib);
+addAnnotation(ann_sqlite3_io_methods);
+auto ann_sqlite3_vfs = new sqlite3_vfs_GeneratedAnnotation(lib);
+addAnnotation(ann_sqlite3_vfs);
+auto ann_sqlite3_mem_methods = new sqlite3_mem_methods_GeneratedAnnotation(lib);
+addAnnotation(ann_sqlite3_mem_methods);
+auto ann_sqlite3_module = new sqlite3_module_GeneratedAnnotation(lib);
+addAnnotation(ann_sqlite3_module);
+auto ann_sqlite3_index_constraint = new sqlite3_index_info_sqlite3_index_constraint_GeneratedAnnotation(lib);
+addAnnotation(ann_sqlite3_index_constraint);
+auto ann_sqlite3_index_orderby = new sqlite3_index_info_sqlite3_index_orderby_GeneratedAnnotation(lib);
+addAnnotation(ann_sqlite3_index_orderby);
+auto ann_sqlite3_index_constraint_usage = new sqlite3_index_info_sqlite3_index_constraint_usage_GeneratedAnnotation(lib);
+addAnnotation(ann_sqlite3_index_constraint_usage);
+auto ann_sqlite3_index_info = new sqlite3_index_info_GeneratedAnnotation(lib);
+addAnnotation(ann_sqlite3_index_info);
+auto ann_sqlite3_vtab = new sqlite3_vtab_GeneratedAnnotation(lib);
+addAnnotation(ann_sqlite3_vtab);
+auto ann_sqlite3_vtab_cursor = new sqlite3_vtab_cursor_GeneratedAnnotation(lib);
+addAnnotation(ann_sqlite3_vtab_cursor);
+auto ann_sqlite3_mutex_methods = new sqlite3_mutex_methods_GeneratedAnnotation(lib);
+addAnnotation(ann_sqlite3_mutex_methods);
+auto ann_sqlite3_pcache_page = new sqlite3_pcache_page_GeneratedAnnotation(lib);
+addAnnotation(ann_sqlite3_pcache_page);
+auto ann_sqlite3_pcache_methods2 = new sqlite3_pcache_methods2_GeneratedAnnotation(lib);
+addAnnotation(ann_sqlite3_pcache_methods2);
+auto ann_sqlite3_pcache_methods = new sqlite3_pcache_methods_GeneratedAnnotation(lib);
+addAnnotation(ann_sqlite3_pcache_methods);
+auto ann_sqlite3_snapshot = new sqlite3_snapshot_GeneratedAnnotation(lib);
+addAnnotation(ann_sqlite3_snapshot);
+auto ann_sqlite3_rtree_geometry = new sqlite3_rtree_geometry_GeneratedAnnotation(lib);
+addAnnotation(ann_sqlite3_rtree_geometry);
+auto ann_sqlite3_rtree_query_info = new sqlite3_rtree_query_info_GeneratedAnnotation(lib);
+addAnnotation(ann_sqlite3_rtree_query_info);
+auto ann_Fts5PhraseIter = new Fts5PhraseIter_GeneratedAnnotation(lib);
+addAnnotation(ann_Fts5PhraseIter);
+auto ann_Fts5ExtensionApi = new Fts5ExtensionApi_GeneratedAnnotation(lib);
+addAnnotation(ann_Fts5ExtensionApi);
+auto ann_fts5_tokenizer = new fts5_tokenizer_GeneratedAnnotation(lib);
+addAnnotation(ann_fts5_tokenizer);
+auto ann_fts5_api = new fts5_api_GeneratedAnnotation(lib);
+addAnnotation(ann_fts5_api);

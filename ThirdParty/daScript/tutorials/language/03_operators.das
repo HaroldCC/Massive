@@ -34,11 +34,11 @@ def main {
     print("x / y = {x / y}\n")     // float division
 
     // === Comparison ===
-    print("5 == 5 is {5 == 5}\n")  // nolint:LINT007 — tutorial demonstrates the `==` operator
+    print("5 == 5 is {5 == 5}\n")
     print("5 != 3 is {5 != 3}\n")
     print("5 > 3 is {5 > 3}\n")
     print("5 < 3 is {5 < 3}\n")
-    print("5 >= 5 is {5 >= 5}\n")  // nolint:LINT007 — tutorial demonstrates the `>=` operator
+    print("5 >= 5 is {5 >= 5}\n")
     print("5 <= 4 is {5 <= 4}\n")
 
     // === Logical ===
@@ -87,7 +87,7 @@ def main {
 
     // = is copy assignment — works for simple types and copyable values.
     let p = 10
-    var q = p       // q is a copy of p  // nolint:LINT010 — demonstrating reassignment after copy
+    var q = p       // q is a copy of p
     q = 99
     print("p={p}  q={q}\n")    // p is unchanged
 

@@ -1,17 +1,16 @@
 #include "daScript/misc/platform.h"
 
-#include "daScript/simulate/runtime_iterator.h"
 #include "daScript/simulate/runtime_table_nodes.h"
 
 namespace das
 {
     template <typename KeyType>
-    void table_reserve_internal ( Context & context, Table & arr, uint64_t newCapacity, uint32_t valueTypeSize, LineInfo * at ) {
+    void table_reserve_internal ( Context & context, Table & arr, uint32_t newCapacity, uint32_t valueTypeSize, LineInfo * at ) {
         TableHash<KeyType> hash(&context, valueTypeSize);
         hash.reserve(arr, newCapacity, at);
     }
 
-    void table_reserve_impl ( Context & context, Table & arr, int32_t baseType, uint64_t newCapacity, uint32_t valueTypeSize, LineInfo * at ) {
+    void table_reserve_impl ( Context & context, Table & arr, int32_t baseType, uint32_t newCapacity, uint32_t valueTypeSize, LineInfo * at ) {
         if ( arr.isLocked() ) context.throw_error_at(at, "can't reserve locked table");
         if ( !newCapacity ) return;
         switch ( Type(baseType) ) {
@@ -58,7 +57,7 @@ namespace das
     void table_clear ( Context & context, Table & arr, LineInfo * at ) {
         if ( arr.isLocked() ) context.throw_error_at(at, "can't clear locked table");
         if ( arr.data ) {
-            memset(arr.hashes, 0, arr.capacity*tableHashSlotBytes(arr));
+            memset(arr.hashes, 0, arr.capacity*sizeof(TableHashKey));
             memset(arr.data, 0, arr.keys - arr.data);
         }
         arr.size = 0;
@@ -102,7 +101,7 @@ namespace das
 
     size_t TableIterator::nextValid ( size_t index ) const {
         for ( auto indexs=table->capacity; index < indexs; index++) {
-            if (tableLiveSlot(*table, index)) {
+            if (table->hashes[index] > HASH_KILLED64) {
                 break;
             }
         }
@@ -157,19 +156,15 @@ namespace das
             table_end = data + table->capacity*stride;
             size_t index = nextValid(0);
             data += index * stride;
-            // Only read the key when the slot is real: an empty / fully-erased table lands data at
-            // table_end (one past the keys block). For a non-string packed table the keys block is
-            // the last region (no hash array follows), so dereferencing there is a heap overflow.
-            if ( data != table_end ) *(KeyType *)_value = *(KeyType *)data;
+            if ( data ) *(KeyType *)_value = *(KeyType *)data;
             return (bool) table->size;
         }
         virtual bool next  ( Context &, char * _value ) override {
             size_t index = (data-originData)/stride;
             index = nextValid(index + 1);
             data = originData + index * stride;
-            bool more = data != table_end;
-            if ( more ) *(KeyType *)_value = *(KeyType *)data;   // skip the past-end read on exhaustion
-            return more;
+            *(KeyType *)_value = *(KeyType *)data;
+            return data != table_end;
         }
         virtual void close ( Context & context, char * ) override {
             if ( getData()!=originData ) {
@@ -216,7 +211,7 @@ namespace das
             return;
         }
         ptrdiff_t index = offset / value_stride;
-        if ( !tableLiveSlot(tab, (uint64_t)index) ) {
+        if ( tab.hashes[index] <= HASH_KILLED64 ) {
             __context__->throw_error_at(at, "get_key: value points to an empty or deleted table slot");
             return;
         }
@@ -232,7 +227,7 @@ namespace das
         for ( uint32_t i=0, is=total; i!=is; ++i, pTable-- ) {
             if ( pTable->data ) {
                 if ( !pTable->isLocked() ) {
-                    uint64_t oldSize = pTable->capacity * uint64_t(vts_add_kts) + pTable->capacity*tableHashSlotBytes(*pTable);
+                    uint32_t oldSize = pTable->capacity*(vts_add_kts + sizeof(TableHashKey));
                     context.free(pTable->data, oldSize, &debugInfo);
                 } else {
                     context.throw_error_at(debugInfo, "deleting locked table%s", errorMessage);

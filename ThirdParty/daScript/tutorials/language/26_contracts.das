@@ -33,7 +33,7 @@ require daslib/contracts
 // [expect_any_array] — matches array<T>, T[N], or das::vector<T>
 [expect_any_array(arr)]
 def print_first(arr) {
-    if (!empty(arr)) {
+    if (length(arr) > 0) {
         print("  first element: {arr[0]}\n")
     } else {
         print("  empty array\n")
@@ -101,7 +101,6 @@ def not_a_number(x) : string {
 // Fallback that accepts anything (including numeric)
 // When x IS numeric, the contract [!expect_any_numeric] fails,
 // so this fallback is selected instead.
-[unused_argument(x)]
 def not_a_number(x : int) : string {
     return "is numeric"
 }

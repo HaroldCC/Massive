@@ -1,6 +1,5 @@
 #pragma once
 
-#include "daScript/simulate/runtime_iterator.h"
 #include "daScript/simulate/simulate.h"
 
 namespace das

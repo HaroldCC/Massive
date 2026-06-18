@@ -100,8 +100,12 @@ def main {
 
     // Multi-line anonymous function
     let clamp <- @@(x : int) : int {
-        if (x < 0) return 0
-        if (x > 100) return 100
+        if (x < 0) {
+            return 0
+        }
+        if (x > 100) {
+            return 100
+        }
         return x
     }
     print("clamp(-5) = {clamp(-5)}\n")

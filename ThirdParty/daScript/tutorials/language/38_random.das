@@ -115,7 +115,9 @@ def iterator_demo() {
     for (val in each_random_uint(42)) {
         print("{val} ")
         count ++
-        if (count >= 5) break
+        if (count >= 5) {
+            break
+        }
     }
     print("\n")
 }

@@ -21,15 +21,15 @@ namespace das {
     void assignDefaultArguments ( Function * func );
 
     // puts all expression's subexpressions at new location
-    DAS_CC_API ExpressionPtr forceAt ( ExpressionPtr expr, const LineInfo & at );
-    DAS_CC_API FunctionPtr forceAtFunction ( const FunctionPtr & func, const LineInfo & at );
+    ExpressionPtr forceAt ( ExpressionPtr expr, const LineInfo & at );
+    FunctionPtr forceAtFunction ( const FunctionPtr & func, const LineInfo & at );
 
     // change generated flag for all subexpressions and variables
-    DAS_CC_API ExpressionPtr forceGenerated ( ExpressionPtr expr, bool setGenerated );
-    DAS_CC_API FunctionPtr forceGeneratedFunction ( const FunctionPtr & expr, bool setGenerated );
+    ExpressionPtr forceGenerated ( ExpressionPtr expr, bool setGenerated );
+    FunctionPtr forceGeneratedFunction ( const FunctionPtr & expr, bool setGenerated );
 
     // gives combined region for all subexpressions
-    DAS_CC_API LineInfo encloseAt ( ExpressionPtr expr );
+    LineInfo encloseAt ( ExpressionPtr expr );
 
     // replaces all occurrences of block argument name
     void renameBlockArgument ( ExprBlock * block, const string & name, const string & newName );
@@ -56,7 +56,7 @@ namespace das {
             with self
                 ...
     */
-    DAS_CC_API void modifyToClassMember ( Function * func, Structure * baseClass, bool isExplicit, bool isConstant );
+    DAS_API void modifyToClassMember ( Function * func, Structure * baseClass, bool isExplicit, bool isConstant );
 
     /*
         def Foo ( ... )
@@ -64,38 +64,24 @@ namespace das {
             Foo`Foo(self,...)
             return self
     */
-    DAS_CC_API FunctionPtr makeClassConstructor ( Structure * baseClass, Function * method );
+    DAS_API FunctionPtr makeClassConstructor ( Structure * baseClass, Function * method );
 
     /*
         __rtti : void? = typeinfo(rtti_classinfo type<Foo>)
     */
-    DAS_CC_API void makeClassRtti ( Structure * baseClass );
+    DAS_API void makeClassRtti ( Structure * baseClass );
 
     /*
         override def __finalize()
             delete self
     */
-    DAS_CC_API FunctionPtr makeClassFinalize ( Structure * baseClass );
+    DAS_API FunctionPtr makeClassFinalize ( Structure * baseClass );
 
     /*
      def STRUCT_NAME
         return [[STRUCT_NAME field1=init1, field2=init2, ...]]
      */
-    FunctionPtr makeConstructor ( Structure * str, bool isPrivate );
-
-    // Walk `cls`'s inheritance chain starting from cls->parent, return the closest
-    // ancestor with a user-defined ctor (Klass`Klass not generated). Used by the
-    // synth-ctor body emitter (skip past empty intermediates straight to the deepest
-    // user code) and by the lint (super(...) walk-up matches the same target).
-    // Returns nullptr if `cls` isn't a class, has no parent, or no ancestor has a
-    // user ctor.
-    DAS_CC_API Structure * findChainCtorAncestor ( Structure * cls );
-
-    // Finalizer twin of findChainCtorAncestor: closest ancestor with a user-defined
-    // finalizer ("finalize" class method, not generated). Used by the generated
-    // structure finalizer (chain to the parent's finalize) and by the lint
-    // (derived user finalizer must `delete super.self` when this returns non-null).
-    DAS_API Structure * findChainFinalizerAncestor ( Structure * cls );
+    DAS_API FunctionPtr makeConstructor ( Structure * str, bool isPrivate );
 
     /*
      def clone(var a:STRUCT_NAME; b:STRUCT_NAME)
@@ -103,7 +89,7 @@ namespace das {
         a.f2 := b.f2
         ...
     */
-    DAS_CC_API FunctionPtr makeClone ( Structure * str );
+    DAS_API FunctionPtr makeClone ( Structure * str );
 
     /*
      def clone(var a:tuple<...>; var b:tuple<...>)
@@ -111,7 +97,7 @@ namespace das {
       a._1 := b._1
       ...
     */
-    FunctionPtr makeCloneTuple(const LineInfo & at, const TypeDeclPtr & tupleType, bool fromConst);
+    DAS_API FunctionPtr makeCloneTuple(const LineInfo & at, const TypeDeclPtr & tupleType, bool fromConst);
 
     /*
      def clone(var a:tuple<...>; var b:tuple<...>)
@@ -121,23 +107,23 @@ namespace das {
         a._1 := b._1
       ...
     */
-    FunctionPtr makeCloneVariant(const LineInfo & at, const TypeDeclPtr & variantType, bool fromConst);
+    DAS_API FunctionPtr makeCloneVariant(const LineInfo & at, const TypeDeclPtr & variantType, bool fromConst);
 
     /*
         delete var
      */
-    ExpressionPtr makeDelete ( const VariablePtr & var );
+    DAS_API ExpressionPtr makeDelete ( const VariablePtr & var );
 
     /*
         a->b(args) is short for invoke(a.b, a, args)
      */
     struct ExprInvoke;
-    ExprInvoke * makeInvokeMethod ( const LineInfo & at, Expression * a, const string & b );
+    DAS_API ExprInvoke * makeInvokeMethod ( const LineInfo & at, Expression * a, const string & b );
 
     /*
         this is short for invoke(type<callStruct>.b, a, args)
     */
-    ExprInvoke * makeInvokeMethod ( const LineInfo & at, Structure * callStruct, Expression * a, const string & b );
+    DAS_API ExprInvoke * makeInvokeMethod ( const LineInfo & at, Structure * callStruct, Expression * a, const string & b );
 
     /*
      pointer finalizer, i.e.
@@ -147,7 +133,7 @@ namespace das {
             delete native THIS
             THIS = null
      */
-    FunctionPtr generatePointerFinalizer ( const TypeDeclPtr & ptrType, const LineInfo & at );
+    DAS_API FunctionPtr generatePointerFinalizer ( const TypeDeclPtr & ptrType, const LineInfo & at );
 
     /*
      structure finalizer, i.e.
@@ -157,7 +143,7 @@ namespace das {
             delete field2
             memzero(THIS)
      */
-    FunctionPtr generateStructureFinalizer ( const StructurePtr & ls );
+    DAS_API FunctionPtr generateStructureFinalizer ( const StructurePtr & ls );
 
     /*
      tuple finalizer, i.e.
@@ -166,7 +152,7 @@ namespace das {
         delete _1
         memzero(THIS)
      */
-    FunctionPtr generateTupleFinalizer(const LineInfo & at, const TypeDeclPtr & tupleType);
+    DAS_API FunctionPtr generateTupleFinalizer(const LineInfo & at, const TypeDeclPtr & tupleType);
 
     /*
      variant finalizer, i.e.
@@ -178,14 +164,14 @@ namespace das {
         ....
         memzero(THIS)
      */
-    FunctionPtr generateVariantFinalizer(const LineInfo & at, const TypeDeclPtr & variantType);
+    DAS_API FunctionPtr generateVariantFinalizer(const LineInfo & at, const TypeDeclPtr & variantType);
 
     /*
      variant finalizer, i.e.
       def clone(dest:smart_ptr<...>; src : any-ptr<...> )
         smart_ptr_clone(dest, src)
      */
-    FunctionPtr makeCloneSmartPtr ( const LineInfo & at, const TypeDeclPtr & left, const TypeDeclPtr & right );
+    DAS_API FunctionPtr makeCloneSmartPtr ( const LineInfo & at, const TypeDeclPtr & left, const TypeDeclPtr & right );
 
     /*
      struct __lambda_at_line_xxx
@@ -194,7 +180,7 @@ namespace das {
         capture_field_1
         capture_field_2
      */
-    StructurePtr generateLambdaStruct ( const string & lambdaName, ExprBlock * block,
+    DAS_API StructurePtr generateLambdaStruct ( const string & lambdaName, ExprBlock * block,
                                        const safe_var_set & capt, const vector<CaptureEntry> & capture, bool needYield = false );
 
     /*
@@ -208,7 +194,7 @@ namespace das {
         generator_jit = (1<<1),
         generator_nojit = (1<<2)
     };
-    FunctionPtr generateLambdaFunction ( const string & lambdaName, ExprBlock * block,
+    DAS_API FunctionPtr generateLambdaFunction ( const string & lambdaName, ExprBlock * block,
                                         const StructurePtr & ls, const safe_var_set & capt,
                                         const vector<CaptureEntry> & capture, uint32_t genFlags, Program * thisProgram );
 
@@ -216,7 +202,7 @@ namespace das {
         local function, i.e.
          def __localfunction_function_at_line_xxx(...block_args...)
      */
-    FunctionPtr generateLocalFunction ( const string & lambdaName, ExprBlock * block );
+    DAS_API FunctionPtr generateLocalFunction ( const string & lambdaName, ExprBlock * block );
 
     /*
         lambda finalizer, i.e.
@@ -224,7 +210,7 @@ namespace das {
             with THIS
                 ...block_finally...
      */
-    FunctionPtr generateLambdaFinalizer ( const string & lambdaName, ExprBlock * block,
+    DAS_API FunctionPtr generateLambdaFinalizer ( const string & lambdaName, ExprBlock * block,
                                          const StructurePtr & ls, Program * thisProgram );
 
     /*
@@ -233,7 +219,7 @@ namespace das {
             FINALIZER=@__lambda_finalier_at_line_xx;
             _ba1=ba1; ba2=ba2; ... ]]
      */
-    ExpressionPtr generateLambdaMakeStruct ( const StructurePtr & ls, const FunctionPtr & lf, const FunctionPtr & lff,
+    DAS_API ExpressionPtr generateLambdaMakeStruct ( const StructurePtr & ls, const FunctionPtr & lf, const FunctionPtr & lff,
                                             const safe_var_set & capt, const vector<CaptureEntry> & capture, const LineInfo & at,
                                             const LineInfo & captureAt, Program * thisProgram );
 
@@ -247,7 +233,7 @@ namespace das {
              return temp
     */
     struct ExprArrayComprehension;
-    ExpressionPtr generateComprehension ( ExprArrayComprehension * expr, bool tableSyntax );
+    DAS_API ExpressionPtr generateComprehension ( ExprArrayComprehension * expr, bool tableSyntax );
 
     /*
          array comprehension [[ for x in src; x_expr; where x_expr ]]
@@ -257,7 +243,7 @@ namespace das {
                      yield subexpr
              return false
     */
-    ExpressionPtr generateComprehensionIterator ( ExprArrayComprehension * expr );
+    DAS_API ExpressionPtr generateComprehensionIterator ( ExprArrayComprehension * expr );
 
     /*
         replace reference with pointer
@@ -267,19 +253,19 @@ namespace das {
             ...
             deref(blah)
      */
-    void replaceRef2Ptr ( ExpressionPtr expr, const string & name );
+    DAS_API void replaceRef2Ptr ( ExpressionPtr expr, const string & name );
 
     /*
         give variables in the scope of 'expr' block unique names
         only for the top-level block
      */
-    void giveBlockVariablesUniqueNames  ( ExpressionPtr expr );
+    DAS_API void giveBlockVariablesUniqueNames  ( ExpressionPtr expr );
 
     /*
         replace break and continue of a particular loop
         with 'goto label bg' and 'goto label cg' accordingly
      */
-    void replaceBreakAndContinue ( Expression * expr, int32_t bg, int32_t cg );
+    DAS_API void replaceBreakAndContinue ( Expression * expr, int32_t bg, int32_t cg );
 
     /*
         replace
@@ -291,7 +277,7 @@ namespace das {
             label X
      */
     struct ExprYield;
-    ExpressionPtr generateYield( ExprYield * expr, const FunctionPtr & func );
+    DAS_API ExpressionPtr generateYield( ExprYield * expr, const FunctionPtr & func );
 
     /*
         replace
@@ -303,7 +289,7 @@ namespace das {
         if variable is & - swap to pointer
      */
     struct ExprLet;
-    ExpressionPtr replaceGeneratorLet ( ExprLet * expr, const FunctionPtr & func, ExprBlock * scope );
+    DAS_API ExpressionPtr replaceGeneratorLet ( ExprLet * expr, const FunctionPtr & func, ExprBlock * scope );
 
     /*
         replace
@@ -329,7 +315,7 @@ namespace das {
 
      */
     struct ExprIfThenElse;
-    ExpressionPtr replaceGeneratorIfThenElse ( ExprIfThenElse * expr, const FunctionPtr & func );
+    DAS_API ExpressionPtr replaceGeneratorIfThenElse ( ExprIfThenElse * expr, const FunctionPtr & func );
 
     /*
     replace
@@ -346,7 +332,7 @@ namespace das {
         finally
     */
     struct ExprWhile;
-    ExpressionPtr replaceGeneratorWhile ( ExprWhile * expr, const FunctionPtr & func );
+    DAS_API ExpressionPtr replaceGeneratorWhile ( ExprWhile * expr, const FunctionPtr & func );
 
     /*
     replace
@@ -369,6 +355,6 @@ namespace das {
 
      */
     struct ExprFor;
-    ExpressionPtr replaceGeneratorFor ( ExprFor * expr, const FunctionPtr & func );
+    DAS_API ExpressionPtr replaceGeneratorFor ( ExprFor * expr, const FunctionPtr & func );
 }
 

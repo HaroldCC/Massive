@@ -22,7 +22,10 @@ def info_character_at_standalone(s : string) : int {
 }
 
 def info_character_at_if(s : string) : bool {
-    return character_at(s, 0) == 'h'
+    if (character_at(s, 0) == 'h') {       // PERF003 (informational)
+        return true
+    }
+    return false
 }
 
 // --- No warnings for peek_data ---

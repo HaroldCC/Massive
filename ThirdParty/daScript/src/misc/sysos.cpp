@@ -2,11 +2,7 @@
 
 #include "daScript/misc/sysos.h"
 
-#if defined(_WIN32) && !defined(_GAMING_XBOX) && !defined(_DURANGO)
-// All Windows toolchains use the same <windows.h> Win32 API for executable
-// path, dynamic loader, and hardware breakpoints. The old _MSC_VER gate sent
-// clang-mingw / gcc-mingw to the platform-fallback branch, which fatally
-// throws on getExecutablePathName().
+#if defined(_MSC_VER) && !defined(_GAMING_XBOX) && !defined(_DURANGO)
     #define WIN32_LEAN_AND_MEAN
     #include <windows.h>
     namespace das {
@@ -193,28 +189,18 @@
             return false;
         }
         size_t getExecutablePathName(char* pathName, size_t pathNameCapacity) {
-#if defined(_EMSCRIPTEN_VER)
-            // wasm-standalone has no /proc/self/exe; readlink would import
-            // env::__syscall_readlinkat which wasi-only hosts can't satisfy.
-            if (pathNameCapacity > 0) pathName[0] = '\0';
-            return 0;
-#else
             size_t pathNameSize = readlink("/proc/self/exe", pathName, pathNameCapacity - 1);
             pathName[pathNameSize] = '\0';
             return pathNameSize;
-#endif
         }
         void * loadDynamicLibrary ( const char * lib ) {
-            // RTLD_GLOBAL so symbols from loaded .shared_module files
-            // (e.g. live_host_*) are visible to dlsym(RTLD_DEFAULT) in
-            // host executables like daslang-live.
-            return dlopen(lib,RTLD_LAZY|RTLD_GLOBAL);
+            return dlopen(lib,RTLD_LAZY);
         }
         void * getFunctionAddress ( void * lib, const char * name ) {
             return lib ? dlsym(lib, name) : nullptr;
         }
         void * getLibraryHandle ( const char * lib ) {
-            return dlopen(lib,RTLD_LAZY|RTLD_GLOBAL);
+            return dlopen(lib,RTLD_LAZY);
         }
         string getDynamicLibraryError ( void ) {
             const char * e = dlerror();
@@ -493,14 +479,13 @@
             return 0;
         }
         void * loadDynamicLibrary ( const char * lib ) {
-            // RTLD_GLOBAL — see Linux note above.
-            return dlopen(lib,RTLD_LAZY|RTLD_GLOBAL);
+            return dlopen(lib,RTLD_LAZY);
         }
         void * getFunctionAddress ( void * lib, const char * name ) {
             return lib ? dlsym(lib, name) : nullptr;
         }
         void * getLibraryHandle ( const char * lib ) {
-            return dlopen(lib,RTLD_LAZY|RTLD_GLOBAL);
+            return dlopen(lib,RTLD_LAZY);
         }
         string getDynamicLibraryError ( void ) {
             const char * e = dlerror();
@@ -544,14 +529,13 @@
             return snprintf(pathName, pathNameCapacity, "%s", executablePath);
         }
         void * loadDynamicLibrary ( const char * lib ) {
-            // RTLD_GLOBAL — see Linux note above.
-            return dlopen(lib,RTLD_LAZY|RTLD_GLOBAL);
+            return dlopen(lib,RTLD_LAZY);
         }
         void * getFunctionAddress ( void * lib, const char * name ) {
             return lib ? dlsym(lib, name) : nullptr;
         }
         void * getLibraryHandle ( const char * lib ) {
-            return dlopen(lib,RTLD_LAZY|RTLD_GLOBAL);
+            return dlopen(lib,RTLD_LAZY);
         }
         string getDynamicLibraryError ( void ) {
             const char * e = dlerror();
