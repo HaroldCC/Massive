@@ -19,63 +19,58 @@ namespace MMO
 /** @brief thread_local 默认 = kInvalidID（0xFFFFFFFF），忘记 SetTraceID 则输出 [FFFFFFFF] */
 thread_local uint64 Log::_traceID = kInvalidID;
 
-/**
- * @brief 初始化 spdlog
- *
- * 默认 sink: stdout + colorful
- * 后续可扩展 file sink、rotating、async
- */
-void Log::Initialize()
+void Log::Init(const std::string& name, ELogLevel level)
 {
     auto sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
-    auto logger = std::make_shared<spdlog::logger>("massive", std::move(sink));
-    logger->set_level(spdlog::level::trace);
+    auto logger = std::make_shared<spdlog::logger>(name, std::move(sink));
+    logger->set_level(static_cast<spdlog::level::level_enum>(level));
     logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
     spdlog::set_default_logger(logger);
 }
 
-/** @brief 关闭 spdlog */
 void Log::Shutdown()
 {
     spdlog::shutdown();
 }
 
-/** @brief 设置当前线程的 traceID */
+void Log::Flush()
+{
+    spdlog::default_logger()->flush();
+}
+
+void Log::SetLevel(ELogLevel level)
+{
+    auto logger = spdlog::default_logger();
+    if (logger)
+    {
+        logger->set_level(static_cast<spdlog::level::level_enum>(level));
+    }
+}
+
 void Log::SetTraceID(uint64 traceID)
 {
     _traceID = traceID;
 }
 
-/** @brief 获取当前线程的 traceID */
 uint64 Log::GetTraceID()
 {
     return _traceID;
 }
 
-/**
- * @brief 内部实现：拼接 traceID + file:line func + message → spdlog
- * @param level   日志级别
- * @param file    源文件名
- * @param line    行号
- * @param func    函数名
- * @param message 日志内容
- */
-void Log::LogImpl(
-    ELogLevel level,
-    fmt::string_view file,
-    int line,
-    fmt::string_view func,
-    std::string&& message)
+namespace LogDetail
+{
+
+void LogImpl(ELogLevel level, const SourceLoc& loc, std::string_view message)
 {
     auto full = fmt::format(
         "[{:#010X}] [{}:{} {}] {}",
-        _traceID,
-        file,
-        line,
-        func,
+        Log::GetTraceID(),
+        loc.file,
+        loc.line,
+        loc.func,
         message);
 
-    auto logger = spdlog::get("massive");
+    auto logger = spdlog::default_logger();
     if (!logger)
     {
         return;
@@ -104,4 +99,5 @@ void Log::LogImpl(
     }
 }
 
+} // namespace LogDetail
 } // namespace MMO

@@ -9,7 +9,7 @@
 
 #include <vector>
 
-#include "ThirdParty/ConcurrentQueue/ConcurrentQueue.h"
+#include <concurrentqueue.h>
 
 namespace MMO
 {

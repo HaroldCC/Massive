@@ -4,9 +4,7 @@
  */
 
 #include "Common/Timer/TimingWheel.h"
-
-#include <algorithm>
-#include <cstdio>
+#include "Common/Log/Log.h"
 
 namespace MMO
 {
@@ -193,8 +191,7 @@ void TimingWheel::Tick()
         size_t count = ActiveCount();
         if (count > kWarnThreshold)
         {
-            fprintf(stderr,
-                "[TimingWheel] WARNING: active timers=%zu exceeds threshold=%zu — possible timer leak\n",
+            Log::Error("TimingWheel WARNING: active timers={} exceeds threshold={} — possible timer leak",
                 count, kWarnThreshold);
         }
     }
