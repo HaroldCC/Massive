@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SessionToken · 无状态 Gate 路由机制 — MMO 服务器架构设计 v1.2</title>
+<link rel="stylesheet" href="../shared.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="../Design.html">🏠 总目录</a></nav>
+<div class="container">
+<span class="badge confirmed">✔ 已确认 · C2 拓扑</span>
+
+<div class="section" id="s7b">
+  <h2>7b. SessionToken · 无状态 Gate 路由机制</h2>
+
+  <h3>1. 设计目标</h3>
+  <p>
+    C2 拓扑中，<strong>GateServer 必须完全无状态</strong>——不持有 SessionKey、不做加解密、不查数据库。
+    只做一件事：根据 SessionToken 的前几个字节（明文）做 O(1) 路由。
+    所有安全验证和加解密都由 <strong>WorldServer</strong> 完成。GateServer 宕机重启后，
+    客户端重新连接任意 Gate，Gate 无需任何恢复逻辑。
+  </p>
+
+  <div class="callout info">
+    <strong>核心原则</strong>：SessionToken 是一个自包含的、防篡改的凭证。<br>
+    LoginServer 签发 → 客户端持有 → 每次通信携带 → Gate 只读路由字段 → WorldServer 验证 HMAC 并还原 SessionKey。<br><br>
+    <strong>Token 有效期策略</strong>：采用<strong>长有效期（8 小时）</strong>，覆盖单次游玩。
+    不使用滑动窗口续期——一旦过期，客户端需重新走 LoginServer 完整 ECDH 流程获取新 Token。
+    这比复杂的 Token 续期协议更简单、更安全。
+  </div>
+
+  <h3>2. SessionToken 结构（46 字节）</h3>
+  <pre><code><span class="cm">// SessionToken — 46 字节自包含凭证</span>
+<span class="cm">//</span>
+<span class="cm">// [worldServerId: 2B] [accountId: 4B] [expireTime: 4B] [encryptedSessionKey: 32B] [HMAC-SHA256: 4B(truncated)]</span>
+<span class="cm">//       ↑─── 明文段（10 字节，受 HMAC 保护）───↑   ↑─── 加密段（32 字节）───↑   ↑─ HMAC ─↑</span>
+<span class="cm">//</span>
+<span class="cm">// 明文段：GateServer 读取 worldServerId 做路由——O(1) 查表，无需解密。</span>
+<span class="cm">//         accountId 和 expireTime 明文传输但受 HMAC 保护——客户端无法篡改。</span>
+<span class="cm">//</span>
+<span class="cm">// 加密段：AES-256-ECB(LSS_key, sessionKey) = 32B 密文。</span>
+<span class="cm">//         sessionKey 长度 32B → AES-256-ECB 输出的密文也是 32B——天然对齐，无截断、无 padding。</span>
+<span class="cm">//         不用 GCM——HMAC 已覆盖整个 token 提供完整性保护，不需要 AEAD。</span>
+<span class="cm">//</span>
+<span class="cm">// HMAC: HMAC-SHA256(LSS_key, token[0..41])，截取前 4 字节。</span>
+<span class="cm">//        覆盖整个 token 的明文段 + 加密段——任何篡改都会被检测。</span>
+
+<span class="kw">struct</span> <span class="tp">SessionToken</span> {
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="tp">size_t</span> kTotalSize  = <span class="num">46</span>;
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="tp">size_t</span> kPlainSize  = <span class="num">10</span>;   <span class="cm">// 明文段: worldServerId(2B) + accountId(4B) + expireTime(4B)</span>
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="tp">size_t</span> kKeyEncSize = <span class="num">32</span>;   <span class="cm">// 加密的 SessionKey (AES-256-ECB, 32B→32B 无 padding)</span>
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="tp">size_t</span> kHmacSize   = <span class="num">4</span>;    <span class="cm">// HMAC-SHA256 截断</span>
+
+    <span class="tp">uint8_t</span> data[kTotalSize];
+
+    <span class="cm">// GateServer 只读这个——零解密</span>
+    <span class="tp">uint16_t</span> <span class="fn">WorldServerId</span>() <span class="kw">const</span> {
+        <span class="tp">uint16_t</span> id;
+        <span class="tp">std::memcpy</span>(&amp;id, data, <span class="num">2</span>);
+        <span class="kw">return</span> id;
+    }
+};</code></pre>
+
+  <h3>3. 密钥体系</h3>
+  <table>
+    <tr><th>密钥</th><th>持有者</th><th>用途</th><th>长度</th><th>算法</th></tr>
+    <tr><td><code>LoginServerSecret</code> (LSS)</td><td>LoginServer · WorldServer（共享）</td><td>加密 SessionToken 加密段 + HMAC 签名</td><td>32 字节</td><td>AES-256-ECB + HMAC-SHA256</td></tr>
+    <tr><td><code>SessionKey</code></td><td>LoginServer → 写入 SessionToken → WorldServer 解密还原</td><td>客户端 ↔ WorldServer AES-256-GCM 加解密</td><td>32 字节</td><td>ECDH → SHA-256 派生</td></tr>
+    <tr><td><code>ECDH Server Private Key</code></td><td>LoginServer</td><td>与客户端做 ECDH 协商生成 SessionKey</td><td>32 字节</td><td>X25519 or P-256</td></tr>
+    <tr><td><code>GateServer</code></td><td>无密钥</td><td>——</td><td>——</td><td>——</td></tr>
+  </table>
+
+  <div class="callout warn">
+    <strong>LSS 分发</strong>：LoginServer 和所有 WorldServer 在部署时共享同一个 <code>LoginServerSecret</code>。
+    通过配置文件注入（<code>server.toml</code> 的 <code>[security] login_server_secret</code>），
+    或通过环境变量 <code>MASSIVE_LSS</code>。不经过网络传输，不出现在日志中。
+  </div>
+
+  <h3>4. SessionToken 生命周期</h3>
+  <pre>
+Client → LoginServer: auth + ECDH
+  │
+  │ LoginServer:
+  │   · argon2id 验证密码
+  │   · ECDH → SessionKey
+  │   · 选择 WorldServer（最少负载）
+  │   · 构造 SessionToken（expireTime = now + 8h）
+  │   · AES-256-ECB(LSS, sessionKey) → 32B 密文
+  │   · HMAC-SHA256(LSS, token[0..41]) → 取前 4B
+  │
+  │ LoginServer → Client: {gateIPs: [...], sessionToken: &lt;46 bytes&gt;}
+  │
+Client → GateServer: TCP connect
+  │ 首包: MSG_LOGIN_ENTER_WORLD_REQ { sessionToken: &lt;46 bytes&gt;, nonce: 8B }
+  │
+  │ Gate: 读 token[0..1] → worldServerId
+  │       _sessionRoutes[sessionId] = {worldId, clientSocket}
+  │       _worldConns[worldId] → 转发整包
+  │
+  │ WorldServer 收包:
+  │   1. NonceVerifier.CheckAndInsert(pkt.nonce) —— 防重放
+  │   2. HMAC-SHA256(LSS, token[0..41]) == token[42..45]?
+  │   3. AES-256-ECB 解密 token[10..41] → SessionKey(32B)
+  │   4. accountId + expireTime 从明文段读取并验过期
+  │   5. 加载/创建 Entity → 绑定 sessionId → 绑定 CryptoSession{SessionKey}
+  │
+  │ WorldServer → Gate → Client: MSG_LOGIN_ENTER_WORLD_RSP
+
+Token 过期（8 小时后）：
+  客户端需要重新 TCP connect LoginServer（TLS）
+  → 完整 ECDH → 新 SessionToken → 重新进入世界</pre>
+
+  <h3>5. LoginServer 签发逻辑</h3>
+  <pre><code><span class="cm">// LoginServer.cpp — SessionToken 签发</span>
+<span class="tp">SessionToken</span> <span class="fn">IssueSessionToken</span>(<span class="tp">uint32_t</span> accountId,
+                              <span class="kw">const</span> <span class="tp">std::vector</span>&lt;<span class="tp">uint8_t</span>&gt;&amp; sessionKey)
+{
+    <span class="kw">auto</span> worldServer = <span class="fn">PickWorldServer</span>();  <span class="cm">// 最少负载选择</span>
+    <span class="kw">auto</span> expireTime  = <span class="fn">time</span>(<span class="nb">nullptr</span>) + <span class="num">28800</span>;  <span class="cm">// 8 小时过期（覆盖单次游玩）</span>
+
+    <span class="tp">SessionToken</span> token;
+
+    <span class="cm">// 1. 明文段：worldServerId(2B) + accountId(4B) + expireTime(4B) = 10B</span>
+    <span class="tp">uint8_t</span> plaintext[<span class="num">10</span>];
+    <span class="tp">std::memcpy</span>(plaintext,      &amp;worldServer.serverId, <span class="num">2</span>);
+    <span class="tp">std::memcpy</span>(plaintext + <span class="num">2</span>, &amp;accountId,             <span class="num">4</span>);
+    <span class="tp">std::memcpy</span>(plaintext + <span class="num">6</span>, &amp;expireTime,            <span class="num">4</span>);
+    <span class="tp">std::memcpy</span>(token.data, plaintext, <span class="num">10</span>);
+
+    <span class="cm">// 2. 加密段：AES-256-ECB(&lt;lssKey&gt;, sessionKey) → 32B 密文（与明文同长，无 padding）</span>
+    <span class="kw">auto</span> encrypted = <span class="fn">Aes256EcbEncrypt</span>(<span class="kw">_lssKey</span>, sessionKey.data(), <span class="num">32</span>);
+    <span class="kw">if</span> (encrypted.size() != <span class="num">32</span>) <span class="kw">return</span> {};
+    <span class="tp">std::memcpy</span>(token.data + <span class="num">10</span>, encrypted.data(), <span class="num">32</span>);
+
+    <span class="cm">// 3. HMAC = HMAC-SHA256(LSS, token[0..41])，截取前 4 字节 → token[42..45]</span>
+    <span class="kw">auto</span> hmac = <span class="fn">HmacSha256</span>(<span class="kw">_lssKey</span>, token.data, <span class="num">42</span>);
+    <span class="tp">std::memcpy</span>(token.data + <span class="num">42</span>, hmac.data(), <span class="num">4</span>);
+
+    <span class="kw">return</span> token;
+}</code></pre>
+
+  <h3>6. WorldServer 验证逻辑</h3>
+  <pre><code><span class="cm">// WorldServer.cpp — SessionToken 验证 + SessionKey 还原</span>
+<span class="kw">struct</span> <span class="tp">TokenPayload</span> {
+    <span class="tp">uint32_t</span> accountId;
+    <span class="tp">uint32_t</span> expireTime;
+    <span class="tp">std::vector</span>&lt;<span class="tp">uint8_t</span>&gt; sessionKey;  <span class="cm">// 32B</span>
+};
+
+<span class="tp">std::optional</span>&lt;<span class="tp">TokenPayload</span>&gt; <span class="fn">VerifySessionToken</span>(<span class="kw">const</span> <span class="tp">SessionToken</span>&amp; token) {
+    <span class="cm">// 1. 验 HMAC</span>
+    <span class="kw">auto</span> expectedHmac = <span class="fn">HmacSha256</span>(<span class="kw">_lssKey</span>, token.data, <span class="num">42</span>);
+    <span class="kw">if</span> (<span class="tp">std::memcmp</span>(expectedHmac.data(), token.data + <span class="num">42</span>, <span class="num">4</span>) != <span class="num">0</span>)
+        <span class="kw">return</span> <span class="tp">std::nullopt</span>;
+
+    <span class="cm">// 2. 解密 SessionKey: AES-256-ECB 解密 token[10..41] → 32B SessionKey</span>
+    <span class="kw">auto</span> decrypted = <span class="fn">Aes256EcbDecrypt</span>(<span class="kw">_lssKey</span>, token.data + <span class="num">10</span>, <span class="num">32</span>);
+    <span class="kw">if</span> (!decrypted) <span class="kw">return</span> <span class="tp">std::nullopt</span>;
+
+    <span class="tp">TokenPayload</span> payload;
+    payload.sessionKey.assign(decrypted-&gt;begin(), decrypted-&gt;end());
+
+    <span class="cm">// 3. 从明文段提取 accountId + expireTime</span>
+    <span class="tp">std::memcpy</span>(&amp;payload.accountId,  token.data + <span class="num">2</span>, <span class="num">4</span>);
+    <span class="tp">std::memcpy</span>(&amp;payload.expireTime, token.data + <span class="num">6</span>, <span class="num">4</span>);
+
+    <span class="cm">// 4. 过期检查（8 小时）</span>
+    <span class="kw">if</span> (payload.expireTime &lt; <span class="fn">time</span>(<span class="nb">nullptr</span>))
+        <span class="kw">return</span> <span class="tp">std::nullopt</span>;
+
+    <span class="kw">return</span> payload;
+}</code></pre>
+
+  <h3>7. GateServer 内部数据结构</h3>
+  <pre><code><span class="cm">// GateServer.h — 极简状态（连接级，非业务级）</span>
+<span class="kw">class</span> <span class="tp">GateServer</span> {
+<span class="kw">public</span>:
+    <span class="kw">struct</span> <span class="tp">SessionRoute</span> {
+        <span class="tp">uint16_t</span> worldServerId;
+        <span class="tp">TcpSocketPtr</span> clientSocket;
+    };
+
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">uint32_t</span>, <span class="tp">SessionRoute</span>&gt; <span class="kw">_sessionRoutes</span>;  <span class="cm">// sessionId → Route</span>
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">uint16_t</span>, <span class="tp">TcpSocketPtr</span>&gt; <span class="kw">_worldConns</span>;     <span class="cm">// worldId → TCP</span>
+
+    <span class="cm">// 入站：客户端 → Gate → WorldServer</span>
+    <span class="kt">void</span> <span class="fn">OnClientPacket</span>(<span class="tp">TcpSocketPtr</span> clientSock, <span class="kw">const</span> <span class="tp">std::vector</span>&lt;<span class="kt">char</span>&gt;&amp; data) {
+        <span class="kw">auto</span> sessionId = <span class="fn">ExtractSessionId</span>(data);
+        <span class="kw">auto</span> it = <span class="kw">_sessionRoutes</span>.find(sessionId);
+
+        <span class="kw">if</span> (it == <span class="kw">_sessionRoutes</span>.end()) {
+            <span class="kw">if</span> (<span class="kw">auto</span> token = <span class="fn">TryExtractSessionToken</span>(data)) {
+                <span class="kw">auto</span> worldId = token-&gt;WorldServerId();
+                <span class="kw">_sessionRoutes</span>[sessionId] = SessionRoute{worldId, clientSock};
+                <span class="fn">EnsureWorldConnection</span>(worldId);
+                <span class="fn">ForwardToWorld</span>(worldId, data);
+            }
+            <span class="kw">return</span>;
+        }
+
+        <span class="cm">// 后续包——查缓存的 worldId 直接转发，零解析</span>
+        <span class="fn">ForwardToWorld</span>(it-&gt;second.worldServerId, data);
+    }
+
+    <span class="cm">// 出站：WorldServer → Gate → Client</span>
+    <span class="kt">void</span> <span class="fn">OnWorldOutbound</span>(<span class="kw">const</span> <span class="tp">std::vector</span>&lt;<span class="kt">char</span>&gt;&amp; data) {
+        <span class="kw">auto</span> sessionId = <span class="fn">ExtractSessionId</span>(data);
+        <span class="kw">auto</span> it = <span class="kw">_sessionRoutes</span>.find(sessionId);
+        <span class="kw">if</span> (it != <span class="kw">_sessionRoutes</span>.end())
+            <span class="fn">SendToClient</span>(it-&gt;second.clientSocket, data);
+    }
+};</code></pre>
+
+  <h3>8. 线格式 (Wire Format)</h3>
+  <table>
+    <tr><th>包类型</th><th>结构</th><th>加密</th></tr>
+    <tr>
+      <td>首包（登录进世界）</td>
+      <td><code>[4B Length][4B MsgID=MSG_LOGIN_ENTER_WORLD_REQ][4B SessionId][8B Nonce][46B SessionToken 明文]</code></td>
+      <td>未加密——Gate 需读 SessionToken；Nonce 用于防重放</td>
+    </tr>
+    <tr>
+      <td>后续业务包</td>
+      <td><code>[4B Length][4B MsgID][4B SessionId][8B Nonce][AES-256-GCM Encrypted Body]</code></td>
+      <td>Body 用 SessionKey(AES-256-GCM) 加密；Nonce 每次随机</td>
+    </tr>
+  </table>
+
+  <h3>9. 安全分析</h3>
+  <table>
+    <tr><th>攻击面</th><th>防御</th></tr>
+    <tr><td>客户端篡改 SessionToken 明文段（worldServerId / accountId / expireTime）</td><td>HMAC 覆盖明文段 + 加密段——WorldServer 验签失败 → 拒绝连接</td></tr>
+    <tr><td>客户端重放旧 SessionToken</td><td>Nonce 校验（Bloom filter）+ expireTime 双重防护</td></tr>
+    <tr><td>客户端伪造 SessionToken</td><td>伪造的 sessionKey 密文解密后不是合法密钥——WorldServer 拒绝</td></tr>
+    <tr><td>客户端直接连 WorldServer（绕过 Gate）</td><td>WorldServer 只监听内网 IP，不接受公网连接</td></tr>
+    <tr><td>GateServer 被攻陷 → 读 Body</td><td>Body 是 AES-256-GCM 密文——Gate 没有 SessionKey</td></tr>
+    <tr><td>中间人攻击（LoginServer 响应被篡改）</td><td>LoginServer 使用 TLS</td></tr>
+  </table>
+
+  <h3>10. 防重放：Nonce + Bloom Filter</h3>
+  <p>
+    每次客户端发起新连接（及关键业务包）携带 <strong>64-bit 随机 nonce</strong>。
+    WorldServer 用 Bloom filter 记录所有已验证的 nonce，拒绝已出现的 nonce。
+    不使用 seq_num——Gate 切换后 seq 必须重置，语义混乱。纯随机 nonce 更简洁。
+  </p>
+
+  <pre><code><span class="cm">// WorldServer.cpp — Nonce 验证（Bloom filter, 128KB）</span>
+<span class="kw">class</span> <span class="tp">NonceVerifier</span> {
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="tp">size_t</span> kFilterBits = <span class="num">1</span> &lt;&lt; <span class="num">20</span>;  <span class="cm">// 1M bits = 128KB</span>
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="tp">size_t</span> kHashFuncs  = <span class="num">3</span>;
+
+    <span class="tp">std::bitset</span>&lt;kFilterBits&gt; <span class="kw">_filter</span>;
+    <span class="tp">std::deque</span>&lt;<span class="tp">std::pair</span>&lt;<span class="tp">Clock::time_point</span>, <span class="tp">uint64_t</span>&gt;&gt; <span class="kw">_recent</span>;
+
+<span class="kw">public</span>:
+    <span class="kt">bool</span> <span class="fn">CheckAndInsert</span>(<span class="tp">uint64_t</span> nonce) {
+        <span class="kw">if</span> (<span class="fn">ProbablySeen</span>(nonce))
+            <span class="kw">return</span> <span class="nb">false</span>;  <span class="cm">// 可能已使用——拒绝（误判率 ~1%）</span>
+        <span class="fn">Insert</span>(nonce);
+        <span class="kw">_recent</span>.push_back({<span class="tp">Clock::now</span>(), nonce});
+        <span class="fn">EvictOld</span>(<span class="tp">std::chrono::hours</span>(<span class="num">8</span>));  <span class="cm">// 清理超过 Token 有效期的 nonce</span>
+        <span class="kw">return</span> <span class="nb">true</span>;
+    }
+};</code></pre>
+
+  <div class="callout info">
+    <strong>Nonce 方案设计要点</strong>：
+    Bloom filter 128KB 内存可支撑数百万 nonce，~1% 误判率（把未用过的 nonce 误判为已用过）。
+    1% 的合法请求被误拒可通过客户端自动重试（新 nonce）来消解——用户体验无感知。
+    同时 WorldServer 维护一个精确小列表（最近 N 秒内的 nonce 精确比对），双重保障。
+  </div>
+
+  <h3>11. Gate 迁移（Gate-Switch）处理</h3>
+  <p>
+    GateServer 断开（宕机、网络故障、运维重启）→ 客户端自动连接下一个 gateIP →
+    使用同一 SessionToken 重新登录。WorldServer 通过 15 秒迁移窗口实现无缝 session rebind。
+  </p>
+
+  <pre>
+Gate_1 正常 → WorldServer：维持内部 TCP 连接，Session 绑定到 Gate_1
+  │
+Gate_1 断开（TCP FIN / timeout）
+  │
+WorldServer 收到 FIN：
+  ├── 标记 SessionBinding.migration_deadline = now + 15s
+  ├── 保留 session 状态（Entity、CryptoSession、缓冲区）
+  └── 启动 15s 倒计时
+
+客户端 → Gate_2：首包 MSG_LOGIN_ENTER_WORLD_REQ { SessionToken, nonce }
+  │
+Gate_2 → WorldServer：转发首包
+
+WorldServer：
+  ├── NonceVerifier.CheckAndInsert(nonce)
+  ├── 验证 SessionToken（HMAC + 解密 + expireTime）
+  ├── 查找 session → migration_deadline 有效？
+  ├── YES → rebind Gate_2 的内部连接 → 清除 deadline → 玩家无缝在线
+  └── NO  → 拒绝（需重新走 LoginServer）
+
+15s 超时：
+  → 保存玩家数据 → 销毁 Entity → 通知 CenterServer 清理位置索引</pre>
+
+  <pre><code><span class="cm">// WorldServer.cpp — Session 绑定 + Gate 迁移处理</span>
+<span class="kw">struct</span> <span class="tp">SessionBinding</span> {
+    <span class="tp">uint16_t</span> currentGateId;
+    <span class="tp">uint64_t</span> sessionId;
+    <span class="tp">SteadyClock::time_point</span> migrationDeadline;  <span class="cm">// zero = 正常</span>
+
+    <span class="kt">bool</span> <span class="fn">IsMigrating</span>() <span class="kw">const</span> {
+        <span class="kw">return</span> migrationDeadline != <span class="tp">SteadyClock::time_point</span>{};
+    }
+};
+
+<span class="kt">void</span> <span class="tp">WorldServer</span>::<span class="fn">OnGateDisconnected</span>(<span class="tp">uint16_t</span> gateId) {
+    <span class="kw">for</span> (<span class="kw">auto</span>&amp; [id, bind] : <span class="kw">_sessionBindings</span>) {
+        <span class="kw">if</span> (bind.currentGateId == gateId &amp;&amp; !bind.IsMigrating()) {
+            bind.migrationDeadline = <span class="tp">SteadyClock::now</span>() + <span class="tp">std::chrono::seconds</span>(<span class="num">15</span>);
+            LOG_INFO(<span class="str">"Session {} entered gate migration window"</span>, id);
+        }
+    }
+}
+
+<span class="kt">void</span> <span class="tp">WorldServer</span>::<span class="fn">ProcessMigrationTimeouts</span>() {
+    <span class="kw">auto</span> now = <span class="tp">SteadyClock::now</span>();
+    <span class="kw">for</span> (<span class="kw">auto</span> it = <span class="kw">_sessionBindings</span>.begin(); it != <span class="kw">_sessionBindings</span>.end(); ) {
+        <span class="kw">auto</span>&amp; bind = it-&gt;second;
+        <span class="kw">if</span> (bind.IsMigrating() &amp;&amp; now &gt; bind.migrationDeadline) {
+            <span class="fn">CleanupSession</span>(it-&gt;first);   <span class="cm">// 保存 PG → 销毁 Entity → 通知 Center</span>
+            it = <span class="kw">_sessionBindings</span>.erase(it);
+        } <span class="kw">else</span> ++it;
+    }
+}</code></pre>
+
+  <div class="callout info">
+    <strong>迁移窗口折衷</strong>：15s 不是随意选的——TCP 超时通常 30s，但客户端 detect 断线 + 切换 gate
+    需要的时间远低于 30s。如果 Gate 宕机后被 monitor 自动重启，新的 Gate 实例需要 ~10s 才能就绪。
+    15s 是平衡"玩家不掉线"和"资源不浪费"的点。如果 15s 内没回来，玩家按离线处理（数据已保存）。
+  </div>
+
+</div>
+
+</div>
+<nav class="breadcrumb" style="margin-top:24px;"><a href="../Design.html">🏠 返回总目录</a></nav>
+<div class="footer">MMO Server Architecture Design Document · Version 1.2</div>
+</body>
+</html>

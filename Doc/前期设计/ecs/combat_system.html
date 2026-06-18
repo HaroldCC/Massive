@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>战斗系统基础设施 — MMO 服务器架构设计 v1.2</title>
+<link rel="stylesheet" href="../shared.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="../Design.html">🏠 总目录</a></nav>
+<div class="container">
+<span class="badge confirmed">✔ 已确认</span>
+
+<div class="section" id="combat">
+  <h2>战斗系统基础设施 · 伤害管线 + 属性系统</h2>
+
+  <h3>1. 设计哲学</h3>
+  <p>
+    战斗系统是 MMO 服务器的核心热路径。设计约束：
+    <strong>每 Tick 数千次伤害计算不能成为瓶颈</strong>。
+    伤害管线采用 <strong>固定阶段流水线</strong>（非插件式钩子），每个阶段是简单的数学变换，
+    没有虚函数调用、没有动态内存分配。所有伤害公式参数从 ConfigTable 查表，
+    公式本身在 DasLang 脚本中定义（可热更新）。
+  </p>
+
+  <h3>2. 属性系统</h3>
+
+  <h4>2.1 属性定义（C++ 侧，高频→EnTT）</h4>
+  <pre><code><span class="cm">// Components.h — 战斗属性组件（高频，存 EnTT）</span>
+
+<span class="cm">// 基础属性——装备/等级/加点直接修改</span>
+<span class="kw">struct</span> <span class="tp">Attributes</span> {
+    <span class="kt">int32_t</span>  strength      = <span class="num">0</span>;   <span class="cm">// 力量 → 物理攻击</span>
+    <span class="kt">int32_t</span>  agility       = <span class="num">0</span>;   <span class="cm">// 敏捷 → 暴击率、闪避</span>
+    <span class="kt">int32_t</span>  intelligence  = <span class="num">0</span>;   <span class="cm">// 智力 → 魔法攻击</span>
+    <span class="kt">int32_t</span>  stamina       = <span class="num">0</span>;   <span class="cm">// 耐力 → 最大 HP</span>
+    <span class="kt">int32_t</span>  spirit        = <span class="num">0</span>;   <span class="cm">// 精神 → 回复速度</span>
+};
+
+<span class="cm">// 战斗属性——每 Tick 频繁读写</span>
+<span class="kw">struct</span> <span class="tp">BattleStats</span> {
+    <span class="kt">int32_t</span>  maxHp         = <span class="num">0</span>;
+    <span class="kt">int32_t</span>  currentHp     = <span class="num">0</span>;
+    <span class="kt">int32_t</span>  maxMp         = <span class="num">0</span>;
+    <span class="kt">int32_t</span>  currentMp     = <span class="num">0</span>;
+    <span class="kt">int32_t</span>  attack        = <span class="num">0</span>;   <span class="cm">// 最终攻击力</span>
+    <span class="kt">int32_t</span>  defense       = <span class="num">0</span>;   <span class="cm">// 最终防御力</span>
+    <span class="kt">int32_t</span>  magicAttack   = <span class="num">0</span>;
+    <span class="kt">int32_t</span>  magicDefense  = <span class="num">0</span>;
+    <span class="kt">int32_t</span>  critRate      = <span class="num">0</span>;   <span class="cm">// 暴击率（万分比：500 = 5%）</span>
+    <span class="kt">int32_t</span>  critDamage    = <span class="num">0</span>;   <span class="cm">// 暴击伤害加成（万分比：1500 = +15%）</span>
+    <span class="kt">int32_t</span>  dodgeRate     = <span class="num">0</span>;   <span class="cm">// 闪避率（万分比）</span>
+    <span class="kt">int32_t</span>  hitRate       = <span class="num">0</span>;   <span class="cm">// 命中率（万分比）</span>
+    <span class="kt">int32_t</span>  attackSpeed   = <span class="num">0</span>;   <span class="cm">// 攻击速度（万分比，10000 = 1.0）</span>
+    <span class="kt">int32_t</span>  moveSpeed     = <span class="num">0</span>;   <span class="cm">// 移动速度（万分比）</span>
+};</code></pre>
+
+  <h4>2.2 属性重算触发</h4>
+  <p>
+    Attributes 变化（换装备、升级、加点）→ 标记 <code>StatsDirtyTag</code> →
+    下一 Tick 的 <code>ecs_stage "stats"</code> 中全量重算 BattleStats。
+    重算公式：基础属性 × 装备系数 + Buff 加成。结果直接写回 BattleStats 组件。
+  </p>
+
+  <pre><code><span class="cm">// 属性重算系统——DasLang 侧，可热更新公式</span>
+[export]
+<span class="kw">def</span> <span class="fn">SystemRecalcStats</span>(sceneId : uint32)
+{
+    ecs_query(sceneId;
+        attr : Attributes&amp;;
+        stats : BattleStats&amp;;
+        equip : EquipmentSlots;          <span class="cm">// 脚本组件</span>
+        <span class="kw">with</span> StatsDirtyTag
+    ) {
+        <span class="cm">// 1. 基础值 = 属性 × 系数（ConfigTable）</span>
+        <span class="kw">let</span> cfg = g_classConfig.Find(GetPlayerClass(attr))
+        stats.attack  = attr.strength * cfg.strToAtk / <span class="num">100</span>
+        stats.defense = attr.agility * cfg.agiToDef / <span class="num">100</span>
+        stats.maxHp   = attr.stamina * cfg.staToHp
+        stats.maxMp   = attr.intelligence * cfg.intToMp
+
+        <span class="cm">// 2. 装备加成</span>
+        <span class="kw">for</span> slotId = <span class="num">0</span>; slotId &lt; EquipmentSlots::MAX_SLOTS; slotId++ {
+            <span class="kw">let</span> equipped = equip.slots[slotId]
+            <span class="kw">if</span> (equipped == <span class="nb">null</span>) <span class="kw">continue</span>
+            <span class="kw">let</span> itemCfg = g_itemTemplates.Find(equipped.itemId)
+            <span class="kw">if</span> (itemCfg != <span class="nb">null</span>) {
+                stats.attack  += itemCfg.attackBonus
+                stats.defense += itemCfg.defenseBonus
+                stats.maxHp   += itemCfg.hpBonus
+                stats.critRate += itemCfg.critBonus
+            }
+        }
+
+        <span class="cm">// 3. Buff 加成（由 BuffSystem 处理，此处只做基准）</span>
+        stats.currentHp = min(stats.currentHp, stats.maxHp)
+        stats.currentMp = min(stats.currentMp, stats.maxMp)
+
+        <span class="cm">// 4. 清除脏标记</span>
+        ecs_remove_component(attr, type&lt;<span class="tp">StatsDirtyTag</span>&gt;)
+    }
+}</code></pre>
+
+  <h3>3. 伤害管线（Damage Pipeline）</h3>
+
+  <h4>3.1 管线阶段</h4>
+  <p>
+    伤害计算分为 <strong>6 个固定阶段</strong>。每个阶段是纯函数，输入→输出，
+    无副作用、无虚函数。顺序固定，不允许跳过阶段。
+  </p>
+
+  <pre>
+DamageEvent{attacker, defender, skillId, baseDamage, damageType}
+  │
+  ├── 阶段 1: 命中判定
+  │     hitRate = attacker.hitRate - defender.dodgeRate
+  │     isHit = Random(0, 10000) &lt; hitRate
+  │     isHit == false → 返回 MissResult → 管线结束
+  │
+  ├── 阶段 2: 暴击判定（PRD 伪随机）
+  │     <span class="cm">// 使用 Dota 2 / LoL 标准的伪随机分布 (PRD)</span>
+  │     <span class="cm">// 每次不暴击，暴击概率递增；暴击后重置</span>
+  │     <span class="cm">// 避免纯随机的连续暴击/连续不暴击，提升玩家体验</span>
+  │     isCrit = RollCritPRD(attacker.critRate, defender.critState)
+  │     critMultiplier = isCrit ? (1.0 + attacker.critDamage / 10000.0) : 1.0
+  │
+  ├── 阶段 3: 基础伤害计算
+  │     rawDamage = baseDamage × critMultiplier
+  │     if (damageType == PHYSICAL)
+  │         rawDamage = rawDamage × (1.0 - defense / (defense + K))  // 护甲减伤曲线
+  │     if (damageType == MAGICAL)
+  │         rawDamage = rawDamage × (1.0 - magicDefense / (magicDefense + K))
+  │
+  ├── 阶段 4: 伤害修正（Buff/被动技能）
+  │     damage = rawDamage × Π(increaseFactors) × Π(reduceFactors)
+  │     increaseFactors: 增伤 Buff、易伤 Debuff、种族克制
+  │     reduceFactors:   减伤 Buff、护盾、无敌
+  │     每个 factor 从 BuffList 组件中收集
+  │
+  ├── 阶段 5: 吸收/护盾
+  │     absorbed = min(damage, shieldRemaining)
+  │     damage -= absorbed
+  │     shieldRemaining -= absorbed
+  │
+  └── 阶段 6: 应用伤害 + 事件
+        defender.currentHp -= damage
+        投递 ecs_dispatch("on_damage_dealt", DamageResult)
+        投递 ecs_dispatch("on_damage_received", DamageResult)
+        if (defender.currentHp &lt;= 0)
+            投递 ecs_dispatch("on_entity_killed", KillEvent)</pre>
+
+  <h4>3.2 管线实现（C++ 侧——热路径，零分配）</h4>
+  <pre><code><span class="cm">// DamagePipeline.h — 伤害管线（C++ 引擎层，最高性能）</span>
+
+<span class="kw">struct</span> <span class="tp">DamageEvent</span> {
+    <span class="tp">Entity</span> attacker;
+    <span class="tp">Entity</span> defender;
+    <span class="tp">uint32_t</span> skillId;
+    <span class="kt">int32_t</span>  baseDamage;
+    <span class="kw">enum class</span> <span class="tp">Type</span> { Physical, Magical, True } damageType;
+};
+
+<span class="kw">struct</span> <span class="tp">DamageResult</span> {
+    <span class="kt">bool</span>    isHit;
+    <span class="kt">bool</span>    isCrit;
+    <span class="kt">int32_t</span> finalDamage;
+    <span class="kt">int32_t</span> absorbedByShield;
+    <span class="kt">int32_t</span> hpBefore;
+    <span class="kt">int32_t</span> hpAfter;
+    <span class="kw">enum class</span> <span class="tp">Outcome</span> { Miss, Hit, Crit, Kill } outcome;
+};
+
+<span class="kw">class</span> <span class="tp">DamagePipeline</span> {
+<span class="kw">public</span>:
+    <span class="cm">// execute 是纯静态方法——无状态，可在 DasLang 直接调用</span>
+    <span class="kw">static</span> <span class="tp">DamageResult</span> <span class="fn">Execute</span>(<span class="kw">const</span> <span class="tp">DamageEvent</span>&amp; event,
+                              <span class="kw">const</span> <span class="tp">BattleStats</span>&amp; atkStats,
+                              <span class="kw">const</span> <span class="tp">BattleStats</span>&amp; defStats,
+                              <span class="kw">const</span> <span class="tp">BuffList</span>* defBuffs);    <span class="cm">// 脚本组件，可为 nullptr</span>
+
+<span class="kw">private</span>:
+    <span class="kw">static</span> <span class="kt">bool</span>    <span class="fn">CheckHit</span>(<span class="kw">const</span> <span class="tp">BattleStats</span>&amp; atk, <span class="kw">const</span> <span class="tp">BattleStats</span>&amp; def);
+    <span class="kw">static</span> <span class="kt">bool</span>    <span class="fn">CheckCrit</span>(<span class="kw">const</span> <span class="tp">BattleStats</span>&amp; atk);
+    <span class="kw">static</span> <span class="kt">int32_t</span> <span class="fn">CalcRawDamage</span>(<span class="kt">int32_t</span> base, <span class="kt">bool</span> crit, <span class="kw">const</span> <span class="tp">BattleStats</span>&amp; atk, <span class="kw">const</span> <span class="tp">BattleStats</span>&amp; def, <span class="tp">DamageEvent::Type</span> type);
+    <span class="kw">static</span> <span class="kt">int32_t</span> <span class="fn">ApplyModifiers</span>(<span class="kt">int32_t</span> raw, <span class="kw">const</span> <span class="tp">BuffList</span>* buffs, <span class="tp">DamageEvent::Type</span> type);
+    <span class="kw">static</span> <span class="kt">int32_t</span> <span class="fn">ApplyShield</span>(<span class="kt">int32_t</span> damage, <span class="kw">const</span> <span class="tp">BuffList</span>* buffs);
+
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="kt">int32_t</span> kDefenseConstant = <span class="num">5000</span>;  <span class="cm">// 护甲减伤曲线常数 K</span>
+};</code></pre>
+
+  <h4>3.3 伪随机分布 (PRD) 算法</h4>
+  <p>
+    暴击和闪避使用 <strong>Dota 2 / League of Legends</strong> 标准的伪随机分布（Pseudo-Random Distribution）。
+    纯随机 <code>rand() &lt; critRate</code> 虽然期望正确，但可能导致玩家连续 5 次暴击或不暴击——体验极差。
+    PRD 保证暴击均匀分布，长期期望 = 标称值。
+  </p>
+
+  <pre><code><span class="cm">// PRDSystem.h — 伪随机分布（BlobStorage per-entity 状态）</span>
+[script_component]
+<span class="kw">struct</span> <span class="tp">PRDState</span> {
+    <span class="kt">float</span> critChance;   <span class="cm">// 当前实际暴击概率（从 C 值开始，逐渐递增）</span>
+    <span class="kt">float</span> dodgeChance;  <span class="cm">// 当前实际闪避概率</span>
+}
+
+<span class="cm">// 标称暴击率 → PRD C 值查表（Dota 2 标准）</span>
+<span class="cm">// C 值 = 初始暴击概率，每次不暴击递增 C，暴击后重置为 C</span>
+<span class="kw">static</span> <span class="kt">float</span> <span class="fn">NominalToPRDC</span>(<span class="kt">float</span> nominal) {
+    <span class="cm">// 精确值见 Dota 2 Gamepedia PRD 表，此处用近似公式</span>
+    <span class="kw">if</span> (nominal &lt;= <span class="num">0.01f</span>) <span class="kw">return</span> <span class="num">0.00014f</span>;   <span class="cm">// ~1%</span>
+    <span class="kw">if</span> (nominal &gt;= <span class="num">0.80f</span>) <span class="kw">return</span> <span class="num">0.6f</span>;        <span class="cm">// ~80%</span>
+    <span class="kw">return</span> nominal * <span class="num">0.32f</span>;                      <span class="cm">// 近似 C ≈ nominal × 0.32</span>
+}
+
+<span class="kt">bool</span> <span class="fn">RollCritPRD</span>(<span class="tp">BattleStats</span>&amp; atk, <span class="tp">PRDState</span>&amp; state) {
+    <span class="kt">float</span> roll = <span class="fn">Random01</span>();
+    <span class="kw">if</span> (roll &lt; state.critChance) {
+        state.critChance = <span class="fn">NominalToPRDC</span>(atk.critRate / <span class="num">10000.0f</span>);  <span class="cm">// 暴击——重置</span>
+        <span class="kw">return</span> <span class="nb">true</span>;
+    }
+    state.critChance += <span class="fn">NominalToPRDC</span>(atk.critRate / <span class="num">10000.0f</span>);   <span class="cm">// 不暴击——递增</span>
+    <span class="kw">return</span> <span class="nb">false</span>;
+}
+
+<span class="cm">// 闪避同理——使用独立的 dodgeChance 状态</span>
+<span class="kt">bool</span> <span class="fn">RollDodgePRD</span>(<span class="tp">BattleStats</span>&amp; def, <span class="tp">PRDState</span>&amp; state) {
+    <span class="kt">float</span> roll = <span class="fn">Random01</span>();
+    <span class="kw">if</span> (roll &lt; state.dodgeChance) {
+        state.dodgeChance = <span class="fn">NominalToPRDC</span>(def.dodgeRate / <span class="num">10000.0f</span>);
+        <span class="kw">return</span> <span class="nb">true</span>;
+    }
+    state.dodgeChance += <span class="fn">NominalToPRDC</span>(def.dodgeRate / <span class="num">10000.0f</span>);
+    <span class="kw">return</span> <span class="nb">false</span>;
+}</code></pre>
+
+  <div class="callout info">
+    <strong>适用范围</strong>：PRD 仅用于<strong>暴击和闪避</strong>——这两个对玩家战斗体验影响最大。
+    其他概率系统（格挡、掉落、命中）保持纯随机以减少 per-entity 状态开销。
+    PRDState 存为 BlobStorage 脚本组件，每 entity 额外开销仅 2 个 float = 8 字节。
+  </div>
+
+  <h4>3.4 DasLang 侧调用</h4>
+  <pre><code><span class="cm">// combat_handler.das — 技能伤害结算</span>
+<span class="kw">def</span> <span class="fn">HandleSkillDamage</span>(attacker : Entity; defender : Entity; skillId : uint32; baseDamage : int)
+{
+    ecs_edit(attacker) $(<span class="kw">var</span> atkCmp) {
+    ecs_edit(defender) $(<span class="kw">var</span> defCmp)
+    {
+        <span class="kw">let</span> event = DamageEvent{
+            attacker   = attacker,
+            defender   = defender,
+            skillId    = skillId,
+            baseDamage = baseDamage,
+            damageType = GetSkillDamageType(skillId)
+        }
+
+        <span class="cm">// 调用 C++ 管线</span>
+        <span class="kw">let</span> result = ExecuteDamagePipeline(event, atkCmp.battleStats, defCmp.battleStats, &amp;defCmp.buffList)
+
+        <span class="cm">// 应用结果</span>
+        <span class="kw">if</span> (result.outcome == DamageOutcome::Miss) {
+            SendToClient(attacker, MSG_COMBAT_FLOAT_NTF, BuildFloatMsg(defender, <span class="str">"MISS"</span>))
+            <span class="kw">return</span>
+        }
+
+        defCmp.battleStats.currentHp = result.hpAfter
+
+        <span class="cm">// 广播伤害数字</span>
+        <span class="kw">let</span> floatType = result.isCrit ? <span class="str">"CRIT"</span> : <span class="str">"DMG"</span>
+        BroadcastNearby(defender, MSG_COMBAT_FLOAT_NTF,
+            BuildFloatMsg(defender, floatType, result.finalDamage))
+
+        <span class="cm">// 事件投递</span>
+        <span class="kw">if</span> (result.outcome == DamageOutcome::Kill) {
+            ecs_dispatch(<span class="str">"on_entity_killed"</span>, attacker, defender, skillId)
+        }
+    }}
+}</code></pre>
+
+  <h3>4. 伤害类型与抗性</h3>
+  <table>
+    <tr><th>类型</th><th>防御属性</th><th>典型来源</th></tr>
+    <tr><td>物理 (Physical)</td><td>defense（护甲减伤曲线）</td><td>普攻、战士技能</td></tr>
+    <tr><td>魔法 (Magical)</td><td>magicDefense（魔抗减伤曲线）</td><td>法师技能</td></tr>
+    <tr><td>真实 (True)</td><td>无（无视防御）</td><td>百分比扣血、斩杀技能</td></tr>
+  </table>
+
+  <h3>5. 战斗状态机</h3>
+  <p>
+    每个实体有 CombatState 组件（EnTT Tag）：
+  </p>
+  <table>
+    <tr><th>状态</th><th>进入条件</th><th>退出条件</th><th>影响</th></tr>
+    <tr><td><code>CombatTag</code></td><td>受到伤害 or 造成伤害</td><td>5s 无伤害事件</td><td>禁止传送、禁止下线、HP/MP 回复速率降低</td></tr>
+    <tr><td><code>DeadTag</code></td><td>currentHp ≤ 0</td><td>复活（释放尸体 or 原地复活）</td><td>无法移动/攻击/使用道具</td></tr>
+    <tr><td><code>StunnedTag</code></td><td>晕眩技能命中</td><td>持续时间到 or 驱散</td><td>无法移动/攻击/施法</td></tr>
+  </table>
+
+  <pre><code><span class="cm">// 进入/离开战斗——定时器检测</span>
+<span class="kw">def</span> <span class="fn">CheckCombatTimeout</span>(entity : Entity)
+{
+    <span class="kw">if</span> (GetTickTime() - GetLastCombatTime(entity) &gt; <span class="num">5.0</span>) {
+        ecs_remove(entity, type&lt;<span class="tp">CombatTag</span>&gt;)
+        ecs_dispatch(<span class="str">"on_leave_combat"</span>, entity)
+    }
+}</code></pre>
+
+  <h3>6. 仇恨系统（Threat）</h3>
+  <p>
+    仇恨表是每个怪物 Entity 的脚本组件（BlobStorage），记录所有攻击者的威胁值。
+  </p>
+
+  <pre><code><span class="cm">// 脚本组件——ThreatTable（低频，BlobStorage）</span>
+[script_component]
+<span class="kw">struct</span> <span class="tp">ThreatEntry</span> {
+    targetEntity : Entity
+    threat       : int64_t       <span class="cm">// 累积威胁值</span>
+}
+
+[script_component]
+<span class="kw">struct</span> <span class="tp">ThreatTable</span> {
+    entries     : array&lt;ThreatEntry&gt;   <span class="cm">// 按 threat 降序排列</span>
+    dirty       : bool                 <span class="cm">// 需要重排序</span>
+}
+
+<span class="cm">// 威胁更新</span>
+<span class="kw">def</span> <span class="fn">AddThreat</span>(monster : Entity; attacker : Entity; amount : int64_t)
+{
+    ecs_edit(monster) $(<span class="kw">var</span> cmp)
+    {
+        <span class="kw">let</span> found = <span class="nb">false</span>
+        <span class="kw">for</span> <span class="kw">var</span> entry <span class="kw">in</span> cmp.threatTable.entries {
+            <span class="kw">if</span> (entry.targetEntity == attacker) {
+                entry.threat += amount
+                found = <span class="nb">true</span>
+                <span class="kw">break</span>
+            }
+        }
+        <span class="kw">if</span> (!found) {
+            cmp.threatTable.entries |> push(ThreatEntry{targetEntity = attacker, threat = amount})
+        }
+        cmp.threatTable.dirty = <span class="nb">true</span>
+    }
+}
+
+<span class="cm">// 获取仇恨目标——最高威胁值</span>
+<span class="kw">def</span> <span class="fn">GetTopThreatTarget</span>(monster : Entity) : Entity
+{
+    <span class="kw">var</span> result = InvalidEntity
+    ecs_edit(monster) $(<span class="kw">var</span> cmp)
+    {
+        <span class="kw">if</span> (cmp.threatTable.dirty) {
+            <span class="cm">// 按 threat 降序排序</span>
+            cmp.threatTable.entries |> sort($(a, b) =&gt; b.threat &lt; a.threat)
+            cmp.threatTable.dirty = <span class="nb">false</span>
+        }
+        <span class="kw">if</span> (!cmp.threatTable.entries |> empty()) {
+            result = cmp.threatTable.entries[<span class="num">0</span>].targetEntity
+        }
+    }
+    <span class="kw">return</span> result
+}</code></pre>
+
+  <h4>6.1 威胁值计算规则</h4>
+  <table>
+    <tr><th>行为</th><th>威胁值</th></tr>
+    <tr><td>造成 1 点伤害</td><td>+1 威胁</td></tr>
+    <tr><td>治疗（过量治疗无效）</td><td>+0.5 威胁/每点治疗</td></tr>
+    <tr><td>嘲讽技能</td><td>威胁值 = 当前最高威胁 × 1.1（强制成为第一目标）</td></tr>
+    <tr><td>进入战斗初始</td><td>+10 威胁（先手仇恨）</td></tr>
+    <tr><td>超出怪物追击范围</td><td>威胁清零（脱战）</td></tr>
+  </table>
+
+  <h4>6.2 目标切换逻辑（DasLang 侧）</h4>
+  <pre><code><span class="cm">// 怪物 AI 决策——目标选择</span>
+<span class="kw">def</span> <span class="fn">MonsterSelectTarget</span>(monster : Entity) : Entity
+{
+    <span class="kw">let</span> topTarget = GetTopThreatTarget(monster)
+    <span class="kw">if</span> (topTarget == InvalidEntity) {
+        <span class="kw">return</span> InvalidEntity
+    }
+
+    <span class="cm">// 检查目标是否在追击范围内</span>
+    <span class="kw">let</span> dist = DistanceBetween(monster, topTarget)
+    <span class="kw">if</span> (dist &gt; GetMonsterChaseRange(monster)) {
+        ClearThreatTable(monster)      <span class="cm">// 脱战——清零仇恨</span>
+        ecs_dispatch(<span class="str">"on_monster_evade"</span>, monster)
+        <span class="kw">return</span> InvalidEntity
+    }
+
+    <span class="kw">return</span> topTarget
+}</code></pre>
+
+  <h3>7. DasLang 桥接 API</h3>
+  <pre><code><span class="cm">// C++ 侧注册给 DasLang</span>
+<span class="fn">ExecuteDamagePipeline</span>(event: DamageEvent; atkStats: BattleStats; defStats: BattleStats; defBuffs: BuffList?): DamageResult
+<span class="fn">GetSkillDamageType</span>(skillId: uint32): DamageType
+<span class="fn">GetMonsterChaseRange</span>(monster: Entity): float
+<span class="fn">DistanceBetween</span>(a: Entity; b: Entity): float
+<span class="fn">GetLastCombatTime</span>(entity: Entity): float</code></pre>
+
+  <h3>8. 性能分析</h3>
+  <table>
+    <tr><th>操作</th><th>频率</th><th>单次耗时</th><th>每 Tick 总耗时</th></tr>
+    <tr><td>属性重算</td><td>仅在换装/升级时触发（低频）</td><td>~5μs</td><td>可忽略</td></tr>
+    <tr><td>伤害管线</td><td>100 个怪物 × 每 2s 一次 = 50/sec</td><td>~2μs（纯数学）</td><td>~0.1ms</td></tr>
+    <tr><td>仇恨排序</td><td>同上（仅 dirty 时）</td><td>~10μs（5 条目）</td><td>~0.5ms</td></tr>
+    <tr><td>战斗状态检查</td><td>100 实体 × 每 Tick</td><td>~0.1μs</td><td>~0.01ms</td></tr>
+  </table>
+  <div class="callout info">
+    <strong>📌 结论</strong>：战斗管线每 Tick 总开销 &lt; 1ms，远低于 50ms Tick 预算。伤害管线走 C++ 纯数学路径，零堆分配，
+    最高频的操作（命中判定、暴击判定、护甲减伤）都在静态函数内完成。
+  </div>
+
+  <h3>9. 战斗浮字协议</h3>
+  <pre><code><span class="cm">// proto 定义——战斗浮字通知</span>
+message CombatFloatNtf {
+    uint32 target_entity_id = 1;       <span class="cm">// 被攻击者</span>
+    CombatFloatType float_type = 2;    <span class="cm">// MISS/DMG/CRIT/HEAL/DODGE/BLOCK</span>
+    int32  value = 3;                 <span class="cm">// 伤害/治疗数值</span>
+    uint32 skill_id = 4;              <span class="cm">// 来源技能（0 = 普攻）</span>
+}
+
+enum CombatFloatType {
+    COMBAT_FLOAT_MISS  = 0;
+    COMBAT_FLOAT_DMG   = 1;
+    COMBAT_FLOAT_CRIT  = 2;
+    COMBAT_FLOAT_HEAL  = 3;
+    COMBAT_FLOAT_DODGE = 4;
+    COMBAT_FLOAT_BLOCK = 5;
+    COMBAT_FLOAT_ABSORB = 6;
+}</code></pre>
+
+  <h3>10. 死亡与复活流程</h3>
+  <pre>
+Entity.currentHp ≤ 0
+  │
+  ├── 1. 添加 DeadTag
+  │     ecs_emplace(entity, DeadTag{deathTime = GetTickTime()})
+  │
+  ├── 2. 清除 Buff/Debuff（可配置哪些 Buff 死亡不消失）
+  │     RemoveExpirableBuffs(entity)
+  │
+  ├── 3. 清除仇恨表
+  │     ClearThreatTable(entity)
+  │
+  ├── 4. 投递事件
+  │     ecs_dispatch("on_entity_killed", killer, victim, skillId)
+  │     → 经验结算、掉落生成、任务进度更新、成就触发
+  │
+  ├── 5. 死亡状态持续
+  │     玩家：显示释放尸体 UI，可选原地复活（消耗道具）or 墓地复活
+  │     怪物：N 秒后尸体消失 → ecs_destroy
+  │
+  └── 6. 复活
+        玩家：ecs_remove(DeadTag) → 恢复 HP/MP → 传送回复活点
+        副本/战场内：特殊复活规则（次数限制、复活等待时间）</pre>
+
+</div>
+
+</div>
+<nav class="breadcrumb" style="margin-top:24px;"><a href="../Design.html">🏠 返回总目录</a></nav>
+<div class="footer">MMO Server Architecture Design Document · Version 1.2</div>
+</body>
+</html>

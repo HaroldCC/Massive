@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>10. 设计决策与权衡 — MMO 服务器架构设计 v1</title>
+<link rel="stylesheet" href="../shared.css">
+</head>
+<body>
+
+<nav class="breadcrumb">
+  <a href="../Design.html">🏠 总目录</a>
+</nav>
+
+<div class="container">
+<span class="badge confirmed">✔ 已确认</span>
+
+<!-- ==================== S10 ==================== -->
+<div class="section" id="s10">
+  <h2>10. 设计决策与权衡</h2>
+
+  <h3>10.1 IOContextPool vs 单 io_context + 多线程</h3>
+  <table>
+    <tr><th>维度</th><th>IOContextPool</th><th>单 io_context 多线程</th></tr>
+    <tr><td>锁竞争</td><td>每个 io_context 独立队列</td><td>单队列竞争</td></tr>
+    <tr><td>连接亲和性</td><td>同连接始终同线程</td><td>回调可能跨线程</td></tr>
+  </table>
+
+  <h3>10.2 为什么单线程逻辑</h3>
+  <p>游戏逻辑是状态机，单线程保证确定性、无锁、可调试。万人同时在线单核足以支撑。</p>
+
+  <h3>10.3 DasLang vs Lua</h3>
+  <table>
+    <tr><th>维度</th><th>DasLang</th><th>Lua</th></tr>
+    <tr><td>性能</td><td>AOT → 原生码，~C++</td><td>解释/JIT，慢一个量级</td></tr>
+    <tr><td>类型</td><td>强类型 + 编译检查</td><td>动态类型</td></tr>
+    <tr><td>内存</td><td>每 Context 独立 Heap，默认 Bump Allocator（无 GC 暂停）；可选 persistent_heap + Mark-Sweep GC</td><td>全局 Mark-Sweep GC 有暂停</td></tr>
+    <tr><td>热更新</td><td>函数级原生</td><td>需 hack</td></tr>
+  </table>
+
+  <h3>10.4 命名规范</h3>
+  <table>
+    <tr><th>元素</th><th>规范</th><th>示例</th></tr>
+    <tr><td>类名/结构体名</td><td>大驼峰</td><td><code>LogicServer</code>, <code>Health</code></td></tr>
+    <tr><td>抽象类/接口</td><td>大驼峰 + I 前缀</td><td><code>IScene</code>, <code>IModule</code></td></tr>
+    <tr><td>命名空间</td><td>大驼峰</td><td><code>Mmo::Network</code></td></tr>
+    <tr><td>函数名</td><td>大驼峰</td><td><code>GetNextContext()</code>, <code>HandleMove()</code></td></tr>
+    <tr><td>类成员变量</td><td>小驼峰 + _ 前缀</td><td><code>_ioContexts</code>, <code>_sceneId</code></td></tr>
+    <tr><td>类静态常量</td><td>大驼峰 + k 前缀</td><td><code>kHotThreshold</code>, <code>kMaxPacketSize</code></td></tr>
+    <tr><td>结构体成员</td><td>小驼峰（无前缀）</td><td><code>current</code>, <code>sessionId</code></td></tr>
+    <tr><td>局部变量</td><td>小驼峰</td><td><code>entityId</code>, <code>totalLength</code></td></tr>
+    <tr><td>枚举值</td><td>全大写 + 下划线</td><td><code>MSG_MOVE_REQ</code></td></tr>
+    <tr><td>宏</td><td>全大写 + 下划线</td><td><code>REGISTER_COMPONENT</code></td></tr>
+  </table>
+
+  <h4>协议消息命名</h4>
+  <table>
+    <tr><th>方向</th><th>后缀</th><th>示例</th></tr>
+    <tr><td>客户端→服务器</td><td><code>_Req</code></td><td><code>MSG_MOVE_REQ</code></td></tr>
+    <tr><td>服务器→客户端</td><td><code>_Rsp</code></td><td><code>MSG_MOVE_RSP</code></td></tr>
+    <tr><td>服务器主动推送</td><td><code>_Ntf</code></td><td><code>MSG_ENTITY_CREATE_NTF</code></td></tr>
+  </table>
+
+  <p><span class="badge confirmed">✔ 已确认</span></p>
+</div>
+
+<nav class="breadcrumb" style="margin-top:24px;">
+  <a href="../Design.html">🏠 返回总目录</a>
+</nav>
+
+</div>
+<div class="footer">
+  MMO Server Architecture Design Document · Version 1.2
+</div>
+</body>
+</html>

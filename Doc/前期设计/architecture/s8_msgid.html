@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>8. 消息分发 · MsgID 函数表 — MMO 服务器架构设计 v1</title>
+<link rel="stylesheet" href="../shared.css">
+</head>
+<body>
+
+<nav class="breadcrumb">
+  <a href="../Design.html">🏠 总目录</a>
+</nav>
+
+<div class="container">
+<span class="badge confirmed">✔ 已确认</span>
+
+<!-- ==================== S8 ==================== -->
+<div class="section" id="s8">
+  <h2>8. 消息分发 · MsgID 函数表</h2>
+
+  <div style="margin-bottom:16px;"><span class="badge confirmed">✔ 已确认</span></div>
+
+  <h3>8.1 核心设计：MsgID 数组索引 + 模板注册</h3>
+  <p><code>std::array&lt;Handler, 4096&gt;</code> 做 O(1) 查表，msgId 直接作为数组下标。每新增一个消息一行 Register。</p>
+
+  <pre><code><span class="kw">class</span> <span class="tp">MessageDispatcher</span> {
+<span class="kw">public</span>:
+    <span class="kw">struct</span> <span class="tp">Handler</span> {
+        <span class="tp">std::function</span>&lt;<span class="kt">void</span>(<span class="tp">WorldEntity</span>, <span class="kw">const</span> <span class="tp">std::vector</span>&lt;<span class="kt">char</span>&gt;&amp;)&gt; fn;
+    };
+
+    <span class="kw">template</span>&lt;<span class="kw">typename</span> T&gt;
+    <span class="kt">void</span> <span class="fn">Register</span>(<span class="tp">uint32_t</span> msgId, <span class="tp">std::function</span>&lt;<span class="kt">void</span>(<span class="tp">Entity</span>, <span class="kw">const</span> <span class="tp">T</span>&amp;)&gt; handler) {
+        <span class="cm">// 重复注册检测</span>
+        <span class="kw">if</span> (<span class="kw">_handlers</span>[msgId].fn) {
+            LOG_WARN(<span class="num">0</span>, <span class="str">"MsgID {} already registered, overwriting"</span>, msgId);
+        }
+        <span class="kw">_handlers</span>[msgId].fn = [handler](<span class="tp">Entity</span> we, <span class="kw">const</span> <span class="tp">std::vector</span>&lt;<span class="kt">char</span>&gt;&amp; body) {
+            <span class="tp">T</span> msg;
+            <span class="kw">if</span> (!msg.ParseFromArray(body.data(), <span class="kw">int</span>(body.size()))) {
+                LOG_ERROR(<span class="num">0</span>, <span class="str">"Protobuf parse failed for MsgID {} ({} bytes)"</span>, msgId, body.size());
+                <span class="kw">return</span>;  <span class="cm">// 解析失败，跳过并记录日志</span>
+            }
+            handler(we, msg);
+        };
+    }
+
+    <span class="kt">void</span> <span class="fn">Dispatch</span>(<span class="tp">WorldEntity</span> we, <span class="tp">uint32_t</span> msgId, <span class="kw">const</span> <span class="tp">std::vector</span>&lt;<span class="kt">char</span>&gt;&amp; body) {
+        <span class="kw">if</span> (msgId &lt; <span class="kw">_handlers</span>.size() &amp;&amp; <span class="kw">_handlers</span>[msgId].fn)
+            <span class="kw">_handlers</span>[msgId].fn(we, body);
+    }
+<span class="kw">private</span>:
+    <span class="tp">std::array</span>&lt;<span class="tp">Handler</span>, <span class="num">4096</span>&gt; <span class="kw">_handlers</span>;
+};
+
+<span class="cm">// 注册示例</span>
+dispatcher.Register&lt;<span class="tp">MoveReq</span>&gt;(MSG_MOVE_REQ, [](<span class="tp">WorldEntity</span> we, <span class="kw">const</span> <span class="tp">MoveReq</span>&amp; msg) {
+    <span class="fn">HandleMove</span>(we, msg.x, msg.y);
+});</code></pre>
+</div>
+
+<nav class="breadcrumb" style="margin-top:24px;">
+  <a href="../Design.html">🏠 返回总目录</a>
+</nav>
+
+</div>
+<div class="footer">
+  MMO Server Architecture Design Document · Version 1.2
+</div>
+</body>
+</html>

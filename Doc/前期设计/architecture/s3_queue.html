@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3. 无锁并发任务队列 — MMO 服务器架构设计 v1</title>
+<link rel="stylesheet" href="../shared.css">
+</head>
+<body>
+
+<nav class="breadcrumb">
+  <a href="../Design.html">🏠 总目录</a>
+</nav>
+
+<div class="container">
+<span class="badge confirmed">✔ 已确认</span>
+
+<div class="section" id="s3">
+  <h2>3. 无锁并发任务队列</h2>
+
+  <h3>3.1 消息结构</h3>
+  <pre><code><span class="kw">struct</span> <span class="tp">LogicMessage</span> {
+    <span class="tp">uint32_t</span>    sessionId;
+    <span class="tp">uint32_t</span>    msgId;
+    <span class="tp">uint64_t</span>    traceId;       <span class="cm">// GateServer 生成，贯穿 Gate→World→DB</span>
+    <span class="tp">uint64_t</span>    clientTraceId;  <span class="cm">// 客户端可选传入</span>
+    <span class="tp">std::vector</span>&lt;<span class="kt">char</span>&gt; body;
+    <span class="tp">std::chrono::steady_clock::time_point</span> recvTime;
+};</code></pre>
+
+  <h3>3.2 队列设计</h3>
+  <p><strong>单 MPSC 队列，自实现（非第三方库）。</strong>多生产者（N 个网络线程 enqueue）→ 单消费者（1 个逻辑线程 batch drain）。</p>
+
+  <h3>3.3 实现：基于链表节点的无锁 MPSC 队列</h3>
+  <p>
+    基于 Michael-Scott 无锁队列变体做单消费者优化。核心是原子 head/tail 指针 + 链表节点池。
+    DrainAll 时将整个链表"摘走"——原子地 swap head 和 null，零竞争地拿到整条链表然后反转顺序，
+    消费者一侧无需遍历链表。
+  </p>
+
+  <pre><code><span class="cm">// MpscQueue.h — 自实现无锁 MPSC 队列</span>
+
+<span class="kw">class</span> <span class="tp">MpscQueue</span> {
+<span class="kw">public</span>:
+    <span class="kw">struct</span> <span class="tp">Node</span> {
+        <span class="tp">LogicMessage</span> msg;
+        <span class="tp">std::atomic</span>&lt;<span class="tp">Node</span>*&gt; next{<span class="nb">nullptr</span>};
+    };
+
+    <span class="fn">MpscQueue</span>() {
+        <span class="cm">// dummy 节点保证 head 始终非空，简化边界条件</span>
+        <span class="kw">_head</span> = <span class="kw">_tail</span> = <span class="kw">new</span> Node{};
+    }
+
+    <span class="cm">// 生产者端（网络线程调用） — 无锁 enqueue</span>
+    <span class="kt">void</span> <span class="fn">Enqueue</span>(<span class="tp">LogicMessage</span> msg) {
+        <span class="kw">auto</span>* node = <span class="kw">new</span> Node{std::move(msg), <span class="nb">nullptr</span>};
+        <span class="kw">auto</span>* prev = <span class="kw">_tail</span>.exchange(node, std::memory_order_acq_rel);
+        prev-&gt;next.store(node, std::memory_order_release);
+    }
+
+    <span class="cm">// 消费者端（逻辑线程调用） — 批量 drain，O(1) 摘走整条链表</span>
+    <span class="kt">void</span> <span class="fn">DrainAll</span>(<span class="tp">std::vector</span>&lt;<span class="tp">LogicMessage</span>&gt;&amp; out) {
+        <span class="cm">// 1. 原子地从 tail swap 一个新 dummy——排入队列的消息同时被"摘走"</span>
+        <span class="kw">auto</span>* newDummy = <span class="kw">new</span> Node{};
+        <span class="kw">auto</span>* first = <span class="kw">_head</span>.load(std::memory_order_acquire);
+        <span class="kw">auto</span>* last  = <span class="kw">_tail</span>.exchange(newDummy, std::memory_order_acq_rel);
+        <span class="kw">_head</span>.store(newDummy, std::memory_order_release);
+
+        <span class="cm">// 2. 遍历从 first→next 到 last，取出所有消息</span>
+        <span class="kw">auto</span>* curr = first;
+        <span class="kw">while</span> (curr != last) {
+            <span class="kw">auto</span>* next = curr-&gt;next.load(std::memory_order_acquire);
+            <span class="kw">auto</span>* old  = curr;
+            out.push_back(std::move(old-&gt;msg));
+            <span class="kw">if</span> (curr != first) <span class="kw">delete</span> curr;  <span class="cm">// 保留 head dummy</span>
+            curr = next;
+        }
+        <span class="cm">// 3. 释放旧的 head dummy（first）</span>
+        <span class="kw">delete</span> first;
+    }
+
+    <span class="tp">size_t</span> <span class="fn">SizeApprox</span>() <span class="kw">const</span> {
+        <span class="kw">return</span> <span class="kw">_count</span>.load(std::memory_order_relaxed);
+    }
+
+<span class="kw">private</span>:
+    <span class="tp">std::atomic</span>&lt;<span class="tp">Node</span>*&gt; <span class="kw">_head</span>;   <span class="cm">// 消费者侧 (只读)</span>
+    <span class="tp">std::atomic</span>&lt;<span class="tp">Node</span>*&gt; <span class="kw">_tail</span>;   <span class="cm">// 生产者侧 (atomic swap)</span>
+    <span class="tp">std::atomic</span>&lt;<span class="tp">size_t</span>&gt; <span class="kw">_count</span>{<span class="num">0</span>};  <span class="cm">// 近似计数 (不精确)</span>
+};
+</code></pre>
+
+  <h3>3.4 内存序与正确性</h3>
+  <table>
+    <tr><th>操作</th><th>内存序</th><th>保证</th></tr>
+    <tr><td><code>_tail.exchange</code></td><td><code>acq_rel</code></td><td>保证生产者看到消费者对 linked list 的完整写入</td></tr>
+    <tr><td><code>next.store</code></td><td><code>release</code></td><td>保证消息内容在 node 被消费者看到之前已经完全写入</td></tr>
+    <tr><td><code>_head.load</code></td><td><code>acquire</code></td><td>消费者对 head 的读取与 tail 的 exchange 配对</td></tr>
+  </table>
+
+  <div class="callout warn">
+    <strong>⚠ 容量限制</strong>：当前实现不对队列容量做限制。如果逻辑线程处理速度落后于网络线程入队速度，
+    队列会无限增长（内存耗尽）。生产环境应在 <code>Enqueue</code> 前检查 <code>SizeApprox()</code>，
+    超过阈值时丢弃低优先级消息或主动断开慢速连接。
+  </div>
+
+  <p><span class="badge confirmed">✔ 已确认</span></p>
+</div>
+
+<nav class="breadcrumb" style="margin-top:24px;">
+  <a href="../Design.html">🏠 返回总目录</a>
+</nav>
+
+</div>
+<div class="footer">
+  MMO Server Architecture Design Document · Version 1.2
+</div>
+</body>
+</html>

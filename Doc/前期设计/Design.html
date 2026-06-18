@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MMO 服务器架构详细设计文档 v1.2</title>
+<link rel="stylesheet" href="shared.css">
+</head>
+<body>
+
+<div class="header">
+  <h1>MMO 服务器架构详细设计文档</h1>
+  <div class="subtitle">C2 Topology · Stateless Gate Routing · SessionToken · ECDH + AES-256-GCM · IOContextPool · Lock-Free MPSC Queue · Single-Thread Logic · DasLang Script · EnTT ECS · Combat Pipeline · Buff System · Skill Pipeline · BehaviorTree AI · Item+Barter+Trade · Chat+Friend+Guild+Mail · CenterServer RPC · Matchmaking · SceneRegistry×N + Manager单例 · Hybrid AOI · Timing Wheel · Tracy Profiler · SceneSnapshot</div>
+  <div class="meta">Boost.Asio · C++23 · DasLang · EnTT · Protobuf · PostgreSQL · Version 1.2</div>
+</div>
+
+<div class="container">
+
+<div class="toc">
+  <h2>📖 目录</h2>
+  <ol>
+    <li><a href="architecture/s1_overview.html">1. 整体架构总览</a></li>
+    <li><a href="architecture/s2_network.html">2. 网络层 · IOContextPool 设计</a></li>
+    <li><a href="architecture/s3_queue.html">3. 无锁并发任务队列</a></li>
+    <li><a href="architecture/s4_logic_loop.html">4. 单线程逻辑层</a></li>
+    <li><a href="architecture/s5_session.html">5. Session 生命周期管理</a></li>
+    <li><a href="architecture/s6_outbound.html">6. 出站消息与 Session 写回</a></li>
+    <li><a href="architecture/s7_protocol.html">7. 消息协议 · ECDH + AES-GCM + SessionToken</a></li>
+    <li><a href="architecture/s7b_session_token.html">7b. SessionToken · 无状态 Gate 路由机制</a></li>
+    <li><a href="architecture/s8_msgid.html">8. 消息分发 · MsgID 函数表</a></li>
+    <li><a href="architecture/s9_timer.html">9. 定时器 · 多级时间轮</a></li>
+    <li><a href="design/s10_decisions.html">10. 设计决策与权衡</a></li>
+    <li><a href="design/s11_sharding.html">11. 部署拓扑 · C2 多进程分布式</a></li>
+    <li><a href="design/s12_aoi.html">12. AOI 兴趣区域系统 · 九宫格 + 空间哈希</a></li>
+    <li><a href="ecs/s13_ecs_core.html">13. ECS 架构 · EnTT + BlobStorage 混合</a></li>
+    <li><a href="ecs/s14_script_api.html">14. 脚本层 · DasLang 集成</a></li>
+    <li><a href="operations/s15_persistence.html">15. 数据持久化与缓存架构</a></li>
+    <li><a href="operations/s16_logging.html">16. 错误处理 · 日志 · 可观测性</a></li>
+    <li><a href="operations/s17_pathfinding.html">17. 寻路与移动校验</a></li>
+    <li><a href="operations/s18_gm.html">18. GM 指令系统</a></li>
+    <li><a href="operations/s19_hotreload.html">19. 配置数据热更新</a></li>
+    <li><a href="operations/s20_entity_id.html">20. EntityId 编码与 WorldEntity 版本管理</a></li>
+    <li><a href="operations/s21_deployment.html">21. 部署运维概览</a></li>
+    <li><a href="ecs/combat_system.html">22. 战斗系统 · 伤害管线 + 属性 + 仇恨</a></li>
+    <li><a href="ecs/buff_system.html">23. Buff/Debuff 系统 · Modifier + Tick + 事件</a></li>
+    <li><a href="ecs/skill_system.html">24. 技能系统 · 施法管线 + 冷却 + GCD</a></li>
+    <li><a href="ecs/ai_system.html">25. AI 框架 · 行为树 + 黑板 + LOD</a></li>
+    <li><a href="ecs/item_system.html">26. 物品与背包系统 · Bag + Equip + Trade + Loot</a></li>
+    <li><a href="ecs/social_system.html">27. 社交系统 · Chat + Friend + Guild + Mail</a></li>
+    <li><a href="architecture/center_server.html">28. CenterServer · 跨服通信与服务发现</a></li>
+    <li><a href="operations/matchmaking.html">29. 匹配系统 · 副本 + 战场 + 竞技场</a></li>
+  </ol>
+</div>
+
+<h2>文档结构</h2>
+<div class="section">
+  <h3>architecture/ — 架构篇</h3>
+  <ul>
+    <li><a href="architecture/s1_overview.html">§1 整体架构总览</a></li>
+    <li><a href="architecture/s2_network.html">§2 网络层 · IOContextPool 设计</a></li>
+    <li><a href="architecture/s3_queue.html">§3 无锁并发任务队列</a></li>
+    <li><a href="architecture/s4_logic_loop.html">§4 单线程逻辑层</a></li>
+    <li><a href="architecture/s5_session.html">§5 Session 生命周期管理</a></li>
+    <li><a href="architecture/s6_outbound.html">§6 出站消息与 Session 写回</a></li>
+    <li><a href="architecture/s7_protocol.html">§7 消息协议 · ECDH + AES-GCM + SessionToken（C2 拓扑）</a></li>
+    <li><a href="architecture/s7b_session_token.html">§7b SessionToken 设计 · 无状态 Gate 路由 + 密钥体系</a></li>
+    <li><a href="architecture/s8_msgid.html">§8 消息分发 · MsgID 函数表</a></li>
+    <li><a href="architecture/s9_timer.html">§9 定时器 · 多级时间轮</a></li>
+    <li><a href="architecture/center_server.html">§28 CenterServer · 跨服通信与服务发现</a></li>
+  </ul>
+
+  <h3>design/ — 决策篇</h3>
+  <ul>
+    <li><a href="design/s10_decisions.html">§10 设计决策与权衡（含命名规范）</a></li>
+    <li><a href="design/s11_sharding.html">§11 部署拓扑 · C2 多进程分布式（5 进程）</a></li>
+    <li><a href="design/s12_aoi.html">§12 AOI 兴趣区域系统 · 九宫格 + 空间哈希</a></li>
+  </ul>
+
+  <h3>ecs/ — ECS 与游戏系统篇</h3>
+  <ul>
+    <li><a href="ecs/s13_ecs_core.html">§13 ECS 架构 · EnTT + BlobStorage 混合（双模式 ecs_query/ecs_edit）</a></li>
+    <li><a href="ecs/s14_script_api.html">§14 脚本层 · DasLang 集成（ecs_query / ecs_edit / ecs_stage）</a></li>
+    <li><a href="ecs/scene_lifecycle.html">§13b Scene 生命周期管理（常驻/副本/战场）</a></li>
+    <li><a href="ecs/global_managers.html">§13c 全局 Manager 单例（GuildMgr / ChatChannelMgr / BossScheduler / MailMgr / ConfigTable）</a></li>
+    <li><a href="ecs/network_replication.html">§14b 网络复制系统 · 差量 + 快照混合</a></li>
+    <li><a href="operations/testing.html">§14c 测试策略 · 三层金字塔</a></li>
+    <li><a href="ecs/combat_system.html">§22 战斗系统 · 伤害管线 + 属性 + 仇恨</a></li>
+    <li><a href="ecs/buff_system.html">§23 Buff/Debuff 系统 · Modifier + Tick + 事件</a></li>
+    <li><a href="ecs/skill_system.html">§24 技能系统 · 施法管线 + 冷却 + GCD</a></li>
+    <li><a href="ecs/ai_system.html">§25 AI 框架 · 行为树 + 黑板 + LOD</a></li>
+    <li><a href="ecs/item_system.html">§26 物品与背包系统 · Bag + Equip + Trade + Loot</a></li>
+    <li><a href="ecs/social_system.html">§27 社交系统 · Chat + Friend + Guild + Mail</a></li>
+  </ul>
+
+  <h3>operations/ — 运营篇</h3>
+  <ul>
+    <li><a href="operations/s15_persistence.html">§15 数据持久化与缓存架构</a></li>
+    <li><a href="operations/s16_logging.html">§16 错误处理 · 日志 · 可观测性</a></li>
+    <li><a href="operations/s17_pathfinding.html">§17 寻路与移动校验</a></li>
+    <li><a href="operations/s18_gm.html">§18 GM 指令系统</a></li>
+    <li><a href="operations/s19_hotreload.html">§19 配置数据热更新</a></li>
+    <li><a href="operations/s20_entity_id.html">§20 EntityId 编码与 WorldEntity 版本管理</a></li>
+    <li><a href="operations/s21_deployment.html">§21 部署运维概览</a></li>
+    <li><a href="operations/matchmaking.html">§29 匹配系统 · 副本 + 战场 + 竞技场</a></li>
+  </ul>
+</div>
+
+</div>
+
+<div class="footer">
+  MMO Server Architecture Design Document · Version 1.2<br>
+  Generated &amp; Maintained via AI-Assisted Design
+</div>
+
+</body>
+</html>

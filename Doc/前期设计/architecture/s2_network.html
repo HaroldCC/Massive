@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>2. 网络层 · IOContextPool 设计 — MMO 服务器架构设计 v1.2</title>
+<link rel="stylesheet" href="../shared.css">
+</head>
+<body>
+
+<nav class="breadcrumb">
+  <a href="../Design.html">🏠 总目录</a>
+</nav>
+
+<div class="container">
+<span class="badge confirmed">✔ 已确认</span>
+
+<div class="section" id="s2">
+  <h2>2. 网络层 · IOContextPool 设计</h2>
+
+  <h3>2.1 核心思想</h3>
+  <p>N 个独立 asio::io_context 各运行于独立线程，Round-Robin 分配连接，同一连接始终在同一线程（零锁竞争）。
+  所有 5 种进程都使用相同的 IOContextPool 组件——只是连接对象不同。</p>
+
+  <h3>2.2 IOContextPool 实现</h3>
+  <pre><code><span class="cm">// IOContextPool.h</span>
+<span class="kw">class</span> <span class="tp">IOContextPool</span> {
+<span class="kw">public</span>:
+    <span class="fn">IOContextPool</span>(<span class="tp">std::size_t</span> <span class="kw">size</span> = <span class="tp">std::thread</span>::hardware_concurrency());
+    <span class="tp">asio::io_context</span>&amp; <span class="fn">GetNextContext</span>();
+    <span class="kt">void</span> <span class="fn">Stop</span>();
+<span class="kw">private</span>:
+    <span class="tp">std::vector</span>&lt;<span class="tp">asio::io_context</span>&gt; <span class="kw">_ioContexts</span>;
+    <span class="tp">std::vector</span>&lt;<span class="tp">WorkPtr</span>&gt; <span class="kw">_works</span>;
+    <span class="tp">std::vector</span>&lt;<span class="tp">std::thread</span>&gt; <span class="kw">_threads</span>;
+    <span class="tp">std::atomic</span>&lt;<span class="tp">std::size_t</span>&gt; <span class="kw">_nextIndex</span>{<span class="num">0</span>};
+};</code></pre>
+
+  <h3>2.3 各进程的连接拓扑</h3>
+  <table>
+    <tr><th>进程</th><th>作为 Server 端接受</th><th>作为 Client 端发起</th></tr>
+    <tr><td><strong>LoginServer</strong></td><td>客户端 TLS 连接（短连接，登录即断）</td><td>PgBouncer（查账号密码哈希、封禁状态）</td></tr>
+    <tr><td><strong>GateServer</strong></td><td>客户端 TCP 连接（长连接，10K+）</td><td>所有 WorldServer（内部 TCP 长连接，每 World 一条）</td></tr>
+    <tr><td><strong>WorldServer</strong></td><td>Gate/Center/Social 的内部 TCP 连接</td><td>CenterServer（注册/心跳）、SocialServer（RPC）</td></tr>
+    <tr><td><strong>CenterServer</strong></td><td>World/Social 的注册/心跳连接</td><td>—（无 DB 访问）</td></tr>
+    <tr><td><strong>SocialServer</strong></td><td>WorldServer 的 RPC 连接</td><td>PgBouncer（公会/邮件/好友持久化）</td></tr>
+  </table>
+
+  <p>注：DBWorkerPool 的 libpq 连接不走 asio——是独立的 Worker 线程，直接阻塞式 libpq 调用。结果通过 MPSC Queue 回到逻辑线程。</p>
+
+  <h3>2.4 GateServer 的 Session——连接级极简状态</h3>
+  <pre><code><span class="cm">// GateSession.h — Gate 侧 session（极简，无业务）</span>
+<span class="kw">class</span> <span class="tp">GateSession</span> : <span class="kw">public</span> <span class="tp">std::enable_shared_from_this</span>&lt;<span class="tp">GateSession</span>&gt; {
+<span class="kw">public</span>:
+    <span class="fn">GateSession</span>(<span class="tp">asio::io_context</span>&amp; ctx, <span class="tp">uint32_t</span> sessionId);
+
+    <span class="kt">void</span> <span class="fn">Start</span>();
+    <span class="kt">void</span> <span class="fn">SendToClient</span>(<span class="tp">std::vector</span>&lt;<span class="kt">char</span>&gt; data);
+    <span class="kt">void</span> <span class="fn">Close</span>();
+
+    <span class="tp">uint32_t</span> <span class="fn">GetSessionId</span>() <span class="kw">const</span> { <span class="kw">return</span> <span class="kw">_sessionId</span>; }
+    <span class="tp">uint16_t</span> <span class="kw">_worldServerId</span> = <span class="num">0</span>;  <span class="cm">// 首次从 SessionToken 解析后存储</span>
+    <span class="kt">bool</span>     <span class="kw">_routed</span> = <span class="nb">false</span>;
+
+<span class="kw">private</span>:
+    <span class="tp">asio::ip::tcp::socket</span> <span class="kw">_socket</span>;
+    <span class="tp">uint32_t</span> <span class="kw">_sessionId</span>;
+    <span class="tp">std::vector</span>&lt;<span class="kt">char</span>&gt; <span class="kw">_readBuffer</span>;
+    <span class="tp">std::mutex</span> <span class="kw">_writeMutex</span>;
+    <span class="tp">std::vector</span>&lt;<span class="kt">char</span>&gt; <span class="kw">_writeBuffer</span>;
+    <span class="kt">bool</span> <span class="kw">_writing</span>{<span class="nb">false</span>};
+};</code></pre>
+
+  <h3>2.5 WorldServer 的 Session</h3>
+  <p>
+    WorldServer 不直接接受客户端 TCP。它接受来自 GateServer 的内部 TCP 连接。
+    每个 GateServer ↔ WorldServer 连接承载多个客户端的消息复用（通过 InternalHeader.sessionId 区分）。
+  </p>
+
+  <pre><code><span class="cm">// WorldSession.h — WorldServer 侧的 session</span>
+<span class="kw">class</span> <span class="tp">WorldSession</span> {
+<span class="kw">public</span>:
+    <span class="tp">uint32_t</span> <span class="kw">sessionId</span>;
+    <span class="tp">Entity</span>    <span class="kw">playerEntity</span>;
+    <span class="tp">CryptoSession</span> <span class="kw">crypto</span>;           <span class="cm">// AES-GCM 加密上下文</span>
+
+    <span class="kt">void</span> <span class="fn">Send</span>(<span class="tp">std::vector</span>&lt;<span class="kt">char</span>&gt; data) {
+        <span class="kw">_gateConn</span>-&gt;Send(InternalHeader{<span class="kw">sessionId</span>}, <span class="kw">crypto</span>.Encrypt(data));
+    }
+
+<span class="kw">private</span>:
+    <span class="tp">std::shared_ptr</span>&lt;<span class="tp">GateConnection</span>&gt; <span class="kw">_gateConn</span>;
+};</code></pre>
+
+  <p><span class="badge confirmed">✔ 已确认 · C2 分布式</span></p>
+</div>
+
+<nav class="breadcrumb" style="margin-top:24px;">
+  <a href="../Design.html">🏠 返回总目录</a>
+</nav>
+
+</div>
+<div class="footer">
+  MMO Server Architecture Design Document · Version 1.2
+</div>
+</body>
+</html>

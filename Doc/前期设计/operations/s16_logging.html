@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>16. 错误处理 · 日志 · 可观测性 — MMO 服务器架构设计 v1</title>
+<link rel="stylesheet" href="../shared.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="../Design.html">🏠 总目录</a></nav>
+<div class="container">
+<span class="badge confirmed">✔ 已确认</span>
+
+<div class="section" id="s16">
+  <h2>16. 错误处理 · 日志 · 可观测性</h2>
+
+  <h3>16.1 日志格式与输出</h3>
+  <p>
+    使用 <strong>spdlog</strong>（C++20 header-only，工业级性能）。格式采用 printif 风格易读，
+    同时输出到终端（stdout）和日志文件。如果未开启终端（后台/守护进程），只写文件。
+  </p>
+
+  <pre><code><span class="cm">// LogService.h — spdlog 配置</span>
+<span class="kw">namespace</span> <span class="tp">Log</span> {
+
+<span class="kw">inline</span> <span class="kt">void</span> <span class="fn">Init</span>(<span class="kw">const</span> <span class="tp">std::string</span>&amp; logDir, <span class="kt">bool</span> console) {
+    <span class="kw">auto</span> fileSink = <span class="tp">std::make_shared</span>&lt;<span class="tp">spdlog::sinks::rotating_file_sink_mt</span>&gt;(
+        logDir + <span class="str">"/massive.log"</span>, <span class="num">10</span> * <span class="num">1024</span> * <span class="num">1024</span>, <span class="num">5</span>);  <span class="cm">// 10MB × 5 文件</span>
+
+    <span class="kw">if</span> (console) {
+        <span class="kw">auto</span> consoleSink = <span class="tp">std::make_shared</span>&lt;<span class="tp">spdlog::sinks::stdout_color_sink_mt</span>&gt;();
+        <span class="kw">auto</span> logger = <span class="tp">std::make_shared</span>&lt;<span class="tp">spdlog::logger</span>&gt;(<span class="str">"massive"</span>,
+            <span class="tp">spdlog::sinks_init_list</span>{consoleSink, fileSink});
+        spdlog::register_logger(logger);
+    } <span class="kw">else</span> {
+        <span class="kw">auto</span> logger = <span class="tp">std::make_shared</span>&lt;<span class="tp">spdlog::logger</span>&gt;(<span class="str">"massive"</span>, fileSink);
+        spdlog::register_logger(logger);
+    }
+    spdlog::set_default_logger(spdlog::get(<span class="str">"massive"</span>));
+    spdlog::set_pattern(<span class="str">"[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [%n] [trace:%X] %v"</span>);
+    spdlog::set_level(spdlog::level::info);
+}
+
+<span class="cm">// 使用宏——开发中加性能埋点后可在 Tracy 中关联</span>
+<span class="macro">#define LOG_ERROR(traceId, fmt, ...)</span> spdlog::error(<span class="str">"[{}] "</span> fmt, traceId, ##__VA_ARGS__)
+<span class="macro">#define LOG_WARN(traceId, fmt, ...)</span>  spdlog::warn(<span class="str">"[{}] "</span> fmt, traceId, ##__VA_ARGS__)
+<span class="macro">#define LOG_INFO(traceId, fmt, ...)</span>  spdlog::info(<span class="str">"[{}] "</span> fmt, traceId, ##__VA_ARGS__)
+<span class="macro">#define LOG_DEBUG(traceId, fmt, ...)</span> spdlog::debug(<span class="str">"[{}] "</span> fmt, traceId, ##__VA_ARGS__)
+
+<span class="cm">// C++ 侧</span>
+LOG_WARN(sessionId, <span class="str">"queue depth approaching limit: depth={} max={}"</span>, depth, kMaxQueueSize);
+LOG_ERROR(trace, <span class="str">"db connection lost: {}"</span>, e.what());
+
+<span class="cm">// DasLang 侧桥接</span>
+<span class="fn">LogInfo</span>(msg: string)
+<span class="fn">LogWarn</span>(msg: string)
+<span class="fn">LogError</span>(msg: string)</code></pre>
+
+  <table>
+    <tr><th>级别</th><th>绑定方法</th><th>用途</th><th>生产环境</th></tr>
+    <tr><td><strong>ERROR</strong></td><td>LOG_ERROR(traceId, …)</td><td>需立刻响应的故障：DB 断开、registry 损坏</td><td>✅ 全量输出</td></tr>
+    <tr><td><strong>WARN</strong></td><td>LOG_WARN(traceId, …)</td><td>异常但可恢复：队列接近上限、认证失败、消息超时</td><td>✅ 全量输出</td></tr>
+    <tr><td><strong>INFO</strong></td><td>LOG_INFO(traceId, …)</td><td>关键业务事件：登录/登出、等级提升、交易完成、场景切换</td><td>✅ 全量输出</td></tr>
+    <tr><td><strong>DEBUG</strong></td><td>LOG_DEBUG(traceId, …)</td><td>开发调试：组件值变化、AOI 事件、each 循环次数</td><td>❌ 可开关</td></tr>
+    <tr><td><strong>TRACE</strong></td><td>spdlog::trace(…)</td><td>极致细节：网络包内容 dump</td><td>❌ 仅本机</td></tr>
+  </table>
+
+  <h3>16.2 spdlog 集成 DasLang 桥接</h3>
+  <pre><code><span class="cm">// C++ 侧 — 注册到 DasLang Module</span>
+<span class="kw">static</span> <span class="kt">void</span> <span class="fn">das_LogInfo</span>(<span class="kw">const</span> <span class="tp">char</span>* msg) { spdlog::info(msg); }
+<span class="kw">static</span> <span class="kt">void</span> <span class="fn">das_LogWarn</span>(<span class="kw">const</span> <span class="tp">char</span>* msg) { spdlog::warn(msg); }
+<span class="kw">static</span> <span class="kt">void</span> <span class="fn">das_LogError</span>(<span class="kw">const</span> <span class="tp">char</span>* msg) { spdlog::error(msg); }
+
+addExtern&lt;<span class="tp">DAS_BIND_FUN</span>(das_LogInfo)&gt;(*<span class="kw">this</span>, lib, <span class="str">"LogInfo"</span>,
+    <span class="tp">SideEffects</span>::modifyExternal);
+<span class="cm">// LogWarn / LogError 同理</span></code></pre>
+
+  <h3>16.3 性能指标与 Tracy 埋点</h3>
+  <p>
+    使用 <strong>Tracy</strong>（C++ 实时性能分析器）做开发期埋点。每个系统函数、DB 查询、Tick 阶段
+    用 <code>ZoneScoped</code> 标记——Tracy GUI 中可以按线程、按帧查看每段代码的耗时瀑布图。
+    生产环境通过编译宏禁用 Tracy（零开销）。
+  </p>
+
+  <pre><code><span class="macro">#ifdef MASSIVE_ENABLE_TRACY</span>
+<span class="macro">  #include &lt;tracy/Tracy.hpp&gt;</span>
+<span class="macro">  #define MASSIVE_PROFILE()</span>       ZoneScoped
+<span class="macro">  #define MASSIVE_PROFILE_NAME(x)</span>  ZoneScopedN(x)
+<span class="macro">  #define MASSIVE_FRAME_MARK()</span>     FrameMark
+<span class="macro">#else</span>
+<span class="macro">  #define MASSIVE_PROFILE()</span>
+<span class="macro">  #define MASSIVE_PROFILE_NAME(x)</span>
+<span class="macro">  #define MASSIVE_FRAME_MARK()</span>
+<span class="macro">#endif</span>
+
+<span class="cm">// 使用——开发期 xmake f -m debug --tracy=y 即可</span>
+<span class="kt">void</span> <span class="tp">LogicServer</span>::<span class="fn">Run</span>() {
+    <span class="kw">while</span> (!<span class="kw">_stopped</span>.load()) {
+        MASSIVE_FRAME_MARK();  <span class="cm">// 标记帧边界——Tracy 中按帧分析</span>
+        {
+            MASSIVE_PROFILE_NAME(<span class="str">"ProcessMessages"</span>);
+            <span class="fn">ProcessMessages</span>();
+        }
+        {
+            MASSIVE_PROFILE_NAME(<span class="str">"TimingWheelTick"</span>);
+            <span class="kw">_timingWheel</span>.Tick();
+        }
+        {
+            MASSIVE_PROFILE_NAME(<span class="str">"GameTick"</span>);
+            <span class="fn">Tick</span>(elapsed);
+        }
+    }
+}
+
+<span class="cm">// DB 查询埋点</span>
+<span class="kt">void</span> <span class="tp">DbService</span>::<span class="fn">ExecuteQuery</span>(<span class="kw">const</span> <span class="tp">std::string</span>&amp; sql) {
+    MASSIVE_PROFILE_NAME(<span class="str">"DB_ExecuteQuery"</span>);
+    <span class="cm">// ... PG 查询</span>
+}
+
+<span class="cm">// 系统函数埋点——移动系统耗时一目了然</span>
+<span class="kw">def</span> <span class="fn">SystemMovement</span>(sceneId : uint32; dt : float) {
+    <span class="cm">// C++ 桥接函数内已埋 MASSIVE_PROFILE_NAME("SystemMovement")</span>
+    ecs_query(sceneId; pos : Position&amp;; vel : Velocity) {
+        pos.x += vel.vx * dt
+    }
+}</code></pre>
+
+  <div class="callout info">
+    <strong>📌 Tracy 优势</strong>：零侵入（宏在 Release 下编译为空白）、帧级时间线、
+    跨线程追踪（DB 线程查询耗时也在同一 Timeline 上）、GPU 追踪、内存追踪、
+    无需外部数据库（Tracy GUI 直连应用端口）。
+  </div>
+
+  <h3>16.4 分布式请求追踪：双 traceId</h3>
+  <p>
+    <code>traceId</code> 由 <strong>GateServer</strong> 在拆包生成 LogicMessage 时生成（uint64_t 自增 + 时间戳编码）。
+    <code>clientTraceId</code> 由客户端可选传入（在 proto 消息体中）。如果客户端不传，留空。
+  </p>
+
+  <pre><code><span class="kw">struct</span> <span class="tp">LogicMessage</span> {
+    <span class="tp">uint32_t</span>    sessionId;
+    <span class="tp">uint32_t</span>    msgId;
+    <span class="tp">uint64_t</span>    traceId;        <span class="cm">// GateServer 生成，贯穿 Gate→World→DB</span>
+    <span class="tp">uint64_t</span>    clientTraceId;  <span class="cm">// 客户端可选传入（0 表示未传）</span>
+    <span class="tp">std::vector</span>&lt;<span class="kt">char</span>&gt; body;
+    <span class="tp">std::chrono::steady_clock::time_point</span> recvTime;
+};
+
+<span class="cm">// GateServer 端 traceId 生成：时间戳高32位 + 自增序号低32位</span>
+<span class="kw">static</span> <span class="tp">std::atomic</span>&lt;<span class="tp">uint32_t</span>&gt; seq{<span class="num">0</span>};
+<span class="kw">auto</span> traceId = (<span class="kw">uint64_t</span>(time(nullptr)) &lt;&lt; <span class="num">32</span>) | seq.fetch_add(<span class="num">1</span>);</code></pre>
+
+  <h3>16.5 Crash 恢复</h3>
+  <table>
+    <tr><th>组件</th><th>策略</th></tr>
+    <tr><td>WorldServer</td><td>进程守护 (systemd Restart=always) 自动重启 → DB 加载场景快照 → 恢复在线玩家 Entity + 组件 → 通知 GateServer 更新路由</td></tr>
+    <tr><td>GateServer</td><td>无状态，直接重启。客户端重连走其他 Gate。</td></tr>
+    <tr><td>DBServer</td><td>主备切换。PgBouncer 自动路由到新 PG 实例。</td></tr>
+  </table>
+
+  <h3>16.6 Assert vs Panic</h3>
+  <table>
+    <tr><th>场景</th><th>策略</th></tr>
+    <tr><td>C++ 引擎内部不变量</td><td><code>MASSIVE_ASSERT</code> 自定义断言宏：Debug 下 abort 进调试器，Release 下记录 ERROR 日志并继续执行（不 crash）。标准 <code>assert()</code> 在 Release 下被完全移除，无法满足需求。</td></tr>    <tr><td>DasLang 脚本逻辑错误</td><td><code>panic</code> → ERROR 日志 + 行号 → 返回错误给客户端，不 crash 服务器</td></tr>
+    <tr><td>DB 写入失败</td><td>重试 3 次 → 每次间隔 100ms → 仍失败则 ERROR 日志 → 继续服务（不 crash）</td></tr>
+    <tr><td>内存耗尽</td><td>主动 <code>std::abort()</code> + 生成 core dump，systemd 自动重启</td></tr>
+    <tr><td>EnTT registry 损坏</td><td>panic → 记录全量 debug_dump → abort → 重启恢复</td></tr>
+  </table>
+
+  <h3>16.7 指标暴露与告警</h3>
+  <p>
+    应用层内嵌一个轻量 HTTP 服务器（Asio HTTP），暴露 <code>/metrics</code> 端点供 Prometheus 拉取。
+    告警规则由 Prometheus AlertManager 外部驱动，不内嵌在代码中。
+  </p>
+
+  <pre><code><span class="cm">// MetricsEndpoint.h — 内嵌 /metrics HTTP 端点</span>
+<span class="kw">class</span> <span class="tp">MetricsEndpoint</span> {
+<span class="kw">public</span>:
+    <span class="fn">MetricsEndpoint</span>(<span class="tp">asio::io_context</span>&amp; ctx, <span class="tp">uint16_t</span> port = <span class="num">9090</span>);
+
+    <span class="cm">// 指标注册（每个指标一个 gauge/counter）</span>
+    <span class="kt">void</span> <span class="fn">RegisterGauge</span>(<span class="kw">const</span> <span class="tp">std::string</span>&amp; name, <span class="tp">std::function</span>&lt;<span class="kt">double</span>()&gt; getter);
+    <span class="kt">void</span> <span class="fn">IncrementCounter</span>(<span class="kw">const</span> <span class="tp">std::string</span>&amp; name);
+
+    <span class="cm">// 每 Tick 调用：更新所有指标值</span>
+    <span class="kt">void</span> <span class="fn">Update</span>();
+
+<span class="kw">private</span>:
+    <span class="tp">asio::ip::tcp::acceptor</span> <span class="kw">_acceptor</span>;
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">std::string</span>, <span class="tp">GaugeMetric</span>&gt; <span class="kw">_gauges</span>;
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">std::string</span>, <span class="tp">std::atomic</span>&lt;<span class="tp">uint64_t</span>&gt;&gt; <span class="kw">_counters</span>;
+};</code></pre>
+
+  <h3>16.8 告警规则</h3>
+  <p>
+    告警规则由外部监控系统（Prometheus AlertManager）驱动，不在代码内嵌规则。
+    代码只负责暴露指标和输出日志。
+  </p>
+
+  <table>
+    <tr><th>指标</th><th>告警条件</th><th>级别</th></tr>
+    <tr><td>massive_errors_total{type="db_connection_fail"}</td><td>&gt; 0 for 1m</td><td>🔴 紧急</td></tr>
+    <tr><td>massive_queue_depth</td><td>&gt; 80% 容量 for 3m</td><td>🟡 警告</td></tr>
+    <tr><td>massive_tick_duration_ms</td><td>&gt; 45ms for 5m（接近 50ms Tick 上限）</td><td>🟡 警告</td></tr>
+    <tr><td>massive_sessions_online</td><td>突然下降 &gt; 50% in 1m</td><td>🔴 紧急</td></tr>
+    <tr><td>massive_db_query_duration_ms</td><td>p99 &gt; 50ms for 5m</td><td>🟡 警告</td></tr>
+  </table>
+
+</div>
+
+</div>
+<nav class="breadcrumb" style="margin-top:24px;"><a href="../Design.html">🏠 返回总目录</a></nav>
+<div class="footer">MMO Server Architecture Design Document · Version 1.2</div>
+</body>
+</html>

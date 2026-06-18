@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>技能系统 — MMO 服务器架构设计 v1.2</title>
+<link rel="stylesheet" href="../shared.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="../Design.html">🏠 总目录</a></nav>
+<div class="container">
+<span class="badge confirmed">✔ 已确认</span>
+
+<div class="section" id="skill">
+  <h2>技能系统 · 施法管线 + 冷却管理 + 目标选择</h2>
+
+  <h3>1. 设计概述</h3>
+  <p>
+    技能系统负责技能施放的完整生命周期：客户端请求 → 服务器校验 → 施法 → 效果结算 → 冷却管理。
+    采用 <strong>固定阶段流水线</strong>（同伤害管线），无虚函数、零堆分配。技能数据从 ConfigTable 查表，
+    施法逻辑在 DasLang 脚本中实现（可热更新）。
+  </p>
+
+  <h3>2. 技能模板（ConfigTable）</h3>
+  <pre><code><span class="kw">CREATE TABLE</span> skill_templates (
+    skill_id          <span class="kw">INT PRIMARY KEY</span>,
+    skill_name        <span class="kw">TEXT NOT NULL</span>,
+    skill_type        <span class="kw">INT NOT NULL</span>,         <span class="cm">// 0=瞬发 1=读条 2=引导 3=被动</span>
+    target_type       <span class="kw">INT NOT NULL</span>,         <span class="cm">// 0=自身 1=单体 2=AoE点 3=AoE自身 4=方向</span>
+    max_range         <span class="kw">REAL DEFAULT</span> 0,        <span class="cm">// 施法距离（米）</span>
+    aoe_radius        <span class="kw">REAL DEFAULT</span> 0,        <span class="cm">// AoE 半径（米）</span>
+    cast_time_ms      <span class="kw">INT DEFAULT</span> 0,         <span class="cm">// 读条时间（毫秒），0=瞬发</span>
+    channel_time_ms   <span class="kw">INT DEFAULT</span> 0,         <span class="cm">// 引导时间（毫秒）</span>
+    cooldown_ms       <span class="kw">INT DEFAULT</span> 0,         <span class="cm">// 冷却时间（毫秒）</span>
+    gcd_category      <span class="kw">INT DEFAULT</span> 0,         <span class="cm">// GCD 分组（0=独立，1=通用GCD）</span>
+    gcd_ms            <span class="kw">INT DEFAULT</span> 1500,       <span class="cm">// GCD 时间（毫秒）</span>
+    cost_mp           <span class="kw">INT DEFAULT</span> 0,         <span class="cm">// MP 消耗</span>
+    cost_hp           <span class="kw">INT DEFAULT</span> 0,         <span class="cm">// HP 消耗</span>
+    cost_rage         <span class="kw">INT DEFAULT</span> 0,         <span class="cm">// 怒气/能量消耗</span>
+    min_level          <span class="kw">INT DEFAULT</span> 1,
+    require_weapon     <span class="kw">INT DEFAULT</span> 0,         <span class="cm">// 0=不限 1=需装备武器</span>
+    on_cast_script     <span class="kw">TEXT</span>,                <span class="cm">// 施法成功后执行的脚本函数名</span>
+    on_hit_script      <span class="kw">TEXT</span>,                <span class="cm">// 命中目标后执行的脚本函数名</span>
+    icon               <span class="kw">TEXT</span>,
+    description        <span class="kw">TEXT</span>
+);
+
+<span class="cm">// C++ 侧：ConfigTable 实例</span>
+ConfigTable&lt;SkillTemplate&gt; <span class="kw">g_skillTemplates</span>;</code></pre>
+
+  <h3>3. 玩家技能组件（BlobStorage——低频）</h3>
+  <pre><code><span class="cm">// 脚本组件——玩家技能栏</span>
+[script_component]
+<span class="kw">struct</span> <span class="tp">SkillSlot</span> {
+    skillId     : uint32
+    level       : int           <span class="cm">// 技能等级</span>
+}
+
+[script_component]
+<span class="kw">struct</span> <span class="tp">SkillBar</span> {
+    slots       : array&lt;SkillSlot&gt;     <span class="cm">// 技能栏（索引 = 栏位号）</span>
+}
+
+<span class="cm">// 脚本组件——技能冷却记录</span>
+[script_component]
+<span class="kw">struct</span> <span class="tp">CooldownEntry</span> {
+    skillId     : uint32
+    endTime     : float             <span class="cm">// 冷却结束时刻（TickTime）</span>
+}
+
+[script_component]
+<span class="kw">struct</span> <span class="tp">Cooldowns</span> {
+    entries     : array&lt;CooldownEntry&gt;
+    gcdEndTime  : float             <span class="cm">// GCD 结束时刻，0=不在 GCD</span>
+}</code></pre>
+
+  <h3>4. 施法管线（Cast Pipeline）</h3>
+  <h4>4.1 管线阶段</h4>
+  <pre>
+Client → MSG_SKILL_CAST_REQ(skillId, targetEntityId, targetX, targetY, targetZ)
+  │
+  ├── 阶段 1: 基础校验
+  │     □ caster 未死亡 (no DeadTag)
+  │     □ caster 未被控制 (no StunnedTag/SilencedTag/DisarmedTag)
+  │     □ caster 不在读条中 (castState == IDLE)
+  │     □ 技能在冷却中？→ REJECTED "on cooldown"
+  │     □ GCD 未结束？→ REJECTED "gcd active"
+  │     □ caster 未进入战斗？被动恢复技能允许，其余需要 CombatTag
+  │
+  ├── 阶段 2: 资源校验
+  │     □ currentMp ≥ cost_mp → 否则 REJECTED "not enough mp"
+  │     □ currentHp ≥ cost_hp（且 currentHp - cost_hp > 0）→ 否则 REJECTED
+  │     □ 其他资源（怒气/能量/连击点）检查
+  │
+  ├── 阶段 3: 目标校验
+  │     □ target_type == SELF → 自动通过
+  │     □ target_type == SINGLE → target 存在且有效、未死亡、非无敌
+  │     □ target_type == AOE_POINT → (targetX, targetZ) 在 NavMesh 上
+  │     □ 距离检查：Distance(caster, target) ≤ max_range → 否则 REJECTED "out of range"
+  │     □ 视线检查：IsInLineOfSight(caster, target) → 否则 REJECTED
+  │     □ PVP 标记检查（是否允许攻击同阵营/和平玩家）
+  │
+  ├── 阶段 4: 施法执行
+  │     □ 瞬发(cast_time_ms=0) → 立即执行效果
+  │     □ 读条(cast_time_ms>0) → 设置 CastState=CASTING + 注册定时器
+  │     □ 引导(channel_time_ms>0) → 设置 CastState=CHANNELING + 周期性 Tick
+  │
+  ├── 阶段 5: 效果结算
+  │     □ 扣资源（MP/HP/怒气）
+  │     □ 设置冷却 + GCD
+  │     □ 执行 on_cast_script → 生成 DamageEvent / HealEvent / BuffApply
+  │     □ 执行 on_hit_script（对每个目标）
+  │     □ 广播 MSG_SKILL_CAST_NTF 给附近玩家（动画同步）
+  │
+  └── 阶段 6: 回复
+        MSG_SKILL_CAST_RSP(accepted, skillId, cooldownEnd, gcdEnd)</pre>
+
+  <h4>4.2 施法状态机</h4>
+  <pre><code><span class="cm">// CastState — EnTT Tag 组件</span>
+<span class="kw">enum class</span> <span class="tp">CastState</span> : uint8_t {
+    Idle        = <span class="num">0</span>,   <span class="cm">// 空闲</span>
+    Casting     = <span class="num">1</span>,   <span class="cm">// 读条中（不可移动，不可施放其他技能）</span>
+    Channeling  = <span class="num">2</span>,   <span class="cm">// 引导中（可移动视技能而定）</span>
+};
+
+<span class="kw">struct</span> <span class="tp">CastingComponent</span> {
+    <span class="tp">uint32_t</span>  skillId;
+    <span class="tp">Entity</span>    targetEntity;
+    <span class="tp">Vector3</span>   targetPos;    <span class="cm">// AoE 用</span>
+    <span class="tp">uint32_t</span>  timerId;      <span class="cm">// 定时器 ID（取消读条用）</span>
+    <span class="tp">CastState</span> state;
+};
+
+<span class="cm">// 施法校验 + 执行——DasLang 侧</span>
+<span class="kw">def</span> <span class="fn">HandleSkillCast</span>(caster : Entity; skillId : uint32; target : Entity; targetX : float; targetY : float; targetZ : float)
+{
+    <span class="kw">let</span> template = g_skillTemplates.Find(skillId)
+    <span class="kw">if</span> (template == <span class="nb">null</span>) {
+        SendSkillCastRsp(caster, skillId, SKILL_ERR_NOT_FOUND)
+        <span class="kw">return</span>
+    }
+
+    <span class="cm">// === 阶段 1: 基础校验 ===</span>
+    <span class="kw">var</span> canCast = <span class="nb">true</span>
+    <span class="kw">var</span> errorCode = SKILL_OK
+
+    ecs_edit(caster) $(<span class="kw">var</span> cmp)
+    {
+        <span class="cm">// 状态检查</span>
+        <span class="kw">if</span> (HasTag(caster, DeadTag) || HasTag(caster, StunnedTag)) {
+            canCast = <span class="nb">false</span>; errorCode = SKILL_ERR_CANT_CAST
+        }
+
+        <span class="cm">// 读条中不可施法</span>
+        <span class="kw">if</span> (canCast &amp;&amp; GetCastState(caster) != CastState::Idle) {
+            canCast = <span class="nb">false</span>; errorCode = SKILL_ERR_ALREADY_CASTING
+        }
+
+        <span class="cm">// GCD 检查</span>
+        <span class="kw">if</span> (canCast &amp;&amp; cmp.cooldowns.gcdEndTime &gt; GetTickTime()) {
+            canCast = <span class="nb">false</span>; errorCode = SKILL_ERR_GCD_ACTIVE
+        }
+
+        <span class="cm">// 冷却检查</span>
+        <span class="kw">if</span> (canCast) {
+            <span class="kw">for</span> cd <span class="kw">in</span> cmp.cooldowns.entries {
+                <span class="kw">if</span> (cd.skillId == skillId &amp;&amp; cd.endTime &gt; GetTickTime()) {
+                    canCast = <span class="nb">false</span>; errorCode = SKILL_ERR_ON_COOLDOWN
+                    <span class="kw">break</span>
+                }
+            }
+        }
+    }
+
+    <span class="kw">if</span> (!canCast) { SendSkillCastRsp(caster, skillId, errorCode); <span class="kw">return</span> }
+
+    <span class="cm">// === 阶段 2: 资源校验 ===</span>
+    ecs_edit(caster) $(<span class="kw">var</span> cmp)
+    {
+        <span class="kw">if</span> (template.cost_mp &gt; cmp.battleStats.currentMp) {
+            errorCode = SKILL_ERR_NOT_ENOUGH_MP
+        } <span class="kw">elif</span> (template.cost_hp &gt; <span class="num">0</span> &amp;&amp; cmp.battleStats.currentHp - template.cost_hp &lt;= <span class="num">0</span>) {
+            errorCode = SKILL_ERR_NOT_ENOUGH_HP
+        }
+    }
+    <span class="kw">if</span> (errorCode != SKILL_OK) { SendSkillCastRsp(caster, skillId, errorCode); <span class="kw">return</span> }
+
+    <span class="cm">// === 阶段 3: 目标校验 ===</span>
+    <span class="kw">if</span> (template.target_type != SKILL_TARGET_SELF) {
+        <span class="kw">if</span> (target == InvalidEntity || !IsValidEntity(target)) {
+            SendSkillCastRsp(caster, skillId, SKILL_ERR_INVALID_TARGET); <span class="kw">return</span>
+        }
+        <span class="kw">if</span> (HasTag(target, DeadTag)) {
+            SendSkillCastRsp(caster, skillId, SKILL_ERR_TARGET_DEAD); <span class="kw">return</span>
+        }
+        <span class="kw">if</span> (DistanceBetween(caster, target) &gt; template.max_range) {
+            SendSkillCastRsp(caster, skillId, SKILL_ERR_OUT_OF_RANGE); <span class="kw">return</span>
+        }
+    }
+
+    <span class="cm">// === 阶段 4: 扣资源 + 设冷却（先扣再执行，防止脚本出错重复扣）===</span>
+    ecs_edit(caster) $(<span class="kw">var</span> cmp)
+    {
+        cmp.battleStats.currentMp -= template.cost_mp
+        cmp.battleStats.currentHp -= template.cost_hp
+
+        <span class="cm">// 设置冷却</span>
+        <span class="kw">if</span> (template.cooldown_ms &gt; <span class="num">0</span>) {
+            SetCooldown(cmp.cooldowns, skillId, GetTickTime() + float(template.cooldown_ms) / <span class="num">1000.0</span>)
+        }
+
+        <span class="cm">// 设置 GCD</span>
+        <span class="kw">if</span> (template.gcd_category != <span class="num">0</span>) {
+            cmp.cooldowns.gcdEndTime = GetTickTime() + float(template.gcd_ms) / <span class="num">1000.0</span>
+        }
+    }
+
+    <span class="cm">// === 阶段 5: 读条（如需要）===</span>
+    <span class="kw">if</span> (template.cast_time_ms &gt; <span class="num">0</span>) {
+        <span class="kw">let</span> timerId = ScheduleTimer(template.cast_time_ms, $(timerId: uint32) {
+            ExecuteSkillEffect(caster, template, target, targetX, targetY, targetZ)
+            SetCastState(caster, CastState::Idle)
+        })
+        SetCasting(caster, skillId, target, timerId, CastState::Casting)
+    } <span class="kw">else</span> {
+        <span class="cm">// 瞬发——立即执行</span>
+        ExecuteSkillEffect(caster, template, target, targetX, targetY, targetZ)
+    }
+
+    <span class="cm">// 广播施法动画</span>
+    <span class="kw">let</span> ntf = SkillCastNtf{
+        casterEntityId = caster,
+        skillId = skillId,
+        targetEntityId = target,
+        castTimeMs = template.cast_time_ms
+    }
+    BroadcastNearby(caster, MSG_SKILL_CAST_NTF, SerializeProto(ntf))
+
+    <span class="cm">// 回复客户端——先发 RSP 表示接受了施法请求</span>
+    SendSkillCastRsp(caster, skillId, SKILL_OK)
+}</code></pre>
+
+  <h3>5. 效果执行——脚本驱动</h3>
+  <pre><code><span class="cm">// 技能效果执行——DasLang 侧</span>
+<span class="kw">def</span> <span class="fn">ExecuteSkillEffect</span>(caster : Entity; template : SkillTemplate; primaryTarget : Entity;
+                       targetX : float; targetY : float; targetZ : float)
+{
+    <span class="cm">// 1. 收集目标列表（单体 vs AoE）</span>
+    <span class="kw">var</span> targets : array&lt;Entity&gt;
+    <span class="kw">if</span> (template.target_type == SKILL_TARGET_SINGLE) {
+        targets |> push(primaryTarget)
+    } <span class="kw">elif</span> (template.target_type == SKILL_TARGET_AOE_POINT) {
+        targets = GetEntitiesInAoiRadius(GetSceneId(caster), targetX, targetZ, template.aoe_radius)
+    } <span class="kw">elif</span> (template.target_type == SKILL_TARGET_AOE_SELF) {
+        <span class="kw">let</span> pos = GetPosition(caster)
+        targets = GetEntitiesInAoiRadius(GetSceneId(caster), pos.x, pos.z, template.aoe_radius)
+    }
+
+    <span class="cm">// 2. 对每个目标执行 on_hit_script</span>
+    <span class="kw">if</span> (template.on_hit_script != <span class="str">""</span>) {
+        <span class="kw">for</span> t <span class="kw">in</span> targets {
+            CallSkillScript(template.on_hit_script, caster, t, template)
+        }
+    }
+
+    <span class="cm">// 3. 执行 on_cast_script（施法者自身的额外效果）</span>
+    <span class="kw">if</span> (template.on_cast_script != <span class="str">""</span>) {
+        CallSkillScript(template.on_cast_script, caster, primaryTarget, template)
+    }
+}
+
+<span class="cm">// 示例：火球术 on_hit 脚本</span>
+<span class="kw">def</span> <span class="fn">SkillScript_Fireball_Hit</span>(caster : Entity; target : Entity; template : SkillTemplate)
+{
+    <span class="cm">// 伤害结算</span>
+    <span class="kw">let</span> baseDamage = CalcSkillDamage(caster, template.skill_id)
+    HandleSkillDamage(caster, target, template.skill_id, baseDamage)
+
+    <span class="cm">// 附加效果：15% 概率附加灼烧 Debuff</span>
+    <span class="kw">if</span> (RandomFloat(<span class="num">0.0</span>, <span class="num">1.0</span>) &lt; <span class="num">0.15</span>) {
+        ApplyBuff(target, caster, BUFF_BURNING, <span class="num">1</span>)
+    }
+}</code></pre>
+
+  <h3>6. 冷却管理</h3>
+  <pre><code><span class="cm">// Cooldowns 操作（DasLang 侧）</span>
+
+<span class="kw">def</span> <span class="fn">SetCooldown</span>(var cds : Cooldowns; skillId : uint32; endTime : float)
+{
+    <span class="cm">// 查找是否已有该技能的冷却记录</span>
+    <span class="kw">for</span> <span class="kw">var</span> cd <span class="kw">in</span> cds.entries {
+        <span class="kw">if</span> (cd.skillId == skillId) {
+            cd.endTime = endTime     <span class="cm">// 覆盖</span>
+            <span class="kw">return</span>
+        }
+    }
+
+    <span class="cm">// 新记录</span>
+    cds.entries |> push(CooldownEntry{skillId = skillId, endTime = endTime})
+}
+
+<span class="kw">def</span> <span class="fn">GetCooldownRemaining</span>(cds : Cooldowns; skillId : uint32) : float
+{
+    <span class="kw">for</span> cd <span class="kw">in</span> cds.entries {
+        <span class="kw">if</span> (cd.skillId == skillId) {
+            <span class="kw">return</span> max(<span class="num">0.0</span>, cd.endTime - GetTickTime())
+        }
+    }
+    <span class="kw">return</span> <span class="num">0.0</span>
+}
+
+<span class="cm">// 定期清理过期冷却记录（可在 SystemSkillCooldown 中调用）</span>
+<span class="kw">def</span> <span class="fn">CleanupExpiredCooldowns</span>(var cds : Cooldowns)
+{
+    <span class="kw">let</span> now = GetTickTime()
+    <span class="kw">for</span> <span class="kw">var</span> i = cds.entries |> length() - <span class="num">1</span>; i &gt;= <span class="num">0</span>; i-- {
+        <span class="kw">if</span> (cds.entries[i].endTime &lt;= now) {
+            cds.entries |> erase(i)
+        }
+    }
+}</code></pre>
+
+  <h3>7. GCD 管理</h3>
+  <table>
+    <tr><th>GCD 分组</th><th>说明</th><th>示例</th></tr>
+    <tr><td>0 (独立)</td><td>不触发任何 GCD，也不受其他技能 GCD 影响</td><td>药水、饰品、位移技能</td></tr>
+    <tr><td>1 (通用GCD)</td><td>触发通用 GCD（默认 1.5s），受攻击速度影响</td><td>大多数攻击技能、法术</td></tr>
+  </table>
+  <pre><code><span class="cm">// GCD 计算公式：实际 GCD = 基础GCD × (1 - 急速加成)</span>
+<span class="kw">def</span> <span class="fn">GetActualGcdMs</span>(caster : Entity; template : SkillTemplate) : int
+{
+    <span class="kw">if</span> (template.gcd_category == <span class="num">0</span>) <span class="kw">return</span> <span class="num">0</span>
+
+    ecs_edit(caster) $(<span class="kw">var</span> cmp)
+    {
+        <span class="kw">let</span> haste = float(cmp.battleStats.attackSpeed) / <span class="num">10000.0</span>  <span class="cm">// attackSpeed 是万分比</span>
+        <span class="kw">return</span> int(float(template.gcd_ms) / (<span class="num">1.0</span> + haste))
+    }
+    <span class="kw">return</span> template.gcd_ms
+}</code></pre>
+
+  <h3>8. 读条打断</h3>
+  <pre><code><span class="cm">// 读条可被打断的场景</span>
+<span class="kw">def</span> <span class="fn">InterruptCasting</span>(caster : Entity; reason : InterruptReason)
+{
+    ecs_edit(caster) $(<span class="kw">var</span> cmp)
+    {
+        <span class="kw">let</span> castComp = GetCastingComponent(caster)
+        <span class="kw">if</span> (castComp.state == CastState::Idle) <span class="kw">return</span>
+
+        <span class="cm">// 取消读条定时器</span>
+        CancelTimer(castComp.timerId)
+
+        <span class="cm">// 返还资源（或部分返还）</span>
+        <span class="kw">let</span> template = g_skillTemplates.Find(castComp.skillId)
+        <span class="kw">if</span> (template != <span class="nb">null</span>) {
+            <span class="kw">if</span> (reason == InterruptReason::PlayerCancelled) {
+                <span class="cm">// 主动取消——全额返还</span>
+                cmp.battleStats.currentMp += template.cost_mp
+            } <span class="kw">elif</span> (reason == InterruptReason::Interrupted) {
+                <span class="cm">// 被打断——返还 50%</span>
+                cmp.battleStats.currentMp += template.cost_mp / <span class="num">2</span>
+            }
+            <span class="cm">// InterruptReason::CancelledByMove — 移动取消，不返还</span>
+        }
+
+        SetCastState(caster, CastState::Idle)
+        SendSkillCastRsp(caster, castComp.skillId, SKILL_ERR_INTERRUPTED)
+    }
+}
+
+<span class="kw">enum</span> <span class="tp">InterruptReason</span> {
+    INTERRUPT_PLAYER,       <span class="cm">// 玩家主动取消（按 ESC）</span>
+    INTERRUPT_MOVE,         <span class="cm">// 移动打断</span>
+    INTERRUPT_STUN,         <span class="cm">// 被控制打断</span>
+    INTERRUPT_KNOCKBACK,    <span class="cm">// 击退打断</span>
+    INTERRUPT_COUNTER,      <span class="cm">// 打断技能打断</span>
+}</code></pre>
+
+  <h3>9. 技能协议</h3>
+  <pre><code><span class="cm">// Proto 定义</span>
+message SkillCastReq {
+    uint32 skill_id = 1;
+    uint32 target_entity_id = 2;        <span class="cm">// 单体目标（AoE 时留空 or 中心目标）</span>
+    float  target_x = 3;                <span class="cm">// AoE 坐标</span>
+    float  target_y = 4;
+    float  target_z = 5;
+}
+
+message SkillCastRsp {
+    uint32 skill_id = 1;
+    SkillErrorCode error_code = 2;      <span class="cm">// 0=成功</span>
+    float  cooldown_end = 3;            <span class="cm">// 冷却结束时刻（客户端同步用）</span>
+    float  gcd_end = 4;                 <span class="cm">// GCD 结束时刻</span>
+}
+
+message SkillCastNtf {
+    uint32 caster_entity_id = 1;        <span class="cm">// 施法者</span>
+    uint32 skill_id = 2;
+    uint32 target_entity_id = 3;        <span class="cm">// 目标（AoE 时为 0）</span>
+    float  target_x = 4;                <span class="cm">// AoE 中心点</span>
+    float  target_y = 5;
+    float  target_z = 6;
+    int32  cast_time_ms = 7;            <span class="cm">// 读条时间（客户端播施法动画）</span>
+}
+
+enum SkillErrorCode {
+    SKILL_OK               = 0;
+    SKILL_ERR_NOT_FOUND    = 1;
+    SKILL_ERR_ON_COOLDOWN  = 2;
+    SKILL_ERR_GCD_ACTIVE   = 3;
+    SKILL_ERR_NOT_ENOUGH_MP = 4;
+    SKILL_ERR_NOT_ENOUGH_HP = 5;
+    SKILL_ERR_INVALID_TARGET = 6;
+    SKILL_ERR_TARGET_DEAD  = 7;
+    SKILL_ERR_OUT_OF_RANGE = 8;
+    SKILL_ERR_CANT_CAST    = 9;         <span class="cm">// 晕眩/沉默/缴械等</span>
+    SKILL_ERR_ALREADY_CASTING = 10;
+    SKILL_ERR_INTERRUPTED  = 11;
+}</code></pre>
+
+  <h3>10. 性能分析</h3>
+  <table>
+    <tr><th>操作</th><th>频率</th><th>单次耗时</th><th>说明</th></tr>
+    <tr><td>施法校验（6 阶段）</td><td>每技能施放（~50/sec）</td><td>~5μs</td><td>纯内存操作+查表，无 DB</td></tr>
+    <tr><td>冷却查询</td><td>每 SkillCastReq（~50/sec）</td><td>~0.5μs</td><td>遍历 ≤10 条冷却记录</td></tr>
+    <tr><td>目标收集（AoE）</td><td>AoE 技能（~10/sec）</td><td>~50μs</td><td>AOI 查询——见 §12 AOI</td></tr>
+    <tr><td>效果执行</td><td>每命中的目标（~100/sec）</td><td>~3μs</td><td>伤害管线 + Buff 施加</td></tr>
+  </table>
+
+</div>
+
+</div>
+<nav class="breadcrumb" style="margin-top:24px;"><a href="../Design.html">🏠 返回总目录</a></nav>
+<div class="footer">MMO Server Architecture Design Document · Version 1.2</div>
+</body>
+</html>

@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>21. 部署运维概览 — MMO 服务器架构设计 v1.2</title>
+<link rel="stylesheet" href="../shared.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="../Design.html">🏠 总目录</a></nav>
+<div class="container">
+<span class="badge confirmed">✔ 已确认 · C2 分布式</span>
+
+<div class="section" id="s21">
+  <h2>21. 部署运维概览 · 5 进程一步到位</h2>
+
+  <h3>21.1 构建系统：xmake</h3>
+  <p>所有 5 种进程共享同一个 xmake.lua，DBWorkerPool 在 common 库中。</p>
+
+  <pre><code><span class="cm">-- xmake.lua</span>
+set_project(<span class="str">"Massive"</span>)
+set_languages(<span class="str">"c++23"</span>)
+add_rules(<span class="str">"mode.debug"</span>, <span class="str">"mode.release"</span>)
+
+add_requires(<span class="str">"entt v4.0.0"</span>, <span class="str">"asio"</span>, <span class="str">"protobuf-cpp"</span>,
+             <span class="str">"spdlog"</span>, <span class="str">"openssl"</span>, <span class="str">"recastnavigation"</span>,
+             <span class="str">"tomlplusplus"</span>, <span class="str">"tracy"</span>, <span class="str">"libpq"</span>)
+
+option(<span class="str">"tracy"</span>, {default = false, description = <span class="str">"Enable Tracy profiler"</span>})
+
+<span class="cm">-- 公共库（被所有进程链接）——含 DBWorkerPool + DBRange + DirtyTracker</span>
+target(<span class="str">"massive_common"</span>)
+    set_kind(<span class="str">"static"</span>)
+    add_files(<span class="str">"src/common/**.cpp"</span>)
+    add_packages(<span class="str">"entt"</span>, <span class="str">"asio"</span>, <span class="str">"protobuf-cpp"</span>,
+                 <span class="str">"spdlog"</span>, <span class="str">"openssl"</span>, <span class="str">"recastnavigation"</span>,
+                 <span class="str">"tomlplusplus"</span>, <span class="str">"libpq"</span>)
+
+<span class="cm">-- 🔄 Schema → C++ 代码生成（构建前自动执行）</span>
+task(<span class="str">"gen-db-bindings"</span>)
+    on_run(function()
+        os.exec(<span class="str">"python tools/generate_db_bindings.py --config config/world_1.toml"</span>)
+    end)
+
+<span class="cm">-- 5 个独立进程</span>
+target(<span class="str">"LoginServer"</span>)
+    set_kind(<span class="str">"binary"</span>)
+    add_files(<span class="str">"src/login/**.cpp"</span>)
+    add_deps(<span class="str">"massive_common"</span>)
+
+target(<span class="str">"GateServer"</span>)
+    set_kind(<span class="str">"binary"</span>)
+    add_files(<span class="str">"src/gate/**.cpp"</span>)
+    add_deps(<span class="str">"massive_common"</span>)
+
+target(<span class="str">"WorldServer"</span>)
+    set_kind(<span class="str">"binary"</span>)
+    add_files(<span class="str">"src/world/**.cpp"</span>)
+    add_deps(<span class="str">"massive_common"</span>)
+
+target(<span class="str">"CenterServer"</span>)
+    set_kind(<span class="str">"binary"</span>)
+    add_files(<span class="str">"src/center/**.cpp"</span>)
+    add_deps(<span class="str">"massive_common"</span>)
+
+target(<span class="str">"SocialServer"</span>)
+    set_kind(<span class="str">"binary"</span>)
+    add_files(<span class="str">"src/social/**.cpp"</span>)
+    add_deps(<span class="str">"massive_common"</span>)
+
+<span class="cm">-- DasLang 模块</span>
+target(<span class="str">"module_entt"</span>)
+    set_kind(<span class="str">"shared"</span>)
+    add_files(<span class="str">"src/ecs/ModuleEntt.cpp"</span>)
+    add_packages(<span class="str">"entt"</span>)</code></pre>
+
+  <h3>21.2 配置管理：TOML</h3>
+  <pre><code><span class="cm"># config/login.toml</span>
+[server] name = <span class="str">"login_1"</span>; port = 8443
+[security] login_server_secret = <span class="str">"${MASSIVE_LSS}"</span>
+[database] host = <span class="str">"localhost"</span>; port = 6432; dbname = <span class="str">"massive"</span>
+[world_servers] instances = [<span class="str">"localhost:8001"</span>, <span class="str">"localhost:8002"</span>]
+
+<span class="cm"># config/gate_1.toml</span>
+[server] name = <span class="str">"gate_1"</span>; port = 9000; io_threads = 8
+[world_connections] world_1 = <span class="str">"localhost:8001"</span>; world_2 = <span class="str">"localhost:8002"</span>
+
+<span class="cm"># config/world_1.toml</span>
+[server] name = <span class="str">"world_1"</span>; listen_port = 8001
+[security] login_server_secret = <span class="str">"${MASSIVE_LSS}"</span>
+[center] address = <span class="str">"localhost:7000"</span>
+[social] address = <span class="str">"localhost:7001"</span>
+[database] host = <span class="str">"localhost"</span>; port = 6432; dbname = <span class="str">"massive"</span>; db_workers = 5
+[[scenes]] id = 1001; name = <span class="str">"main_city"</span></code></pre>
+
+  <h3>21.3 项目目录结构</h3>
+  <pre>
+massive/
+  xmake.lua
+  src/
+    common/              <span class="cm"># IOContextPool, MpscQueue, PacketHeader, SessionToken, TOML reader</span>
+    common/db/           <span class="cm"># DBWorkerPool, DBResult, DBRange, Column, DirtyTracker — 被 World/Social/Login 链接</span>
+    common/db/autogen/   <span class="cm"># 🔄 自动生成: players_table.h, guilds_table.h, items_table.h, ... (不手动编辑)</span>
+    login/               <span class="cm"># LoginServer: AuthHandler, SessionTokenIssue, BanChecker, ECDH</span>
+    gate/                <span class="cm"># GateServer: GateSession, SessionRouter, WorldConnPool, RateLimiter</span>
+    world/               <span class="cm"># WorldServer: LogicServer, TimingWheel, MessageDispatcher, Scene</span>
+    center/              <span class="cm"># CenterServer: ServiceRegistry, PlayerLocationIndex, RpcRouter</span>
+    social/              <span class="cm"># SocialServer: GuildMgr, ChatChannelMgr, MailMgr, AuctionHouse, MatchQueue</span>
+    ecs/                 <span class="cm"># ECS 组件 + ModuleEntt + Scene + GridAoiSystem + 所有 System</span>
+    navmesh/             <span class="cm"># NavMeshManager (Recast/Detour)</span>
+    dasbridge/           <span class="cm"># DasLang 桥接</span>
+  config/                <span class="cm"># 各进程 TOML 配置文件</span>
+  data/navmesh/          <span class="cm"># Recast 烘焙的 .navmesh 文件</span>
+  scripts/               <span class="cm"># DasLang 脚本（AI, Skill, Quest, GM...）</span>
+  tools/
+    generate_db_bindings.py  <span class="cm"># 🔄 Schema → C++ 代码生成器（连接 PG → information_schema → autogen/）</span>
+    recast_builder.py        <span class="cm"># NavMesh 烘焙工具</span>
+  Doc/                   <span class="cm"># 本文档</span>
+  logs/</pre>
+
+  <div class="callout info">
+    <strong>🔄 代码生成自动化</strong>：CMake/xmake 中配置 <code>add_custom_command</code>——检测 <code>common/db/autogen/</code>
+    目录的修改时间 vs <code>migrations/</code> 目录的修改时间。如果 migrations 更新了，自动重跑
+    <code>generate_db_bindings.py</code> 再编译。日常开发不需要手动跑脚本。
+  </div>
+
+  <h3>21.4 启动命令</h3>
+  <pre>
+xmake f -m debug --tracy=y
+xmake build
+
+<span class="cm"># 按依赖顺序启动</span>
+pgbouncer config/pgbouncer.ini                          <span class="cm"># 1. 基础设施</span>
+./CenterServer --config config/center.toml               <span class="cm"># 2. 协调层</span>
+./SocialServer --config config/social.toml               <span class="cm"># 3. 社交层（DBWorkerPool 连 PgBouncer）</span>
+./WorldServer  --config config/world_1.toml              <span class="cm"># 4. 游戏层（DBWorkerPool 连 PgBouncer）</span>
+./GateServer   --config config/gate_1.toml               <span class="cm"># 5. 网关层</span>
+./LoginServer  --config config/login.toml                <span class="cm"># 6. 登录层（直连 PgBouncer）</span></pre>
+
+  <h3>21.5 部署策略：渐进式</h3>
+  <p>
+    根据项目规模分阶段升级部署方案——不提前投资不需要的复杂度。
+  </p>
+
+  <h4>阶段 1：开发环境 — Docker Compose</h4>
+  <pre><span class="cm"># docker-compose.yml — 本地开发一键启动</span>
+services:
+  postgres:   { image: postgres:16, ports: ["5432:5432"] }
+  pgbouncer:  { image: edoburu/pgbouncer, ports: ["6432:6432"] }
+
+  center:  { build: ., command: ./CenterServer, depends_on: [pgbouncer] }
+  social:  { build: ., command: ./SocialServer, depends_on: [pgbouncer] }
+  world:   { build: ., command: ./WorldServer,  depends_on: [pgbouncer, center, social] }
+  gate:    { build: ., command: ./GateServer,   depends_on: [world], ports: ["9000:9000"] }
+  login:   { build: ., command: ./LoginServer,  depends_on: [pgbouncer, world], ports: ["8443:8443"] }</pre>
+  <p>Docker Compose 仅用于<strong>本地开发和内测阶段</strong>（0-500 人），不适合生产。</p>
+
+  <h4>阶段 2：测试/生产（初期）— systemd + Ansible</h4>
+  <p>
+    每台物理机直接跑进程，systemd 管理生命周期——这是传统游戏公司（Blizzard、TrinityCore 私服等）的标准做法。
+  </p>
+  <pre>/etc/systemd/system/
+  center-server.service
+  social-server.service
+  world-server@.service    (模板实例: world-server@1, world-server@2)
+  gate-server@.service
+  login-server.service
+
+# 批量部署——Ansible playbook
+ansible-playbook -i inventory/production deploy.yml
+# → scp 二进制 → systemctl restart → 健康检查</pre>
+  <table>
+    <tr><th>systemd 能力</th><th>覆盖项</th></tr>
+    <tr><td>Restart=always</td><td>进程崩溃自动重启</td></tr>
+    <tr><td>WatchdogSec=30s</td><td>无心跳自动 kill + restart</td></tr>
+    <tr><td>journald</td><td>日志集中收集</td></tr>
+  </table>
+  <p>此方案足够支撑到数万 PCU——复杂性低，运维透明。</p>
+
+  <h4>阶段 3：生产（规模扩大后）— k8s 升级路径</h4>
+  <p>
+    当 WorldServer 实例数扩展到 16+、运维人力充足时，可升级到 Kubernetes：
+  </p>
+  <pre>k8s 部署：
+  Deployment/LoginServer  (replicas: 2)
+  DaemonSet/GateServer    (每节点一个，hostNetwork)
+  StatefulSet/WorldServer (replicas: N, StatefulSet 保留 pod 标识)
+  StatefulSet/CenterServer (replicas: 1, 主备通过 etcd 选主)
+  StatefulSet/SocialServer (replicas: 2)
+  PgBouncer → Service → ExternalName 指向外部 PG
+  服务发现：Consul DNS 或 k8s Service DNS</pre>
+
+  <h3>21.7 进程崩溃恢复</h3>
+  <table>
+    <tr><th>进程</th><th>恢复策略</th></tr>
+    <tr><td>LoginServer</td><td>无状态。systemd Restart=always。新实例立即可用。</td></tr>
+    <tr><td>GateServer</td><td>无状态。客户端自动切换到下一个 gateIP。systemd 自动重启。</td></tr>
+    <tr><td>WorldServer</td><td>有状态（场景数据）。Crash 后从 DB 场景快照恢复（§15.7）。systemd Restart=always。</td></tr>
+    <tr><td>CenterServer</td><td>有状态（服务注册表）。主备切换（§28）。</td></tr>
+    <tr><td>SocialServer</td><td>有状态。数据在 PG。重启后从 DB 重载。</td></tr>
+  </table>
+
+  <h3>21.8 反外挂：多层检测框架</h3>
+  <p>
+    服务器权威架构（SSOT）已免疫大部分客户端外挂——内存修改、数据包篡改、穿墙瞬移均被 §17 的
+    NavMesh 校验 + AES-GCM 加密阻断。但 Bot/脚本外挂发送的每个操作都是"合法的"（合法的移动距离、
+    合法的技能释放）——必须通过行为检测来识别。
+  </p>
+
+  <h4>第 1 层：服务端权威校验（已有设计）</h4>
+  <table>
+    <tr><th>校验项</th><th>实现位置</th><th>违规处理</th></tr>
+    <tr><td>移动速度 ≤ 1.2x 最大速度</td><td>§17 移动校验</td><td>拒绝移动</td></tr>
+    <tr><td>目标在 NavMesh 可达区域</td><td>§17 NavMeshManager</td><td>拒绝移动</td></tr>
+    <tr><td>技能 CD 已就绪</td><td>§24 SkillCooldown</td><td>拒绝施法</td></tr>
+    <tr><td>拾取距离 ≤ 拾取范围</td><td>§26 物品系统</td><td>拒绝拾取</td></tr>
+    <tr><td>背包空间足够</td><td>§26 背包系统</td><td>拒绝获得物品</td></tr>
+  </table>
+
+  <h4>第 2 层：Token Bucket 频率限制 + Suspicion Score</h4>
+  <pre><code><span class="cm">// AntiCheat.h — 轻量实时异常检测</span>
+<span class="kw">class</span> <span class="tp">AntiCheat</span> {
+    <span class="kw">struct</span> <span class="tp">PlayerMetrics</span> {
+        <span class="tp">TokenBucket</span> moveBucket{<span class="num">20</span>, <span class="num">20</span>};     <span class="cm">// 20/s 移动操作</span>
+        <span class="tp">TokenBucket</span> skillBucket{<span class="num">10</span>, <span class="num">10</span>};   <span class="cm">// 10/s 技能释放</span>
+        <span class="tp">TokenBucket</span> lootBucket{<span class="num">5</span>, <span class="num">5</span>};      <span class="cm">// 5/s 拾取操作</span>
+        <span class="tp">int</span> suspicionScore = <span class="num">0</span>;
+    };
+
+    <span class="tp">bool</span> <span class="fn">CheckOperation</span>(<span class="tp">Entity</span> player, <span class="tp">OperationType</span> op) {
+        <span class="kw">auto</span>&amp; m = <span class="kw">_metrics</span>[player];
+        <span class="kw">if</span> (!m.<span class="fn">GetBucket</span>(op).TryConsume()) {
+            m.suspicionScore += <span class="num">1</span>;
+            <span class="kw">if</span> (m.suspicionScore &gt; <span class="num">100</span>) {
+                <span class="fn">KickPlayer</span>(player, <span class="tp">"suspicious activity detected"</span>);
+                LOG_WARN(<span class="tp">"ANTICHEAT: player {} flagged, score={}"</span>, player, m.suspicionScore);
+                <span class="kw">return</span> <span class="tp">false</span>;
+            }
+            <span class="kw">return</span> <span class="tp">false</span>;  <span class="cm">// 拒绝超频操作</span>
+        }
+        <span class="kw">if</span> (m.suspicionScore &gt; <span class="num">0</span>)
+            m.suspicionScore--;  <span class="cm">// 衰减——正常操作逐渐恢复信誉</span>
+        <span class="kw">return</span> <span class="tp">true</span>;
+    }
+};</code></pre>
+
+  <table>
+    <tr><th>检测维度</th><th>人类特征</th><th>Bot 特征</th><th>检测方式</th></tr>
+    <tr><td>操作频率</td><td>按需，有波动</td><td>恒定高频、无疲劳</td><td>Token Bucket 限频</td></tr>
+    <tr><td>在线时长</td><td>≤16h/天</td><td>24h 连续</td><td>≥24h → 强制下线 15min</td></tr>
+    <tr><td>操作间隔方差</td><td>有自然抖动</td><td>近乎完美恒定间隔</td><td>未来阶段实现（需离线分析）</td></tr>
+    <tr><td>移动路径</td><td>有微偏差</td><td>NavMesh 最优直线</td><td>未来阶段实现（需离线分析）</td></tr>
+  </table>
+
+  <h4>第 3 层：离线经济/行为分析（公测阶段按需建设）</h4>
+  <p>
+    第 1+2 层覆盖 80% 常见外挂检测。第 3 层（经济异常、多账号关联、物品流转图分析）
+    需要专门的数据管道和 GM 审核团队——在公测阶段按需建设。
+  </p>
+
+  <h3>21.9 灰度发布（Canary）</h3>
+  <p>
+    <strong>当前阶段（开发/内测）</strong>：全量部署 + systemd 自动重启。
+    PCU < 500 时灰度发布是过度工程化。
+  </p>
+
+  <p>
+    <strong>公测前实施</strong>：Gate 版本路由 + 逐台 WorldServer 滚动更新。
+    C2 拓扑天然支持逐台替换——Gate 根据后端容量路由，WorldServer 之间不直接通信。
+  </p>
+
+  <pre>滚动更新流程（公测版）：
+  ├── 1. 编译新版本二进制
+  ├── 2. 选择 1 台 WorldServer → systemctl stop → 替换二进制 → start
+  ├── 3. 该 WorldServer 向 CenterServer 注册（携带版本号）
+  ├── 4. GateServer 优先将新登录的玩家路由到新版 WorldServer
+  ├── 5. 已在旧版 World 上的玩家保持旧版（不强制迁移）
+  ├── 6. 观察 15 分钟（/metrics: 错误率、CPU、内存）
+  │   ├── 正常 → 逐台重启剩余 WorldServer
+  │   └── 异常 → 杀掉新版 → rollback 二进制 → 新连接回到旧版
+  └── 7. 全部升级完成 → 旧版本废弃</pre>
+
+  <div class="callout info">
+    <strong>兼容性约束</strong>：为支持将来的灰度发布，现在开始遵守两个约束——
+    Proto 字段<strong>只追加不删除</strong>（protobuf 天然支持），Entity 组件<strong>只新增不重命名</strong>。
+    这样新旧版本在通信和数据格式上可以共存。
+  </div>
+
+</div>
+
+</div>
+<nav class="breadcrumb" style="margin-top:24px;"><a href="../Design.html">🏠 返回总目录</a></nav>
+<div class="footer">MMO Server Architecture Design Document · Version 1.2</div>
+</body>
+</html>

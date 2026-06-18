@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>15. 数据持久化与缓存架构 — MMO 服务器架构设计 v1.2</title>
+<link rel="stylesheet" href="../shared.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="../Design.html">🏠 总目录</a></nav>
+<div class="container">
+<span class="badge confirmed">✔ 方案 2 · Schema → C++ 代码生成</span>
+
+<div class="section" id="s15">
+  <h2>15. 数据持久化 · 代码生成 + DBWorkerPool + PgBouncer</h2>
+
+  <h3>15.1 总体架构</h3>
+  <p>
+    <strong>方案 2：Schema → C++ 代码生成</strong>。C++ 层通过 Python 脚本从 PgSQL information_schema 自动生成
+    类型安全的 DAO 代码——开发者不写 SQL 字符串。底层 DBWorkerPool 持参数化 SQL + libpq → PgBouncer → PostgreSQL。
+    不设独立 DBServer 进程。
+  </p>
+
+  <div class="flow-diagram">
+    <div class="flow-box" style="border-color:#c62828;background:#ffebee;">DasLang 脚本<br><span style="font-size:.7rem;">AstCallMacro LINQ 管道链</span></div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-box" style="border-color:#2e7d32;background:#e8f5e9;">C++ DBQuery<br><span style="font-size:.7rem;">条件累积 → BuildSQL()</span></div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-box" style="border-color:#1a73e8;background:#e8f0fe;">DBWorkerPool<br><span style="font-size:.7rem;">3-5 Worker × libpq</span></div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-box" style="border-color:#6a1b9a;background:#f3e5f5;">PgBouncer:6432</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-box" style="border-color:#376791;background:#e3f2fd;">PostgreSQL</div>
+  </div>
+
+  <pre>
+数据访问的两条路径（殊途同归——最终都走 DBWorkerPool）：
+
+C++ 引擎层:
+  db::Range&lt;PlayersTable&gt;()           ← 类型安全查询（由 Python 生成的 header）
+      .Where(PlayersTable::PlayerId == 1001)
+      .Select(PlayersTable::Name, PlayersTable::Level)
+      .SingleOrDefault()
+     → BuildSQL() → DBWorkerPool.AsyncQuery(sql, params, callback)
+
+DasLang 脚本层:
+  table("players")
+      |> where_($(r) => r.player_id == 1001)
+      |> select($(r) => {r.name, r.level})
+      |> single_or_default()
+     → AstCallMacro 展开 → BuildSQL() → DBWorkerPool.AsyncQuery(sql, params, callback)
+
+复杂查询（JOIN / 子查询）:
+  RuntimeQuery("SELECT ... JOIN ... WHERE ...", {params})  ← escape hatch</pre>
+
+  <h3>15.2 代码生成管道</h3>
+  <pre>
+PostgreSQL schema 变更 (ALTER TABLE players ADD COLUMN ...)
+  │
+  ▼
+运行: python tools/generate_db_bindings.py
+  │
+  ├── 连接 PgBouncer → SELECT column_name, data_type, is_nullable
+  │                    FROM information_schema.columns WHERE table_name = '...'
+  │
+  ├── 生成 src/common/db/autogen/players_table.h:
+  │     struct PlayersTable { static constexpr Column<uint32_t> PlayerId{"player_id"}; ... };
+  │
+  ├── 生成 src/common/db/autogen/guilds_table.h:
+  │     struct GuildsTable { ... };
+  │
+  └── 生成 src/common/db/autogen/all_tables.h:
+        #include "players_table.h" ...  (聚合引用)
+  │
+  ▼
+xmake build → C++ 编译器验证:
+  · PlayersTable::AccountId == "hello" → ❌ 编译失败 (string vs uint32_t)
+  · INSERT PlayerRow{.name="foo"} ← 缺少必填字段 → ❌ 编译失败</pre>
+
+  <h4>15.2.1 生成示例 —— players 表</h4>
+  <pre><code><span class="cm">// ==========================================</span>
+<span class="cm">// 自动生成文件: src/common/db/autogen/players_table.h</span>
+<span class="cm">// 来源: PostgreSQL table 'players'</span>
+<span class="cm">// 生成时间: 2026-01-15 14:30:22</span>
+<span class="cm">// ⚠ 此文件由 generate_db_bindings.py 生成——不要手动编辑</span>
+<span class="cm">// ==========================================</span>
+<span class="macro">#pragma once</span>
+<span class="macro">#include "db/TableSchema.h"</span>
+
+<span class="kw">struct</span> <span class="tp">PlayersTable</span> {
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="kw">const</span> <span class="kt">char</span>* kTableName = <span class="str">"players"</span>;
+
+    <span class="cm">// 列定义——类型来自 information_schema.columns.data_type</span>
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="kw">auto</span> PlayerId    = Column&lt;<span class="tp">uint32_t</span>&gt;{<span class="str">"player_id"</span>,    kPK | kAutoInc};
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="kw">auto</span> AccountId   = Column&lt;<span class="tp">uint32_t</span>&gt;{<span class="str">"account_id"</span>,   kRequired};
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="kw">auto</span> Name        = Column&lt;<span class="tp">std::string</span>&gt;{<span class="str">"name"</span>,       kRequired};
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="kw">auto</span> ClassId     = Column&lt;<span class="tp">int32_t</span>&gt;{<span class="str">"class_id"</span>,    kRequired};
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="kw">auto</span> Level       = Column&lt;<span class="tp">int32_t</span>&gt;{<span class="str">"level"</span>,       kDefaulted, <span class="num">1</span>};
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="kw">auto</span> Gold        = Column&lt;<span class="tp">int64_t</span>&gt;{<span class="str">"gold"</span>,        kDefaulted, <span class="num">0LL</span>};
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="kw">auto</span> Exp         = Column&lt;<span class="tp">int64_t</span>&gt;{<span class="str">"exp"</span>,         kDefaulted, <span class="num">0LL</span>};
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="kw">auto</span> GuildId     = Column&lt;<span class="tp">uint32_t</span>&gt;{<span class="str">"guild_id"</span>,    kNullable};
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="kw">auto</span> SceneId     = Column&lt;<span class="tp">uint32_t</span>&gt;{<span class="str">"scene_id"</span>,    kRequired};
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="kw">auto</span> PosX        = Column&lt;<span class="kt">float</span>&gt;{<span class="str">"pos_x"</span>,       kRequired};
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="kw">auto</span> PosY        = Column&lt;<span class="kt">float</span>&gt;{<span class="str">"pos_y"</span>,       kRequired};
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="kw">auto</span> PosZ        = Column&lt;<span class="kt">float</span>&gt;{<span class="str">"pos_z"</span>,       kRequired};
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="kw">auto</span> Hp          = Column&lt;<span class="tp">int32_t</span>&gt;{<span class="str">"hp"</span>,          kDefaulted, <span class="num">100</span>};
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="kw">auto</span> Mp          = Column&lt;<span class="tp">int32_t</span>&gt;{<span class="str">"mp"</span>,          kDefaulted, <span class="num">50</span>};
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="kw">auto</span> CreatedAt   = Column&lt;<span class="tp">Timestamp</span>&gt;{<span class="str">"created_at"</span>,  kDefaulted, Timestamp::Now()};
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="kw">auto</span> LastLoginAt = Column&lt;<span class="tp">Timestamp</span>&gt;{<span class="str">"last_login_at"</span>, kNullable};
+
+    <span class="cm">// 便利别名——主键</span>
+    <span class="kw">using</span> <span class="tp">PKType</span> = <span class="tp">uint32_t</span>;
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="kw">auto</span> PK = PlayerId;
+};</code></pre>
+
+  <h4>15.2.2 Column 实现——operator== 返回 Expression，不是 bool</h4>
+  <pre><code><span class="cm">// TableSchema.h —— 核心模板</span>
+<span class="kw">template</span>&lt;<span class="kw">typename</span> T&gt;
+<span class="kw">struct</span> <span class="tp">Column</span> {
+    <span class="kw">const</span> <span class="kt">char</span>* name;
+    <span class="tp">uint32_t</span> flags;
+
+    <span class="cm">// ⚡ 关键: operator== 返回 Expression 而非 bool——这是 C++ 能实现 LINQ 语法的根基</span>
+    <span class="kw">constexpr</span> <span class="kw">auto</span> <span class="kw">operator</span>==(T value) <span class="kw">const</span> {
+        <span class="kw">return</span> Expression&lt;T&gt;{name, Op::EQ, value};
+    }
+
+    <span class="kw">constexpr</span> <span class="kw">auto</span> <span class="kw">operator</span>&lt;(T value)  <span class="kw">const</span> { <span class="kw">return</span> Expression&lt;T&gt;{name, Op::LT, value}; }
+    <span class="kw">constexpr</span> <span class="kw">auto</span> <span class="kw">operator</span>&gt;(T value)  <span class="kw">const</span> { <span class="kw">return</span> Expression&lt;T&gt;{name, Op::GT, value}; }
+    <span class="kw">constexpr</span> <span class="kw">auto</span> <span class="kw">operator</span>&lt;=(T value) <span class="kw">const</span> { <span class="kw">return</span> Expression&lt;T&gt;{name, Op::LE, value}; }
+    <span class="kw">constexpr</span> <span class="kw">auto</span> <span class="kw">operator</span>&gt;=(T value) <span class="kw">const</span> { <span class="kw">return</span> Expression&lt;T&gt;{name, Op::GE, value}; }
+};
+
+<span class="cm">// Expression 支持 && 组合</span>
+<span class="kw">template</span>&lt;<span class="kw">typename</span> T&gt;
+<span class="kw">struct</span> <span class="tp">Expression</span> {
+    <span class="kw">const</span> <span class="kt">char</span>* columnName;
+    <span class="tp">Op</span> op;
+    T value;
+
+    <span class="cm">// WHERE a = 1 AND b > 5 → Expression::operator&&</span>
+    <span class="kw">auto</span> <span class="kw">operator</span>&amp;&amp;(<span class="kw">const</span> <span class="kw">auto</span>&amp; other) <span class="kw">const</span> {
+        <span class="kw">return</span> CompoundExpr{std::vector{<span class="kw">this</span>-&gt;clone(), other.clone()}, LogicalOp::AND};
+    }
+};</code></pre>
+
+  <h3>15.3 db::Range&lt;T&gt; —— 类型安全查询</h3>
+  <pre><code><span class="cm">// DBRange.h — 类型安全查询构建器</span>
+<span class="kw">template</span>&lt;<span class="kw">typename</span> TableSchema&gt;
+<span class="kw">class</span> <span class="tp">DBRange</span> {
+<span class="kw">public</span>:
+    <span class="fn">DBRange</span>() : <span class="kw">_tableName</span>(TableSchema::kTableName) {}
+
+    <span class="cm">// ⚡ Where 接受 Expression——由 Column::operator== 返回</span>
+    <span class="kw">template</span>&lt;<span class="kw">typename</span>... Exprs&gt;
+    <span class="kw">auto</span>&amp; <span class="fn">Where</span>(<span class="kw">auto</span> expr, Exprs... more) {
+        <span class="fn">AddExpression</span>(expr);
+        <span class="kw">if</span> <span class="kw">constexpr</span> (<span class="kw">sizeof</span>...(more) &gt; <span class="num">0</span>) <span class="kw">return</span> <span class="fn">Where</span>(more...);
+        <span class="kw">return</span> *<span class="kw">this</span>;
+    }
+
+    <span class="cm">// ⚡ Select 接受 Column 对象——编译期确定字段列表</span>
+    <span class="kw">template</span>&lt;<span class="kw">typename</span>... Cols&gt;
+    <span class="kw">auto</span>&amp; <span class="fn">Select</span>(Cols... cols) {
+        (<span class="kw">_selects</span>.push_back({cols.name, TypeName&lt;<span class="kw">typename</span> Cols::ValueType&gt;()}), ...);
+        <span class="kw">return</span> *<span class="kw">this</span>;
+    }
+
+    <span class="kw">auto</span>&amp; <span class="fn">OrderBy</span>(<span class="kw">auto</span> col)     { <span class="kw">_orderBy</span> = col.name; <span class="kw">_orderDesc</span> = <span class="nb">false</span>; <span class="kw">return</span> *<span class="kw">this</span>; }
+    <span class="kw">auto</span>&amp; <span class="fn">OrderByDesc</span>(<span class="kw">auto</span> col) { <span class="kw">_orderBy</span> = col.name; <span class="kw">_orderDesc</span> = <span class="nb">true</span>;  <span class="kw">return</span> *<span class="kw">this</span>; }
+    <span class="kw">auto</span>&amp; <span class="fn">Limit</span>(<span class="tp">int</span> n)          { <span class="kw">_limit</span> = n; <span class="kw">return</span> *<span class="kw">this</span>; }
+
+    <span class="cm">// ⚡ 执行操作——BuildSQL() + 提交 DBWorkerPool + 结果反序列化到强类型</span>
+    <span class="kw">template</span>&lt;<span class="kw">typename</span> Callback&gt;
+    <span class="kt">void</span> <span class="fn">ToArray</span>(Callback&amp;&amp; callback);      <span class="cm">// 异步回调：vector&lt;Row&gt;</span>
+
+    <span class="kw">template</span>&lt;<span class="kw">typename</span> Callback&gt;
+    <span class="kt">void</span> <span class="fn">SingleOrDefault</span>(Callback&amp;&amp; callback);  <span class="cm">// Row or null</span>
+
+    <span class="cm">// 写入操作（同步提交——立即投递给 Worker，不等结果）</span>
+    <span class="kt">void</span> <span class="fn">Insert</span>(<span class="kw">auto</span>&amp;... rows);
+    <span class="kt">void</span> <span class="fn">Update</span>(<span class="kw">auto</span>&amp;&amp; setExpr);   <span class="cm">// 必须前有 Where()</span>
+    <span class="kt">void</span> <span class="fn">Delete</span>();                   <span class="cm">// 必须前有 Where()</span>
+
+<span class="kw">private</span>:
+    <span class="tp">std::string</span> <span class="kw">_tableName</span>;
+    <span class="tp">std::vector</span>&lt;<span class="tp">Condition</span>&gt; <span class="kw">_conditions</span>;
+    <span class="tp">std::vector</span>&lt;<span class="tp">SelectColumn</span>&gt; <span class="kw">_selects</span>;
+    <span class="tp">std::string</span> <span class="kw">_orderBy</span>;
+    <span class="kt">bool</span> <span class="kw">_orderDesc</span> = <span class="nb">false</span>;
+    <span class="tp">int</span> <span class="kw">_limit</span> = <span class="num">-1</span>;
+    <span class="tp">DBWorkerPool</span>* <span class="kw">_pool</span> = DBWorkerPool::Instance();
+};</code></pre>
+
+  <h3>15.4 C++ 层使用——完整示例</h3>
+  <pre><code><span class="cm">// ========== 查询 ==========</span>
+<span class="cm">// 单行查询——类型安全，字段名是编译期常量</span>
+db::Range&lt;<span class="tp">PlayersTable</span>&gt;()
+    .Where(PlayersTable::PlayerId == <span class="num">1001</span>)
+    .SingleOrDefault([](<span class="tp">std::optional</span>&lt;<span class="tp">PlayerRow</span>&gt; player) {
+        <span class="kw">if</span> (player) LoadPlayerIntoWorld(*player);
+    });
+
+<span class="cm">// 多条件查询</span>
+<span class="kw">auto</span> healers = db::Range&lt;<span class="tp">PlayersTable</span>&gt;()
+    .Where(PlayersTable::ClassId == CLASS_PRIEST, PlayersTable::Level &gt;= <span class="num">60</span>)
+    .OrderBy(PlayersTable::Level)
+    .Limit(<span class="num">100</span>);
+
+<span class="cm">// ========== 写入 ==========</span>
+<span class="cm">// INSERT——结构化初始化，字段遗漏 = 编译报错</span>
+db::Range&lt;<span class="tp">PlayersTable</span>&gt;().Insert(
+    PlayerRow{
+        .AccountId = <span class="num">5001</span>,
+        .Name      = <span class="str">"DarkMage"</span>,
+        .ClassId   = CLASS_MAGE,
+        .Level     = <span class="num">1</span>,
+        .SceneId   = <span class="num">1001</span>,
+        .PosX      = <span class="num">100.0</span>f,
+        .PosY      = <span class="num">50.0</span>f,
+        .PosZ      = <span class="num">0.0</span>f
+    }
+);
+
+<span class="cm">// UPDATE</span>
+db::Range&lt;<span class="tp">PlayersTable</span>&gt;()
+    .Where(PlayersTable::PlayerId == <span class="num">1001</span>)
+    .Update(UpdateSet{}.Set(PlayersTable::Level, <span class="num">61</span>)
+                       .Set(PlayersTable::Gold,   <span class="num">99999LL</span>));
+
+<span class="cm">// DELETE</span>
+db::Range&lt;<span class="tp">GuildsTable</span>&gt;()
+    .Where(GuildsTable::GuildId == <span class="num">42</span>)
+    .Delete();</code></pre>
+
+  <div class="callout info">
+    <strong>🧠 设计要点：为什么 Column::operator== 返回 Expression 而非 bool</strong><br>
+    这是 C++ 实现类型安全查询的核心技巧。如果 <code>operator==</code> 返回 <code>bool</code>，
+    <code>Where(PlayersTable::Level >= 60)</code> 会在编译期被求值为 <code>Where(true)</code>——丢失了列名和条件。
+    返回 <code>Expression</code> 对象则保留了所有编译期信息——列名 <code>"level"</code>、运算符 <code>&gt;=</code>、值 <code>60</code>——
+    Where() 收集这些信息，ToArray() 时拼接为参数化 SQL。效果和 C# LINQ-to-SQL 一致。
+  </div>
+
+  <h3>15.5 DBWorkerPool —— 异步执行层</h3>
+  <pre><code><span class="cm">// DBWorkerPool.h — 所有需要 DB 的进程共用（common 库）</span>
+<span class="kw">class</span> <span class="tp">DBWorkerPool</span> {
+<span class="kw">public</span>:
+    <span class="kw">static</span> <span class="tp">DBWorkerPool</span>* <span class="fn">Instance</span>() { <span class="kw">static</span> <span class="tp">DBWorkerPool</span> inst; <span class="kw">return</span> &amp;inst; }
+
+    <span class="fn">DBWorkerPool</span>(<span class="tp">int</span> workerCount, <span class="kw">const</span> <span class="tp">std::string</span>&amp; connString);
+
+    <span class="cm">// ⚡ 参数化 SQL——防注入。SQL 由 db::Range 或 DBQuery 的 BuildSQL() 生成</span>
+    <span class="kt">void</span> <span class="fn">AsyncQuery</span>(<span class="tp">std::string</span> sql,
+                  <span class="tp">std::vector</span>&lt;<span class="tp">DbValue</span>&gt; params,
+                  <span class="tp">std::function</span>&lt;<span class="kt">void</span>(<span class="kw">const</span> <span class="tp">DBResult</span>&amp;)&gt; callback);
+
+    <span class="kt">void</span> <span class="fn">ProcessCallbacks</span>();  <span class="cm">// LogicThread 每 Tick 调用</span>
+
+<span class="kw">private</span>:
+    <span class="kw">struct</span> <span class="tp">Worker</span> {
+        <span class="tp">PGconn</span>* conn;
+        <span class="tp">std::thread</span> thread;
+        <span class="tp">MpscQueue</span>&lt;<span class="tp">DBTask</span>&gt; taskQueue;
+    };
+    <span class="tp">std::vector</span>&lt;<span class="tp">Worker</span>&gt; <span class="kw">_workers</span>;
+    <span class="tp">MpscQueue</span>&lt;<span class="tp">DBCallback</span>&gt; <span class="kw">_completedCallbacks</span>;
+};
+
+<span class="cm">// Worker 线程——使用参数化查询（PQexecParams），非无参 PQexec</span>
+<span class="kt">void</span> <span class="tp">DBWorkerPool::Worker</span>::<span class="fn">Run</span>() {
+    <span class="kw">while</span> (!<span class="kw">_stop</span>) {
+        <span class="kw">for</span> (<span class="kw">auto</span>&amp; task : <span class="kw">taskQueue</span>.DrainAll()) {
+            <span class="kw">auto</span> result = <span class="fn">PQexecParams</span>(conn, task.sql.c_str(),
+                <span class="kw">int</span>(task.params.size()), <span class="nb">nullptr</span>,
+                task.paramValues(), task.paramLengths(), task.paramFormats(),
+                <span class="num">0</span>);  <span class="cm">// 0 = text format</span>
+
+            <span class="kw">if</span> (<span class="fn">PQresultStatus</span>(result) == PGRES_TUPLES_OK ||
+                <span class="fn">PQresultStatus</span>(result) == PGRES_COMMAND_OK) {
+                <span class="kw">_pool</span>-&gt;<span class="kw">_completedCallbacks</span>.Enqueue({task.callback, DBResult{result}});
+            } <span class="kw">else</span> {
+                LOG_ERROR(<span class="num">0</span>, <span class="str">"DB error: {}"</span>, <span class="fn">PQresultErrorMessage</span>(result));
+            }
+            <span class="fn">PQclear</span>(result);
+        }
+    }
+}</code></pre>
+
+  <h3>15.6 DasLang 侧 —— AstCallMacro LINQ</h3>
+  <p>
+    DasLang 脚本层同样走类型安全管道链（通过 AstCallMacro 展开为 C++ DBQuery 调用），最终同样到达 DBWorkerPool。详细分析见 §15.3（上一版已详细覆盖）。
+  </p>
+  <pre><code><span class="cm">// 查询</span>
+<span class="kw">def</span> <span class="fn">LoadPlayerFromDB</span>(playerId : uint32)
+{
+    table(<span class="str">"players"</span>)
+        |> where_($(r) =&gt; r.player_id == playerId)
+        |> select($(r) =&gt; PlayerData{ playerId=r.player_id, name=r.name, level=r.level })
+        |> single_or_default() $(<span class="kw">var</span> player : PlayerData?) { ... }
+}
+
+<span class="cm">// INSERT</span>
+DBInsert(<span class="str">"player_friends"</span>, [{ player_id=p1, friend_id=p2 }, { player_id=p2, friend_id=p1 }])
+
+<span class="cm">// DELETE</span>
+table(<span class="str">"guilds"</span>) |> where_($(r) =&gt; r.guild_id == guildId) |> DBDelete()</code></pre>
+
+  <h3>15.7 RuntimeQuery —— 复杂查询 escape hatch</h3>
+  <p>
+    对于 LINQ 管道链无法表达的复杂查询（跨表 JOIN、子查询、窗口函数、CTE），保留参数化 SQL 接口。
+    这是 DBWorkerPool 的唯一公开 SQL 入口——正常的 CRUD 都应走 <code>db::Range&lt;T&gt;</code> 或 DasLang LINQ。
+  </p>
+  <pre><code><span class="cm">// C++ 侧</span>
+<span class="kw">auto</span> result = RuntimeQuery(
+    <span class="str">"SELECT p.player_id, p.name, SUM(c.damage) as total_dps</span>
+<span class="str">     FROM players p</span>
+<span class="str">     JOIN combat_log c ON p.player_id = c.player_id</span>
+<span class="str">     WHERE p.guild_id = $1 AND c.log_time > $2</span>
+<span class="str">     GROUP BY p.player_id, p.name</span>
+<span class="str">     ORDER BY total_dps DESC LIMIT 10"</span>,
+    {guildId, GetTickTime() - <span class="num">3600</span>}
+);
+
+<span class="cm">// DasLang 侧</span>
+<span class="kw">def</span> <span class="fn">GetTopDpsByGuild</span>(guildId : uint32) : array&lt;<span class="tp">PlayerDpsInfo</span>&gt;
+{
+    <span class="kw">var</span> result : array&lt;<span class="tp">PlayerDpsInfo</span>&gt;
+    RuntimeQuery(
+        <span class="str">"SELECT ... JOIN ... WHERE ... GROUP BY ..."</span>,
+        [guildId, GetTickTime() - <span class="num">3600</span>]
+    ) $(<span class="kw">var</span> rows : array&lt;<span class="tp">DBRow</span>&gt;) { ... }
+    <span class="kw">return</span> result
+}</code></pre>
+
+  <h3>15.8 脏标记：Per-Component</h3>
+  <pre><code><span class="kw">template</span>&lt;<span class="kw">typename</span> T&gt;
+<span class="kw">struct</span> <span class="tp">DirtyTracker</span> {
+    <span class="tp">std::unordered_set</span>&lt;<span class="tp">uint32_t</span>&gt; dirtyEntities;
+    <span class="kt">void</span> <span class="fn">Mark</span>(<span class="tp">uint32_t</span> e) { dirtyEntities.insert(e); }
+    <span class="kt">void</span> <span class="fn">Clear</span>(<span class="tp">uint32_t</span> e) { dirtyEntities.erase(e); }
+};</code></pre>
+
+  <h3>15.9 写回策略：分级</h3>
+  <table>
+    <tr><th>级别</th><th>触发条件</th><th>实现</th></tr>
+    <tr><td><strong>立即同步</strong></td><td>交易、升级、获得稀有物品</td><td>db::Range::Insert/Update/Delete 直接投递 DBWorkerPool</td></tr>
+    <tr><td><strong>定时批量（30s）</strong></td><td>Position、HP、MP 等频繁变更</td><td>脏标记累积 → FlushDirtyBatch(maxPerTick=100)</td></tr>
+    <tr><td><strong>全量 Flush</strong></td><td>玩家登出、场景切换、断线超时</td><td>该 entity 所有脏组件全部写 DB</td></tr>
+    <tr><td><strong>全服快照（5min）</strong></td><td>定时全服脏数据存量</td><td>分 5 批每 Tick 写 100 个 entity</td></tr>
+  </table>
+
+  <h3>15.10 PgBouncer</h3>
+  <p>Transaction Pooling。WorldServer 3-5 Worker + SocialServer 2 Worker + LoginServer 2-3 = 7-10 客户端连接 → 映射到 PG 物理连接池（default_pool_size=20）。</p>
+
+  <h3>15.11 场景快照（Crash 恢复用）</h3>
+  <pre><code><span class="kw">CREATE TABLE</span> scene_snapshots (
+    scene_id    <span class="kw">INT</span>,
+    entity_id   <span class="kw">INT</span>,
+    components  <span class="kw">JSONB</span>,
+    blob_data   <span class="kw">BYTEA</span>,
+    saved_at    <span class="kw">TIMESTAMPTZ DEFAULT NOW</span>()
+);</code></pre>
+
+  <h3>15.12 Schema 热迁移</h3>
+  <table>
+    <tr><th>迁移类型</th><th>操作</th><th>锁表？</th></tr>
+    <tr><td>新增可空列</td><td><code>ALTER TABLE … ADD COLUMN IF NOT EXISTS … DEFAULT …</code></td><td>❌</td></tr>
+    <tr><td>新增非空列</td><td>加可空列 → 批量回填 → SET NOT NULL</td><td>❌</td></tr>
+    <tr><td>新增表</td><td><code>CREATE TABLE IF NOT EXISTS …</code></td><td>❌</td></tr>
+    <tr><td>新增索引</td><td><code>CREATE INDEX CONCURRENTLY …</code></td><td>❌</td></tr>
+  </table>
+  <p>迁移后：运行 <code>python tools/generate_db_bindings.py → xmake build</code>——如果 C++ 代码引用了已删除的列或类型不匹配，编译报错。</p>
+
+  <h3>15.13 数据库扩展路径</h3>
+  <p>
+    采用<strong>渐进式扩展策略</strong>，按规模分阶段升级，避免过早引入不需要的复杂度。
+  </p>
+
+  <h4>第 1 层：单机优化（当前阶段）</h4>
+  <table>
+    <tr><th>优化项</th><th>设置</th></tr>
+    <tr><td>shared_buffers</td><td>25% RAM</td></tr>
+    <tr><td>effective_cache_size</td><td>75% RAM</td></tr>
+    <tr><td>random_page_cost</td><td>1.1 (SSD)</td></tr>
+    <tr><td>PgBouncer</td><td>Transaction pooling（已设计）</td></tr>
+    <tr><td>批量写入</td><td>30s 定时批量 flush（已设计）</td></tr>
+  </table>
+
+  <h4>第 2 层：读写分离（公测初期）</h4>
+  <pre>PgBouncer（读写分离模式）
+  ├── Write → Primary PostgreSQL
+  └── Read  → Read Replica × N（streaming replication）
+
+DBWorkerPool 路由：
+  AsyncWrite(sql) → Primary
+  AsyncRead(sql)  → RoundRobin(Replicas)</pre>
+
+  <h4>第 3 层：分库分表（远期选项，仅写瓶颈时启用）</h4>
+  <pre>player_id % N → shard_N
+全局数据（guild, auction house 等）→ 独立 global DB</pre>
+
+  <h4>备份策略</h4>
+  <table>
+    <tr><th>备份项</th><th>方案</th><th>频率</th></tr>
+    <tr><td>全量</td><td>pg_basebackup</td><td>每日</td></tr>
+    <tr><td>增量/WAL</td><td>WAL archiving</td><td>实时</td></tr>
+    <tr><td>时间点恢复</td><td>PITR</td><td>任意时刻</td></tr>
+  </table>
+
+  <h3>15.14 玩家数据 Schema</h3>
+  <table>
+    <tr><th>表名</th><th>主键</th><th>写入策略</th></tr>
+    <tr><td><code>players</code></td><td>player_id</td><td>登录加载、30s + 关键操作</td></tr>
+    <tr><td><code>player_inventory</code></td><td>player_id, slot_idx</td><td>物品变更立即</td></tr>
+    <tr><td><code>player_quests</code></td><td>player_id, quest_id</td><td>任务状态立即</td></tr>
+    <tr><td><code>player_skills</code></td><td>player_id, skill_id</td><td>技能变更立即</td></tr>
+    <tr><td><code>player_equipment</code></td><td>player_id, slot</td><td>穿脱立即</td></tr>
+    <tr><td><code>accounts</code></td><td>account_id</td><td>注册时写入</td></tr>
+    <tr><td><code>guilds</code></td><td>guild_id</td><td>创建/解散时写入</td></tr>
+    <tr><td><code>item_templates</code></td><td>item_id</td><td>运营导入，热重载</td></tr>
+    <tr><td><code>skill_templates</code></td><td>skill_id</td><td>运营导入，热重载</td></tr>
+    <tr><td><code>monster_templates</code></td><td>monster_id</td><td>运营导入，热重载</td></tr>
+    <tr><td><code>schema_migrations</code></td><td>version</td><td>启动时自动执行</td></tr>
+  </table>
+
+  <h3>15.15 启动流程</h3>
+  <pre>
+WorldServer 启动
+  ├── 1. DBWorkerPool.Init(3, "host=PgBouncer port=6432 dbname=massive")
+  ├── 2. ExecutePendingMigrations() → 执行未执行的 SQL
+  ├── 3. LoadConfigTables() → db::Range&lt;ItemTemplatesTable&gt;().Where(...).ToArray()
+  │                          → db::Range&lt;SkillTemplatesTable&gt;().Where(...).ToArray()
+  ├── 4. CreateScenes() → 创建常驻场景
+  └── 5. 进入主循环 → 接受内部 TCP</pre>
+
+</div>
+
+</div>
+<nav class="breadcrumb" style="margin-top:24px;"><a href="../Design.html">🏠 返回总目录</a></nav>
+<div class="footer">MMO Server Architecture Design Document · Version 1.2</div>
+</body>
+</html>

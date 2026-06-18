@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>5. Session 生命周期管理 — MMO 服务器架构设计 v1.2</title>
+<link rel="stylesheet" href="../shared.css">
+</head>
+<body>
+
+<nav class="breadcrumb">
+  <a href="../Design.html">🏠 总目录</a>
+</nav>
+
+<div class="container">
+<span class="badge confirmed">✔ 已确认 · C2 分布式</span>
+
+<div class="section" id="s5">
+  <h2>5. Session 生命周期管理</h2>
+
+  <h3>5.1 Gate Session vs World Session</h3>
+  <p>
+    C2 拓扑中有两层 Session：GateSession（连接级，Gate 持有）和 WorldSession（逻辑级，World 持有）。
+    一个客户端连接对应一个 GateSession + 一个 WorldSession。两者通过 <code>sessionId</code> 关联。
+  </p>
+
+  <table>
+    <tr><th></th><th>GateSession</th><th>WorldSession</th></tr>
+    <tr><td>持有方</td><td>GateServer</td><td>WorldServer</td></tr>
+    <tr><td>生命周期</td><td>TCP 连接建立 → 断开</td><td>Entity 创建 → Entity 销毁（可跨 TCP 重连保留）</td></tr>
+    <tr><td>状态</td><td>sessionId, worldServerId, clientSocket</td><td>sessionId, playerEntity, CryptoSession</td></tr>
+    <tr><td>断线行为</td><td>通知 World → 销毁自身</td><td>保留 Entity 60s 等待重连</td></tr>
+  </table>
+
+  <h3>5.2 完整生命周期</h3>
+  <pre>
+Client TCP → GateServer
+  │
+  ├── Gate: 分配 sessionId → 创建 GateSession
+  │
+  ├── Client → Gate: MSG_LOGIN_ENTER_WORLD_REQ {sessionId, sessionToken}
+  │     Gate: 读 sessionToken[0..1] → worldServerId
+  │     Gate: 建立/复用 到 WorldServer 的 TCP 连接
+  │     Gate → World: InternalHeader + 原包
+  │
+  ├── World: HMAC 验证 SessionToken → 解密 → 提取 accountId + SessionKey
+  │     World: 加载/创建 Entity → 绑定 WorldSession（sessionId → Entity）
+  │     World: _sessionToEntity[sessionId] = entity
+  │     World: _sessionKeys[sessionId] = CryptoSession{SessionKey}
+  │     World → Gate → Client: MSG_LOGIN_ENTER_WORLD_RSP
+  │
+  ├── 正常运行
+  │     Client ⇄ Gate ⇄ World
+  │
+  ├── TCP 断线（Gate 侧检测）
+  │     Gate: GateSession 析构
+  │     Gate → World: InternalHeader(MSG_DISCONNECT, sessionId)
+  │     World: 给 Entity 加 DisconnectedTag + 注册 60s 超时定时器
+  │     World: 保留 _sessionKeys[sessionId]（等待重连）
+  │
+  ├── 60s 内重连（客户端用同一个 SessionToken 连任意 Gate）
+  │     Gate: 新 sessionId（新的 GateSession）
+  │     Gate → World: MSG_LOGIN_ENTER_WORLD_REQ {新sessionId, 旧SessionToken}
+  │     World: 从 SessionToken 还原 accountId → 找到原 Entity（DisconnectedTag 还在）
+  │     World: _sessionToEntity[新sessionId] = entity（切换 sessionId 绑定）
+  │     World: ecs_remove(DisconnectedTag) → 定时器空转跳过
+  │
+  └── 60s 超时
+        World: 定时器触发 → Entity 仍带 DisconnectedTag → SaveDB → Destroy</pre>
+
+  <h3>5.3 WorldServer 侧关键数据</h3>
+  <pre><code><span class="cm">// WorldServer 内</span>
+<span class="tp">std::unordered_map</span>&lt;<span class="tp">uint32_t</span>, <span class="tp">Entity</span>&gt;         <span class="kw">_sessionToEntity</span>;   <span class="cm">// sessionId → 玩家 Entity</span>
+<span class="tp">std::unordered_map</span>&lt;<span class="tp">uint32_t</span>, <span class="tp">CryptoSession</span>&gt;  <span class="kw">_sessionKeys</span>;       <span class="cm">// sessionId → 加密上下文</span>
+<span class="tp">std::unordered_map</span>&lt;<span class="tp">uint32_t</span>, <span class="tp">uint32_t</span>&gt;        <span class="kw">_accountToEntity</span>;    <span class="cm">// accountId → entity</span>
+
+<span class="kt">void</span> <span class="fn">OnGateDisconnect</span>(<span class="tp">uint32_t</span> sessionId) {
+    <span class="kw">auto</span> it = <span class="kw">_sessionToEntity</span>.find(sessionId);
+    <span class="kw">if</span> (it == <span class="kw">_sessionToEntity</span>.end()) <span class="kw">return</span>;
+
+    <span class="kw">auto</span> entity = it-&gt;second;
+    ecs_emplace(entity, type&lt;<span class="tp">DisconnectedTag</span>&gt;, DisconnectedTag{GetTickTime()});
+
+    <span class="cm">// 注册 60s 超时</span>
+    <span class="kw">_timingWheel</span>.Schedule(GenTimerId(), <span class="tp">std::chrono::seconds</span>(<span class="num">60</span>), [<span class="kw">this</span>, entity] {
+        <span class="kw">if</span> (ecs_has(entity, type&lt;<span class="tp">DisconnectedTag</span>&gt;)) {
+            SaveEntityToDb(entity);
+            ecs_destroy(entity);
+        }
+    });
+
+    <span class="cm">// 保留 CryptoSession 和 session→entity 映射，不立即删除</span>
+    <span class="cm">// 如果 60s 内重连，从 SessionToken 找到旧 entity 重新绑定新 sessionId</span>
+}</code></pre>
+
+  <h3>5.4 登录鉴权——两次 TCP</h3>
+  <p>
+    完整流程见 §7 的时序图。关键点：
+    ① LoginServer 验证密码 → ECDH 生成 SessionKey → 封装进 SessionToken →
+    ② 客户端带 SessionToken 连 Gate → Gate 读 worldServerId 路由 → World 验证+还原 SessionKey。
+  </p>
+
+</div>
+
+<nav class="breadcrumb" style="margin-top:24px;">
+  <a href="../Design.html">🏠 返回总目录</a>
+</nav>
+
+</div>
+<div class="footer">
+  MMO Server Architecture Design Document · Version 1.2
+</div>
+</body>
+</html>

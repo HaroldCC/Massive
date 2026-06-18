@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>19. 配置数据热更新 — MMO 服务器架构设计 v1</title>
+<link rel="stylesheet" href="../shared.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="../Design.html">🏠 总目录</a></nav>
+<div class="container">
+<span class="badge confirmed">✔ 已确认</span>
+
+<div class="section" id="s19">
+  <h2>19. 配置数据热更新</h2>
+
+  <h3>19.1 热更新范围：配置表 + 脚本</h3>
+  <p>
+    技能模板、道具模板、怪物配置、活动参数等（PersistentRegistry 数据）支持热重载，不重启服务器。
+    DasLang 脚本文件变化 → 原生热重载（<code>Context::relocateCode()</code>）。
+    C++ 引擎、EnTT Component 定义、DB Schema 走停机维护。
+  </p>
+
+  <h3>19.2 热更新流程</h3>
+  <pre>
+GM 指令: /reload_config skill_templates
+  │
+  ▼
+PersistentScene::ReloadTable("skill_templates")
+  │
+  ├── 1. 从 DB 加载新版数据到临时 buffer
+  │     table("skill_templates") |> where_($(r) => r.is_active == true) |> to_array()
+  │
+  ├── 2. 校验新版数据合法性
+  │     - 必填字段非空检查
+  │     - 数值范围检查（CD ≥ 0, 伤害 ≥ 0）
+  │     - 引用完整性检查（关联的 buff_id 在 buff_templates 中存在）
+  │
+  ├── 3. 校验通过 → 原子 swap
+  │     swap(oldData, newData) — 旧数据保留作为回退备份
+  │
+  ├── 4. 广播配置变更事件
+  │     ecs_dispatch("on_config_reloaded", "skill_templates")
+  │     → DasLang 各系统收到通知 → 惰性清理缓存 / 全量刷新
+  │
+  └── 5. 校验失败 → 记录 ERROR 日志 + 返回错误给 GM + 保留旧数据不变</pre>
+
+  <h3>19.3 安全保证</h3>
+  <ul>
+    <li><strong>原子替换</strong>：新数据加载到独立 buffer，校验通过后一次 swap。swap 是 O(1) 指针交换，不出现"半更新"状态。</li>
+    <li><strong>旧数据回退</strong>：旧数据保留在 swap 后的 buffer 中。如果新配置导致大量 ERROR，GM 可以 /reload_config rollback 切回旧版本。</li>
+    <li><strong>版本号追踪</strong>：每张配置表有 <code>config_version</code> 字段。客户端可通过版本号对比决定是否需要更新本地缓存。</li>
+    <li><strong>不影响运行中数据</strong>：配置热重载只改配置表内存副本，不影响已创建的 Entity、已执行的逻辑。新逻辑从下次调用开始生效。</li>
+  </ul>
+
+  <h3>19.3.1 Schema 变更限制：只允许数值热重载</h3>
+  <p>
+    热重载<strong>只允许修改字段值</strong>（如：火球伤害 100 → 120），不允许结构变更（新增/删除/重命名字段）。
+    结构变更是"版本更新"，应配合 WorldServer 重启滚动更新。
+    这是业界标准做法——95% 的策划热更新需求只是改数值。
+  </p>
+
+  <table>
+    <tr><th>变更类型</th><th>热重载？</th><th>说明</th></tr>
+    <tr><td>修改字段值</td><td>✅ 允许</td><td>火球伤害 100→120、CD 10s→8s、掉落率 5%→8%</td></tr>
+    <tr><td>新增表行</td><td>✅ 允许</td><td>新增技能 ID=999——不是改 schema，是增行</td></tr>
+    <tr><td>新增字段（nullable）</td><td>❌ 拒绝</td><td>skill_templates 新增 min_range——需 WorldServer 重启</td></tr>
+    <tr><td>删除字段</td><td>❌ 拒绝</td><td>删除 mana_cost_percent——需 WorldServer 重启</td></tr>
+    <tr><td>修改字段类型</td><td>❌ 拒绝</td><td>cooldown int→float——需 WorldServer 重启</td></tr>
+    <tr><td>重命名字段</td><td>❌ 拒绝</td><td>castTime→cast_time_ms——需 WorldServer 重启</td></tr>
+  </table>
+
+  <pre><code><span class="cm">// ConfigTable.h — 热重载安全校验</span>
+<span class="kw">struct</span> <span class="tp">HotReloadValidator</span> {
+    <span class="kw">static</span> <span class="tp">bool</span> <span class="fn">CanHotReload</span>(<span class="kw">const</span> <span class="tp">ConfigSchema</span>&amp; oldS, <span class="kw">const</span> <span class="tp">ConfigSchema</span>&amp; newS) {
+        <span class="kw">for</span> (<span class="kw">auto</span>&amp; oldField : oldS.fields) {
+            <span class="kw">auto</span> it = newS.fields.find(oldField.name);
+            <span class="kw">if</span> (it == newS.fields.end()) <span class="kw">return</span> <span class="tp">false</span>;  <span class="cm">// 字段被删除</span>
+            <span class="kw">if</span> (it-&gt;type != oldField.type) <span class="kw">return</span> <span class="tp">false</span>;  <span class="cm">// 类型被修改</span>
+        }
+        <span class="kw">return</span> <span class="tp">true</span>;  <span class="cm">// 只允许新增 nullable 字段——不破坏旧结构</span>
+    }
+};
+
+<span class="tp">void</span> <span class="fn">ReloadConfig</span>(<span class="kw">const</span> <span class="tp">std::string</span>&amp; tableName) {
+    <span class="kw">auto</span> newData = <span class="fn">LoadFromDB</span>(tableName);
+    <span class="kw">if</span> (<span class="tp">HotReloadValidator::CanHotReload</span>(<span class="kw">_currentSchema</span>[tableName], newData.schema)) {
+        <span class="kw">_tables</span>[tableName].AtomicSwap(newData);
+        LOG_INFO(<span class="tp">"ConfigTable {} reloaded: {} rows"</span>, tableName, newData.rows);
+    } <span class="kw">else</span> {
+        LOG_WARN(<span class="tp">"ConfigTable {} schema changed — needs WorldServer restart"</span>, tableName);
+    }
+}</code></pre>
+
+  <h3>19.4 副作用处理</h3>
+  <table>
+    <tr><th>策略</th><th>适用表</th><th>实现</th></tr>
+    <tr>
+      <td><strong>惰性更新</strong></td>
+      <td>技能模板、道具模板、掉落表</td>
+      <td>收到 <code>on_config_reloaded</code> 事件后清空相关缓存。下次使用时从新模板重新加载。</td>
+    </tr>
+    <tr>
+      <td><strong>全量刷新</strong></td>
+      <td>活动开关、功能开关</td>
+      <td>立即遍历所有受影响的 Entity 应用新配置（分帧执行避免卡 Tick）。</td>
+    </tr>
+  </table>
+
+  <pre><code><span class="cm">// DasLang 侧 — 事件监听</span>
+[export]
+<span class="kw">def</span> <span class="fn">InitConfigReloadHandlers</span>()
+{
+    ecs_listen(<span class="str">"on_config_reloaded"</span>) $(<span class="kw">var</span> tableName : string)
+    {
+        <span class="kw">if</span> (tableName == <span class="str">"skill_templates"</span>) {
+            ClearSkillCache()
+        } <span class="kw">elif</span> (tableName == <span class="str">"event_config"</span>) {
+            <span class="cm">// 活动开关——立即刷新所有 NPC</span>
+            <span class="kw">for</span> sceneId <span class="kw">in</span> GetAllSceneIds() {
+                ecs_query(sceneId; npc : NPCTag&amp;; event : EventParticipant&amp;) {
+                    RefreshNpcEventState(npc, event)
+                }
+            }
+        }
+    }
+}</code></pre>
+
+  <h3>19.5 配置数据存储：DB 为权威来源</h3>
+  <p>
+    配置表存储在 PostgreSQL 中（<code>item_templates</code>、<code>skill_templates</code>、<code>monster_templates</code> 等）。
+    运营工具直接用 SQL 更新配置。WorldServer 启动时从 DB 加载全部配置到 PersistentRegistry，运行中通过 GM 指令热重载。
+  </p>
+
+  <table>
+    <tr><th>表名</th><th>内容</th><th>热重载触发</th></tr>
+    <tr><td>item_templates</td><td>道具名称、类型、属性、icon、售价</td><td>/reload_config item_templates</td></tr>
+    <tr><td>skill_templates</td><td>技能名称、CD、消耗、伤害公式、Buff 关联</td><td>/reload_config skill_templates</td></tr>
+    <tr><td>monster_templates</td><td>怪物 HP、攻击、掉落表、AI 类型、刷新时间</td><td>/reload_config monster_templates</td></tr>
+    <tr><td>quest_templates</td><td>任务条件、奖励、对话文本</td><td>/reload_config quest_templates</td></tr>
+    <tr><td>event_config</td><td>活动开关、时间窗口、参与条件、奖励倍率</td><td>/reload_config event_config</td></tr>
+  </table>
+
+  <h3>19.6 DasLang 脚本热更新</h3>
+  <p>
+    GM 指令 <code>/reload_script skill_fireball</code> → C++ 调用 <code>Context::relocateCode()</code> →
+    重新编译指定的 .das 模块 → 新函数指针替换旧函数。正在执行的旧版本调用不受影响，新调用走新版。
+  </p>
+
+</div>
+
+</div>
+<nav class="breadcrumb" style="margin-top:24px;"><a href="../Design.html">🏠 返回总目录</a></nav>
+<div class="footer">MMO Server Architecture Design Document · Version 1.2</div>
+</body>
+</html>

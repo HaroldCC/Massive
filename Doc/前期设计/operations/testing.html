@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>测试策略 — MMO 服务器架构设计 v1.2</title>
+<link rel="stylesheet" href="../shared.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="../Design.html">🏠 总目录</a></nav>
+<div class="container">
+<span class="badge confirmed">✔ 已确认</span>
+
+<div class="section" id="testing">
+  <h2>测试策略 · 三层金字塔</h2>
+
+  <h3>1. 概述</h3>
+  <p>
+    测试按成本/速度/真实性分层。底层覆盖逻辑核心，上层覆盖端到端流程。
+    <strong>不对序列化/网络进行 Mock</strong>——集成测试即真实收发包。
+  </p>
+
+  <div class="arch-box">
+    <div class="arch-layer" style="border-color:#c62828;background:#ffebee;min-width:300px;">
+      <strong>E2E 模拟测试 (最慢, 最少)</strong><br>
+      <span style="font-size:.7rem;">1000 虚拟客户端 &rarr; 登录 &rarr; 发移动请求 &rarr; 检查广播 &rarr; 登出</span>
+    </div>
+    <div class="arch-arrow" style="font-size:1rem;">⬆ 50-100 个</div>
+    <div class="arch-layer" style="border-color:#e65100;background:#fff3e0;min-width:300px;">
+      <strong>集成测试 (中等)</strong><br>
+      <span style="font-size:.7rem;">Scene 加载 &rarr; ECS 操作 &rarr; 寻路 &rarr; DB 读写</span>
+    </div>
+    <div class="arch-arrow" style="font-size:1rem;">⬆ 200-500 个</div>
+    <div class="arch-layer" style="border-color:#2e7d32;background:#e8f5e9;min-width:300px;">
+      <strong>单元测试 (最快, 最多)</strong><br>
+      <span style="font-size:.7rem;">队列、时间轮、MsgID 分发、NavMesh、DirtyTracker</span>
+    </div>
+  </div>
+
+  <h3>2. 单元测试层</h3>
+  <table>
+    <tr><th>被测模块</th><th>测试点</th><th>工具</th></tr>
+    <tr><td>MpscQueue</td><td>单生产者入队顺序、多生产者并发入队、DrainAll 全量取出、空队列 DrainAll、内存序正确性</td><td rowspan="6">Catch2</td></tr>
+    <tr><td>TimingWheel</td><td>Schedule 单槽触发、Tick 推进、多级级联、Cancel 未触发节点、剩余轮数 > 0、Schedule 3h 边界</td></tr>
+    <tr><td>MessageDispatcher</td><td>已知 MsgID 正确分发、未注册 MsgID 静默忽略、重复注册警告、Protobuf 解析失败处理</td></tr>
+    <tr><td>DirtyTracker</td><td>标记变化、清空所有脏标记、快照比较</td></tr>
+    <tr><td>NavMesh FindPath</td><td>直线可达返回路径、穿墙返回空、多层路径正确</td></tr>
+    <tr><td>ECS Component</td><td>EnTT emplace/get/replace、owning group 对齐、view 包含/排除</td></tr>
+  </table>
+
+  <h3>3. 集成测试层</h3>
+  <table>
+    <tr><th>场景</th><th>验证内容</th></tr>
+    <tr><td>场景加载 + Entity 生命周期</td><td>Scene::CreateEntity / DestroyEntity、EnTT entity 有效性、DisconnectedTag 超时</td></tr>
+    <tr><td>ECS 查询</td><td>ecs_query (owning group) 遍历、ecs_edit ComponentMap 映射、C++ 组件 + 脚本组件混合查询</td></tr>
+    <tr><td>寻路</td><td>FindPath 在真实 NavMesh 上的路径、最大迭代限制、分帧计算正确性</td></tr>
+    <tr><td>AOI</td><td>九宫格 GetWatchers、热点升级/降级、Enter/Leave 事件、3D 高度过滤</td></tr>
+    <tr><td>DB 持久化</td><td>玩家数据写回、登出全量 flush、分级写入触发、PgBouncer 连接恢复</td></tr>
+    <tr><td>GM 指令</td><td>权限校验、审计日志写入、速率限制</td></tr>
+  </table>
+
+  <h3>4. E2E 模拟测试</h3>
+  <pre><code><span class="cm">// TestClient.h — 虚拟客户端池</span>
+<span class="kw">class</span> <span class="tp">TestClientPool</span> {
+<span class="kw">public</span>:
+    <span class="kw">struct</span> <span class="tp">Client</span> {
+        <span class="tp">uint32_t</span> sessionId;
+        <span class="tp">Entity</span> playerEntity;
+        <span class="tp">Vector3</span> position;
+        <span class="tp">std::deque</span>&lt;<span class="tp">std::vector</span>&lt;<span class="kt">char</span>&gt;&gt; receivedPackets;  <span class="cm">// 服务器发给客户端的包</span>
+    };
+
+    <span class="cm">// 批量连接 N 个虚拟客户端</span>
+    <span class="kt">void</span> <span class="fn">ConnectClients</span>(<span class="tp">int</span> count);
+
+    <span class="cm">// 每个客户端发送移动请求</span>
+    <span class="kt">void</span> <span class="fn">SendRandomMoveRequests</span>();
+
+    <span class="cm">// 检查每个客户端收到的广播——验证 AOI + 差量复制</span>
+    <span class="kt">void</span> <span class="fn">VerifyBroadcasts</span>();
+
+    <span class="kw">auto</span>&amp; <span class="fn">Clients</span>() { <span class="kw">return</span> <span class="kw">_clients</span>; }
+
+<span class="kw">private</span>:
+    <span class="tp">std::vector</span>&lt;<span class="tp">Client</span>&gt; <span class="kw">_clients</span>;
+    <span class="tp">std::unique_ptr</span>&lt;<span class="tp">asio::io_context</span>&gt; <span class="kw">_testCtx</span>;
+};
+
+<span class="cm">// 测试用例</span>
+TEST_CASE(<span class="str">"100 clients join world and move"</span>) {
+    <span class="kw">auto</span> server = <span class="fn">StartTestServer</span>();  <span class="cm">// 启动精简版服务器（无加密、无 PgBouncer）</span>
+    <span class="tp">TestClientPool</span> pool;
+    pool.ConnectClients(<span class="num">100</span>);
+    <span class="kw">for</span> (<span class="kt">int</span> tick = <span class="num">0</span>; tick &lt; <span class="num">20</span>; tick++) {
+        server.Tick(<span class="tp">std::chrono::milliseconds</span>(<span class="num">50</span>));
+        <span class="kw">for</span> (<span class="kw">auto</span>&amp; client : pool.Clients()) {
+            <span class="fn">VerifyReceivedPacketCount</span>(client);  <span class="cm">// 检查收到 AOI 广播</span>
+        }
+        pool.SendRandomMoveRequests();
+    }
+}</code></pre>
+
+  <h3>5. 确定性保证</h3>
+  <p>
+    单线程逻辑层的最大优势：相同输入 + 相同初始状态 → 相同输出。这使得回放测试成为可能。
+  </p>
+  <table>
+    <tr><th>测试能力</th><th>说明</th></tr>
+    <tr><td>回放测试 (Replay)</td><td>录制所有入站消息（LogicMessage），重放时逐 Tick 比对输出——检测回归 bug。每天 CI 跑 10 分钟录制的生产流量。</td></tr>
+    <tr><td>混沌测试 (Chaos)</td><td>随机发送非法消息、超长包、乱序包——验证服务器不崩溃（仅 ERROR 日志）。</td></tr>
+    <tr><td>内存泄漏检测</td><td>每 100 Tick 检查进程 RSS 增长——回归检测。</td></tr>
+  </table>
+
+</div>
+
+</div>
+<nav class="breadcrumb" style="margin-top:24px;"><a href="../Design.html">🏠 返回总目录</a></nav>
+<div class="footer">MMO Server Architecture Design Document · Version 1.2</div>
+</body>
+</html>

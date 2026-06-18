@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Scene 生命周期管理 — MMO 服务器架构设计 v1.2</title>
+<link rel="stylesheet" href="../shared.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="../Design.html">🏠 总目录</a></nav>
+<div class="container">
+<span class="badge confirmed">✔ 已确认</span>
+
+<div class="section" id="scene-lifecycle">
+  <h2>Scene 生命周期管理</h2>
+
+  <h3>1. 总览</h3>
+
+  <p>
+    Scene 是拥有独立 EnTT Registry + BlobStorage + AOI + NavMesh 的完整游戏世界单元。
+    按生命周期分为三类：
+  </p>
+
+  <table>
+    <tr><th>类型</th><th>实例数</th><th>创建时机</th><th>销毁时机</th><th>示例</th></tr>
+    <tr>
+      <td><strong>常驻场景</strong></td>
+      <td>预创建 3-10 个</td>
+      <td>WorldServer 启动时</td>
+      <td>WorldServer 关闭时</td>
+      <td>主城、野外、公共 PVP 区域</td>
+    </tr>
+    <tr>
+      <td><strong>多实例副本</strong>（小型副本）</td>
+      <td>N 个团队 × 1 个实例</td>
+      <td>团队队长进入时创建</td>
+      <td>所有成员退出后 5 分钟</td>
+      <td>5 人副本（死亡矿井、哀嚎洞穴）</td>
+    </tr>
+    <tr>
+      <td><strong>单例副本</strong>（大型 raid）</td>
+      <td>1 个全局实例</td>
+      <td>第一个团队进入时创建</td>
+      <td>所有团队退出后</td>
+      <td>40 人 raid（熔火之心、黑翼之巢）</td>
+    </tr>
+    <tr>
+      <td><strong>战场</strong></td>
+      <td>匹配成功时创建</td>
+      <td>双方队伍匹配完成</td>
+      <td>战斗结束</td>
+      <td>10v10, 15v15</td>
+    </tr>
+  </table>
+
+  <h3>2. 常驻场景：预加载 + 预热</h3>
+
+  <p>
+    WorldServer 启动时根据配置文件预创建所有常驻场景。
+    预创建期间完成 NavMesh 加载 + AOI 网格初始化 + 模板 NPC 实体创建。
+    预创建完成后 server 才开始接受客户端连接。
+  </p>
+
+  <pre><code><span class="cm">// GameWorld.h — 启动时预创建常驻场景</span>
+<span class="kw">class</span> <span class="tp">GameWorld</span> {
+<span class="kw">public</span>:
+    <span class="kt">void</span> <span class="fn">Initialize</span>(<span class="kw">const</span> <span class="tp">ServerConfig</span>&amp; config) {
+        <span class="kw">for</span> (<span class="kw">auto</span>&amp; sceneCfg : config.scenes) {
+            <span class="kw">auto</span>&amp; scene = <span class="fn">CreateScene</span>(sceneCfg);
+            <span class="cm">// 预热：加载 NavMesh</span>
+            <span class="kw">_navMeshManager</span>.Load(scene.GetId(), sceneCfg.navmeshPath);
+            <span class="cm">// 预热：创建模板 NPC</span>
+            <span class="fn">SpawnTemplateNPCs</span>(scene);
+            LOG_INFO(<span class="num">0</span>, <span class="str">"Scene {} ({}) initialized"</span>, sceneCfg.id, sceneCfg.name);
+        }
+        <span class="kw">_readyForConnections</span> = <span class="nb">true</span>;
+    }
+
+<span class="kw">private</span>:
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">uint32_t</span>, <span class="tp">std::unique_ptr</span>&lt;<span class="tp">Scene</span>&gt;&gt; <span class="kw">_scenes</span>;
+    <span class="tp">std::atomic</span>&lt;<span class="kt">bool</span>&gt; <span class="kw">_readyForConnections</span>{<span class="nb">false</span>};
+};</code></pre>
+
+  <h3>3. 多实例副本（5 人副本）</h3>
+
+  <p>
+    每个团队的副本拥有独立实例——不同团队的怪物独立、BOSS 独立、掉落独立。
+    实例在团队队长进入时创建，队伍全退后 5 分钟自动销毁。
+  </p>
+
+  <pre><code><span class="cm">// DungeonManager.h — 多实例副本管理</span>
+<span class="kw">class</span> <span class="tp">DungeonManager</span> {
+<span class="kw">public</span>:
+    <span class="kw">struct</span> <span class="tp">DungeonInstance</span> {
+        <span class="tp">uint32_t</span> dungeonId;       <span class="cm">// 副本模板 ID（死亡矿井=1001）</span>
+        <span class="tp">uint32_t</span> instanceId;       <span class="cm">// 实例 ID（全局唯一）</span>
+        <span class="tp">uint32_t</span> partyLeaderId;    <span class="cm">// 团队队长 PlayerId</span>
+        <span class="tp">uint32_t</span> sceneId;          <span class="cm">// 对应的 Scene ID</span>
+        <span class="tp">std::set</span>&lt;<span class="tp">uint32_t</span>&gt; partyMembers;
+        <span class="tp">std::chrono::steady_clock::time_point</span> emptySince;  <span class="cm">// 全退后开始倒计时</span>
+    };
+
+    <span class="cm">// 团队队长进入副本——创建实例</span>
+    <span class="tp">uint32_t</span> <span class="fn">CreateInstance</span>(<span class="tp">uint32_t</span> dungeonTemplateId, <span class="tp">uint32_t</span> partyLeaderId);
+
+    <span class="cm">// 查询玩家所在的副本实例</span>
+    <span class="tp">std::optional</span>&lt;<span class="tp">DungeonInstance</span>&gt; <span class="fn">GetInstanceForPlayer</span>(<span class="tp">uint32_t</span> playerId);
+
+    <span class="cm">// 玩家退出副本——更新成员列表</span>
+    <span class="kt">void</span> <span class="fn">OnPlayerExit</span>(<span class="tp">uint32_t</span> instanceId, <span class="tp">uint32_t</span> playerId);
+
+    <span class="cm">// 每 10 秒 Tick——检查是否有空实例需要销毁</span>
+    <span class="kt">void</span> <span class="fn">CleanupEmptyInstances</span>();
+
+<span class="kw">private</span>:
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">uint32_t</span>, <span class="tp">DungeonInstance</span>&gt; <span class="kw">_instances</span>;     <span class="cm">// instanceId → 实例</span>
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">uint32_t</span>, <span class="tp">uint32_t</span>&gt; <span class="kw">_playerToInstance</span>;  <span class="cm">// playerId → instanceId</span>
+    <span class="tp">std::atomic</span>&lt;<span class="tp">uint32_t</span>&gt; <span class="kw">_nextInstanceId</span>{<span class="num">1</span>};
+
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="kw">auto</span> kEmptyDestroyDelay = <span class="tp">std::chrono::minutes</span>(<span class="num">5</span>);
+};
+
+<span class="cm">// 实例创建流程</span>
+<span class="tp">uint32_t</span> <span class="tp">DungeonManager</span>::<span class="fn">CreateInstance</span>(<span class="tp">uint32_t</span> dungeonId, <span class="tp">uint32_t</span> leaderId) {
+    <span class="kw">auto</span> instanceId = <span class="kw">_nextInstanceId</span>.fetch_add(<span class="num">1</span>);
+    <span class="kw">auto</span> sceneId = instanceId + <span class="num">100000</span>;  <span class="cm">// 副本实例的 sceneId 偏移</span>
+
+    <span class="kw">auto</span>&amp; scene = <span class="fn">GetGameWorld</span>().CreateScene(SceneConfig{
+        .id = sceneId,
+        .name = <span class="str">"dungeon_{}_{}"</span>_format(dungeonId, instanceId),
+        .navmeshPath = <span class="str">"data/navmesh/dungeon_{}.navmesh"</span>_format(dungeonId),
+        .gridSize = <span class="num">30.0</span>,
+        .viewRadiusXZ = <span class="num">80.0</span>,
+        .viewRadiusY = <span class="num">30.0</span>
+    });
+
+    <span class="cm">// 按副本模板创建 NPC/BOSS</span>
+    <span class="fn">SpawnDungeonEntities</span>(scene, dungeonId);
+
+    <span class="kw">_instances</span>[instanceId] = {dungeonId, instanceId, leaderId, sceneId, {leaderId}, {}};
+    <span class="kw">_playerToInstance</span>[leaderId] = instanceId;
+
+    <span class="kw">return</span> instanceId;
+}</code></pre>
+
+  <h3>4. 单例副本（40 人 Raid）</h3>
+
+  <p>
+    单例副本全局只有一个实例——所有团队共用同一个副本世界。
+    第一个团队进入时创建副本，所有团队退出后 10 分钟自动销毁。
+    BOSS 共享——不同团队在同一个副本中竞争或协作。
+  </p>
+
+  <pre><code><span class="kw">struct</span> <span class="tp">RaidInstance</span> {
+    <span class="tp">uint32_t</span> raidId;
+    <span class="tp">uint32_t</span> sceneId;
+    <span class="tp">std::set</span>&lt;<span class="tp">uint32_t</span>&gt; activeTeams;   <span class="cm">// 当前在副本中的所有团队 ID</span>
+    <span class="tp">std::chrono::steady_clock::time_point</span> emptySince;
+};
+
+<span class="kw">class</span> <span class="tp">RaidManager</span> {
+    <span class="cm">// 等同 DungeonManager 模式，但 key = raidTemplateId（非 instanceId）</span>
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="kw">auto</span> kEmptyDestroyDelay = <span class="tp">std::chrono::minutes</span>(<span class="num">10</span>);
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="tp">uint32_t</span> kMaxTeamsPerRaid = <span class="num">8</span>;  <span class="cm">// 最多 8 个团队（320 人）</span>
+};</code></pre>
+
+  <h3>5. 战场</h3>
+
+  <p>
+    匹配系统将双方玩家放入一个新创建的 Scene。战斗结束后迁移所有存活玩家回原场景，销毁战场场景。
+  </p>
+
+  <pre><code><span class="kw">struct</span> <span class="tp">BattlegroundInstance</span> {
+    <span class="tp">uint32_t</span> bgTemplateId;     <span class="cm">// 战场模板 ID</span>
+    <span class="tp">uint32_t</span> sceneId;
+    <span class="tp">std::vector</span>&lt;<span class="tp">uint32_t</span>&gt; teamA;   <span class="cm">// 队伍 A 的 PlayerId 列表</span>
+    <span class="tp">std::vector</span>&lt;<span class="tp">uint32_t</span>&gt; teamB;
+    <span class="tp">uint32_t</span> scoreA = <span class="num">0</span>, scoreB = <span class="num">0</span>;
+
+    <span class="kt">void</span> <span class="fn">EndBattle</span>() {
+        <span class="cm">// 迁移所有存活玩家回原场景（走 §20.4 Clone迁移）</span>
+        <span class="kw">for</span> (<span class="kw">auto</span> playerId : teamA)
+            <span class="fn">MigrateEntityToScene</span>(playerId, <span class="fn">GetHomeSceneId</span>(playerId));
+        <span class="kw">for</span> (<span class="kw">auto</span> playerId : teamB)
+            <span class="fn">MigrateEntityToScene</span>(playerId, <span class="fn">GetHomeSceneId</span>(playerId));
+        <span class="fn">GetGameWorld</span>().DestroyScene(sceneId);
+    }
+};</code></pre>
+
+  <h3>6. 场景配置（server.toml）</h3>
+  <pre><code><span class="cm"># config/server.toml — 场景配置</span>
+[[scenes]]
+id = 1001
+name = "main_city"
+navmesh = "data/navmesh/scene_1001.navmesh"
+grid_size = 50.0
+view_radius_xz = 100.0
+view_radius_y = 50.0
+
+[[scenes]]
+id = 1002
+name = "wilderness"
+navmesh = "data/navmesh/scene_1002.navmesh"
+grid_size = 80.0
+view_radius_xz = 120.0
+
+# 副本模板（不创建实例，只定义配置）
+[[dungeon_templates]]
+id = 2001
+name = "deadmines"
+type = "multi_instance"   # 小型副本——多实例
+navmesh = "data/navmesh/dungeon_2001.navmesh"
+min_level = 15
+min_players = 1
+max_players = 5
+
+[[dungeon_templates]]
+id = 3001
+name = "molten_core"
+type = "singleton"        # 大型 raid——单例
+navmesh = "data/navmesh/raid_3001.navmesh"
+min_level = 60
+min_players = 20
+max_players = 40
+max_teams = 8
+
+[[dungeon_templates]]
+id = 4001
+name = "warsong_gulch"
+type = "battleground"
+navmesh = "data/navmesh/bg_4001.navmesh"
+min_players = 10
+max_players = 15
+team_count = 2</code></pre>
+
+  <h3>7. 场景销毁流程</h3>
+  <pre>
+Scene 标记为待销毁
+  │
+  ├── 1. 停止接受新实体（拒绝 ecs_create）
+  │
+  ├── 2. 迁移剩余玩家（如战场结束 / 副本关闭）
+  │     所有玩家 MigrationToScene 回主城
+  │
+  ├── 3. 检查所有实体已迁出（entity count == 0）
+  │
+  ├── 4. ~~Unload NavMesh~~
+  │
+  ├── 5. Scene 析构 → EnTT registry 销毁 + BlobStorage 释放
+  │
+  └── 6. 从 GameWorld._scenes 中移除</pre>
+
+</div>
+
+</div>
+<nav class="breadcrumb" style="margin-top:24px;"><a href="../Design.html">🏠 返回总目录</a></nav>
+<div class="footer">MMO Server Architecture Design Document · Version 1.2</div>
+</body>
+</html>

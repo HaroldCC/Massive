@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>13. ECS 架构 · EnTT + BlobStorage 混合 — MMO 服务器架构设计 v1.2</title>
+<link rel="stylesheet" href="../shared.css">
+</head>
+<body>
+
+<nav class="breadcrumb">
+  <a href="../Design.html">🏠 总目录</a>
+</nav>
+
+<div class="container">
+<span class="badge confirmed">✔ 已确认</span>
+
+<!-- ==================== S13 ==================== -->
+<div class="section" id="s13">
+  <h2>13. ECS 架构 · EnTT + BlobStorage 混合</h2>
+
+  <div style="margin-bottom:16px;"><span class="badge confirmed">✔ 已确认</span></div>
+
+  <h3>13.1 设计核心：数据形状决定数据归属</h3>
+  <p>
+    不是"C++ 层实现 ECS 最好"，而是每组数据的 <strong>遍历宽度</strong> 和 <strong>逻辑复杂度</strong> 决定它的存储位置。
+    宽遍历（1000+ 实体/简单公式）→ C++ EnTT SoA 布局，利用 cache 友好和 SIMD。
+    深逻辑（少量实体/复杂分支）→ daslang BlobStorage，利用热更新和类型灵活性。
+    <strong>真理之源原则</strong>：每个 Component 只在一层拥有写入权，绝不在两层同时写同一个组件。
+    C++ 引擎以 <strong>EnTT</strong> 管理 Entity 生命周期和高频 C++ 组件（SOA 布局）。
+    脚本层定义的组件通过 <strong>ScriptComponentStorage</strong>（并行 SoA blob 列）独立存储。
+    脚本 API 采用 <strong>DECS 风格语法</strong>——声明式 <code>ecs_query</code> / 引用直改 <code>ecs_edit</code> / Stage 组织 <code>ecs_stage</code>，
+    底层自动路由到 EnTT storage 或 BlobStorage，对脚本开发者透明。
+    <strong>零宏</strong>：C++ Component 一行模板函数注册，脚本 Component 一个 struct 注解即可。
+  </p>
+
+  <div class="callout warn">
+    <strong>⚠ EnTT View 迭代顺序说明</strong>：
+    EnTT v4.0 的 view 迭代器<strong>从后往前</strong>遍历 packed array（反向迭代）。
+    这是 EnTT 为支持在迭代中安全删除（swap_and_pop）而做的设计决策——
+    反向遍历保证新 swap 进来的元素已被遍历过，不会漏掉。
+    因此<strong>ecs_query 不保证遍历顺序</strong>，同帧内所有修改应视为一个原子快照。
+    业务逻辑不应依赖实体的迭代先后——调试复现应使用 registry snapshot 而非迭代顺序。
+  </div>
+
+  <table>
+    <tr><th>决策维度</th><th>C++ EnTT</th><th>DasLang BlobStorage</th></tr>
+    <tr><td>每 Tick 遍历实体数</td><td>1000+（全场景）</td><td>&lt; 100（仅相关实体）</td></tr>
+    <tr><td>操作复杂度</td><td>简单公式、线性计算</td><td>多分支、状态机、业务规则</td></tr>
+    <tr><td>热更新需求</td><td>低（引擎级，稳定后不变）</td><td>高（策划迭代、运营调整）</td></tr>
+    <tr><td>典型 Component</td><td>Position, Velocity, Health, Collider</td><td>QuestProgress, BuffState, TradeRecord, SkillCooldown</td></tr>
+    <tr><td>内存布局</td><td>EnTT SoA 分页（cache 友好）</td><td>ScriptComponentStorage SoA Blob</td></tr>
+    <tr><td>写入权</td><td>C++ System 独占写入</td><td>DasLang System 独占写入</td></tr>
+  </table>
+
+  <h3>13.2 Scene 类：EnTT + BlobStorage（调整）</h3>
+  <pre><code><span class="cm">// Scene.h — 每个场景独立</span>
+<span class="kw">class</span> <span class="tp">Scene</span> {
+<span class="kw">public</span>:
+    <span class="fn">Scene</span>(<span class="tp">uint32_t</span> sceneId) : <span class="kw">_sceneId</span>(sceneId) {}
+
+    <span class="cm">// Entity 生命周期 — EnTT 管理</span>
+    <span class="tp">Entity</span> <span class="fn">CreateEntity</span>() {
+        <span class="kw">auto</span> e = <span class="kw">_ecsRegistry</span>.create();
+        <span class="kw">return</span> Entity{<span class="kw">_sceneId</span>, uint32_t(e)};
+    }
+    <span class="kt">void</span> <span class="fn">DestroyEntity</span>(<span class="tp">Entity</span> we) {
+        <span class="kw">for</span> (<span class="kw">auto</span>&amp; [name, storage] : <span class="kw">_scriptStorages</span>)
+            storage-&gt;Remove(we.entityId);
+        <span class="kw">_ecsRegistry</span>.destroy(entt::entity(we.entityId));
+    }
+    <span class="kt">bool</span> <span class="fn">IsValid</span>(<span class="tp">Entity</span> we) <span class="kw">const</span> {
+        <span class="kw">return</span> <span class="kw">_ecsRegistry</span>.valid(entt::entity(we.entityId));
+    }
+
+    <span class="cm">// C++ 组件 — 直接走 EnTT storage</span>
+    <span class="kw">template</span>&lt;<span class="kw">typename</span> T&gt; T&amp; <span class="fn">GetComponent</span>(<span class="tp">Entity</span> we);
+    <span class="kw">template</span>&lt;<span class="kw">typename</span> T&gt; <span class="kw">auto</span>&amp; <span class="fn">EnTTStorage</span>();
+
+    <span class="cm">// 多组件暴露 — ecs_query 底层</span>
+    <span class="kw">template</span>&lt;<span class="kw">typename</span>... Components&gt;
+    <span class="kw">auto</span> <span class="fn">CreateView</span>() { <span class="kw">return</span> <span class="kw">_ecsRegistry</span>.view&lt;Components...&gt;(); }
+
+    <span class="cm">// 脚本组件 — 运行时注册 + SoA blob 存储</span>
+    <span class="kt">void</span> <span class="fn">RegisterScriptComponent</span>(<span class="kw">const</span> <span class="tp">std::string</span>&amp; name, <span class="tp">size_t</span> componentSize);
+    <span class="tp">ScriptComponentStorage</span>* <span class="fn">GetScriptStorage</span>(<span class="kw">const</span> <span class="tp">std::string</span>&amp; name);
+
+    <span class="tp">entt::registry</span>&amp; <span class="fn">EcsRegistry</span>() { <span class="kw">return</span> <span class="kw">_ecsRegistry</span>; }
+
+    <span class="cm">// 脏标记 — 网络复制使用</span>
+    <span class="kw">template</span>&lt;<span class="kw">typename</span> T&gt; <span class="kt">void</span> <span class="fn">MarkDirty</span>(<span class="kw">const</span> <span class="tp">Entity</span>&amp; we);
+    <span class="kw">template</span>&lt;<span class="kw">typename</span> T&gt; <span class="kt">bool</span> <span class="fn">IsDirty</span>(<span class="kw">const</span> <span class="tp">Entity</span>&amp; we) <span class="kw">const</span>;
+
+<span class="kw">private</span>:
+    <span class="tp">uint32_t</span> <span class="kw">_sceneId</span>;
+    <span class="tp">entt::registry</span> <span class="kw">_ecsRegistry</span>;  <span class="cm">// C++ 组件（Position/Velocity/Health...）</span>
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">std::string</span>, <span class="tp">std::unique_ptr</span>&lt;<span class="tp">ScriptComponentStorage</span>&gt;&gt; <span class="kw">_scriptStorages</span>;
+};</code></pre>
+
+  <h3>13.3 ScriptComponentStorage — 脚本组件的 SoA blob 列</h3>
+  <pre><code><span class="kw">class</span> <span class="tp">ScriptComponentStorage</span> {
+<span class="kw">public</span>:
+    <span class="fn">ScriptComponentStorage</span>(<span class="tp">std::string</span> name, <span class="tp">size_t</span> componentSize)
+        : <span class="kw">_name</span>(std::move(name)), <span class="kw">_stride</span>(componentSize) {}
+
+    <span class="kt">bool</span> <span class="fn">Has</span>(<span class="tp">uint32_t</span> entityId) <span class="kw">const</span> { <span class="kw">return</span> <span class="kw">_sparse</span>.contains(entityId); }
+    <span class="kt">void</span>* <span class="fn">GetPtr</span>(<span class="tp">uint32_t</span> entityId) { <span class="kw">return</span> <span class="kw">_data</span>.data() + <span class="kw">_sparse</span>.at(entityId) * <span class="kw">_stride</span>; }
+
+    <span class="kt">void</span> <span class="fn">Emplace</span>(<span class="tp">uint32_t</span> entityId, <span class="kw">const</span> <span class="kt">void</span>* src);      <span class="cm">// 存在则原地覆盖</span>
+    <span class="kt">void</span> <span class="fn">Remove</span>(<span class="tp">uint32_t</span> entityId);                       <span class="cm">// swap-with-last O(1)</span>
+
+    <span class="kw">const</span> <span class="tp">uint8_t</span>* <span class="fn">DataPtr</span>() <span class="kw">const</span> { <span class="kw">return</span> <span class="kw">_data</span>.data(); }  <span class="cm">// 给 DasLang temp array 暴露指针</span>
+    <span class="tp">size_t</span> <span class="fn">Count</span>() <span class="kw">const</span> { <span class="kw">return</span> <span class="kw">_data</span>.size() / <span class="kw">_stride</span>; }
+
+<span class="kw">private</span>:
+    <span class="tp">std::string</span> <span class="kw">_name</span>;
+    <span class="tp">size_t</span> <span class="kw">_stride</span>;
+    <span class="tp">std::vector</span>&lt;<span class="tp">uint8_t</span>&gt; <span class="kw">_data</span>;                              <span class="cm">// SoA blob 数据</span>
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">uint32_t</span>, <span class="tp">uint32_t</span>&gt; <span class="kw">_sparse</span>;  <span class="cm">// entityId → index</span>
+};</code></pre>
+
+  <h3>13.4 C++ Component 注册（零宏 + 两种桥接模式）</h3>
+  <p>
+    每个 C++ Component 在 Module 构造函数中一行注册。自动生成跨语言结构映射，支持两种运行模式。
+  </p>
+  <pre><code><span class="kw">template</span>&lt;<span class="kw">typename</span> T&gt;
+<span class="kt">void</span> <span class="fn">RegisterEcsComponent</span>(<span class="tp">Module</span>&amp; mod, <span class="tp">ModuleLibrary</span>&amp; lib, <span class="kw">const</span> <span class="kt">char</span>* dasName) {
+    mod.addAnnotation(<span class="kw">new</span> ManagedStructureAnnotation&lt;T, <span class="nb">true</span>&gt;(dasName, lib));
+    <span class="cm">// + addExtern: ecs_query_get_{T} / ecs_edit_get_{T} / ecs_edit_set_{T} / ecs_view_{T}</span>
+}
+
+<span class="cm">// Module 构造函数 — 一行注册一个 Component</span>
+<span class="fn">ModuleEntt</span>() : <span class="tp">Module</span>(<span class="str">"ecs"</span>) {
+    <span class="tp">ModuleLibrary</span> lib(<span class="kw">this</span>);
+    lib.addBuiltInModule();
+    RegisterEcsComponent&lt;<span class="tp">Position</span>&gt;(*<span class="kw">this</span>, lib, <span class="str">"Position"</span>);
+    RegisterEcsComponent&lt;<span class="tp">Velocity</span>&gt;(*<span class="kw">this</span>, lib, <span class="str">"Velocity"</span>);
+    RegisterEcsComponent&lt;<span class="tp">Health</span>&gt;(*<span class="kw">this</span>, lib, <span class="str">"Health"</span>);
+    RegisterEcsComponent&lt;<span class="tp">Mana</span>&gt;(*<span class="kw">this</span>, lib, <span class="str">"Mana"</span>);
+}</code></pre>
+
+  <h4>两种桥接模式</h4>
+  <table>
+    <tr><th>模式</th><th>适用场景</th><th>底层实现</th></tr>
+    <tr>
+      <td><strong>ecs_query</strong> — 声明式批量遍历</td>
+      <td>每 Tick 遍历全部拥有某组件的实体</td>
+      <td>EnTT View → daslang temp array 包装 EnTT dense buffer（零拷贝引用）</td>
+    </tr>
+    <tr>
+      <td><strong>ecs_edit</strong> — ComponentMap 单实体操作</td>
+      <td>处理消息/事件，操作 1 个实体的多个组件</td>
+      <td>registry.get&lt;T&gt;(e) 返回引用 → ComponentMap 字段聚合（直接写 EnTT/BlobStorage）</td>
+    </tr>
+  </table>
+
+  <h3>13.5 遍历：ecs_query 与 ecs_edit 两种模式</h3>
+
+  <h4>模式 1：ecs_query — 声明式批量遍历（替代 ecs_view）</h4>
+  <p>
+    脚本声明需要的组件列表，宏在编译期展开为 EnTT <strong>owning group</strong>。
+    owning group 保证所有 owned 组件的 storage 前 N 个位置严格对齐（同一entity 在同一索引），
+    <code>raw()</code> 的指针可直接用于 parallel array 遍历。
+    循环内变量是 <strong>引用</strong>，赋值直接写入 EnTT storage，零拷贝。
+  </p>
+
+  <div class="callout warn">
+    <strong>⚠ 为什么不能直接用 view.storage&lt;T&gt;().raw()</strong>：
+    EnTT 4.0 的 <code>view.storage&lt;T&gt;()</code> 返回的是原始 storage 指针（全量数据），不是 view 的交集子集。
+    Flavor A（raw() 全量 → parallel array）的结果是未对齐的——pos_arr[i] 和 vel_arr[i] 可能对应不同的 entity。
+    正确的做法是用 <strong>owning group</strong>：
+    <code>registry.group&lt;owned_t&lt;Position, Velocity&gt;&gt;()</code> 在 on_construct / on_destroy 时物理重排 storage，
+    保证 <code>group.storage&lt;Position&gt;().raw()[0..N-1]</code> 和 <code>group.storage&lt;Velocity&gt;().raw()[0..N-1]</code>
+    严格对齐（同一个 entity 在两个数组中的索引相同）。
+    owning group 的重排开销在创建/销毁 entity 时发生，遍历热路径零开销。
+  </div>
+
+  <pre><code><span class="cm">// daslang 宏 ecs_query — 编译期展开（Flavor C：owning group）</span>
+<span class="cm">// ecs_query(sceneId; pos : Position&amp; ; vel : Velocity)</span>
+<span class="cm">//   ↓ 展开为 ↓</span>
+<span class="cm">// auto group = registry.group&lt;entt::owned_t&lt;Position, Velocity&gt;&gt;();</span>
+<span class="cm">//   → EnTT 物理重排 storage，前 N 个元素对齐</span>
+<span class="cm">// pos_arr = makeTempArray(group.storage&lt;Position&gt;().raw(), group.size());</span>
+<span class="cm">// vel_arr = makeTempArray(group.storage&lt;Velocity&gt;().raw(), group.size());</span>
+<span class="cm">// for i in range(group.size()): loop body — pos_arr[i] 和 vel_arr[i] 同一 entity</span>
+
+<span class="cm">// C++ 桥接实现</span>
+<span class="kw">template</span>&lt;<span class="kw">typename</span>... OwnedComponents&gt;
+<span class="kw">static</span> <span class="kt">void</span> <span class="fn">EcsQueryBridge</span>(<span class="tp">Scene</span>&amp; scene,
+                          <span class="kw">const</span> <span class="tp">TBlock</span>&lt;<span class="kt">void</span>, array&lt;OwnedComponents&gt;...&gt;&amp; block,
+                          <span class="tp">Context</span>* ctx, <span class="tp">LineInfoArg</span>* at)
+{
+    <span class="cm">// owning group：owned 组件 storage 前 N 个元素严格对齐</span>
+    <span class="kw">auto</span> group = scene.EcsRegistry().group&lt;
+        entt::owned_t&lt;OwnedComponents...&gt;&gt;();
+
+    <span class="kw">int32_t</span> count = <span class="kw">int32_t</span>(group.size());  <span class="cm">// 交集 entity 数量</span>
+
+    <span class="cm">// group 中每个 Component 的 raw() 前 count 个 = 对齐的交集数据</span>
+    <span class="cm">// makeTempArray 零拷贝 — daslang array 指向 EnTT 内部 paged buffer</span>
+    das_invoke&lt;<span class="kt">void</span>&gt;::invoke(ctx, at, block,
+        makeTempArray&lt;OwnedComponents&gt;(
+            group.template storage&lt;OwnedComponents&gt;().raw(), count)...);
+}</code></pre>
+
+  <h4>模式 2：ecs_edit — ComponentMap 单实体操作（替代 ecs_get/set/emplace）</h4>
+  <p>
+    闭包接收 <code>ComponentMap</code> 对象，<code>cmp.field.subfield</code> 语法直接读写组件。
+    每个字段是 C++ 存储的引用——修改即时生效，无需三行 get/copy/set。
+    自动判别 EnTT 组件 vs BlobStorage 组件，路由到正确的存储。
+  </p>
+
+  <pre><code><span class="cm">// C++ 端 ComponentMap 构建</span>
+<span class="cm">// ecs_edit(entity) $(cmp) { cmp.health.current -= 10; }</span>
+<span class="cm">//   ↓ 展开为 ↓</span>
+<span class="cm">// auto& hp  = registry.get&lt;Health&gt;(entity);        // EnTT 引用</span>
+<span class="cm">// auto* qp  = scriptStorage-&gt;GetPtr(entity);       // BlobStorage 指针</span>
+<span class="cm">// ComponentMap cmp = {{"health", &hp}, {"questProgress", qp}};</span>
+<span class="cm">// 闭包执行 → cmp.health 是 Health&，cmp.questProgress 是 QuestProgress*</span>
+
+<span class="cm">// ecs_edit 底层桥接</span>
+<span class="kw">struct</span> <span class="tp">ComponentMap</span> {
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">std::string</span>, <span class="tp">void</span>*&gt; enTTFields;    <span class="cm">// EnTT 组件引用 → 直接是 T*</span>
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">std::string</span>, <span class="tp">void</span>*&gt; scriptFields;  <span class="cm">// BlobStorage 组件指针</span>
+};
+
+<span class="kw">template</span>&lt;<span class="kw">typename</span> Func&gt;
+<span class="kt">void</span> <span class="fn">EcsEditBridge</span>(<span class="tp">Scene</span>&amp; scene, <span class="tp">Entity</span> we, Func&amp;&amp; body) {
+    <span class="kw">auto</span> e = entt::entity(we.entityId);
+    <span class="tp">ComponentMap</span> cmp;
+
+    <span class="cm">// 遍历 Scene 注册的 EnTT 组件 → 每人一行 resolve</span>
+    <span class="cp">#define RESOLVE_ENTT_FIELD(T, name) \
+        if (scene.EcsRegistry().all_of&lt;T&gt;(e)) \
+            cmp.enTTFields[name] = &amp;scene.EcsRegistry().get&lt;T&gt;(e);</span>
+    RESOLVE_ENTT_FIELD(Position,  <span class="str">"position"</span>);
+    RESOLVE_ENTT_FIELD(Health,    <span class="str">"health"</span>);
+    RESOLVE_ENTT_FIELD(Velocity,  <span class="str">"velocity"</span>);
+    <span class="cp">#undef RESOLVE_ENTT_FIELD</span>
+
+    <span class="cm">// 遍历 BlobStorage 组件</span>
+    <span class="kw">for</span> (<span class="kw">auto</span>&amp; [name, storage] : scene.ScriptStorages()) {
+        <span class="kw">if</span> (storage-&gt;Has(we.entityId))
+            cmp.scriptFields[name] = storage-&gt;GetPtr(we.entityId);
+    }
+
+    body(cmp);  <span class="cm">// 执行 daslang 闭包 → cmp 字段直接指 EnTT/BlobStorage</span>
+}</code></pre>
+
+  <h4>查询约束：ecs_query 带条件</h4>
+  <p>
+    支持可选的 with/without 约束——等价于 EnTT 的 include/exclude 过滤，
+    编译期生成正确的 View 类型。
+  </p>
+  <pre><code><span class="cm">// 只遍历同时有 Health 和 MonsterTag 的实体</span>
+<span class="cm">// 排除有 Dead 标记的实体</span>
+ecs_query(sceneId;
+    pos     : Position&amp;;
+    vel     : Velocity;
+    <span class="kw">with</span>    Health, MonsterTag;
+    <span class="kw">without</span> Dead
+) {
+    pos.x += vel.vx * dt
+}
+<span class="cm">// 展开为: registry.view&lt;Position, Velocity&gt;(entt::exclude&lt;Dead&gt;)</span>
+<span class="cm">// 内部只遍历同时有 Health + MonsterTag + Position + Velocity 的实体</span></code></pre>
+
+  <h3>13.6 数据一致性：双缓冲（Double Buffering）模型</h3>
+  <p>
+    为保证同一 Tick 内所有 entity 看到的世界状态完全一致（解决 §1 中 ecs_query / ecs_edit
+    双路径的数据一致性问题），采用<strong>双缓冲共享状态</strong>方案：
+  </p>
+
+  <table>
+    <tr><th>缓冲区</th><th>用途</th><th>访问模式</th></tr>
+    <tr><td><code>current</code></td><td>只读快照——ecs_query 读者的数据源</td><td>本 Tick 内所有系统读取一致</td></tr>
+    <tr><td><code>next</code></td><td>写入目标——所有 ecs_edit/ecs_create/ecs_destroy 的累积结果</td><td>本 Tick 内修改写入此缓冲区</td></tr>
+  </table>
+
+  <pre>
+Tick N 开始:
+  current = Tick N-1 结束时的完整状态
+  next    = current 的副本（初始）
+
+ecs_stage "movement":
+  ecs_query 读 current → 写 next（Position 变更写入 next）
+
+ecs_stage "combat":
+  ecs_query 读 current → 写 next（Health 变更写入 next）
+  ecs_edit 读 current → 写 next（BuffList 变更写入 next）
+  → 关键：entity B 的计算不能依赖 entity A 在本 Tick 内的修改
+  → 因为大家都读 current，都是基于 N-1 帧的快照
+
+Tick N 结束:
+  swap(current, next)  → 所有修改一次性生效
+  next 现在 = 新状态，current = 旧状态（下一 Tick 的 next 会基于此构建）</pre>
+
+  <p>
+    此方案的核心价值：<strong>同一帧内，无论 ecs_query 遍历的顺序如何，无论有多少 entity
+    相互影响，每个 entity 看到的世界状态完全相同 (= 上一 Tick 结束时的状态)</strong>。
+    这保证了即使 EnTT 反向迭代、多个 Stage 交叉修改、脚本和 C++ 双路径并行访问，
+    结果都是确定性的。同时双缓冲天然提供 frame snapshot，用于录像回放和崩溃恢复。
+  </p>
+
+  <div class="callout info">
+    <strong>内存开销</strong>：双缓冲 = 2× EnTT registry + 2× BlobStorage。以 10000 entity ×
+    平均 500 字节组件数据估算 ≈ 10MB 额外内存。对于现代服务器（64GB+）可忽略。
+    实现上 next 缓冲区不会完整拷贝整个 registry——只拷贝有变更的 entity（copy-on-write 分摊）。
+  </div>
+
+  <h3>13.7 ecs_stage — Stage 模式组织系统执行顺序</h3>
+  <p>
+    取代手动调用函数，用 <code>ecs_stage</code> 声明执行顺序。
+    每个 Stage 内部读 current、写 next。Stage 之间 next 状态逐步累积——
+    但 current 在整个 Tick 内保持不变。每 Tick 顶层调度一目了然。
+  </p>
+
+  <pre><code><span class="cm">// server_tick.das — 顶层 Tick 调度</span>
+[export]
+<span class="kw">def</span> <span class="fn">ServerTick</span>(sceneId : uint32; dt : float)
+{
+    ecs_stage <span class="str">"input"</span>      { ProcessInput(sceneId) }
+    ecs_stage <span class="str">"movement"</span>   { SystemMovement(sceneId, dt) }
+    ecs_stage <span class="str">"stats"</span>      { SystemRecalcStats(sceneId) }
+    ecs_stage <span class="str">"combat"</span>     { SystemCombat(sceneId) }
+    ecs_stage <span class="str">"buff"</span>       { SystemBuffTick(sceneId, dt) }
+    ecs_stage <span class="str">"ai"</span>         { SystemAI(sceneId) }
+    ecs_stage <span class="str">"quest"</span>      { SystemQuest(sceneId) }
+    ecs_stage <span class="str">"skill"</span>      { SystemSkillCooldown(sceneId) }
+    ecs_stage <span class="str">"aoi"</span>        { SystemAOI(sceneId) }
+    ecs_stage <span class="str">"replicate"</span>  { SystemReplicate(sceneId) }
+    ecs_stage <span class="str">"save"</span>       { SystemDirtyFlush(sceneId) }
+}</code></pre>
+
+  <h4>延迟操作与双缓冲写入</h4>
+  <p>
+    在双缓冲模型下，所有修改操作不直接写入 current，而是写入 next 缓冲区。
+    Tick 结束时 swap(current, next) 一次性生效。
+    在此期间，"未 swap 的修改"对读路径不可见——避免了"在遍历中看到已修改的数据"这类经典 bug。
+  </p>
+
+  <h3>13.8 Component 删除策略：混合策略</h3>
+  <p>
+    EnTT v4.0 默认使用 <code>in_place</code> 删除策略（tombstone + free-list），
+    保证指针稳定性但会累积 tombstone。根据组件类型采用差异化策略：
+  </p>
+
+  <table>
+    <tr><th>组件类别</th><th>策略</th><th>原因</th><th>示例</th></tr>
+    <tr>
+      <td><strong>高频瞬态组件</strong></td>
+      <td><code>swap_and_pop</code> (in_place_delete = false)</td>
+      <td>每 Tick 频繁创建/销毁（怪物刷新/死亡），无指针稳定性需求</td>
+      <td>Position, Velocity, Health, CombatTag, StatsDirtyTag</td>
+    </tr>
+    <tr>
+      <td><strong>持久状态组件</strong></td>
+      <td><code>in_place</code>（默认）+ 定期 compact</td>
+      <td>ecs_edit 持有引用，需要指针稳定性；销毁频率低</td>
+      <td>Inventory, BuffList, SkillBar, AIBlackboard</td>
+    </tr>
+  </table>
+
+  <pre><code><span class="cm">// component_traits 特化——高频瞬态 → swap_and_pop</span>
+<span class="kw">template</span>&lt;&gt;
+<span class="kw">struct</span> <span class="tp">entt::component_traits</span>&lt;Position&gt; {
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="kw">auto</span> in_place_delete = false;  <span class="cm">// 强制 swap_and_pop</span>
+};
+<span class="kw">template</span>&lt;&gt; <span class="kw">struct</span> <span class="tp">entt::component_traits</span>&lt;Velocity&gt; { <span class="kw">static</span> <span class="kw">constexpr</span> <span class="kw">auto</span> in_place_delete = false; };
+<span class="kw">template</span>&lt;&gt; <span class="kw">struct</span> <span class="tp">entt::component_traits</span>&lt;Health&gt;   { <span class="kw">static</span> <span class="kw">constexpr</span> <span class="kw">auto</span> in_place_delete = false; };
+<span class="kw">template</span>&lt;&gt; <span class="kw">struct</span> <span class="tp">entt::component_traits</span>&lt;CombatTag&gt;{ <span class="kw">static</span> <span class="kw">constexpr</span> <span class="kw">auto</span> in_place_delete = false; };
+
+<span class="cm">// 持久组件保持 in_place（默认），Scene 定期检查并 compact</span>
+<span class="kt">void</span> <span class="tp">Scene</span>::<span class="fn">CheckAndCompact</span>() {
+    <span class="kw">constexpr</span> <span class="kt">float</span> kCompactThreshold = <span class="num">0.5f</span>;  <span class="cm">// tombstone > 50% 触发</span>
+    <span class="kw">constexpr</span> <span class="tp">size_t</span> kMinEntities = <span class="num">1000</span>;       <span class="cm">// 太少了不值得</span>
+
+    <span class="kw">for</span> (<span class="kw">auto</span>&amp;&amp; [id, storage] : <span class="kw">_ecsRegistry</span>.storage()) {
+        <span class="kw">auto</span> total = storage.size() + storage.free_list();
+        <span class="kw">if</span> (total &lt; kMinEntities) <span class="kw">continue</span>;
+        <span class="kt">float</span> ratio = <span class="kt">float</span>(storage.free_list()) / <span class="kt">float</span>(total);
+        <span class="kw">if</span> (ratio &gt; kCompactThreshold) {
+            storage.compact();
+            LOG_WARN(<span class="str">"Scene {} storage compacted: tombstone {:.1f}%"</span>, _sceneId, ratio * <span class="num">100</span>);
+        }
+    }
+}</code></pre>
+
+  <h3>13.9 新增 Component 流程</h3>
+    <tr><th>Component 类型</th><th>步骤</th><th>业务示例</th></tr>
+    <tr>
+      <td><strong>C++ 高频组件</strong></td>
+      <td>① Components.h 写 struct ② Module 加一行 RegisterEcsComponent</td>
+      <td>Position, Velocity, Health, Mana, AIState</td>
+    </tr>
+    <tr>
+      <td><strong>脚本逻辑组件</strong></td>
+      <td>① .das 文件中写 struct + 加 [script_component] 注解</td>
+      <td>QuestProgress, BuffState, DialogueState, TradeRecord</td>
+    </tr>
+  </table>
+
+  <h3>13.10 判断标准</h3>
+  <p>每 Tick 需要成百上千实体批量遍历的 → C++ struct + EnTT。低频逻辑、纯业务、热更新需求 → DasLang [script_component]。</p>
+
+  <h3>13.11 Registry 架构：单层 Scene Registry</h3>
+  <p>
+    和业界主流做法一致——<strong>只保留 SceneRegistry</strong>（每个场景一个 EnTT registry）。
+    GlobalRegistry 和 PersistentRegistry 被拆分为独立的 <strong>C++ 单例 Manager</strong> 和 <strong>紧凑容器</strong>，
+    因为它们管理的对象不需要 ECS 的 entity 生命周期和 sparse_set 存储开销。
+  </p>
+
+  <table>
+    <tr><th>存储层</th><th>实现</th><th>用途</th><th>理由</th></tr>
+    <tr>
+      <td><strong>SceneRegistry × N</strong></td>
+      <td>每个 Scene 持有独立 <code>entt::registry</code></td>
+      <td>玩家/怪物/NPC/掉落——所有有生命周期的场景实体</td>
+      <td>性能刚需——ecs_query 遍历时不该扫到其他场景的 entity</td>
+    </tr>
+    <tr>
+      <td><strong>GuildMgr</strong>（单例）</td>
+      <td><code>std::unordered_map&lt;uint32_t, Guild&gt;</code></td>
+      <td>公会创建/解散/成员管理/公会仓库</td>
+      <td rowspan="4">不是 ECS entity——不需要 create/destroy、sparse_set、view 遍历</td>
+    </tr>
+    <tr>
+      <td><strong>ChatChannelMgr</strong>（单例）</td>
+      <td><code>std::vector&lt;ChatChannel&gt;</code></td>
+      <td>世界频道/公会频道/私聊/队伍频道的消息路由</td>
+    </tr>
+    <tr>
+      <td><strong>BossScheduler</strong>（单例）</td>
+      <td><code>std::unordered_map&lt;uint32_t, BossState&gt;</code></td>
+      <td>世界 Boss 的刷新计时器/HP/阶段/参战玩家列表</td>
+    </tr>
+    <tr>
+      <td><strong>MailMgr</strong>（单例）</td>
+      <td><code>std::vector&lt;MailMessage&gt;</code></td>
+      <td>玩家邮件（发件/收件/附件/已读状态）</td>
+    </tr>
+    <tr>
+      <td><strong>ConfigTable&lt;T&gt;</strong>（单例模板）</td>
+      <td><code>DenseMap&lt;uint32_t, T&gt;</code></td>
+      <td>纯只读配置数据——通过 <code>templateId</code> 做 O(1) 查表</td>
+      <td>静态数据不需要 entity 和 sparse_set 三层间接寻址</td>
+    </tr>
+  </table>
+
+  <h4>ConfigTable 实现</h4>
+  <p>
+    ConfigTable 的权威定义见 <a href="global_managers.html">§13c 全局 Manager 单例</a>。
+    采用 <code>shared_ptr&lt;vector&lt;T&gt;&gt; + shared_ptr&lt;unordered_map&lt;uint32_t,uint32_t&gt;&gt;</code> 双容器方案，
+    Find() 查索引 + 数组取值 O(1)，All() 遍历数组 O(n)。热重载用 shared_ptr 原子 swap。
+  </p>
+
+  <h4>Entity 简化</h4>
+  <p>
+    取消了 GlobalRegistry (sceneId=0) 和 PersistentRegistry (sceneId=0xFFFFFFFF) 的特殊值。
+    <code>Entity</code> 就单纯是 (sceneId, entityId)，只指向 Scene。
+  </p>
+  <pre><code><span class="kw">struct</span> <span class="tp">Entity</span> {
+    <span class="tp">uint32_t</span> sceneId;   <span class="cm">// Scene ID</span>
+    <span class="tp">uint32_t</span> entityId;  <span class="cm">// EnTT entity id</span>
+};</code></pre>
+
+</div>
+
+<nav class="breadcrumb" style="margin-top:24px;">
+  <a href="../Design.html">🏠 返回总目录</a>
+</nav>
+
+</div>
+<div class="footer">
+  MMO Server Architecture Design Document · Version 1.2
+</div>
+</body>
+</html>

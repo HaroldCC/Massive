@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>网络复制系统 — MMO 服务器架构设计 v1.2</title>
+<link rel="stylesheet" href="../shared.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="../Design.html">🏠 总目录</a></nav>
+<div class="container">
+<span class="badge confirmed">✔ 已确认</span>
+
+<div class="section" id="netrep">
+  <h2>网络复制系统 · 差量 + 快照混合</h2>
+
+  <h3>1. 核心设计</h3>
+  <p>
+    服务器 EnTT 组件通过 Per-Component 脏标记追踪变化，Tick 末尾把变更的组件差量推送给各客户端。
+    同时定期发送完整快照作为客户端状态纠正的基线。<strong>快照间隔按 entity 类型差异化</strong>——
+    高速移动 entity（坐骑/载具/冲锋）用更短的间隔防止可见的"拉回"效果。
+    差量优先写满 MTU，快照补发送未变更的数据。
+  </p>
+
+  <div class="callout info">
+    <strong>🧠 设计哲学</strong>：服务器是权威状态（SSOT），客户端是缓存。服务器从不回答“我这个值对不对”，只主动告知“你现在的值是什么”。
+  </div>
+
+  <h3>2. 核心组件</h3>
+
+  <table>
+    <tr><th>组件</th><th>职责</th></tr>
+    <tr><td><code>dirty_bitset (uint64_t)</code></td><td>Per-Entity 的组件脏位掩码 (C++ 引擎层维护)</td></tr>
+    <tr><td><code>last_acked_version (uint32_t)</code></td><td>客户端最后一次确认的快照版本号</td></tr>
+    <tr><td><code>replication_group (uint16_t)</code></td><td>组件分组（高频 0 组、低频 1 组等）</td></tr>
+  </table>
+
+  <h3>3. 数据流</h3>
+  <pre>
+  C++ 引擎每 Tick 执行 ecs_stage "replicate"
+  ┌─────────────────────────────────────────────────┐
+  │                                               │
+  │ 1. 收集 AoI 可见集 (GetWatchers)               │
+  │    遍历所有玩家 Session 的 AOI 可见实体        │
+  │                                               │
+  │ 2. 差量打包 (Per-Player 写 MTU 上限)           │
+  │    [entityId, dirty_flags, changed_fields...]   │
+  │    优先写入：                                   │
+  │      - 新进入 AoI 的实体 (全量)                 │
+  │      - 离开 AoI 的实体 (OutOfRange)             │
+  │      - 本 Tick 变脏的组件 (差量)                │
+  │                                               │
+  │ 3. 快照打包 (Per-Player 拆分包发送)             │
+  │    每 4 Tick (200ms) 发送一次完整快照           │
+  │    未变的数据不再序列化                         │
+  │                                               │
+  │ 4. 发送到客户端                                 │
+  │    MSG_ENTITY_SYNC_NTF → session->Send()       │
+  └─────────────────────────────────────────────────┘</pre>
+
+  <h3>4. 带宽预估 (Per Player, 100 个在 AOI 范围内)</h3>
+
+  <table>
+    <tr><th>场景</th><th>差量 (每 Tick)</th><th>快照 (200ms)</th><th>平均带宽</th></tr>
+    <tr><td>平稳移动 (100 人 × Position dirty)</td><td>~1.8 KB</td><td>~12 KB</td><td>~108 KB/s</td></tr>
+    <tr><td>激烈战斗 (50 人 × Pos/Velocity/HP dirty)</td><td>~2.2 KB</td><td>~12 KB</td><td>~108 KB/s</td></tr>
+    <tr><td>无事件 (0 人 dirty)</td><td>~50 B</td><td>~12 KB</td><td>~60 KB/s</td></tr>
+  </table>
+
+  <div class="callout info">
+    <strong>📌 结论</strong>：差量 + 快照混合模型，玩家最大带宽 100-150 KB/s，远低于 1 MB/s 的家用宽带上限，预测无卡顿。
+  </div>
+
+  <h3>5. Proto 定义</h3>
+  <pre><code>message EntitySyncNtf {
+    uint32 tick_id = 1;              <span class="cm">// 服务器 Tick ID</span>
+
+    message EntityDelta {
+      uint32 entity_id = 1;
+      uint32 dirty_flags = 2;       <span class="cm">// 位掩码: POSITION=1 | HEALTH=2 | ...</span>
+      repeated ComponentUpdate components = 3;
+    }
+
+    message ComponentUpdate {
+      uint32 component_id = 1;      <span class="cm">// 组件类型 ID</span>
+      bytes data = 2;               <span class="cm">// 组件序列化数据（仅含变化字段）</span>
+    }
+
+    repeated EntityDelta deltas = 2;          <span class="cm">// 差量实体列表</span>
+    repeated uint32 create_entities = 3;      <span class="cm">// 新进入 AoI 的实体（客户端需要创建）</span>
+    repeated uint32 destroy_entities = 4;     <span class="cm">// 离开 AoI 的实体（客户端垃圾回收）</span>
+    repeated EntityDelta full_sync = 5;       <span class="cm">// 全量快照（每 200ms）</span>
+    uint32 snapshot_version = 6;              <span class="cm">// 快照版本号</span>
+  }</code></pre>
+
+  <h3>6. 脏标记生命周期</h3>
+  <pre><code><span class="cm">// C++ 引擎层——每当组件被修改时自动置脏</span>
+<span class="kw">struct</span> <span class="tp">DirtyTracker</span> {
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">Entity</span>, <span class="tp">uint64_t</span>&gt; dirtyEntities;  <span class="cm">// entity -> 脏位掩码</span>
+    <span class="tp">std::unordered_set</span>&lt;<span class="tp">Entity</span>&gt; createdEntities;       <span class="cm">// 本 Tick 新创建的实体</span>
+    <span class="tp">std::unordered_set</span>&lt;<span class="tp">Entity</span>&gt; destroyedEntities;      <span class="cm">// 本 Tick 已销毁的实体</span>
+
+    <span class="kt">void</span> <span class="fn">MarkDirty</span>(<span class="tp">Entity</span> entity, <span class="tp">uint32_t</span> componentBit);
+    <span class="kt">void</span> <span class="fn">MarkCreated</span>(<span class="tp">Entity</span> entity);
+    <span class="kt">void</span> <span class="fn">MarkDestroyed</span>(<span class="tp">Entity</span> entity);
+
+    <span class="cm">// 复制结束后清空所有脏标记</span>
+    <span class="kt">void</span> <span class="fn">ClearAll</span>();
+  };</code></pre>
+
+  <h3>7. 组件位掩码分配</h3>
+  <table>
+    <tr><th>位</th><th>组件</th><th>分组</th><th>说明</th></tr>
+    <tr><td>0</td><td>Position</td><td>0 (高频)</td><td>每 Tick 都可能变</td></tr>
+    <tr><td>1</td><td>Velocity</td><td>0 (高频)</td><td>移动系统每 Tick 更新</td></tr>
+    <tr><td>2</td><td>Health</td><td>0 (高频)</td><td>战斗频繁变化</td></tr>
+    <tr><td>3</td><td>Rotation</td><td>0 (高频)</td><td>朝向变化</td></tr>
+    <tr><td>4</td><td>Mana</td><td>0 (高频)</td><td>技能消耗</td></tr>
+    <tr><td>5</td><td>BuffList</td><td>1 (低频)</td><td>Buff 变更</td></tr>
+    <tr><td>6</td><td>Inventory</td><td>1 (低频)</td><td>物品变化</td></tr>
+    <tr><td>7</td><td>QuestLog</td><td>1 (低频)</td><td>任务状态变化</td></tr>
+  </table>
+
+  <h3>8. 优先级与带宽管理</h3>
+  <p>
+    当 MTU 不足以容纳所有脏实体时，按优先级排序发送：
+  </p>
+
+  <table>
+    <tr><th>优先级</th><th>实体类型</th><th>说明</th></tr>
+    <tr><td>1 (最高)</td><td>新进入 AoI (Create)</td><td>客户端必须立刻知道这个实体存在</td></tr>
+    <tr><td>2</td><td>离开 AoI (Destroy)</td><td>立即释放客户端资源</td></tr>
+    <tr><td>3</td><td>玩家自己的 Entity</td><td>核心体验（位置/HP 即时反馈）</td></tr>
+    <tr><td>4</td><td>其他玩家 (PVP)</td><td>PVP 目标——位置必须及时</td></tr>
+    <tr><td>5</td><td>战斗怪物</td><td>PVE 目标——HP 必须及时</td></tr>
+    <tr><td>6 (最低)</td><td>远距 NPC / 装饰</td><td>可推迟到下一个 Tick</td></tr>
+  </table>
+
+  <h3>9. 快照间隔差异化</h3>
+  <p>
+    不是所有 entity 都需要同样的快照纠错频率。静止 NPC 200ms 全量快照完全浪费带宽，
+    而飞行坐骑（30m/s）200ms 后位置偏差可达 6m——客户端纠错时产生明显"拉回"。
+    按 entity 的动态属性采用<strong>阶梯式快照间隔</strong>：
+  </p>
+
+  <table>
+    <tr><th>档位</th><th>间隔</th><th>适用 entity</th><th>PCU 占比估算</th></tr>
+    <tr><td><strong>默认</strong></td><td>200ms</td><td>玩家步行、NPC、静止 entity</td><td>~80%</td></tr>
+    <tr><td><strong>高速</strong></td><td>100ms</td><td>坐骑、载具、飞行、游泳</td><td>~15%</td></tr>
+    <tr><td><strong>战斗高速</strong></td><td>50ms</td><td>冲锋/闪现技能施放中、PvP 竞技场内</td><td>~5%</td></tr>
+  </table>
+
+  <pre><code><span class="cm">// ReplicationConfig.h — 快照间隔查表</span>
+<span class="kw">struct</span> <span class="tp">ReplicationInterval</span> {
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="tp">int</span> kDefault      = <span class="num">200</span>;
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="tp">int</span> kFastMoving   = <span class="num">100</span>;
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="tp">int</span> kCombatDash   = <span class="num">50</span>;
+};
+
+<span class="tp">int</span> <span class="fn">GetSnapshotInterval</span>(<span class="tp">Entity</span> e, <span class="kw">const</span> <span class="tp">entt::registry</span>&amp; reg) {
+    <span class="kw">auto</span> ent = <span class="tp">entt::entity</span>(e.EntityId());
+
+    <span class="cm">// 战斗高速：冲锋/闪现技能施放中</span>
+    <span class="kw">if</span> (reg.all_of&lt;<span class="tp">ChargingTag</span>&gt;(ent) || reg.all_of&lt;<span class="tp">DashingTag</span>&gt;(ent))
+        <span class="kw">return</span> <span class="tp">ReplicationInterval::kCombatDash</span>;
+
+    <span class="cm">// 高速移动：坐骑/载具/飞行</span>
+    <span class="kw">if</span> (reg.all_of&lt;<span class="tp">MountTag</span>&gt;(ent) || reg.all_of&lt;<span class="tp">VehicleTag</span>&gt;(ent))
+        <span class="kw">return</span> <span class="tp">ReplicationInterval::kFastMoving</span>;
+
+    <span class="kw">return</span> <span class="tp">ReplicationInterval::kDefault</span>;
+}
+
+<span class="cm">// 带宽影响估算（10000 PCU，每 player 可见 100 entity）</span>
+<span class="cm">// 80% × 200ms + 15% × 100ms + 5% × 50ms</span>
+<span class="cm">// ≈ 加权平均 ~170ms 等效间隔 → 带宽增幅 &lt; 18%</span></code></pre>
+
+  <div class="callout info">
+    <strong>📌 带宽影响</strong>：差异化快照的总带宽增幅 < 18%——大部分 entity 还是 200ms。
+    换来的是消除高速 entity 的"拉回"体验、竞技场 PvP 的状态准确性。
+    如果不实施差异化，200ms 全量快照对 PvE MMO 也可以工作——但在 PvP 和高速移动场景会有体感问题。
+  </div>
+
+  <h3>10. 客户端预测与服务器和解</h3>
+  <p>
+    客户端必须本地立即响应操作，否则 100ms RTT 意味着每次按键后 100ms 才看到角色响应。
+    采用 MMO 经典的 <strong>Server-authoritative + Client-side Dead Reckoning</strong> 方案。
+  </p>
+
+  <h4>核心流程</h4>
+  <pre>
+客户端：输入 → 立即更新本地位置（乐观预测）
+  ├── 记录 pending moves（未确认的移动序列 + 时间戳）
+  ├── 周期发送 MoveReq{ seqNum, input_direction, timestamp }（15Hz）
+  └── 渲染预测位置
+
+服务器：
+  ├── 收到 MoveReq → NavMesh 校验（速度/可达性/碰撞）
+  ├── 广播权威位置给 AOI 内所有人（通过差量复制）
+  └── 回包 MoveRsp{ seqNum, server_position, timestamp }
+
+客户端收到 MoveRsp：
+  ├── 移除已确认的 pending moves（seqNum ≤ rsp.seqNum 的）
+  ├── 从服务器位置开始重放未确认的 moves
+  │   ├── 位置误差 ≤ 0.5m → 平滑 lerp 纠正（100ms 插值）——几乎无感
+  │   └── 位置误差 > 3m  → 立即 snap + 记录 anomaly ——可能是外挂/瞬移
+  └── 最大 pending 3 个 moves（覆盖 ~200ms 未确认窗口）</pre>
+
+  <h4>参数配置</h4>
+  <table>
+    <tr><th>参数</th><th>值</th><th>说明</th></tr>
+    <tr><td>预测发送频率</td><td>15Hz（~67ms）</td><td>配合 50ms Tick 的移动变化率</td></tr>
+    <tr><td>最大 pending moves</td><td>3</td><td>覆盖 ~200ms 的未确认窗口</td></tr>
+    <tr><td>平滑纠正阈值</td><td>0.5m</td><td>差值小于此值时 lerp 纠正（无感知）</td></tr>
+    <tr><td>立即 Snap 阈值</td><td>3m</td><td>差值大于此值时直接 teleport（异常/瞬移）</td></tr>
+    <tr><td>De-sync 告警阈值</td><td>1m</td><td>超过此值时记录 Tracy 标记（用于调优）</td></tr>
+  </table>
+
+  <div class="callout info">
+    <strong>为何不做客户端回滚预测（Rollback）？</strong>
+    Overwatch / Valorant 等竞技 FPS 使用完整的预测 + 回滚（server reconciliation with rewind），
+    但这需要服务器能"时光倒流"到过去的帧状态来重校验——对 MMO 来说过度工程化。
+    Dead Reckoning 的插值纠正足以应对 MMO 的移动同步精度需求。
+  </div>
+
+  <h3>11. 断线重连：完整状态恢复</h3>
+  <p>
+    断线重连不仅是连接恢复（§7b 的 Gate 15s 迁移窗口）——还需要恢复客户端的游戏状态。
+    15 秒断线期间世界仍在运转：AoI 内 entity 移动了、Boss 放技能了、Buff 到期了。
+    重连时需要把世界状态同步回客户端。
+  </p>
+
+  <h4>分档策略：短断线 vs 长断线</h4>
+  <table>
+    <tr><th>断线时长</th><th>恢复策略</th><th>客户端行为</th></tr>
+    <tr>
+      <td><strong>短断线（< 5s）</strong></td>
+      <td><strong>增量恢复</strong>：客户端保留旧缓存，服务器补发 dirty entity 差量（从 last_acked_tick 到当前）</td>
+      <td>无 loading，差量到达后自动恢复渲染</td>
+    </tr>
+    <tr>
+      <td><strong>长断线（5-15s，迁移窗口）</strong></td>
+      <td><strong>全量重建</strong>：服务器走 loading screen 流程，复用 §20 StateSnapshot 逻辑发送全量同步</td>
+      <td>loading screen（~0.5s）→ 重建 → 恢复</td>
+    </tr>
+    <tr>
+      <td><strong>超时（> 15s）</strong></td>
+      <td>迁移窗口过期 → session 已清理 → 需要重新走 LoginServer</td>
+      <td>踢回登录界面</td>
+    </tr>
+  </table>
+
+  <h4>重连流程</h4>
+  <pre>
+客户端 → Gate_2 → WorldServer: MSG_LOGIN_ENTER_WORLD_REQ { SessionToken }
+  │
+WorldServer 验证 Token → 找到 session:
+  │
+  ├── 短断线（distance < 5s）:
+  │     MSG_RECONNECT_QUICK_NTF {
+  │       tick_id: 当前 tick,
+  │       self_sync: EntitySyncNtf（自己组件的 dirty delta）
+  │       aoi_sync:  EntitySyncNtf（AoI 内 dirty entity 的差量）
+  │     }
+  │     → 客户端保留旧缓存 → 应用差量 → 无缝恢复
+  │
+  └── 长断线（5-15s）:
+        MSG_RECONNECT_FULL_NTF {
+          tick_id: 当前 tick,
+          self_sync: EntitySyncNtf（自己全部组件——全量）
+          aoi_entities: [EntitySyncNtf × N]（AoI 内所有 entity 的全量）
+          scene_id: 当前场景
+        }
+        → 客户端 loading screen → 清空缓存 → 重建 → 恢复
+
+关键事件的补发（断线期间产生）:
+  ✅ 自己的 HP/MP/Position/BuffList — 全量同步
+  ✅ AoI 内 entity 的当前位置/状态
+  ✅ 邮件通知、GM 消息（从 MailMgr 重拉）
+  ✅ 交易结果（服务端缓存最近一次交易状态）
+  ⬚ 世界频道聊天 — 丢弃（发送频率高、丢失可接受）
+  ⬚ 好友上线/下线通知 — 丢弃（下次状态查询自然同步）
+  ⬚ 远处 NPC 移动 — 丢弃（差量自然覆盖）</pre>
+
+  <div class="callout info">
+    <strong>实现复用</strong>：长断线的全量重建直接复用 §20 跨场景迁移的 StateSnapshot 机制——
+    序列化/反序列化实体状态的代码不改。只是不涉及场景变更。
+    短断线的增量恢复直接复用 §3 的差量复制引擎——last_acked_tick → current_tick 的 dirty entity 集合。
+  </div>
+
+  <div class="callout info">
+    <strong>📌 业界参考</strong>：TrinityCore 的 UpdateObject 机制也是差量 + 快照混合（UPDATETYPE_VALUES / CREATE_OBJECT / OUT_OF_RANGE_OBJECTS）。
+    本方案进一步细化了 Per-Component 脏位 + 带宽优先级 + 差异化快照 + 客户端预测 + 断线分层重连的工程实现。
+  </div>
+
+</div>
+
+</div>
+<nav class="breadcrumb" style="margin-top:24px;"><a href="../Design.html">🏠 返回总目录</a></nav>
+<div class="footer">MMO Server Architecture Design Document · Version 1.2</div>
+</body>
+</html>

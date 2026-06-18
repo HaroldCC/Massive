@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CenterServer 跨服通信 — MMO 服务器架构设计 v1.2</title>
+<link rel="stylesheet" href="../shared.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="../Design.html">🏠 总目录</a></nav>
+<div class="container">
+<span class="badge confirmed">✔ 已确认 · C2 分布式</span>
+
+<div class="section" id="center">
+  <h2>CenterServer · 跨服通信与服务发现</h2>
+
+  <h3>1. 定位</h3>
+  <p>
+    CenterServer 是分布式集群的<strong>服务协调中心</strong>。各 WorldServer 启动时注册自身，
+    定期心跳。CenterServer 维护全服玩家位置索引（哪个玩家在哪个 WorldServer），
+    提供跨服消息路由（私聊/全服公告）。<strong>不做业务逻辑</strong>——所有业务逻辑在 WorldServer/SocialServer 中完成。
+  </p>
+
+  <h3>2. 服务注册与发现</h3>
+
+  <h4>2.1 注册流程</h4>
+  <pre>
+WorldServer 启动
+  ├── 1. 从 server.toml 读取 [center] address
+  ├── 2. TCP 连接 CenterServer
+  ├── 3. 发送 REGISTER { serviceType: "world", serverId: "world_1", address: "10.0.0.5:8001", maxPlayers: 5000 }
+  │       CenterServer 记录: serviceId → {type, address, maxPlayers, status=ONLINE}
+  ├── 4. 每 5s 发送 HEARTBEAT
+  │       CenterServer 超时 15s 无心跳 → 标记 OFFLINE → 通知其他 WorldServer
+  └── 5. 优雅关闭时发送 DEREGISTER → CenterServer 立即移除</pre>
+
+  <h4>2.2 服务表</h4>
+  <pre><code><span class="cm">// CenterServer.h — 服务注册表</span>
+<span class="kw">class</span> <span class="tp">ServiceRegistry</span> {
+<span class="kw">public</span>:
+    <span class="kw">struct</span> <span class="tp">ServiceInfo</span> {
+        <span class="tp">std::string</span> serviceId;
+        <span class="tp">ServiceType</span> type;
+        <span class="tp">std::string</span> address;
+        <span class="tp">uint32_t</span> maxPlayers;
+        <span class="tp">uint32_t</span> currentPlayers;
+        <span class="tp">ServiceStatus</span> status;
+        <span class="tp">std::chrono::steady_clock::time_point</span> lastHeartbeat;
+    };
+
+    <span class="kt">void</span> <span class="fn">Register</span>(<span class="kw">const</span> <span class="tp">ServiceInfo</span>&amp; info);
+    <span class="kt">void</span> <span class="fn">Heartbeat</span>(<span class="kw">const</span> <span class="tp">std::string</span>&amp; serviceId, <span class="tp">uint32_t</span> currentPlayers);
+    <span class="kt">void</span> <span class="fn">Deregister</span>(<span class="kw">const</span> <span class="tp">std::string</span>&amp; serviceId);
+
+    <span class="tp">std::vector</span>&lt;<span class="kw">const</span> <span class="tp">ServiceInfo</span>*&gt; <span class="fn">GetServicesByType</span>(<span class="tp">ServiceType</span> type);
+    <span class="kw">const</span> <span class="tp">ServiceInfo</span>* <span class="fn">GetService</span>(<span class="kw">const</span> <span class="tp">std::string</span>&amp; serviceId);
+
+    <span class="kw">const</span> <span class="tp">ServiceInfo</span>* <span class="fn">PickLeastLoadedWorld</span>();
+
+    <span class="kt">void</span> <span class="fn">CheckTimeouts</span>();
+
+<span class="kw">private</span>:
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">std::string</span>, <span class="tp">ServiceInfo</span>&gt; <span class="kw">_services</span>;
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="kw">auto</span> kHeartbeatTimeout = <span class="tp">std::chrono::seconds</span>(<span class="num">15</span>);
+};</code></pre>
+
+  <h3>3. 跨服消息路由</h3>
+
+  <h4>3.1 路由场景</h4>
+  <table>
+    <tr><th>场景</th><th>消息源</th><th>消息目标</th><th>路由方式</th></tr>
+    <tr><td>跨服私聊</td><td>WorldServer_A 玩家</td><td>WorldServer_B 玩家</td><td>CenterServer 查位置 → 转发</td></tr>
+    <tr><td>跨服邮件</td><td>WorldServer_A</td><td>SocialServer</td><td>World→Social 直连 RPC</td></tr>
+    <tr><td>跨服拍卖</td><td>WorldServer_A</td><td>SocialServer（全局拍卖行）</td><td>World→Social 直连 RPC</td></tr>
+    <tr><td>跨服组队</td><td>匹配系统</td><td>多 WorldServer</td><td>SocialServer(匹配子系统)→各 World 直连 RPC</td></tr>
+    <tr><td>全服公告</td><td>GM 工具</td><td>所有 WorldServer</td><td>CenterServer 广播</td></tr>
+  </table>
+
+  <h4>3.2 内部 RPC 协议</h4>
+  <pre><code><span class="cm">// 内部 RPC——5 种进程之间的通信</span>
+<span class="kw">struct</span> <span class="tp">RpcHeader</span> {
+    <span class="tp">uint32_t</span> length;
+    <span class="tp">uint32_t</span> msgType;       <span class="cm">// RPC 消息类型</span>
+    <span class="tp">uint64_t</span> requestId;     <span class="cm">// 请求追踪 ID（Req-Rsp 匹配）</span>
+};
+
+<span class="kw">enum class</span> <span class="tp">RpcMsgType</span> : uint32_t {
+    <span class="cm">// 服务发现</span>
+    REGISTER_REQ       = <span class="num">0x1000</span>,  REGISTER_RSP       = <span class="num">0x1001</span>,
+    HEARTBEAT_REQ      = <span class="num">0x1002</span>,  HEARTBEAT_RSP      = <span class="num">0x1003</span>,
+    DEREGISTER_REQ     = <span class="num">0x1004</span>,
+
+    <span class="cm">// 路由转发</span>
+    FORWARD_MSG        = <span class="num">0x2000</span>,
+
+    <span class="cm">// 事件通知</span>
+    SERVICE_ONLINE_NTF = <span class="num">0x3000</span>,
+    SERVICE_OFFLINE_NTF = <span class="num">0x3001</span>,
+    BROADCAST_NTF      = <span class="num">0x3002</span>,
+    PLAYER_ONLINE_NTF  = <span class="num">0x3003</span>,
+    PLAYER_OFFLINE_NTF = <span class="num">0x3004</span>,
+
+    <span class="cm">// 查询</span>
+    QUERY_PLAYER_LOCATION_REQ = <span class="num">0x4000</span>,
+    QUERY_PLAYER_LOCATION_RSP = <span class="num">0x4001</span>,
+};</code></pre>
+
+  <h4>3.3 跨服私聊路由</h4>
+  <pre>
+WorldServer_A 玩家 A 发私聊给 WorldServer_B 玩家 B
+  │
+  ├── 1. World_A: ChatChannelMgr.SendWhisper → 本地未找到 B
+  ├── 2. World_A → Center: QUERY_PLAYER_LOCATION_REQ { playerName: "B" }
+  │     Center: _playerLocationIndex → { serviceId: "world_2" }
+  ├── 3. World_A → Center: FORWARD_MSG { targetService:"world_2", payload }
+  ├── 4. Center → World_B: FORWARD_MSG { payload }
+  └── 5. World_B: 查本地 → 找到 B → SendToClient
+
+如果 B 离线：Center 返回 "not found" → World_A 返回 "玩家不在线"</pre>
+
+  <h4>3.4 玩家位置索引</h4>
+  <pre><code><span class="kw">class</span> <span class="tp">PlayerLocationIndex</span> {
+<span class="kw">public</span>:
+    <span class="kt">void</span> <span class="fn">RegisterPlayer</span>(<span class="kw">const</span> <span class="tp">std::string</span>&amp; playerName, <span class="kw">const</span> <span class="tp">std::string</span>&amp; serviceId);
+    <span class="kt">void</span> <span class="fn">UnregisterPlayer</span>(<span class="kw">const</span> <span class="tp">std::string</span>&amp; playerName);
+    <span class="tp">std::optional</span>&lt;<span class="tp">std::string</span>&gt; <span class="fn">GetServiceId</span>(<span class="kw">const</span> <span class="tp">std::string</span>&amp; playerName) <span class="kw">const</span>;
+    <span class="tp">uint32_t</span> <span class="fn">GetTotalOnline</span>() <span class="kw">const</span>;
+
+<span class="kw">private</span>:
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">std::string</span>, <span class="tp">std::string</span>&gt; <span class="kw">_playerNameToService</span>;
+};</code></pre>
+
+  <h3>4. WorldServer 侧——CenterClient</h3>
+  <pre><code><span class="cm">// WorldServer 内——CenterServer 客户端</span>
+<span class="kw">class</span> <span class="tp">CenterClient</span> {
+<span class="kw">public</span>:
+    <span class="kt">void</span> <span class="fn">Start</span>(<span class="kw">const</span> <span class="tp">std::string</span>&amp; centerAddress);
+    <span class="kt">void</span> <span class="fn">SendHeartbeat</span>(<span class="tp">uint32_t</span> currentPlayers);
+    <span class="kt">void</span> <span class="fn">QueryPlayerLocation</span>(<span class="kw">const</span> <span class="tp">std::string</span>&amp; playerName,
+                            <span class="tp">std::function</span>&lt;<span class="kt">void</span>(<span class="kw">const</span> <span class="tp">std::string</span>&amp;)&gt; callback);
+    <span class="kt">void</span> <span class="fn">NotifyPlayerOnline</span>(<span class="kw">const</span> <span class="tp">std::string</span>&amp; playerName);
+    <span class="kt">void</span> <span class="fn">NotifyPlayerOffline</span>(<span class="kw">const</span> <span class="tp">std::string</span>&amp; playerName);
+};</code></pre>
+
+  <h3>5. 玩家上线/下线</h3>
+  <pre>
+Player 登录 WorldServer_A
+  ├── 1. World_A → Center: PLAYER_ONLINE_NTF { playerName, serviceId="world_1" }
+  │     Center: _playerLocationIndex.RegisterPlayer(playerName, "world_1")
+  ├── 2. Center → SocialServer: 更新好友在线状态
+  └── 3. Player 断线/登出
+        World_A → Center: PLAYER_OFFLINE_NTF → 从索引移除</pre>
+
+  <h3>6. 性能考量</h3>
+  <table>
+    <tr><th>场景</th><th>RPC 频率</th><th>延迟</th></tr>
+    <tr><td>心跳</td><td>每 5s × N 个 WorldServer</td><td>&lt; 1ms（同机房 TCP）</td></tr>
+    <tr><td>跨服私聊</td><td>按需（低频）</td><td>1-2ms（A→Center→B 两跳）</td></tr>
+    <tr><td>玩家上下线</td><td>每登录/登出一次</td><td>&lt; 1ms</td></tr>
+    <tr><td>全服公告</td><td>运营触发（极低频）</td><td>&lt; 1ms（并行广播）</td></tr>
+  </table>
+
+</div>
+
+</div>
+<nav class="breadcrumb" style="margin-top:24px;"><a href="../Design.html">🏠 返回总目录</a></nav>
+<div class="footer">MMO Server Architecture Design Document · Version 1.2</div>
+</body>
+</html>

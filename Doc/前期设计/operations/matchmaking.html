@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>匹配系统 · 副本 + 战场 + 竞技场 — MMO 服务器架构设计 v1.2</title>
+<link rel="stylesheet" href="../shared.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="../Design.html">🏠 总目录</a></nav>
+<div class="container">
+<span class="badge confirmed">✔ 已确认</span>
+
+<div class="section" id="matchmaking">
+  <h2>匹配系统 · 副本 + 战场 + 竞技场</h2>
+
+  <h3>1. 设计概述</h3>
+  <p>
+    匹配系统负责将玩家分配到副本、战场、竞技场等实例场景中。采用 <strong>MatchQueue + MatchSolver</strong> 双组件架构：
+    MatchQueue 管理排队玩家，MatchSolver 按规则（等级范围、MMR、队伍）组合匹配。
+    作为 <strong>SocialServer 内的子系统</strong> 运行——匹配逻辑与公会/好友等全局状态放在同一进程，
+    方便跨服组队——SocialServer 通过 CenterServer 获取各 WorldServer 玩家在线状态。
+  </p>
+
+  <h3>2. 匹配类型</h3>
+  <table>
+    <tr><th>类型</th><th>人数</th><th>匹配规则</th><th>场景类型</th></tr>
+    <tr><td><strong>小型副本</strong></td><td>5 人（1T + 1H + 3DPS）</td><td>等级 ±3 + 职业分配</td><td>多实例副本（5-man dungeon）</td></tr>
+    <tr><td><strong>大型 RAID</strong></td><td>40 人</td><td>预组满团才进入（不匹配散人）</td><td>单例 RAID</td></tr>
+    <tr><td><strong>战场</strong></td><td>20v20 / 40v40</td><td>MMR ±200 + 阵营平衡</td><td>战场实例</td></tr>
+    <tr><td><strong>竞技场</strong></td><td>2v2 / 3v3 / 5v5</td><td>严格 MMR ±100 + 专精角色类型</td><td>竞技场实例</td></tr>
+  </table>
+
+  <h3>3. MatchQueue 设计（C++ 单例）</h3>
+  <pre><code><span class="cm">// MatchQueue.h — 匹配队列管理</span>
+<span class="kw">class</span> <span class="tp">MatchQueue</span> {
+<span class="kw">public</span>:
+    <span class="kw">static</span> <span class="tp">MatchQueue</span>&amp; <span class="fn">Instance</span>() { <span class="kw">static</span> <span class="tp">MatchQueue</span> inst; <span class="kw">return</span> inst; }
+
+    <span class="kw">enum class</span> <span class="tp">MatchType</span> { Dungeon, Battleground, Arena };
+
+    <span class="kw">struct</span> <span class="tp">MatchEntry</span> {
+        <span class="tp">Entity</span> player;               <span class="cm">// 玩家 Entity</span>
+        <span class="tp">uint32_t</span> playerId;
+        <span class="tp">MatchType</span> matchType;
+        <span class="tp">uint32_t</span> dungeonId = <span class="num">0</span>;      <span class="cm">// 副本 ID（副本匹配用）</span>
+        <span class="tp">uint32_t</span> battlegroundId = <span class="num">0</span>;  <span class="cm">// 战场 ID</span>
+        <span class="tp">uint32_t</span> arenaId = <span class="num">0</span>;         <span class="cm">// 竞技场 ID</span>
+        <span class="kt">int</span> level;
+        <span class="kt">int</span> mmr;                      <span class="cm">// 匹配分（天梯分）</span>
+        <span class="kt">int</span> role;                     <span class="cm">// 0=Tank 1=Healer 2=DPS</span>
+        <span class="tp">uint32_t</span> partyId = <span class="num">0</span>;         <span class="cm">// 组队 ID（0=散排）</span>
+        <span class="tp">std::chrono::steady_clock::time_point</span> enqueueTime;
+        <span class="kt">bool</span> accepted = <span class="nb">false</span>;        <span class="cm">// 已确认进入</span>
+    };
+
+    <span class="cm">// 入队</span>
+    <span class="kt">bool</span> <span class="fn">Enqueue</span>(<span class="kw">const</span> <span class="tp">MatchEntry</span>&amp; entry);
+
+    <span class="cm">// 离队（取消匹配）</span>
+    <span class="kt">void</span> <span class="fn">Dequeue</span>(<span class="tp">Entity</span> player, <span class="tp">MatchType</span> matchType);
+
+    <span class="cm">// 确认进入（匹配成功后客户端点"进入"）</span>
+    <span class="kt">void</span> <span class="fn">Accept</span>(<span class="tp">Entity</span> player, <span class="tp">MatchType</span> matchType);
+
+    <span class="cm">// 获取某类型的队列</span>
+    <span class="kw">const</span> <span class="tp">std::vector</span>&lt;<span class="tp">MatchEntry</span>&gt;&amp; <span class="fn">GetQueue</span>(<span class="tp">MatchType</span> type, <span class="tp">uint32_t</span> specificId = <span class="num">0</span>);
+
+    <span class="cm">// 移除已确认的玩家（匹配成功并确认后调用）</span>
+    <span class="kt">void</span> <span class="fn">RemoveAccepted</span>(<span class="kw">const</span> <span class="tp">std::vector</span>&lt;<span class="tp">Entity</span>&gt;&amp; players, <span class="tp">MatchType</span> matchType);
+
+    <span class="cm">// 超时检查——每 30s 清理超时确认的玩家</span>
+    <span class="kt">void</span> <span class="fn">CheckTimeouts</span>();
+
+<span class="kw">private</span>:
+    <span class="cm">// 副本队列：dungeonId → 排队玩家</span>
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">uint32_t</span>, <span class="tp">std::vector</span>&lt;<span class="tp">MatchEntry</span>&gt;&gt; <span class="kw">_dungeonQueues</span>;
+
+    <span class="cm">// 战场队列：battlegroundId → 排队玩家</span>
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">uint32_t</span>, <span class="tp">std::vector</span>&lt;<span class="tp">MatchEntry</span>&gt;&gt; <span class="kw">_battlegroundQueues</span>;
+
+    <span class="cm">// 竞技场队列：arenaId → 排队玩家</span>
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">uint32_t</span>, <span class="tp">std::vector</span>&lt;<span class="tp">MatchEntry</span>&gt;&gt; <span class="kw">_arenaQueues</span>;
+
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="kw">auto</span> kAcceptTimeout = <span class="tp">std::chrono::seconds</span>(<span class="num">30</span>);
+};</code></pre>
+
+  <h3>4. MatchSolver 匹配算法（C++ 引擎层）</h3>
+
+  <h4>4.1 副本匹配（5 人）</h4>
+  <pre><code><span class="cm">// MatchSolver.h — 匹配求解器</span>
+<span class="kw">class</span> <span class="tp">MatchSolver</span> {
+<span class="kw">public</span>:
+    <span class="kw">struct</span> <span class="tp">MatchResult</span> {
+        <span class="tp">std::vector</span>&lt;<span class="tp">Entity</span>&gt; players;
+        <span class="tp">uint32_t</span> dungeonId = <span class="num">0</span>;
+        <span class="tp">uint32_t</span> battlegroundId = <span class="num">0</span>;
+        <span class="tp">uint32_t</span> arenaId = <span class="num">0</span>;
+        <span class="tp">MatchQueue::MatchType</span> type;
+        <span class="kt">int</span> averageMmr = <span class="num">0</span>;
+    };
+
+    <span class="cm">// 每 5 Tick (250ms) 由逻辑线程调用——尝试求解所有队列</span>
+    <span class="tp">std::vector</span>&lt;<span class="tp">MatchResult</span>&gt; <span class="fn">SolveAll</span>();
+
+<span class="kw">private</span>:
+    <span class="tp">std::vector</span>&lt;<span class="tp">MatchResult</span>&gt; <span class="fn">SolveDungeonQueue</span>(<span class="tp">uint32_t</span> dungeonId,
+                                                  <span class="kw">const</span> <span class="tp">std::vector</span>&lt;<span class="tp">MatchQueue::MatchEntry</span>&gt;&amp; queue);
+    <span class="tp">std::vector</span>&lt;<span class="tp">MatchResult</span>&gt; <span class="fn">SolveBattlegroundQueue</span>(<span class="tp">uint32_t</span> bgId,
+                                                      <span class="kw">const</span> <span class="tp">std::vector</span>&lt;<span class="tp">MatchQueue::MatchEntry</span>&gt;&amp; queue);
+    <span class="tp">std::vector</span>&lt;<span class="tp">MatchResult</span>&gt; <span class="fn">SolveArenaQueue</span>(<span class="tp">uint32_t</span> arenaId,
+                                                <span class="kw">const</span> <span class="tp">std::vector</span>&lt;<span class="tp">MatchQueue::MatchEntry</span>&gt;&amp; queue);
+};
+
+<span class="cm">// 副本匹配算法：角色分配 + 等级范围 + 队组约束</span>
+<span class="tp">std::vector</span>&lt;<span class="tp">MatchResult</span>&gt; <span class="tp">MatchSolver</span>::<span class="fn">SolveDungeonQueue</span>(
+    <span class="tp">uint32_t</span> dungeonId, <span class="kw">const</span> <span class="tp">std::vector</span>&lt;<span class="tp">MatchEntry</span>&gt;&amp; queue)
+{
+    <span class="tp">std::vector</span>&lt;<span class="tp">MatchResult</span>&gt; results;
+
+    <span class="cm">// 1. 分类：Tank / Healer / DPS（按排队时间排序——早排优先）</span>
+    <span class="tp">std::vector</span>&lt;<span class="kw">const</span> <span class="tp">MatchEntry</span>*&gt; tanks, healers, dpsList;
+    <span class="kw">for</span> (<span class="kw">auto</span>&amp; e : queue) {
+        <span class="kw">if</span> (e.accepted) <span class="kw">continue</span>;  <span class="cm">// 跳过已确认但未处理的</span>
+        <span class="kw">if</span> (e.role == <span class="num">0</span>) tanks.push_back(&amp;e);
+        <span class="kw">else if</span> (e.role == <span class="num">1</span>) healers.push_back(&amp;e);
+        <span class="kw">else</span> dpsList.push_back(&amp;e);
+    }
+
+    <span class="cm">// 2. Greedy 匹配：每次取一个 Tank + Healer + 3 DPS</span>
+    <span class="kw">size_t</span> ti = <span class="num">0</span>, hi = <span class="num">0</span>, di = <span class="num">0</span>;
+    <span class="kw">while</span> (ti &lt; tanks.size() &amp;&amp; hi &lt; healers.size() &amp;&amp; di + <span class="num">2</span> &lt; dpsList.size()) {
+        <span class="kw">const</span> <span class="kw">auto</span>* tank   = tanks[ti];
+        <span class="kw">const</span> <span class="kw">auto</span>* healer = healers[hi];
+
+        <span class="cm">// 检查等级范围：所有成员在 [baseLevel-3, baseLevel+3] 内</span>
+        <span class="kt">int</span> baseLevel = tank-&gt;level;
+        <span class="kw">auto</span> levelOk = [baseLevel](<span class="kw">const</span> <span class="tp">MatchEntry</span>* e) {
+            <span class="kw">return</span> std::abs(e-&gt;level - baseLevel) &lt;= <span class="num">3</span>;
+        };
+
+        <span class="kw">if</span> (!levelOk(healer)) { hi++; <span class="kw">continue</span>; }
+
+        <span class="cm">// 收集 3 个 DPS</span>
+        <span class="tp">std::vector</span>&lt;<span class="kw">const</span> <span class="tp">MatchEntry</span>*&gt; dpsGroup;
+        <span class="kw">size_t</span> dCursor = di;
+        <span class="kw">while</span> (dpsGroup.size() &lt; <span class="num">3</span> &amp;&amp; dCursor &lt; dpsList.size()) {
+            <span class="kw">if</span> (levelOk(dpsList[dCursor]) &amp;&amp; !dpsList[dCursor]-&gt;accepted)
+                dpsGroup.push_back(dpsList[dCursor]);
+            dCursor++;
+        }
+
+        <span class="kw">if</span> (dpsGroup.size() &lt; <span class="num">3</span>) <span class="kw">break</span>;  <span class="cm">// 不够 DPS——本批无法匹配</span>
+
+        <span class="cm">// 3. 匹配成功</span>
+        <span class="tp">MatchResult</span> result;
+        result.type = MatchQueue::MatchType::Dungeon;
+        result.dungeonId = dungeonId;
+        result.players = {tank-&gt;player, healer-&gt;player,
+                          dpsGroup[<span class="num">0</span>]-&gt;player, dpsGroup[<span class="num">1</span>]-&gt;player, dpsGroup[<span class="num">2</span>]-&gt;player};
+        result.averageMmr = (tank-&gt;mmr + healer-&gt;mmr +
+                             dpsGroup[<span class="num">0</span>]-&gt;mmr + dpsGroup[<span class="num">1</span>]-&gt;mmr + dpsGroup[<span class="num">2</span>]-&gt;mmr) / <span class="num">5</span>;
+        results.push_back(result);
+
+        ti++; hi++;
+        di = dCursor;  <span class="cm">// 剩余的 DPS 留给下一组</span>
+    }
+
+    <span class="kw">return</span> results;
+}</code></pre>
+
+  <h4>4.2 战场匹配（20v20 / 40v40）</h4>
+  <pre><code><span class="tp">std::vector</span>&lt;<span class="tp">MatchResult</span>&gt; <span class="tp">MatchSolver</span>::<span class="fn">SolveBattlegroundQueue</span>(
+    <span class="tp">uint32_t</span> bgId, <span class="kw">const</span> <span class="tp">std::vector</span>&lt;<span class="tp">MatchEntry</span>&gt;&amp; queue)
+{
+    <span class="cm">// 按 MMR 排序</span>
+    <span class="kw">auto</span> sorted = queue;
+    std::sort(sorted.begin(), sorted.end(),
+              [](<span class="kw">auto</span>&amp; a, <span class="kw">auto</span>&amp; b) { <span class="kw">return</span> a.mmr &lt; b.mmr; });
+
+    <span class="kw">const</span> <span class="kt">int</span> teamSize = <span class="num">20</span>;  <span class="cm">// 或从配置读取</span>
+
+    <span class="kw">if</span> (sorted.size() &lt; teamSize * <span class="num">2</span>) <span class="kw">return</span> {};
+
+    <span class="cm">// 蛇形分配 (Snake Draft)：MMR 排序后交替分配，保证双方实力均衡</span>
+    <span class="cm">// Team A: index 0,3,4,7,8,11,12,15,16,19,20,23...
+    // Team B: index 1,2,5,6,9,10,13,14,17,18,21,22...</span>
+    <span class="tp">std::vector</span>&lt;<span class="tp">Entity</span>&gt; teamA, teamB;
+    <span class="kt">bool</span> toA = <span class="nb">true</span>;
+    <span class="kt">int</span> count = <span class="num">0</span>;
+
+    <span class="kw">for</span> (<span class="kt">size_t</span> i = <span class="num">0</span>; i &lt; teamSize * <span class="num">2</span>; i++) {
+        <span class="kw">if</span> (toA) teamA.push_back(sorted[i].player);
+        <span class="kw">else</span>    teamB.push_back(sorted[i].player);
+        count++;
+        <span class="kw">if</span> (count == <span class="num">2</span>) { toA = !toA; count = <span class="num">0</span>; }
+    }
+
+    <span class="tp">MatchResult</span> result;
+    result.type = MatchQueue::MatchType::Battleground;
+    result.battlegroundId = bgId;
+    result.players = teamA;
+    result.players.insert(result.players.end(), teamB.begin(), teamB.end());
+    <span class="kw">return</span> {result};
+}</code></pre>
+
+  <h4>4.3 竞技场匹配（严格 MMR）</h4>
+  <pre><code><span class="tp">std::vector</span>&lt;<span class="tp">MatchResult</span>&gt; <span class="tp">MatchSolver</span>::<span class="fn">SolveArenaQueue</span>(
+    <span class="tp">uint32_t</span> arenaId, <span class="kw">const</span> <span class="tp">std::vector</span>&lt;<span class="tp">MatchEntry</span>&gt;&amp; queue)
+{
+    <span class="cm">// 竞技场使用 MMR Bucket：将玩家按 100 分一段分桶</span>
+    <span class="cm">// 优先从同桶匹配，桶空则扩大到相邻桶</span>
+    <span class="kw">constexpr</span> <span class="kt">int</span> kBucketSize = <span class="num">100</span>;
+    <span class="kw">constexpr</span> <span class="kt">int</span> kMaxBucketExpand = <span class="num">3</span>;  <span class="cm">// 最多扩展到 ±3 个桶（±300 MMR）</span>
+
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">int</span>, <span class="tp">std::vector</span>&lt;<span class="kw">const</span> <span class="tp">MatchEntry</span>*&gt;&gt; buckets;
+    <span class="kw">for</span> (<span class="kw">auto</span>&amp; e : queue) {
+        <span class="kw">if</span> (e.accepted) <span class="kw">continue</span>;
+        buckets[e.mmr / kBucketSize].push_back(&amp;e);
+    }
+
+    <span class="tp">std::vector</span>&lt;<span class="tp">MatchResult</span>&gt; results;
+
+    <span class="cm">// 按 partyId 分组（同一队伍的玩家一起匹配）</span>
+    <span class="cm">// 简化：遍历所有桶，尝试找 MMR 接近的对手</span>
+
+    <span class="kw">for</span> (<span class="kt">int</span> bucketKey = <span class="num">0</span>; bucketKey &lt; <span class="num">30</span>; bucketKey++) {  <span class="cm">// MMR 0-3000</span>
+        <span class="kw">auto</span> it = buckets.find(bucketKey);
+        <span class="kw">if</span> (it == buckets.end() || it-&gt;second.size() &lt; <span class="num">1</span>) <span class="kw">continue</span>;
+
+        <span class="cm">// 找对手桶（从当前桶开始，逐步扩大）</span>
+        <span class="kw">for</span> (<span class="kt">int</span> expand = <span class="num">0</span>; expand &lt;= kMaxBucketExpand; expand++) {
+            <span class="kw">for</span> (<span class="kt">int</span> opponentBucket : {bucketKey + expand, bucketKey - expand}) {
+                <span class="kw">if</span> (opponentBucket == bucketKey &amp;&amp; expand == <span class="num">0</span>) <span class="kw">continue</span>;  <span class="cm">// 同桶不限 MMR</span>
+                <span class="kw">auto</span> opIt = buckets.find(opponentBucket);
+                <span class="kw">if</span> (opIt == buckets.end() || opIt-&gt;second.size() &lt; <span class="num">1</span>) <span class="kw">continue</span>;
+
+                <span class="kw">if</span> (it-&gt;second.size() &gt;= <span class="num">1</span> &amp;&amp; opIt-&gt;second.size() &gt;= <span class="num">1</span>) {
+                    <span class="tp">MatchResult</span> result;
+                    result.type = MatchQueue::MatchType::Arena;
+                    result.arenaId = arenaId;
+                    result.players = {it-&gt;second.back()-&gt;player, opIt-&gt;second.back()-&gt;player};
+                    result.averageMmr = (it-&gt;second.back()-&gt;mmr + opIt-&gt;second.back()-&gt;mmr) / <span class="num">2</span>;
+                    results.push_back(result);
+                    it-&gt;second.pop_back();
+                    opIt-&gt;second.pop_back();
+                    <span class="kw">break</span>;
+                }
+            }
+        }
+    }
+
+    <span class="kw">return</span> results;
+}</code></pre>
+
+  <h3>5. 匹配流程——完整时序</h3>
+  <pre>
+Client A                          Server (MatchQueue)              Client B
+  │ MSG_MATCH_QUEUE_REQ(dungeonId) │                                  │
+  │────────────────────────────────▶│                                  │
+  │                                  │ Enqueue(A, dungeonId, lv=45, role=DPS)
+  │ MSG_MATCH_QUEUE_RSP(queued)      │                                  │
+  │◀────────────────────────────────│                                  │
+  │ MSG_MATCH_STATUS_NTF(pos 3)     │ (每 5s 推送排队进度)
+  │◀────────────────────────────────│                                  │
+  │                                  │                                  │
+  │                                  │ ... 其他玩家排队 ...             │
+  │                                  │                                  │
+  │                                  │ ◀════ MatchSolver.Solve() ═══  │
+  │                                  │      找到 5 人匹配成功           │
+  │                                  │                                  │
+  │ MSG_MATCH_FOUND_NTF              │ MSG_MATCH_FOUND_NTF              │
+  │ {matchId, members:[5]}          │ {matchId, members:[5]}          │
+  │◀────────────────────────────────│─────────────────────────────────▶│
+  │                                  │                                  │
+  │ MSG_MATCH_ACCEPT_REQ(matchId)   │  (30s 内必须响应)                │
+  │────────────────────────────────▶│◀─────────────────────────────────│
+  │                                  │                                  │
+  │                                  │ [N/5 人确认]                     │
+  │                                  │                                  │
+  │                 ┌─ 全部确认 → 创建副本场景                          │
+  │                 │   → 传送所有成员 → MSG_SCENE_SWITCH_NTF          │
+  │                 │                                                  │
+  │                 └─ 有人拒绝/超时 → 拒绝玩家离队                     │
+  │                    → 剩余玩家回到队首，优先匹配                    │
+  │                    → 拒绝玩家有惩罚（副本 5min、战场 15min）       │
+
+  匹配超时（排队 > 30 分钟）
+    → MSG_MATCH_TIMEOUT_NTF → 自动离队</pre>
+
+  <h3>6. DasLang 侧入口</h3>
+  <pre><code><span class="cm">// match_handler.das — 匹配系统入口</span>
+<span class="kw">def</span> <span class="fn">HandleMatchQueue</span>(player : Entity; matchType : int; specificId : uint32)
+{
+    <span class="cm">// 校验状态</span>
+    <span class="kw">if</span> (IsInCombat(player)) { SendMatchRsp(player, MATCH_ERR_IN_COMBAT); <span class="kw">return</span> }
+    <span class="kw">if</span> (IsInMatch(player))   { SendMatchRsp(player, MATCH_ERR_ALREADY_IN_MATCH); <span class="kw">return</span> }
+    <span class="kw">if</span> (HasMatchPenalty(player)) {
+        <span class="kw">let</span> remaining = GetMatchPenaltyRemaining(player)
+        SendMatchRsp(player, MATCH_ERR_PENALTY, remaining); <span class="kw">return</span>
+    }
+
+    <span class="cm">// 组装匹配条目</span>
+    <span class="kw">let</span> entry = MatchEntry{
+        player     = player,
+        playerId   = GetPlayerId(player),
+        matchType  = matchType,
+        dungeonId  = matchType == MATCH_DUNGEON ? specificId : <span class="num">0</span>,
+        battlegroundId = matchType == MATCH_BG ? specificId : <span class="num">0</span>,
+        arenaId    = matchType == MATCH_ARENA ? specificId : <span class="num">0</span>,
+        level      = GetPlayerLevel(player),
+        mmr        = GetPlayerMMR(player),
+        role       = GetPlayerRole(player),
+        partyId    = GetPlayerPartyId(player),
+        enqueueTime = GetTickTime()
+    }
+
+    <span class="kw">if</span> (!MatchQueue.Enqueue(entry)) {
+        SendMatchRsp(player, MATCH_ERR_ALREADY_IN_QUEUE); <span class="kw">return</span>
+    }
+
+    SendMatchQueueRsp(player, MATCH_OK)
+}</code></pre>
+
+  <h3>7. 匹配协议</h3>
+  <pre><code>message MatchQueueReq {
+    int32  match_type = 1;         <span class="cm">// 0=Dungeon 1=Battleground 2=Arena</span>
+    uint32 specific_id = 2;        <span class="cm">// dungeonId / bgId / arenaId</span>
+}
+message MatchQueueRsp {
+    MatchErrorCode error = 1;
+    int32  penalty_seconds = 2;    <span class="cm">// 处罚剩余时间（如有）</span>
+}
+
+message MatchStatusNtf {
+    int32  position = 1;           <span class="cm">// 队列位置（1-based）</span>
+    int32  estimated_seconds = 2;  <span class="cm">// 预估等待时间</span>
+}
+
+message MatchFoundNtf {
+    uint64 match_id = 1;
+    repeated MatchMember members = 2;
+}
+message MatchMember {
+    uint32 player_id = 1;
+    string player_name = 2;
+    int32  level = 3;
+    int32  role = 4;
+}
+
+message MatchAcceptReq { uint64 match_id = 1; }
+message MatchAcceptRsp {
+    MatchErrorCode error = 1;
+    uint32 scene_id = 2;           <span class="cm">// 成功时——目标场景 ID</span>
+}
+
+message MatchCancelReq {}
+message MatchTimeoutNtf {}
+
+enum MatchErrorCode {
+    MATCH_OK                 = 0;
+    MATCH_ERR_IN_COMBAT      = 1;
+    MATCH_ERR_ALREADY_IN_MATCH = 2;
+    MATCH_ERR_ALREADY_IN_QUEUE = 3;
+    MATCH_ERR_PENALTY        = 4;
+    MATCH_ERR_NOT_IN_QUEUE   = 5;
+    MATCH_ERR_INVALID_DUNGEON = 6;
+}</code></pre>
+
+  <h3>8. 惩罚机制</h3>
+  <table>
+    <tr><th>违规行为</th><th>副本</th><th>战场/竞技场</th></tr>
+    <tr><td>匹配成功后拒绝/超时</td><td>5 分钟禁止排队</td><td>15 分钟禁止排队</td></tr>
+    <tr><td>匹配成功后 3 次拒绝（30 分钟内）</td><td>30 分钟禁止排队</td><td>60 分钟禁止排队</td></tr>
+    <tr><td>进入副本后立即退队</td><td>15 分钟禁止排队 + 副本 CD</td><td>30 分钟禁止排队</td></tr>
+  </table>
+
+</div>
+
+</div>
+<nav class="breadcrumb" style="margin-top:24px;"><a href="../Design.html">🏠 返回总目录</a></nav>
+<div class="footer">MMO Server Architecture Design Document · Version 1.2</div>
+</body>
+</html>

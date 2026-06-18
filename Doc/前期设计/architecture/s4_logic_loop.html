@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>4. 单线程逻辑层 — MMO 服务器架构设计 v1.2</title>
+<link rel="stylesheet" href="../shared.css">
+</head>
+<body>
+
+<nav class="breadcrumb">
+  <a href="../Design.html">🏠 总目录</a>
+</nav>
+
+<div class="container">
+<span class="badge confirmed">✔ 已确认 · C2 分布式</span>
+
+<div class="section" id="s4">
+  <h2>4. 单线程逻辑层（WorldServer 内）</h2>
+
+  <h3>4.1 定位</h3>
+  <p>
+    LogicThread 只在 <strong>WorldServer</strong> 和 <strong>SocialServer</strong> 内存在。
+    GateServer/CenterServer 是纯 IO 进程，LoginServer 是同步处理进程，不需要异步逻辑循环。
+  </p>
+
+  <div class="callout warn">
+    <strong>⚠ 性能目标与压测策略</strong>：
+    "单核 10000 PCU" 是基于 War Thunder 等项目的经验估算，但 War Thunder 是 vehicle combat
+    （逻辑远轻于 MMO 的行为树 AI + NavMesh 寻路 + AOI 广播）。
+    当前设计采用单线程模型，但<strong>必须通过原型压测验证</strong>：
+    <br><br>
+    <strong>BenchmarkScene 测试</strong>：
+    创建 10000 个 entity（各带 Position/Velocity/Health/BuffList 等全套组件），
+    模拟完整的 AOI + combat + buff + move + AI 管线，测量每 Tick 实际耗时。
+    <br><br>
+    <strong>关键变量</strong>：
+    · AI 行为树评估（50μs/entity × 10000 NPC = 500ms 已是预算的 10x）
+    · NavMesh FindPath（200μs/次 × 30% 移动中 = 60ms）
+    · AOI 九宫格广播（实体密度决定）
+    <br><br>
+    <strong>如果实测超预算</strong>：升级为 <strong>Scene 级多线程</strong>——每个 Scene 一个独立 LogicThread
+    （EnTT registry 天然 per-Scene 隔离）。此升级路径已在设计中预留。
+  </div>
+
+  <h3>4.2 核心循环：固定 50ms Tick + 防死亡螺旋 Clamp</h3>
+  <pre><code><span class="kt">void</span> <span class="tp">LogicServer</span>::<span class="fn">Run</span>() {
+    <span class="kw">auto</span> lastTime = <span class="tp">std::chrono::steady_clock</span>::now();
+    <span class="kw">constexpr</span> <span class="kw">auto</span> tickInterval = <span class="tp">std::chrono::milliseconds</span>(<span class="num">50</span>);
+    <span class="kw">constexpr</span> <span class="kw">auto</span> maxElapsed   = <span class="tp">std::chrono::milliseconds</span>(<span class="num">200</span>);
+
+    <span class="kw">while</span> (!<span class="kw">_stopped</span>.load()) {
+        <span class="fn">ProcessMessages</span>();                <span class="cm">// Drain Gate 队列 + MsgID 查表分发</span>
+        <span class="kw">_timingWheel</span>.Tick();                <span class="cm">// 时间轮推进</span>
+        <span class="fn">ProcessDBWorkerCallbacks</span>();       <span class="cm">// DBWorkerPool 完成的查询结果回调</span>
+        <span class="fn">ProcessRpcResponses</span>();            <span class="cm">// Center/Social 的异步 RPC 回包</span>
+
+        <span class="kw">auto</span> now = <span class="tp">std::chrono::steady_clock</span>::now();
+        <span class="kw">auto</span> elapsed = now - lastTime;
+
+        <span class="kw">if</span> (elapsed &gt; maxElapsed) elapsed = maxElapsed;
+        lastTime = now;
+
+        <span class="fn">Tick</span>(elapsed);                      <span class="cm">// 游戏逻辑（DasLang 脚本）</span>
+        <span class="kw">_logicContext</span>.poll_one();
+        <span class="fn">FlushOutgoingMessages</span>();          <span class="cm">// 加密 → Gate 内部连接</span>
+        <span class="fn">SendCenterHeartbeat</span>();            <span class="cm">// 向 CenterServer 报心跳</span>
+
+        <span class="kw">if</span> (elapsed &lt; tickInterval)
+            <span class="tp">std::this_thread::sleep_for</span>(tickInterval - elapsed);
+    }
+}</code></pre>
+
+  <h3>4.3 消息流完整时序（C2 拓扑）</h3>
+  <table>
+    <tr><th>步骤</th><th>线程</th><th>进程</th><th>动作</th></tr>
+    <tr><td>1-2</td><td>IO 线程</td><td>GateServer</td><td>TCP recv → 拆包 Length+MsgID+SessionId → 读 SessionId 查路由 → 写内部 TCP</td></tr>
+    <tr><td>3</td><td>IO 线程</td><td>WorldServer</td><td>内部 TCP recv → 读 InternalHeader → 按 sessionId 找 CryptoSession → AES-GCM 解密 → Enqueue</td></tr>
+    <tr><td>4-5</td><td>逻辑线程</td><td>WorldServer</td><td>DrainAll → 查 _sessionToEntity → MsgID 数组索引 → Handler(body)</td></tr>
+    <tr><td>6</td><td>逻辑线程</td><td>WorldServer</td><td>如需 DB：DBWorkerPool.AsyncQuery(sql, callback)——不阻塞 Tick</td></tr>
+    <tr><td>7-8</td><td>逻辑线程</td><td>WorldServer</td><td>AES-GCM 加密 → InternalHeader → 写对应 Gate 的内部 TCP</td></tr>
+    <tr><td>9</td><td>IO 线程</td><td>GateServer</td><td>内部 TCP recv → InternalHeader.sessionId → clientSocket → async_write</td></tr>
+  </table>
+
+  <h3>4.4 过载保护：降频 + 降级（不变）</h3>
+  <p>同之前设计，3 状态机：Normal→Warning→Degraded。在所有 WorldServer 上各自独立运行。CenterServer 收集各 World 的过载状态做全局告警。</p>
+
+  <h3>4.5 各进程的线程模型对比</h3>
+  <table>
+    <tr><th>进程</th><th>IO 线程</th><th>逻辑线程</th><th>DB Worker 线程</th></tr>
+    <tr><td><strong>LoginServer</strong></td><td>IOContextPool (2-4)</td><td>—</td><td>—（同步查 PG）</td></tr>
+    <tr><td><strong>GateServer</strong></td><td>IOContextPool (N)</td><td>—</td><td>—</td></tr>
+    <tr><td><strong>WorldServer</strong></td><td>IOContextPool (N)</td><td>1 × LogicThread（可升级为 Scene×N）</td><td>3-5</td></tr>
+    <tr><td><strong>CenterServer</strong></td><td>IOContextPool (2)</td><td>—</td><td>—</td></tr>
+    <tr><td><strong>SocialServer</strong></td><td>IOContextPool (2-4)</td><td>1 × LogicThread（低频）</td><td>2</td></tr>
+  </table>
+
+  <h4>4.5.1 升级路径：Scene 级多线程</h4>
+  <p>
+    如果 BenchmarkScene 压测显示单线程无法满足目标 PCU，WorldServer 支持
+    <strong>Scene 级并行</strong>——每个 Scene 一个独立的 LogicThread。
+  </p>
+  <pre><code><span class="cm">// WorldServer 升级为 Scene 级多线程</span>
+<span class="kw">class</span> <span class="tp">WorldServer</span> {
+    <span class="kw">struct</span> <span class="tp">SceneExecutor</span> {
+        <span class="tp">std::thread</span> logicThread;
+        <span class="tp">MpscQueue</span>&lt;<span class="tp">LogicMessage</span>&gt; queue;  <span class="cm">// 每个 Scene 独立队列</span>
+        <span class="tp">Scene</span>* scene;
+    };
+    <span class="tp">std::vector</span>&lt;<span class="tp">SceneExecutor</span>&gt; <span class="kw">_sceneExecutors</span>;
+};
+
+<span class="cm">// IO 线程按 entity 的 sceneId 做消息分发</span>
+<span class="kt">void</span> <span class="fn">DispatchToScene</span>(<span class="kw">const</span> <span class="tp">Message</span>&amp; msg) {
+    <span class="kw">auto</span> sceneId = <span class="fn">GetEntitySceneId</span>(msg);
+    <span class="kw">_sceneExecutors</span>[sceneId].queue.Enqueue(msg);
+    <span class="cm">// 可选：eventfd 唤醒对应 Scene 的 LogicThread</span>
+}</code></pre>
+
+</div>
+
+<nav class="breadcrumb" style="margin-top:24px;">
+  <a href="../Design.html">🏠 返回总目录</a>
+</nav>
+
+</div>
+<div class="footer">
+  MMO Server Architecture Design Document · Version 1.2
+</div>
+</body>
+</html>

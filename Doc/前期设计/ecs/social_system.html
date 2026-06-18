@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>社交系统 · Chat + Friend + Guild + Mail — MMO 服务器架构设计 v1.2</title>
+<link rel="stylesheet" href="../shared.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="../Design.html">🏠 总目录</a></nav>
+<div class="container">
+<span class="badge confirmed">✔ 已确认</span>
+
+<div class="section" id="social">
+  <h2>社交系统 · Chat + Friend + Guild + Mail</h2>
+
+  <h3>1. 架构定位</h3>
+  <p>
+    社交系统作为 <strong>独立的 SocialServer 进程</strong> 运行。WorldServer 通过内部 TCP RPC 调用 SocialServer 接口。
+    GuildMgr、ChatChannelMgr、MailMgr 作为 SocialServer 进程内的单例（见 global_managers.html）。
+    玩家数据的社交属性（好友列表、公会 ID）通过 <code>SocialComponent</code>（BlobStorage）挂载在每个玩家 Entity 上（WorldServer 侧），
+    SocialServer 侧维护全局数据（公会表、邮件箱、拍卖行列表）。
+  </p>
+
+  <div class="callout info">
+    <strong>📌 进程分离</strong>：SocialServer 是 5 种进程之一。WorldServer 通过 SocialClient（类似 CenterClient）
+    发起 RPC 调用。同一个 WorldServer 内的聊天频道由 ChatChannelMgr 在 SocialServer 侧管理——World 只持有一个 SocialClient 连接，
+    所有频道操作通过 RPC 路由到 SocialServer。
+  </div>
+
+  <!-- ======================== 聊天系统 ======================== -->
+  <h2>A. 聊天系统</h2>
+
+  <h3>A.1 频道类型</h3>
+  <table>
+    <tr><th>频道</th><th>可见范围</th><th>存储</th><th>说明</th></tr>
+    <tr><td>世界 (World)</td><td>同一 WorldServer 所有玩家</td><td>无持久化</td><td>有发送间隔限制（3s）</td></tr>
+    <tr><td>场景 (Zone)</td><td>同一 Scene 内所有玩家</td><td>无持久化</td><td>/say 白字</td></tr>
+    <tr><td>公会 (Guild)</td><td>同一公会所有在线成员</td><td>无持久化</td><td>仅公会成员</td></tr>
+    <tr><td>队伍 (Party)</td><td>同一队伍成员</td><td>无持久化</td><td>跨场景</td></tr>
+    <tr><td>私聊 (Whisper)</td><td>两个玩家之间</td><td>无持久化</td><td>跨场景</td></tr>
+    <tr><td>系统 (System)</td><td>指定玩家/全服</td><td>无持久化</td><td>服务器推送公告</td></tr>
+  </table>
+
+  <h3>A.2 ChatChannelMgr 设计（C++ 单例）</h3>
+  <pre><code><span class="cm">// ChatChannelMgr.h — 聊天频道管理</span>
+<span class="kw">class</span> <span class="tp">ChatChannelMgr</span> {
+<span class="kw">public</span>:
+    <span class="kw">static</span> <span class="tp">ChatChannelMgr</span>&amp; <span class="fn">Instance</span>() { <span class="kw">static</span> <span class="tp">ChatChannelMgr</span> inst; <span class="kw">return</span> inst; }
+
+    <span class="cm">// 玩家加入/离开频道</span>
+    <span class="kt">void</span> <span class="fn">JoinWorld</span>(<span class="tp">Entity</span> player);
+    <span class="kt">void</span> <span class="fn">LeaveWorld</span>(<span class="tp">Entity</span> player);
+    <span class="kt">void</span> <span class="fn">JoinScene</span>(<span class="tp">uint32_t</span> sceneId, <span class="tp">Entity</span> player);
+    <span class="kt">void</span> <span class="fn">LeaveScene</span>(<span class="tp">uint32_t</span> sceneId, <span class="tp">Entity</span> player);
+    <span class="kt">void</span> <span class="fn">JoinGuild</span>(<span class="tp">uint32_t</span> guildId, <span class="tp">Entity</span> player);
+    <span class="kt">void</span> <span class="fn">LeaveGuild</span>(<span class="tp">uint32_t</span> guildId, <span class="tp">Entity</span> player);
+    <span class="kt">void</span> <span class="fn">JoinParty</span>(<span class="tp">uint32_t</span> partyId, <span class="tp">Entity</span> player);
+    <span class="kt">void</span> <span class="fn">LeaveParty</span>(<span class="tp">uint32_t</span> partyId, <span class="tp">Entity</span> player);
+
+    <span class="cm">// 发送消息——返回接收者列表</span>
+    <span class="tp">std::vector</span>&lt;<span class="tp">Entity</span>&gt; <span class="fn">SendWorld</span>(<span class="tp">Entity</span> sender, <span class="kw">const</span> <span class="tp">std::string</span>&amp; msg);
+    <span class="tp">std::vector</span>&lt;<span class="tp">Entity</span>&gt; <span class="fn">SendScene</span>(<span class="tp">uint32_t</span> sceneId, <span class="tp">Entity</span> sender, <span class="kw">const</span> <span class="tp">std::string</span>&amp; msg);
+    <span class="tp">std::vector</span>&lt;<span class="tp">Entity</span>&gt; <span class="fn">SendGuild</span>(<span class="tp">uint32_t</span> guildId, <span class="tp">Entity</span> sender, <span class="kw">const</span> <span class="tp">std::string</span>&amp; msg);
+    <span class="tp">std::vector</span>&lt;<span class="tp">Entity</span>&gt; <span class="fn">SendParty</span>(<span class="tp">uint32_t</span> partyId, <span class="tp">Entity</span> sender, <span class="kw">const</span> <span class="tp">std::string</span>&amp; msg);
+    <span class="kt">bool</span> <span class="fn">SendWhisper</span>(<span class="tp">Entity</span> sender, <span class="kw">const</span> <span class="tp">std::string</span>&amp; targetName, <span class="kw">const</span> <span class="tp">std::string</span>&amp; msg);
+
+    <span class="cm">// 频率限制</span>
+    <span class="kt">bool</span> <span class="fn">CheckRateLimit</span>(<span class="tp">Entity</span> player, <span class="tp">ChatChannel</span> channel);
+
+<span class="kw">private</span>:
+    <span class="tp">std::unordered_set</span>&lt;<span class="tp">Entity</span>&gt; <span class="kw">_worldChannel</span>;
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">uint32_t</span>, <span class="tp">std::unordered_set</span>&lt;<span class="tp">Entity</span>&gt;&gt; <span class="kw">_sceneChannels</span>;
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">uint32_t</span>, <span class="tp">std::unordered_set</span>&lt;<span class="tp">Entity</span>&gt;&gt; <span class="kw">_guildChannels</span>;
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">uint32_t</span>, <span class="tp">std::unordered_set</span>&lt;<span class="tp">Entity</span>&gt;&gt; <span class="kw">_partyChannels</span>;
+
+    <span class="cm">// 名字 → Entity 索引（私聊用）</span>
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">std::string</span>, <span class="tp">Entity</span>&gt; <span class="kw">_nameToPlayer</span>;
+
+    <span class="cm">// 频率限制（每玩家）</span>
+    <span class="kw">struct</span> <span class="tp">RateLimitState</span> {
+        <span class="tp">std::chrono::steady_clock::time_point</span> lastSendTime;
+        <span class="kt">int</span> sendCount = <span class="num">0</span>;     <span class="cm">// 当前窗口内的发送次数</span>
+    };
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">Entity</span>, <span class="tp">std::unordered_map</span>&lt;<span class="tp">int</span>, <span class="tp">RateLimitState</span>&gt;&gt; <span class="kw">_rateLimits</span>;
+};</code></pre>
+
+  <h3>A.3 聊天消息处理（DasLang 侧）</h3>
+  <pre><code><span class="cm">// chat_handler.das — 聊天消息入口</span>
+<span class="kw">def</span> <span class="fn">HandleChatSay</span>(player : Entity; channel : int; msg : string; targetName : string = <span class="str">""</span>)
+{
+    <span class="cm">// 1. 脏字过滤</span>
+    <span class="kw">let</span> filtered = FilterChatMessage(msg)
+    <span class="kw">if</span> (filtered == <span class="str">""</span>) <span class="kw">return</span>
+
+    <span class="cm">// 2. 禁言检查</span>
+    <span class="kw">if</span> (IsPlayerMuted(player)) {
+        SendSystemMsg(player, <span class="str">"你已被禁言，剩余时间: {}s"</span>, GetMuteRemaining(player))
+        <span class="kw">return</span>
+    }
+
+    <span class="cm">// 3. 频率限制</span>
+    <span class="kw">if</span> (!ChatChannelMgr.CheckRateLimit(player, ChatChannel(channel))) {
+        SendSystemMsg(player, <span class="str">"发言太频繁，请稍后再试"</span>)
+        <span class="kw">return</span>
+    }
+
+    <span class="cm">// 4. 路由到对应频道</span>
+    <span class="kw">var</span> recipients : array&lt;Entity&gt;
+    <span class="kw">switch</span> (channel)
+    {
+    CHAT_WORLD:
+        recipients = ChatChannelMgr.SendWorld(player, filtered)
+    CHAT_ZONE:
+        recipients = ChatChannelMgr.SendScene(GetSceneId(player), player, filtered)
+    CHAT_GUILD:
+        <span class="kw">let</span> guildId = GetPlayerGuildId(player)
+        <span class="kw">if</span> (guildId == <span class="num">0</span>) { SendSystemMsg(player, <span class="str">"你不在公会中"</span>); <span class="kw">return</span> }
+        recipients = ChatChannelMgr.SendGuild(guildId, player, filtered)
+    CHAT_PARTY:
+        <span class="kw">let</span> partyId = GetPlayerPartyId(player)
+        <span class="kw">if</span> (partyId == <span class="num">0</span>) { SendSystemMsg(player, <span class="str">"你不在队伍中"</span>); <span class="kw">return</span> }
+        recipients = ChatChannelMgr.SendParty(partyId, player, filtered)
+    CHAT_WHISPER:
+        <span class="kw">if</span> (!ChatChannelMgr.SendWhisper(player, targetName, filtered)) {
+            SendSystemMsg(player, <span class="str">"玩家 {} 不在线或不存在"</span>, targetName)
+        }
+        <span class="kw">return</span>  <span class="cm">// 私聊走单独逻辑</span>
+    }
+
+    <span class="cm">// 5. 广播 MSG_CHAT_SAY_NTF 给所有接收者</span>
+    <span class="kw">let</span> ntf = ChatSayNtf{
+        senderEntityId = player,
+        senderName     = GetPlayerName(player),
+        channel        = channel,
+        message        = filtered
+    }
+    <span class="kw">for</span> r <span class="kw">in</span> recipients {
+        SendToClient(GetSessionId(r), MSG_CHAT_SAY_NTF, SerializeProto(ntf))
+    }
+}</code></pre>
+
+  <h3>A.4 聊天协议</h3>
+  <pre><code>message ChatSayReq {
+    int32  channel = 1;              <span class="cm">// ChatChannel enum</span>
+    string message = 2;
+    string target_name = 3;          <span class="cm">// 私聊目标</span>
+}
+
+message ChatSayNtf {
+    uint32 sender_entity_id = 1;
+    string sender_name = 2;
+    int32  channel = 3;
+    string message = 4;
+}
+
+enum ChatChannel {
+    CHAT_WORLD   = 0;
+    CHAT_ZONE    = 1;
+    CHAT_GUILD   = 2;
+    CHAT_PARTY   = 3;
+    CHAT_WHISPER = 4;
+    CHAT_SYSTEM  = 5;
+}</code></pre>
+
+  <!-- ======================== 好友系统 ======================== -->
+  <h2>B. 好友系统</h2>
+
+  <h3>B.1 脚本组件</h3>
+  <pre><code><span class="cm">// 脚本组件——好友列表</span>
+[script_component]
+<span class="kw">struct</span> <span class="tp">FriendEntry</span> {
+    playerId    : uint32
+    addedTime   : float             <span class="cm">// 添加时间 (TickTime)</span>
+    note        : string            <span class="cm">// 备注名</span>
+}
+
+[script_component]
+<span class="kw">struct</span> <span class="tp">FriendList</span> {
+    entries     : array&lt;FriendEntry&gt;
+    maxFriends  : int               <span class="cm">// 好友上限（默认 100）</span>
+    pendingReqs : array&lt;uint32&gt;      <span class="cm">// 待处理的好友申请（对方 playerId）</span>
+}</code></pre>
+
+  <h3>B.2 好友操作</h3>
+  <pre><code><span class="cm">// 发送好友申请 MSG_FRIEND_ADD_REQ(targetPlayerId)</span>
+<span class="kw">def</span> <span class="fn">HandleFriendAdd</span>(player : Entity; targetPlayerId : uint32)
+{
+    ecs_edit(player) $(<span class="kw">var</span> cmp)
+    {
+        <span class="kw">if</span> (cmp.friendList.entries |> length() &gt;= cmp.friendList.maxFriends) {
+            SendFriendRsp(player, FRIEND_ERR_LIST_FULL); <span class="kw">return</span>
+        }
+    }
+
+    <span class="kw">let</span> target = GetEntityByPlayerId(targetPlayerId)
+    <span class="kw">if</span> (target == InvalidEntity) { SendFriendRsp(player, FRIEND_ERR_OFFLINE); <span class="kw">return</span> }
+
+    <span class="cm">// 加入目标的待处理列表</span>
+    ecs_edit(target) $(<span class="kw">var</span> tCmp)
+    {
+        <span class="kw">if</span> (tCmp.friendList.pendingReqs |> contains(GetPlayerId(player))) {
+            SendFriendRsp(player, FRIEND_ERR_ALREADY_PENDING); <span class="kw">return</span>
+        }
+        tCmp.friendList.pendingReqs |> push(GetPlayerId(player))
+    }
+
+    <span class="cm">// 通知目标</span>
+    <span class="kw">let</span> ntf = FriendAddNtf{fromPlayerId = GetPlayerId(player), fromName = GetPlayerName(player)}
+    SendToClient(GetSessionId(target), MSG_FRIEND_ADD_NTF, SerializeProto(ntf))
+}
+
+<span class="cm">// 接受好友 MSG_FRIEND_ACCEPT_REQ(fromPlayerId)</span>
+<span class="kw">def</span> <span class="fn">HandleFriendAccept</span>(player : Entity; fromPlayerId : uint32)
+{
+    ecs_edit(player) $(<span class="kw">var</span> cmp)
+    {
+        <span class="cm">// 从 pending 中移除</span>
+        RemoveFromArray(cmp.friendList.pendingReqs, fromPlayerId)
+
+        <span class="kw">if</span> (cmp.friendList.entries |> length() &gt;= cmp.friendList.maxFriends) {
+            SendFriendRsp(player, FRIEND_ERR_LIST_FULL); <span class="kw">return</span>
+        }
+
+        cmp.friendList.entries |> push(FriendEntry{playerId = fromPlayerId, addedTime = GetTickTime(), note = <span class="str">""</span>})
+    }
+
+    <span class="kw">let</span> fromEntity = GetEntityByPlayerId(fromPlayerId)
+    <span class="kw">if</span> (fromEntity != InvalidEntity) {
+        ecs_edit(fromEntity) $(<span class="kw">var</span> fCmp) {
+            fCmp.friendList.entries |> push(FriendEntry{playerId = GetPlayerId(player), addedTime = GetTickTime(), note = <span class="str">""</span>})
+        }
+    }
+
+    <span class="cm">// 立即写 DB——LINQ 管道链（编译期为 SQL，无手写 SQL 字符串）</span>
+    DBInsert(<span class="str">"player_friends"</span>, [
+        { player_id = GetPlayerId(player), friend_id = fromPlayerId },
+        { player_id = fromPlayerId, friend_id = GetPlayerId(player) }
+    ])
+}</code></pre>
+
+  <!-- ======================== 公会系统 ======================== -->
+  <h2>C. 公会系统</h2>
+
+  <h3>C.1 GuildMgr 扩展（补充 global_managers.html）</h3>
+  <pre><code><span class="cm">// GuildMgr.h — 公会管理单例（补充）</span>
+<span class="kw">class</span> <span class="tp">GuildMgr</span> {
+<span class="kw">public</span>:
+    <span class="kw">static</span> <span class="tp">GuildMgr</span>&amp; <span class="fn">Instance</span>() { <span class="kw">static</span> <span class="tp">GuildMgr</span> inst; <span class="kw">return</span> inst; }
+
+    <span class="kw">struct</span> <span class="tp">Member</span> {
+        <span class="tp">uint32_t</span> playerId;
+        <span class="tp">std::string</span> playerName;
+        <span class="kt">int</span> rank;                    <span class="cm">// 0=会长 1=副会长 2=精英 3=成员 4=见习</span>
+        <span class="tp">int64_t</span>  totalContribution;     <span class="cm">// 累计贡献</span>
+        <span class="tp">std::chrono::steady_clock::time_point</span> joinedAt;
+        <span class="tp">std::chrono::steady_clock::time_point</span> lastOnline;
+    };
+
+    <span class="kw">struct</span> <span class="tp">Guild</span> {
+        <span class="tp">uint32_t</span> guildId;
+        <span class="tp">std::string</span> name;
+        <span class="tp">std::string</span> notice;         <span class="cm">// 公告</span>
+        <span class="kt">int</span> level = <span class="num">1</span>;
+        <span class="tp">int64_t</span> exp = <span class="num">0</span>;
+        <span class="tp">int64_t</span> gold = <span class="num">0</span>;
+        <span class="tp">std::vector</span>&lt;<span class="tp">Member</span>&gt; members;      <span class="cm">// 按 rank + joinedAt 排序</span>
+        <span class="tp">uint32_t</span> maxMembers = <span class="num">50</span>;
+        <span class="tp">uint32_t</span> creatorId;
+        <span class="tp">std::chrono::steady_clock::time_point</span> createdAt;
+    };
+
+    <span class="cm">// 公会操作</span>
+    <span class="tp">uint32_t</span> <span class="fn">CreateGuild</span>(<span class="kw">const</span> <span class="tp">std::string</span>&amp; name, <span class="tp">uint32_t</span> creatorId, <span class="kw">const</span> <span class="tp">std::string</span>&amp; creatorName);
+    <span class="kt">bool</span> <span class="fn">DisbandGuild</span>(<span class="tp">uint32_t</span> guildId, <span class="tp">uint32_t</span> requesterId);
+    <span class="kt">bool</span> <span class="fn">JoinGuild</span>(<span class="tp">uint32_t</span> guildId, <span class="tp">uint32_t</span> playerId, <span class="kw">const</span> <span class="tp">std::string</span>&amp; playerName);
+    <span class="kt">bool</span> <span class="fn">LeaveGuild</span>(<span class="tp">uint32_t</span> guildId, <span class="tp">uint32_t</span> playerId);
+    <span class="kt">bool</span> <span class="fn">KickMember</span>(<span class="tp">uint32_t</span> guildId, <span class="tp">uint32_t</span> kickerId, <span class="tp">uint32_t</span> targetId);
+    <span class="kt">bool</span> <span class="fn">PromoteMember</span>(<span class="tp">uint32_t</span> guildId, <span class="tp">uint32_t</span> operatorId, <span class="tp">uint32_t</span> targetId, <span class="kt">int</span> newRank);
+    <span class="kt">bool</span> <span class="fn">TransferLeader</span>(<span class="tp">uint32_t</span> guildId, <span class="tp">uint32_t</span> currentLeaderId, <span class="tp">uint32_t</span> newLeaderId);
+    <span class="kt">void</span> <span class="fn">SetNotice</span>(<span class="tp">uint32_t</span> guildId, <span class="kw">const</span> <span class="tp">std::string</span>&amp; notice);
+    <span class="kt">void</span> <span class="fn">AddContribution</span>(<span class="tp">uint32_t</span> guildId, <span class="tp">uint32_t</span> playerId, <span class="tp">int64_t</span> amount);
+
+    <span class="kw">const</span> <span class="tp">Guild</span>* <span class="fn">GetGuild</span>(<span class="tp">uint32_t</span> guildId) <span class="kw">const</span>;
+    <span class="tp">uint32_t</span> <span class="fn">GetPlayerGuild</span>(<span class="tp">uint32_t</span> playerId) <span class="kw">const</span>;
+    <span class="tp">std::vector</span>&lt;<span class="tp">uint32_t</span>&gt; <span class="fn">GetOnlineMembers</span>(<span class="tp">uint32_t</span> guildId) <span class="kw">const</span>;
+
+<span class="kw">private</span>:
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">uint32_t</span>, <span class="tp">Guild</span>&gt; <span class="kw">_guilds</span>;
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">uint32_t</span>, <span class="tp">uint32_t</span>&gt; <span class="kw">_playerToGuild</span>;   <span class="cm">// playerId → guildId</span>
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">std::string</span>, <span class="tp">uint32_t</span>&gt; <span class="kw">_nameToGuildId</span>; <span class="cm">// 公会名称→ID</span>
+    <span class="tp">std::atomic</span>&lt;<span class="tp">uint32_t</span>&gt; <span class="kw">_nextGuildId</span>{<span class="num">1</span>};
+};</code></pre>
+
+  <h3>C.2 公会操作（DasLang 侧）</h3>
+  <pre><code><span class="cm">// guild_handler.das — 公会消息入口</span>
+<span class="kw">def</span> <span class="fn">HandleGuildCreate</span>(player : Entity; guildName : string)
+{
+    <span class="cm">// 校验</span>
+    <span class="kw">if</span> (GetPlayerLevel(player) &lt; <span class="num">20</span>) { SendGuildRsp(player, GUILD_ERR_LEVEL_TOO_LOW); <span class="kw">return</span> }
+    <span class="kw">if</span> (GetPlayerGuildId(player) != <span class="num">0</span>) { SendGuildRsp(player, GUILD_ERR_ALREADY_IN_GUILD); <span class="kw">return</span> }
+    <span class="kw">if</span> (guildName |> length() &lt; <span class="num">2</span> || guildName |> length() &gt; <span class="num">12</span>) {
+        SendGuildRsp(player, GUILD_ERR_INVALID_NAME); <span class="kw">return</span>
+    }
+
+    <span class="kw">let</span> gold = GetPlayerGold(player)
+    <span class="kw">if</span> (gold &lt; kGuildCreateCost) { SendGuildRsp(player, GUILD_ERR_NOT_ENOUGH_GOLD); <span class="kw">return</span> }
+
+    <span class="kw">let</span> guildId = GuildMgr.CreateGuild(guildName, GetPlayerId(player), GetPlayerName(player))
+    <span class="kw">if</span> (guildId == <span class="num">0</span>) { SendGuildRsp(player, GUILD_ERR_NAME_TAKEN); <span class="kw">return</span> }
+
+    DeductGold(player, kGuildCreateCost)
+    SetPlayerGuildId(player, guildId)
+    ChatChannelMgr.JoinGuild(guildId, player)
+
+    SendGuildRsp(player, GUILD_OK)
+    DBInsert(<span class="str">"guilds"</span>, [{ guild_id = guildId, guild_name = guildName, creator_id = GetPlayerId(player) }])
+
+    LOG_INFO(<span class="num">0</span>, <span class="str">"Guild '{}' ({}) created by player {}"</span>, guildName, guildId, GetPlayerId(player))
+}
+
+<span class="kw">def</span> <span class="fn">HandleGuildDisband</span>(player : Entity)
+{
+    <span class="kw">let</span> guildId = GetPlayerGuildId(player)
+    <span class="kw">if</span> (guildId == <span class="num">0</span>) { SendGuildRsp(player, GUILD_ERR_NOT_IN_GUILD); <span class="kw">return</span> }
+
+    <span class="kw">let</span> guild = GuildMgr.GetGuild(guildId)
+    <span class="kw">if</span> (guild == <span class="nb">null</span> || guild.creatorId != GetPlayerId(player)) {
+        SendGuildRsp(player, GUILD_ERR_NOT_LEADER); <span class="kw">return</span>
+    }
+
+    <span class="cm">// 通知所有在线成员</span>
+    <span class="kw">let</span> onlineMembers = GuildMgr.GetOnlineMembers(guildId)
+    <span class="kw">for</span> memberId <span class="kw">in</span> onlineMembers {
+        <span class="kw">let</span> member = GetEntityByPlayerId(memberId)
+        <span class="kw">if</span> (member != InvalidEntity) {
+            SetPlayerGuildId(member, <span class="num">0</span>)
+            ChatChannelMgr.LeaveGuild(guildId, member)
+        }
+    }
+
+    GuildMgr.DisbandGuild(guildId, GetPlayerId(player))
+    table(<span class="str">"guilds"</span>) |> where_($(r) =&gt; r.guild_id == guildId) |> DBDelete()
+    <span class="kw">for</span> memberId <span class="kw">in</span> onlineMembers {
+        SendToClient(GetSessionId(GetEntityByPlayerId(memberId)), MSG_GUILD_DISBAND_NTF, <span class="str">""</span>)
+    }
+}</code></pre>
+
+  <!-- ======================== 邮件系统 ======================== -->
+  <h2>D. 邮件系统</h2>
+
+  <h3>D.1 MailMgr 设计（C++ 单例）</h3>
+  <pre><code><span class="kw">class</span> <span class="tp">MailMgr</span> {
+<span class="kw">public</span>:
+    <span class="kw">static</span> <span class="tp">MailMgr</span>&amp; <span class="fn">Instance</span>() { <span class="kw">static</span> <span class="tp">MailMgr</span> inst; <span class="kw">return</span> inst; }
+
+    <span class="kw">struct</span> <span class="tp">Attachment</span> {
+        <span class="tp">uint64_t</span> itemInstanceId;
+        <span class="tp">uint32_t</span> itemId;
+        <span class="tp">int32_t</span>  count;
+    };
+
+    <span class="kw">struct</span> <span class="tp">MailMessage</span> {
+        <span class="tp">uint64_t</span> mailId;
+        <span class="tp">uint32_t</span> receiverId;
+        <span class="tp">uint32_t</span> senderId;            <span class="cm">// 0 = 系统邮件</span>
+        <span class="tp">std::string</span> senderName;
+        <span class="tp">std::string</span> title;
+        <span class="tp">std::string</span> body;
+        <span class="tp">std::vector</span>&lt;<span class="tp">Attachment</span>&gt; attachments;
+        <span class="tp">std::chrono::steady_clock::time_point</span> sendTime;
+        <span class="tp">std::chrono::steady_clock::time_point</span> expireTime;  <span class="cm">// 30 天后过期</span>
+        <span class="kt">bool</span> isRead = <span class="nb">false</span>;
+        <span class="kt">bool</span> isClaimed = <span class="nb">false</span>;      <span class="cm">// 附件已领取</span>
+    };
+
+    <span class="kt">void</span> <span class="fn">SendMail</span>(<span class="kw">const</span> <span class="tp">MailMessage</span>&amp; mail);
+    <span class="kt">void</span> <span class="fn">DeleteMail</span>(<span class="tp">uint32_t</span> playerId, <span class="tp">uint64_t</span> mailId);
+    <span class="kt">bool</span> <span class="fn">ClaimAttachment</span>(<span class="tp">uint32_t</span> playerId, <span class="tp">uint64_t</span> mailId,
+                         <span class="tp">std::vector</span>&lt;<span class="tp">Attachment</span>&gt;&amp; outItems);
+    <span class="tp">std::vector</span>&lt;<span class="kw">const</span> <span class="tp">MailMessage</span>*&gt; <span class="fn">GetMailbox</span>(<span class="tp">uint32_t</span> playerId);
+    <span class="kt">void</span> <span class="fn">MarkRead</span>(<span class="tp">uint32_t</span> playerId, <span class="tp">uint64_t</span> mailId);
+
+    <span class="cm">// 每 5 分钟清过期邮件</span>
+    <span class="kt">void</span> <span class="fn">CleanupExpiredMails</span>();
+
+<span class="kw">private</span>:
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">uint32_t</span>, <span class="tp">std::vector</span>&lt;<span class="tp">MailMessage</span>&gt;&gt; <span class="kw">_mailboxes</span>;
+    <span class="tp">std::atomic</span>&lt;<span class="tp">uint64_t</span>&gt; <span class="kw">_nextMailId</span>{<span class="num">1</span>};
+};</code></pre>
+
+  <h3>D.2 邮件协议</h3>
+  <pre><code>message MailListReq {}                     <span class="cm">// 请求邮件列表</span>
+message MailListRsp {
+    repeated MailSummary mails = 1;
+}
+message MailSummary {
+    uint64 mail_id = 1;
+    string sender_name = 2;
+    string title = 3;
+    bool   is_read = 4;
+    bool   has_attachment = 5;
+    bool   is_claimed = 6;
+    float  expire_time = 7;
+}
+
+message MailReadReq  { uint64 mail_id = 1; }
+message MailReadRsp  {
+    uint64 mail_id = 1;
+    string body = 2;
+    repeated MailAttachment attachments = 3;
+}
+message MailAttachment {
+    uint64 instance_id = 1;
+    uint32 item_id = 2;
+    int32  count = 3;
+}
+
+message MailClaimReq  { uint64 mail_id = 1; }
+message MailClaimRsp  {
+    MailErrorCode error = 1;
+    repeated ItemData items = 2;           <span class="cm">// 领取到的物品</span>
+}
+
+message MailDeleteReq { uint64 mail_id = 1; }
+message MailDeleteRsp { MailErrorCode error = 1; }
+
+enum MailErrorCode {
+    MAIL_OK           = 0;
+    MAIL_ERR_NOT_FOUND = 1;
+    MAIL_ERR_ALREADY_CLAIMED = 2;
+    MAIL_ERR_BAG_FULL = 3;
+    MAIL_ERR_NOT_YOURS = 4;
+}</code></pre>
+
+  <h3>D.3 邮件入口（DasLang 侧）</h3>
+  <pre><code><span class="kw">def</span> <span class="fn">HandleMailClaim</span>(player : Entity; mailId : uint64)
+{
+    <span class="kw">var</span> items : array&lt;Attachment&gt;
+    <span class="kw">let</span> ok = MailMgr.ClaimAttachment(GetPlayerId(player), mailId, items)
+    <span class="kw">if</span> (!ok) { SendMailClaimRsp(player, MAIL_ERR_ALREADY_CLAIMED); <span class="kw">return</span> }
+
+    <span class="cm">// 检查背包空间</span>
+    ecs_edit(player) $(<span class="kw">var</span> cmp)
+    {
+        <span class="kw">let</span> spaceNeeded = items |> length()
+        <span class="kw">let</span> spaceAvailable = CountEmptyBagSlots(cmp.inventory)
+        <span class="kw">if</span> (spaceAvailable &lt; spaceNeeded) {
+            <span class="cm">// 空间不足——回滚领取状态（或保持已领取但物品留邮件中）</span>
+            <span class="kw">return</span> SendMailClaimRsp(player, MAIL_ERR_BAG_FULL)
+        }
+
+        <span class="kw">for</span> att <span class="kw">in</span> items {
+            <span class="kw">let</span> item = CreateItemInstance(att.itemId, att.count)
+            <span class="kw">let</span> emptySlot = FindEmptyBagSlot(cmp.inventory)
+            cmp.inventory.slots[emptySlot].item = item
+        }
+    }
+
+    MarkInventoryDirty(player)
+    SendMailClaimRsp(player, MAIL_OK)
+}</code></pre>
+
+</div>
+
+</div>
+<nav class="breadcrumb" style="margin-top:24px;"><a href="../Design.html">🏠 返回总目录</a></nav>
+<div class="footer">MMO Server Architecture Design Document · Version 1.2</div>
+</body>
+</html>

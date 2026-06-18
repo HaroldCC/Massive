@@ -49,6 +49,3 @@ ThirdParty/Bin/*/
 *.log
 core.*
 *.dmp
-
-# ===== 文档（AI 辅助生成，按需提交） =====
-Doc/

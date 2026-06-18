@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>物品与背包系统 — MMO 服务器架构设计 v1.2</title>
+<link rel="stylesheet" href="../shared.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="../Design.html">🏠 总目录</a></nav>
+<div class="container">
+<span class="badge confirmed">✔ 已确认</span>
+
+<div class="section" id="item">
+  <h2>物品与背包系统 · Bag + Equipment + Trade</h2>
+
+  <h3>1. 设计概述</h3>
+  <p>
+    物品系统采用 <strong>扁平化物品实例</strong> 设计：每个物品是独立实例（instanced item），拥有唯一的 itemInstanceId。
+    这支持了强化、附魔、随机属性等个性化操作。背包是物品实例的容器，装备是背包的特化视图。
+    物品操作（移动/拆分/堆叠/删除）走 <strong>全权服务器校验</strong>，客户端只是提交操作请求 + 渲染。
+  </p>
+
+  <h3>2. 物品模板（ConfigTable）</h3>
+  <pre><code><span class="kw">CREATE TABLE</span> item_templates (
+    item_id         <span class="kw">INT PRIMARY KEY</span>,
+    item_name       <span class="kw">TEXT NOT NULL</span>,
+    item_type       <span class="kw">INT NOT NULL</span>,       <span class="cm">// 0=消耗品 1=装备 2=材料 3=任务物品 4=货币</span>
+    sub_type        <span class="kw">INT DEFAULT</span> 0,        <span class="cm">// 装备子类：0=武器 1=头盔 2=护甲 3=戒指 ...</span>
+    quality         <span class="kw">INT DEFAULT</span> 0,        <span class="cm">// 0=普通 1=优秀 2=稀有 3=史诗 4=传说</span>
+    max_stack       <span class="kw">INT DEFAULT</span> 1,        <span class="cm">// 最大堆叠数</span>
+    bind_type       <span class="kw">INT DEFAULT</span> 0,        <span class="cm">// 0=不绑定 1=拾取绑定 2=装备绑定 3=使用绑定</span>
+    sell_price      <span class="kw">INT DEFAULT</span> 0,
+    use_script      <span class="kw">TEXT</span>,                <span class="cm">// 使用时的脚本函数</span>
+    equip_slot      <span class="kw">INT DEFAULT</span> -1,       <span class="cm">// 装备槽位，-1=不可装备</span>
+    equip_level_min <span class="kw">INT DEFAULT</span> 1,
+    equip_class_req <span class="kw">INT DEFAULT</span> 0,        <span class="cm">// 职业要求，0=不限</span>
+    equip_stats     <span class="kw">JSONB DEFAULT</span> '{}',    <span class="cm">// {"attack":10,"defense":5,"maxHp":30}</span>
+    icon            <span class="kw">TEXT</span>,
+    description     <span class="kw">TEXT</span>
+);
+
+ConfigTable&lt;ItemTemplate&gt; <span class="kw">g_itemTemplates</span>;</code></pre>
+
+  <h3>3. 物品实例（运行时数据）</h3>
+  <pre><code><span class="cm">// 脚本组件——单个物品实例（仅在背包/仓库/邮件中存在）</span>
+[script_component]
+<span class="kw">struct</span> <span class="tp">ItemInstance</span> {
+    instanceId    : uint64           <span class="cm">// 全服唯一实例 ID</span>
+    itemId        : uint32           <span class="cm">// 模板 ID</span>
+    count         : int              <span class="cm">// 堆叠数量</span>
+    bindStatus    : int              <span class="cm">// 0=未绑定 1=已绑定(bindToPlayerId)</span>
+    bindToPlayerId : uint32          <span class="cm">// 绑定的玩家 ID</span>
+
+    <span class="cm">// 装备特有——个性化属性</span>
+    enchantLevel  : int              <span class="cm">// 强化等级</span>
+    gemSlots      : array&lt;uint32&gt;     <span class="cm">// 宝石 ID 列表（每槽一个）</span>
+    randomStats   : array&lt;StatModifier&gt;  <span class="cm">// 随机属性（掉落时生成）</span>
+    durability    : int              <span class="cm">// 耐久度</span>
+    maxDurability : int
+
+    <span class="cm">// 限时物品</span>
+    expireTime    : float            <span class="cm">// 过期时间（TickTime），0=永不过期</span>
+}</code></pre>
+
+  <h4>3.1 物品实例 ID 生成</h4>
+  <pre><code><span class="cm">// C++ 侧——全服唯一 ID 生成器</span>
+<span class="kw">class</span> <span class="tp">ItemInstanceIdGenerator</span> {
+<span class="kw">public</span>:
+    <span class="kw">static</span> <span class="tp">uint64_t</span> <span class="fn">Generate</span>() {
+        <span class="cm">// 高 32 位 = 时间戳（秒），低 32 位 = 自增序号</span>
+        <span class="kw">auto</span> ts = <span class="kw">uint64_t</span>(time(nullptr)) &lt;&lt; <span class="num">32</span>;
+        <span class="kw">return</span> ts | <span class="kw">_counter</span>.fetch_add(<span class="num">1</span>);
+    }
+<span class="kw">private</span>:
+    <span class="kw">static</span> <span class="kw">inline</span> <span class="tp">std::atomic</span>&lt;<span class="tp">uint32_t</span>&gt; <span class="kw">_counter</span>{<span class="num">0</span>};
+};</code></pre>
+
+  <h3>4. 背包组件（ScriptComponent）</h3>
+  <pre><code><span class="cm">// 脚本组件——背包</span>
+[script_component]
+<span class="kw">struct</span> <span class="tp">BagSlot</span> {
+    item          : ItemInstance?      <span class="cm">// nullable——空槽位</span>
+}
+
+[script_component]
+<span class="kw">struct</span> <span class="tp">Inventory</span> {
+    slots         : array&lt;BagSlot&gt;       <span class="cm">// 固定大小（初始 40 格，可通过背包扩展道具增加）</span>
+    maxSlots      : int                 <span class="cm">// 当前最大槽位数</span>
+    gold          : int64_t             <span class="cm">// 金币</span>
+}
+
+<span class="cm">// 装备栏——背包的逻辑视图</span>
+[script_component]
+<span class="kw">struct</span> <span class="tp">EquipmentSlots</span> {
+    <span class="kw">static</span> <span class="kw">constexpr</span> SLOT_WEAPON    = <span class="num">0</span>;
+    <span class="kw">static</span> <span class="kw">constexpr</span> SLOT_HEAD      = <span class="num">1</span>;
+    <span class="kw">static</span> <span class="kw">constexpr</span> SLOT_CHEST     = <span class="num">2</span>;
+    <span class="kw">static</span> <span class="kw">constexpr</span> SLOT_HANDS     = <span class="num">3</span>;
+    <span class="kw">static</span> <span class="kw">constexpr</span> SLOT_LEGS      = <span class="num">4</span>;
+    <span class="kw">static</span> <span class="kw">constexpr</span> SLOT_FEET      = <span class="num">5</span>;
+    <span class="kw">static</span> <span class="kw">constexpr</span> SLOT_RING1     = <span class="num">6</span>;
+    <span class="kw">static</span> <span class="kw">constexpr</span> SLOT_RING2     = <span class="num">7</span>;
+    <span class="kw">static</span> <span class="kw">constexpr</span> SLOT_NECKLACE  = <span class="num">8</span>;
+    <span class="kw">static</span> <span class="kw">constexpr</span> MAX_SLOTS     = <span class="num">9</span>;
+
+    slots         : array&lt;ItemInstance?&gt;  <span class="cm">// 长度 MAX_SLOTS</span>
+}</code></pre>
+
+  <h3>5. 背包操作——全权服务器校验</h3>
+
+  <h4>5.1 移动物品</h4>
+  <pre><code><span class="cm">// MSG_BAG_MOVE_REQ(fromSlot, toSlot) → MSG_BAG_MOVE_RSP</span>
+<span class="kw">def</span> <span class="fn">HandleBagMove</span>(player : Entity; fromSlot : int; toSlot : int)
+{
+    ecs_edit(player) $(<span class="kw">var</span> cmp)
+    {
+        <span class="cm">// 校验：槽位范围</span>
+        <span class="kw">if</span> (fromSlot &lt; <span class="num">0</span> || fromSlot &gt;= cmp.inventory.maxSlots) {
+            SendBagError(player, BAG_ERR_INVALID_SLOT); <span class="kw">return</span>
+        }
+        <span class="kw">if</span> (toSlot &lt; <span class="num">0</span> || toSlot &gt;= cmp.inventory.maxSlots) {
+            SendBagError(player, BAG_ERR_INVALID_SLOT); <span class="kw">return</span>
+        }
+
+        <span class="kw">let</span> fromItem = cmp.inventory.slots[fromSlot].item
+        <span class="kw">let</span> toItem   = cmp.inventory.slots[toSlot].item
+
+        <span class="kw">if</span> (fromItem == <span class="nb">null</span>) {
+            SendBagError(player, BAG_ERR_EMPTY_SLOT); <span class="kw">return</span>
+        }
+
+        <span class="cm">// 堆叠逻辑：同 itemId + 可堆叠 + 未超 maxStack</span>
+        <span class="kw">if</span> (toItem != <span class="nb">null</span> &amp;&amp; toItem.itemId == fromItem.itemId) {
+            <span class="kw">let</span> template = g_itemTemplates.Find(fromItem.itemId)
+            <span class="kw">if</span> (template != <span class="nb">null</span> &amp;&amp; template.max_stack &gt; <span class="num">1</span>) {
+                <span class="kw">let</span> space = template.max_stack - toItem.count
+                <span class="kw">let</span> move = min(fromItem.count, space)
+                toItem.count += move
+                fromItem.count -= move
+                <span class="kw">if</span> (fromItem.count &lt;= <span class="num">0</span>) {
+                    cmp.inventory.slots[fromSlot].item = <span class="nb">null</span>
+                }
+                MarkInventoryDirty(player)
+                SendBagMoveRsp(player, BAG_OK); <span class="kw">return</span>
+            }
+        }
+
+        <span class="cm">// 交换位置</span>
+        cmp.inventory.slots[toSlot].item   = fromItem
+        cmp.inventory.slots[fromSlot].item = toItem
+
+        MarkInventoryDirty(player)
+        SendBagMoveRsp(player, BAG_OK)
+    }
+}</code></pre>
+
+  <h4>5.2 拆分物品</h4>
+  <pre><code><span class="kw">def</span> <span class="fn">HandleBagSplit</span>(player : Entity; fromSlot : int; count : int; toSlot : int)
+{
+    ecs_edit(player) $(<span class="kw">var</span> cmp)
+    {
+        <span class="kw">let</span> fromItem = cmp.inventory.slots[fromSlot].item
+        <span class="kw">if</span> (fromItem == <span class="nb">null</span> || count &lt;= <span class="num">0</span> || count &gt;= fromItem.count) {
+            SendBagError(player, BAG_ERR_INVALID_COUNT); <span class="kw">return</span>
+        }
+
+        <span class="cm">// 创建拆分副本并减少源数量</span>
+        <span class="kw">let</span> splitCopy = CloneItemInstance(fromItem)
+        splitCopy.count = count
+        fromItem.count -= count
+
+        <span class="cm">// 目标槽必须为空</span>
+        <span class="kw">if</span> (cmp.inventory.slots[toSlot].item != <span class="nb">null</span>) {
+            SendBagError(player, BAG_ERR_SLOT_OCCUPIED); <span class="kw">return</span>
+        }
+
+        cmp.inventory.slots[toSlot].item = splitCopy
+        MarkInventoryDirty(player)
+        SendBagMoveRsp(player, BAG_OK)
+    }
+}</code></pre>
+
+  <h4>5.3 使用物品</h4>
+  <pre><code><span class="kw">def</span> <span class="fn">HandleBagUse</span>(player : Entity; slot : int)
+{
+    ecs_edit(player) $(<span class="kw">var</span> cmp)
+    {
+        <span class="kw">let</span> item = cmp.inventory.slots[slot].item
+        <span class="kw">if</span> (item == <span class="nb">null</span>) { SendBagError(player, BAG_ERR_EMPTY_SLOT); <span class="kw">return</span> }
+
+        <span class="kw">let</span> template = g_itemTemplates.Find(item.itemId)
+        <span class="kw">if</span> (template == <span class="nb">null</span>) { SendBagError(player, BAG_ERR_ITEM_NOT_FOUND); <span class="kw">return</span> }
+
+        <span class="cm">// 装备类型 → 穿装备</span>
+        <span class="kw">if</span> (template.item_type == <span class="num">1</span>) {
+            EquipItem(player, slot)
+            <span class="kw">return</span>
+        }
+
+        <span class="cm">// 消耗品 → 使用脚本 + 减少数量</span>
+        <span class="kw">if</span> (template.use_script != <span class="str">""</span>) {
+            CallItemUseScript(template.use_script, player, item)
+        }
+
+        item.count -= <span class="num">1</span>
+        <span class="kw">if</span> (item.count &lt;= <span class="num">0</span>) {
+            cmp.inventory.slots[slot].item = <span class="nb">null</span>
+        }
+
+        <span class="cm">// 绑定检查——使用绑定</span>
+        <span class="kw">if</span> (template.bind_type == <span class="num">3</span> &amp;&amp; item.bindStatus == <span class="num">0</span>) {
+            item.bindStatus = <span class="num">1</span>
+            item.bindToPlayerId = GetPlayerId(player)
+        }
+
+        MarkInventoryDirty(player)
+        SendBagUseRsp(player, BAG_OK)
+    }
+}</code></pre>
+
+  <h3>6. 装备系统</h3>
+
+  <h4>6.1 穿装备</h4>
+  <pre><code><span class="kw">def</span> <span class="fn">EquipItem</span>(player : Entity; bagSlot : int)
+{
+    ecs_edit(player) $(<span class="kw">var</span> cmp)
+    {
+        <span class="kw">let</span> item = cmp.inventory.slots[bagSlot].item
+        <span class="kw">let</span> template = g_itemTemplates.Find(item.itemId)
+
+        <span class="cm">// 校验</span>
+        <span class="kw">if</span> (template.equip_slot &lt; <span class="num">0</span>) { SendBagError(player, BAG_ERR_NOT_EQUIPPABLE); <span class="kw">return</span> }
+        <span class="kw">if</span> (GetPlayerLevel(player) &lt; template.equip_level_min) {
+            SendBagError(player, BAG_ERR_LEVEL_TOO_LOW); <span class="kw">return</span>
+        }
+        <span class="kw">if</span> (template.equip_class_req != <span class="num">0</span> &amp;&amp; template.equip_class_req != GetPlayerClass(player)) {
+            SendBagError(player, BAG_ERR_CLASS_MISMATCH); <span class="kw">return</span>
+        }
+
+        <span class="cm">// 交换：如果有旧装备，换到背包空位</span>
+        <span class="kw">let</span> oldEquip = cmp.equipmentSlots.slots[template.equip_slot]
+
+        <span class="kw">if</span> (oldEquip != <span class="nb">null</span>) {
+            <span class="cm">// 旧装备回到背包</span>
+            <span class="kw">let</span> emptySlot = FindEmptyBagSlot(cmp.inventory)
+            <span class="kw">if</span> (emptySlot &lt; <span class="num">0</span>) { SendBagError(player, BAG_ERR_BAG_FULL); <span class="kw">return</span> }
+            cmp.inventory.slots[emptySlot].item = oldEquip
+        }
+
+        <span class="cm">// 穿上新装备</span>
+        cmp.equipmentSlots.slots[template.equip_slot] = item
+        cmp.inventory.slots[bagSlot].item = <span class="nb">null</span>
+
+        <span class="cm">// 装备绑定</span>
+        <span class="kw">if</span> (template.bind_type == <span class="num">2</span> &amp;&amp; item.bindStatus == <span class="num">0</span>) {
+            item.bindStatus = <span class="num">1</span>
+            item.bindToPlayerId = GetPlayerId(player)
+        }
+
+        <span class="cm">// 属性重算</span>
+        ecs_emplace(player, type&lt;<span class="tp">StatsDirtyTag</span>&gt;, StatsDirtyTag{})
+
+        MarkInventoryDirty(player)
+        SendEquipRsp(player, BAG_OK)
+    }
+}</code></pre>
+
+  <h4>6.2 脱装备</h4>
+  <pre><code><span class="kw">def</span> <span class="fn">UnequipItem</span>(player : Entity; equipSlot : int)
+{
+    ecs_edit(player) $(<span class="kw">var</span> cmp)
+    {
+        <span class="kw">let</span> item = cmp.equipmentSlots.slots[equipSlot]
+        <span class="kw">if</span> (item == <span class="nb">null</span>) { SendBagError(player, BAG_ERR_EMPTY_SLOT); <span class="kw">return</span> }
+
+        <span class="kw">let</span> emptySlot = FindEmptyBagSlot(cmp.inventory)
+        <span class="kw">if</span> (emptySlot &lt; <span class="num">0</span>) { SendBagError(player, BAG_ERR_BAG_FULL); <span class="kw">return</span> }
+
+        cmp.inventory.slots[emptySlot].item = item
+        cmp.equipmentSlots.slots[equipSlot] = <span class="nb">null</span>
+
+        ecs_emplace(player, type&lt;<span class="tp">StatsDirtyTag</span>&gt;, StatsDirtyTag{})
+        MarkInventoryDirty(player)
+        SendUnequipRsp(player, BAG_OK)
+    }
+}</code></pre>
+
+  <h3>7. 交易系统</h3>
+  <p>
+    交易系统采用 <strong>双确认锁步</strong> 模型，防止各种边界竞争条件。
+  </p>
+
+  <h4>7.1 交易流程</h4>
+  <pre>
+Player A                               Server                            Player B
+  │ MSG_TRADE_REQ(B)                     │                                  │
+  │─────────────────────────────────────▶│                                  │
+  │                                      │ MSG_TRADE_REQ_NTF(A)            │
+  │                                      │─────────────────────────────────▶│
+  │                                      │         MSG_TRADE_RSP(accept)   │
+  │                                      │◀─────────────────────────────────│
+  │                                      │                                  │
+  │  [双方进入 TradeState]                │                                  │
+  │                                      │ 创建 TradeSession{A, B}          │
+  │                                      │                                  │
+  │ MSG_TRADE_ADD_ITEM(slot, count)      │                                  │
+  │─────────────────────────────────────▶│                                  │
+  │                                      │ 物品移动到 TradeSession.AItems   │
+  │ MSG_TRADE_UPDATE_NTF                 │  → 同步给对方                   │
+  │◀─────────────────────────────────────│ MSG_TRADE_UPDATE_NTF            │
+  │                                      │─────────────────────────────────▶│
+  │                                                                        │
+  │ (双方可以多次添加/移除物品/金币)        │                                  │
+  │                                                                        │
+  │ MSG_TRADE_CONFIRM_REQ                │                                  │
+  │─────────────────────────────────────▶│                                  │
+  │                                      │ A._confirmed = true              │
+  │                                      │                                  │
+  │                                      │          MSG_TRADE_CONFIRM_REQ   │
+  │                                      │◀─────────────────────────────────│
+  │                                      │                                  │
+  │                                      │ [双方都确认]                      │
+  │                                      │ 1. 验货：物品仍在 A/B 的 TradeItems 中
+  │                                      │ 2. 金额校验                      │
+  │                                      │ 3. 空间检查（接收方背包够不够）    │
+  │                                      │ 4. 原子交换                      │
+  │                                      │ 5. 写 DB（立即同步）              │
+  │ MSG_TRADE_COMPLETE_NTF               │                                  │
+  │◀─────────────────────────────────────│ MSG_TRADE_COMPLETE_NTF           │
+  │                                      │─────────────────────────────────▶│
+
+  任一方在 Confirm 前可以 MSG_TRADE_CANCEL_REQ
+  → TradeSession 销毁 → 物品返回各自背包</pre>
+
+  <h4>7.2 TradeSession 管理（C++ 侧）</h4>
+  <pre><code><span class="cm">// TradeSession.h — 交易会话（C++ 引擎管理，非 ScriptComponent）</span>
+<span class="kw">class</span> <span class="tp">TradeSession</span> {
+<span class="kw">public</span>:
+    <span class="kw">struct</span> <span class="tp">Party</span> {
+        <span class="tp">Entity</span> player;
+        <span class="tp">std::vector</span>&lt;<span class="tp">ItemInstance</span>&gt; items;    <span class="cm">// 从背包移出的物品</span>
+        <span class="tp">int64_t</span> gold = <span class="num">0</span>;
+        <span class="kt">bool</span> confirmed = <span class="nb">false</span>;
+    };
+
+    <span class="tp">Party</span> <span class="kw">_a</span>, <span class="kw">_b</span>;
+    <span class="tp">std::chrono::steady_clock::time_point</span> <span class="kw">_startTime</span>;
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="kw">auto</span> kTimeout = <span class="tp">std::chrono::minutes</span>(<span class="num">5</span>);
+
+    <span class="kt">void</span> <span class="fn">AddItem</span>(<span class="tp">Entity</span> player, <span class="tp">ItemInstance</span> item);
+    <span class="kt">void</span> <span class="fn">RemoveItem</span>(<span class="tp">Entity</span> player, <span class="tp">uint64_t</span> instanceId);
+    <span class="kt">void</span> <span class="fn">SetGold</span>(<span class="tp">Entity</span> player, <span class="tp">int64_t</span> amount);
+    <span class="kt">void</span> <span class="fn">Confirm</span>(<span class="tp">Entity</span> player);
+
+    <span class="cm">// 双确认后原子执行</span>
+    <span class="kt">bool</span> <span class="fn">ExecuteTrade</span>();  <span class="cm">// 返回 false = 交易失败（空间不足等）</span>
+    <span class="kt">void</span> <span class="fn">Cancel</span>();
+
+<span class="kw">private</span>:
+    <span class="tp">Party</span>&amp; <span class="fn">GetParty</span>(<span class="tp">Entity</span> player);
+    <span class="kt">bool</span> <span class="fn">ValidateItems</span>(<span class="kw">const</span> <span class="tp">Party</span>&amp; party);  <span class="cm">// 物品未被外部修改</span>
+    <span class="kt">bool</span> <span class="fn">CheckInventorySpace</span>(<span class="tp">Entity</span> receiver, <span class="kw">const</span> <span class="tp">std::vector</span>&lt;<span class="tp">ItemInstance</span>&gt;&amp; items);
+};
+
+<span class="cm">// LogicServer 中管理所有活跃 TradeSession</span>
+<span class="tp">std::unordered_map</span>&lt;<span class="tp">Entity</span>, <span class="tp">std::shared_ptr</span>&lt;<span class="tp">TradeSession</span>&gt;&gt; <span class="kw">_activeTrades</span>;  <span class="cm">// player → session</span></code></pre>
+
+  <h3>8. 物品掉落</h3>
+  <pre><code><span class="cm">// 掉落生成——怪物死亡时调用</span>
+<span class="kw">def</span> <span class="fn">GenerateDrops</span>(monster : Entity; killer : Entity)
+{
+    <span class="kw">let</span> templateId = GetMonsterTemplateId(monster)
+    <span class="kw">let</span> dropTable = g_dropTables.Find(templateId)
+    <span class="kw">if</span> (dropTable == <span class="nb">null</span>) <span class="kw">return</span>
+
+    <span class="kw">let</span> pos = GetPosition(monster)
+    <span class="kw">var</span> drops : array&lt;ItemInstance&gt;
+
+    <span class="kw">for</span> entry <span class="kw">in</span> dropTable.entries {
+        <span class="kw">if</span> (RandomFloat(<span class="num">0.0</span>, <span class="num">1.0</span>) &lt; entry.dropChance) {
+            <span class="kw">let</span> item = CreateItemInstance(entry.itemId, entry.minCount, entry.maxCount)
+            <span class="kw">if</span> (item != <span class="nb">null</span>) {
+                <span class="cm">// 生成随机属性</span>
+                RollRandomStats(item, entry)
+                drops |> push(item)
+            }
+        }
+    }
+
+    <span class="cm">// 生成地面掉落物 Entity（EnTT）</span>
+    <span class="kw">for</span> item <span class="kw">in</span> drops {
+        <span class="kw">let</span> dropEntity = ecs_create(GetSceneId(monster))
+        ecs_edit(dropEntity) $(<span class="kw">var</span> cmp) {
+            cmp.position = pos
+            cmp.groundItem = GroundItem{
+                item         = item,
+                ownerPlayer  = killer,        <span class="cm">// 30s 内只有 killer 可见</span>
+                dropTime     = GetTickTime(),
+                expireTime   = GetTickTime() + <span class="num">120.0</span>  <span class="cm">// 2 分钟后消失</span>
+            }
+        }
+    }
+}
+
+<span class="cm">// 拾取——MSG_LOOT_REQ(entityId)</span>
+<span class="kw">def</span> <span class="fn">HandleLoot</span>(player : Entity; dropEntity : Entity)
+{
+    <span class="kw">if</span> (DistanceBetween(player, dropEntity) &gt; <span class="num">5.0</span>) {
+        SendLootRsp(player, LOOT_ERR_TOO_FAR); <span class="kw">return</span>
+    }
+
+    ecs_edit(player) $(<span class="kw">var</span> cmp) {
+    ecs_edit(dropEntity) $(<span class="kw">var</span> dropCmp)
+    {
+        <span class="kw">let</span> ground = dropCmp.groundItem
+
+        <span class="cm">// 归属检查（30s 内只有 killer 能捡）</span>
+        <span class="kw">if</span> (ground.ownerPlayer != InvalidEntity &amp;&amp; ground.ownerPlayer != player) {
+            <span class="kw">if</span> (GetTickTime() - ground.dropTime &lt; <span class="num">30.0</span>) {
+                SendLootRsp(player, LOOT_ERR_NOT_OWNER); <span class="kw">return</span>
+            }
+        }
+
+        <span class="cm">// 空间检查</span>
+        <span class="kw">let</span> emptySlot = FindEmptyBagSlot(cmp.inventory)
+        <span class="kw">if</span> (emptySlot &lt; <span class="num">0</span>) { SendLootRsp(player, LOOT_ERR_BAG_FULL); <span class="kw">return</span> }
+
+        <span class="cm">// 拾取绑定</span>
+        <span class="kw">let</span> template = g_itemTemplates.Find(ground.item.itemId)
+        <span class="kw">if</span> (template != <span class="nb">null</span> &amp;&amp; template.bind_type == <span class="num">1</span>) {
+            ground.item.bindStatus = <span class="num">1</span>
+            ground.item.bindToPlayerId = GetPlayerId(player)
+        }
+
+        <span class="cm">// 移入背包</span>
+        cmp.inventory.slots[emptySlot].item = ground.item
+        MarkInventoryDirty(player)
+
+        <span class="cm">// 销毁掉落物</span>
+        ecs_destroy(dropEntity)
+
+        SendLootRsp(player, LOOT_OK)
+    }}
+}</code></pre>
+
+  <h3>9. 物品协议</h3>
+  <pre><code><span class="cm">// Proto 定义</span>
+message BagMoveReq {
+    int32 from_slot = 1;
+    int32 to_slot = 2;
+}
+message BagMoveRsp {
+    BagErrorCode error = 1;
+    repeated BagSlotData updated_slots = 2;   <span class="cm">// 仅发送变化的槽位</span>
+}
+message BagSlotData {
+    int32 slot = 1;
+    ItemData item = 2;                        <span class="cm">// null = 空槽</span>
+}
+message ItemData {
+    uint64 instance_id = 1;
+    uint32 item_id = 2;
+    int32  count = 3;
+    int32  bind_status = 4;
+    int32  enchant_level = 5;
+    repeated uint32 gem_ids = 6;
+    int32  durability = 7;
+}
+
+enum BagErrorCode {
+    BAG_OK           = 0;
+    BAG_ERR_INVALID_SLOT = 1;
+    BAG_ERR_EMPTY_SLOT   = 2;
+    BAG_ERR_SLOT_OCCUPIED = 3;
+    BAG_ERR_BAG_FULL      = 4;
+    BAG_ERR_INVALID_COUNT = 5;
+    BAG_ERR_NOT_EQUIPPABLE = 6;
+    BAG_ERR_LEVEL_TOO_LOW = 7;
+    BAG_ERR_CLASS_MISMATCH = 8;
+    BAG_ERR_ITEM_NOT_FOUND = 9;
+}
+
+message LootReq  { uint32 entity_id = 1; }
+message LootRsp  { LootErrorCode error = 1; ItemData item = 2; }
+
+message TradeReq   { uint32 target_player_id = 1; }
+message TradeReqNtf { uint32 from_player_id = 1; }
+message TradeRsp   { bool accept = 1; }
+message TradeAddItemReq { int32 slot = 1; int32 count = 2; }
+message TradeUpdateNtf { TradePartyData my_items = 1; TradePartyData other_items = 2; }
+message TradePartyData { repeated ItemData items = 1; int64 gold = 2; }
+message TradeConfirmReq {}
+message TradeCompleteNtf {}
+message TradeCancelReq {}</code></pre>
+
+  <h3>10. 背包持久化策略</h3>
+  <table>
+    <tr><th>操作</th><th>写入策略</th></tr>
+    <tr><td>物品移动/拆分/使用</td><td>立即写 <code>player_inventory</code> 表（物品变更双写保数据不丢）</td></tr>
+    <tr><td>穿/脱装备</td><td>立即写 <code>player_inventory</code> + <code>player_equipment</code></td></tr>
+    <tr><td>交易完成</td><td>立即写双方背包（事务性）</td></tr>
+    <tr><td>掉落拾取</td><td>立即写，如果在副本内则 30s 延迟写入（副本崩溃回滚时可恢复）</td></tr>
+  </table>
+
+</div>
+
+</div>
+<nav class="breadcrumb" style="margin-top:24px;"><a href="../Design.html">🏠 返回总目录</a></nav>
+<div class="footer">MMO Server Architecture Design Document · Version 1.2</div>
+</body>
+</html>

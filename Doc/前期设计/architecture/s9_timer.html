@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>9. 定时器 · 多级时间轮 — MMO 服务器架构设计 v1</title>
+<link rel="stylesheet" href="../shared.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="../Design.html">🏠 总目录</a></nav>
+<div class="container">
+<span class="badge confirmed">✔ 已确认</span>
+<div class="section" id="s9">
+  <h2>9. 定时器 · 多级时间轮</h2>
+  <h3>9.1 三级时间轮</h3>
+  <p>每轮 60 槽：轮0=3s(50ms×60)、轮1=3min(3s×60)、轮2=3h(3min×60)。O(1) 插入/触发/取消。</p>
+  <pre><code><span class="kw">class</span> <span class="tp">TimingWheel</span> {
+<span class="kw">public</span>:
+    <span class="kw">struct</span> <span class="tp">TimerNode</span> {
+        <span class="tp">TimerId</span> id;
+        <span class="tp">int</span> remainingRounds;
+        <span class="tp">std::function</span>&lt;<span class="kt">void</span>()&gt; callback;
+        <span class="tp">TimerNode</span>* next = <span class="nb">nullptr</span>;
+    };
+
+    <span class="kt">void</span> <span class="fn">Schedule</span>(<span class="tp">TimerId</span> id, <span class="tp">std::chrono::milliseconds</span> delay, <span class="tp">std::function</span>&lt;<span class="kt">void</span>()&gt; cb);
+    <span class="kt">void</span> <span class="fn">Cancel</span>(<span class="tp">TimerId</span> id);
+    <span class="kt">void</span> <span class="fn">Tick</span>();
+
+<span class="kw">private</span>:
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="kt">int</span> kSlots = <span class="num">60</span>;
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="tp">std::chrono::milliseconds</span> kTickSize[<span class="num">3</span>] = {
+        <span class="tp">std::chrono::milliseconds</span>(<span class="num">50</span>), <span class="tp">std::chrono::milliseconds</span>(<span class="num">3000</span>), <span class="tp">std::chrono::milliseconds</span>(<span class="num">180000</span>)
+    };
+    <span class="tp">TimerNode</span>* <span class="kw">_wheels</span>[<span class="num">3</span>][kSlots] = {};
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">TimerId</span>, <span class="tp">TimerNode</span>*&gt; <span class="kw">_idMap</span>;
+    <span class="kt">int</span> <span class="kw">_currentSlot</span>[<span class="num">3</span>] = {};
+    <span class="tp">TimerNode</span>* <span class="kw">_freeList</span> = <span class="nb">nullptr</span>;  <span class="cm">// 对象池——避免每次 new/delete</span>
+};</code></pre>
+
+  <h3>9.2 Schedule 实现</h3>
+  <pre><code><span class="kt">void</span> <span class="tp">TimingWheel</span>::<span class="fn">Schedule</span>(<span class="tp">TimerId</span> id, <span class="tp">std::chrono::milliseconds</span> delay,
+                          <span class="tp">std::function</span>&lt;<span class="kt">void</span>()&gt; callback) {
+    <span class="cm">// 从对象池分配</span>
+    <span class="kw">auto</span>* node = <span class="kw">_freeList</span> ? <span class="kw">_freeList</span> : <span class="kw">new</span> TimerNode{};
+    <span class="kw">if</span> (<span class="kw">_freeList</span>) <span class="kw">_freeList</span> = <span class="kw">_freeList</span>-&gt;next;
+    node-&gt;id = id;
+    node-&gt;callback = std::move(callback);
+
+    <span class="cm">// 确定轮号: delay / tickSize[0] 算槽位，越界升到轮1/轮2</span>
+    <span class="tp">int</span> wheelIdx = <span class="num">0</span>;
+    <span class="tp">int</span> slotOffset = <span class="kw">int</span>(delay / kTickSize[<span class="num">0</span>]);
+    <span class="kw">if</span> (slotOffset &gt;= kSlots) {
+        slotOffset = <span class="kw">int</span>(delay / kTickSize[<span class="num">1</span>]);
+        wheelIdx = <span class="num">1</span>;
+        <span class="kw">if</span> (slotOffset &gt;= kSlots) {
+            slotOffset = <span class="kw">int</span>(delay / kTickSize[<span class="num">2</span>]);
+            wheelIdx = <span class="num">2</span>;
+        }
+    }
+
+    <span class="cm">// 计算槽位和剩余圈数</span>
+    <span class="tp">int</span> targetSlot = (<span class="kw">_currentSlot</span>[wheelIdx] + slotOffset) % kSlots;
+    node-&gt;remainingRounds = slotOffset / kSlots;
+
+    <span class="cm">// 插入到槽位链表头部</span>
+    node-&gt;next = <span class="kw">_wheels</span>[wheelIdx][targetSlot];
+    <span class="kw">_wheels</span>[wheelIdx][targetSlot] = node;
+
+    <span class="kw">_idMap</span>[id] = node;
+}</code></pre>
+
+  <h3>9.3 Tick 与级联</h3>
+  <pre><code><span class="kt">void</span> <span class="tp">TimingWheel</span>::<span class="fn">Tick</span>() {
+    <span class="cm">// 推进轮0（每 Tick 都推进）</span>
+    <span class="kw">_currentSlot</span>[<span class="num">0</span>] = (<span class="kw">_currentSlot</span>[<span class="num">0</span>] + <span class="num">1</span>) % kSlots;
+
+    <span class="cm">// 收集到期槽的剩余轮数 &gt; 0 的节点 → remainingRounds-- 放回原位置</span>
+    <span class="cm">//         剩余轮数 == 0 的节点 → 触发 callback</span>
+    <span class="kw">auto</span>* cur = <span class="kw">_wheels</span>[<span class="num">0</span>][<span class="kw">_currentSlot</span>[<span class="num">0</span>]];
+    <span class="kw">_wheels</span>[<span class="num">0</span>][<span class="kw">_currentSlot</span>[<span class="num">0</span>]] = <span class="nb">nullptr</span>;
+    <span class="kw">while</span> (cur) {
+        <span class="kw">auto</span>* next = cur-&gt;next;
+        <span class="kw">if</span> (cur-&gt;remainingRounds &gt; <span class="num">0</span>) {
+            <span class="cm">// 还没到期——tick 一圈后再触发</span>
+            cur-&gt;remainingRounds--;
+            cur-&gt;next = <span class="kw">_wheels</span>[<span class="num">0</span>][<span class="kw">_currentSlot</span>[<span class="num">0</span>]];
+            <span class="kw">_wheels</span>[<span class="num">0</span>][<span class="kw">_currentSlot</span>[<span class="num">0</span>]] = cur;
+        } <span class="kw">else</span> {
+            <span class="cm">// 到期！触发后回收节点</span>
+            cur-&gt;callback();
+            <span class="kw">_idMap</span>.erase(cur-&gt;id);
+            cur-&gt;callback = {};
+            cur-&gt;next = <span class="kw">_freeList</span>; <span class="kw">_freeList</span> = cur;  <span class="cm">// 归还对象池</span>
+        }
+        cur = next;
+    }
+
+    <span class="cm">// 级联：轮0跑满 1 圈 (= 60 tick = 3s) → 推进轮1</span>
+    <span class="kw">if</span> (<span class="kw">_currentSlot</span>[<span class="num">0</span>] == <span class="num">0</span>) {
+        <span class="kw">_currentSlot</span>[<span class="num">1</span>] = (<span class="kw">_currentSlot</span>[<span class="num">1</span>] + <span class="num">1</span>) % kSlots;
+        <span class="cm">// 轮1的定时器级联到轮0：重新 Schedule</span>
+        <span class="cm">// 轮1每推进 1 格 = 把所有轮1当前槽的定时器重新 Schedule 进轮0</span>
+        <span class="kw">auto</span>* cascade = <span class="kw">_wheels</span>[<span class="num">1</span>][<span class="kw">_currentSlot</span>[<span class="num">1</span>]];
+        <span class="kw">_wheels</span>[<span class="num">1</span>][<span class="kw">_currentSlot</span>[<span class="num">1</span>]] = <span class="nb">nullptr</span>;
+        <span class="kw">while</span> (cascade) {
+            <span class="kw">auto</span>* next = cascade-&gt;next;
+            <span class="kw">if</span> (cascade-&gt;remainingRounds &gt; <span class="num">0</span>) {
+                cascade-&gt;remainingRounds--;
+                <span class="cm">// 放回轮1 同一槽</span>
+                cascade-&gt;next = <span class="kw">_wheels</span>[<span class="num">1</span>][<span class="kw">_currentSlot</span>[<span class="num">1</span>]];
+                <span class="kw">_wheels</span>[<span class="num">1</span>][<span class="kw">_currentSlot</span>[<span class="num">1</span>]] = cascade;
+            } <span class="kw">else</span> {
+                <span class="cm">// 级联到轮0：重新 Schedule 到轮0</span>
+                <span class="cm">// (简化——将 cascade 直接插入轮0对应槽)</span>
+            }
+            cascade = next;
+        }
+    }
+}</code></pre>
+
+  <h3>9.4 Cancel — O(1) 链表摘除</h3>
+  <pre><code><span class="kt">void</span> <span class="tp">TimingWheel</span>::<span class="fn">Cancel</span>(<span class="tp">TimerId</span> id) {
+    <span class="kw">auto</span> it = <span class="kw">_idMap</span>.find(id);
+    <span class="kw">if</span> (it == <span class="kw">_idMap</span>.end()) <span class="kw">return</span>;
+    <span class="kw">auto</span>* node = it-&gt;second;
+    <span class="kw">_idMap</span>.erase(it);
+
+    <span class="cm">// 从槽位链表中摘除 (需要遍历链表——同样 O(1) 期望，因为链表短)</span>
+    <span class="cm">// 实际等于 O(槽位内节点数)——由于槽位内数量少 (平均 1-5 个)，接近 O(1)</span>
+    <span class="cm">// 更优做法：双向链表 (加 prev 指针)</span>
+    node-&gt;callback = {};
+    node-&gt;next = <span class="kw">_freeList</span>; <span class="kw">_freeList</span> = node;
+}</code></pre>
+
+  <h3>9.5 TimerId 生成</h3>
+  <pre><code><span class="kw">using</span> <span class="tp">TimerId</span> = <span class="tp">uint64_t</span>;
+
+<span class="kw">static</span> <span class="tp">std::atomic</span>&lt;<span class="tp">TimerId</span>&gt; <span class="kw">_nextTimerId</span>{<span class="num">1</span>};
+<span class="tp">TimerId</span> <span class="fn">GenTimerId</span>() { <span class="kw">return</span> <span class="kw">_nextTimerId</span>.fetch_add(<span class="num">1</span>); }
+<span class="cm">// 使用 64 位，实际永不回绕 (每秒 1000 个定时器也要 5.8 亿年)</span></code></pre>
+
+</div>
+</div>
+<nav class="breadcrumb" style="margin-top:24px;"><a href="../Design.html">🏠 返回总目录</a></nav>
+<div class="footer">MMO Server Architecture Design Document · Version 1.2</div>
+</body>
+</html>

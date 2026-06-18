@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>11. 部署拓扑设计 · C2 方案 — MMO 服务器架构设计 v1.2</title>
+<link rel="stylesheet" href="../shared.css">
+</head>
+<body>
+
+<nav class="breadcrumb">
+  <a href="../Design.html">🏠 总目录</a>
+</nav>
+
+<div class="container">
+<span class="badge confirmed">✔ 已确认 · 方案 C2</span>
+
+<div class="section" id="s11">
+  <h2>11. 部署拓扑设计 · C2 方案（无状态 Gate 路由）</h2>
+
+  <h3>11.1 为什么是 C2</h3>
+  <p>
+    项目从一开始就是<strong>多进程分布式架构</strong>，不走单进程合一再拆分的演进路线。
+    直接部署 5 种独立进程。C2 的核心优势：GateServer 完全无状态（只读 SessionToken 明文段做 O(1) 路由），
+    零密钥、零加密、零 DB——纯 TCP 代理。WorldServer 隐藏在内网，所有公网流量强制经过 Gate。
+  </p>
+
+  <h3>11.2 完整拓扑</h3>
+
+  <div class="topo">
+    <div class="topo-row">
+      <div class="topo-box login">LoginServer<br><small>账号认证 · ECDH<br>SessionToken 签发</small></div>
+    </div>
+    <div class="topo-row">
+      <div class="topo-arrow-v">│<br><small>TLS · 返回 gateIPs + SessionToken</small></div>
+    </div>
+    <div class="topo-row">
+      <div class="topo-box gate">GateServer_1</div>
+      <div class="topo-box gate">GateServer_2</div>
+      <div class="topo-box gate">GateServer_N</div>
+    </div>
+    <div class="topo-row">
+      <div class="topo-arrow-v">│ <small>内部 TCP（读 SessionId 路由）</small> │</div>
+    </div>
+    <div class="topo-row">
+      <div class="topo-box world">WorldServer_1<br><small>场景 A·B·C</small></div>
+      <div class="topo-box world">WorldServer_2<br><small>场景 D·E·F</small></div>
+      <div class="topo-box world">WorldServer_M<br><small>场景 G·H·I</small></div>
+    </div>
+    <div class="topo-arrow-v">│</div>
+    <div class="topo-row">
+      <div class="topo-box center">CenterServer<br><small>服务发现 · 跨服路由</small></div>
+      <div class="topo-box social">SocialServer<br><small>公会 · 邮件 · 拍卖行<br>聊天 · 好友 · 匹配</small></div>
+    </div>
+    <div class="topo-arrow-v">│</div>
+    <div class="topo-row"><div class="topo-box pg">PgBouncer → PostgreSQL</div></div>
+  </div>
+
+  <table>
+    <tr><th>进程</th><th>职责</th><th>持有密钥</th><th>公网暴露</th><th>实例数</th></tr>
+    <tr><td><strong>LoginServer</strong></td><td>账号密码验证 (argon2id) · ECDH 密钥协商 · 选择 WorldServer · 签发 SessionToken · 封禁检查 · 排队管理</td><td>LSS + ECDH 私钥</td><td>✅（TLS）</td><td>1-2</td></tr>
+    <tr><td><strong>GateServer</strong></td><td>TCP 连接保持 · 读 SessionToken 明文段做路由 · 连接限流 · DDoS 吸收 · SessionId 分配</td><td>无</td><td>✅</td><td>2-8</td></tr>
+    <tr><td><strong>WorldServer</strong></td><td>游戏逻辑（ECS + DasLang）· AES-GCM 加解密 · SessionToken 验证 · AOI · 寻路 · 网络复制 · 场景管理<br>内置 DBWorkerPool：异步查询 · 脏数据回写 · 配置表加载</td><td>LSS + SessionKey + DB 密码</td><td>❌ 仅内网</td><td>1-16</td></tr>
+    <tr><td><strong>CenterServer</strong></td><td>服务注册发现 · 心跳检测 · 跨服消息路由 · 玩家全局位置索引</td><td>无</td><td>❌ 仅内网</td><td>1（主备）</td></tr>
+    <tr><td><strong>SocialServer</strong></td><td>公会管理 · 聊天频道 · 好友系统 · 邮件系统 · 全服拍卖行 · 匹配系统<br>内置 DBWorkerPool：公会/邮件/好友持久化</td><td>DB 密码</td><td>❌ 仅内网</td><td>1-2</td></tr>
+  </table>
+
+  <h3>11.3 数据库连接拓扑</h3>
+  <p>
+    不设独立的 DBServer 进程。需要持久化的进程（WorldServer / SocialServer / LoginServer）各自内部持有
+    <code>DBWorkerPool</code>（共享的 common 库组件），直连 PgBouncer。这是业界主流做法（TrinityCore / Mangos / 天堂2）。
+  </p>
+  <pre>
+WorldServer ──┐
+              ├── DBWorkerPool (3-5 worker) ──→ PgBouncer:6432 ──→ PostgreSQL
+SocialServer ─┤       ↑ 每个 worker 一个 libpq 连接
+              │
+LoginServer ──┘       (LoginServer 同步查，2-3 连接)</pre>
+
+  <table>
+    <tr><th>进程</th><th>DB Worker 数</th><th>到 PgBouncer 的连接数</th><th>查询模式</th></tr>
+    <tr><td><strong>WorldServer</strong></td><td>3-5</td><td>3-5</td><td>异步回调：LogicThread 发 SQL → Worker 执行 → 结果回 LogicThread</td></tr>
+    <tr><td><strong>SocialServer</strong></td><td>2</td><td>2</td><td>异步回调（同上）</td></tr>
+    <tr><td><strong>LoginServer</strong></td><td>0（同步）</td><td>2-3</td><td>同步阻塞：`SELECT` → 验证 → 返回（登录非高频，可同步）</td></tr>
+  </table>
+
+  <h3>11.4 客户端视角——两次 TCP 连接</h3>
+  <pre>
+Client
+  │
+  ├── ① TCP → LoginServer (TLS)
+  │     MSG_LOGIN_AUTH_REQ {username, password, clientDHKey}
+  │     MSG_LOGIN_AUTH_RSP {gateIPs: [...], sessionToken: &lt;46 bytes&gt;}
+  │     断开
+  │
+  ├── ② TCP → GateServer
+  │     首包: MSG_LOGIN_ENTER_WORLD_REQ {sessionId, sessionToken}
+  │     后续: 所有业务消息 (MsgID + SessionId 明文, Body AES-GCM 加密)
+  │
+  └── ③ Gate 断路 → 选下一个 gateIP 重连 → WorldServer 通过 SessionToken 重新绑定</pre>
+
+  <h3>11.5 各进程对 IOContextPool 的使用</h3>
+  <table>
+    <tr><th>进程</th><th>IOContextPool 连接方</th><th>说明</th></tr>
+    <tr><td>LoginServer</td><td>客户端 TCP（TLS）+ PgBouncer（libpq）</td><td>短连接——登录完就断。IOContextPool 2-4 线程。</td></tr>
+    <tr><td>GateServer</td><td>客户端 TCP + WorldServer 内部 TCP</td><td>对客户端：长连接(10K+)。对 World：每 World 一条 TCP。</td></tr>
+    <tr><td>WorldServer</td><td>Gate 内部 TCP + CenterServer TCP + SocialServer TCP</td><td>所有连接来自内网，不直接对公网。DBWorkerPool 的 libpq 连接不走 asio。</td></tr>
+    <tr><td>CenterServer</td><td>各 WorldServer 注册+心跳 TCP</td><td>低频小包。</td></tr>
+    <tr><td>SocialServer</td><td>各 WorldServer 的 RPC TCP</td><td>中频，小包。DBWorkerPool 走 libpq 直连 PgBouncer。</td></tr>
+  </table>
+
+  <h3>11.6 开发环境——本地全部进程</h3>
+  <pre>
+# 终端 1: PgBouncer（需要 PG 先启动）
+pgbouncer config/pgbouncer.ini
+
+# 终端 2: CenterServer
+./CenterServer --config config/center.toml   # localhost:7000
+
+# 终端 3: SocialServer
+./SocialServer --config config/social.toml   # localhost:7001
+
+# 终端 4-5: WorldServer (可起多个)
+./WorldServer --config config/world_1.toml   # localhost:8001
+./WorldServer --config config/world_2.toml   # localhost:8002
+
+# 终端 6-7: GateServer (可起多个)
+./GateServer --config config/gate_1.toml     # localhost:9000
+
+# 终端 8: LoginServer
+./LoginServer --config config/login.toml     # localhost:8443</pre>
+
+</div>
+
+<nav class="breadcrumb" style="margin-top:24px;">
+  <a href="../Design.html">🏠 返回总目录</a>
+</nav>
+
+</div>
+<div class="footer">
+  MMO Server Architecture Design Document · Version 1.2
+</div>
+</body>
+</html>

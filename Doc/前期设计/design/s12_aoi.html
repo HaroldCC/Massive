@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>12. AOI 兴趣区域系统 · 九宫格 + 空间哈希 — MMO 服务器架构设计 v1</title>
+<link rel="stylesheet" href="../shared.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="../Design.html">🏠 总目录</a></nav>
+<div class="container">
+<span class="badge confirmed">✔ 已确认</span>
+
+<div class="section" id="s12">
+  <h2>12. AOI 兴趣区域系统 · 九宫格 + 空间哈希</h2>
+
+  <h3>12.1 设计动机</h3>
+  <p>
+    纯九宫格（Grid）在实体分布极不均匀时退化：主城广场数千人挤在少数格子中，一次查询退化为全量遍历；
+    野外大部分格子空置，浪费内存。本方案采用 <strong>九宫格 + 空间哈希混合</strong>：
+    九宫格做第一层索引。当格子内实体 ≥ 200 时自动升级为空间哈希（16 子格精细查询），实体 ≤ 50 自动降级。
+  </p>
+
+  <h3>12.2 坐标系统与格子参数</h3>
+  <p>
+    AOI 基于 <strong>水平面（x, z）</strong> 做空间索引。y 轴（高度）不参与 AOI 格子划分——
+    高度校验通过单独的视野范围（<code>|y1 - y2| &lt; viewRangeY</code>）做过滤。
+    这和大多数 MMO 的做法一致（WoW、TrinityCore 都用 2D 水平面 AOI）。
+  </p>
+
+  <table>
+    <tr><th>参数</th><th>默认值</th><th>说明</th></tr>
+    <tr><td><code>kGridSize</code></td><td>50.0m</td><td>格子边长。应 ≈ viewRadius，使九宫格正好覆盖视野。</td></tr>
+    <tr><td><code>kViewRadiusXZ</code></td><td>100.0m</td><td>水平视野半径。AOI 查询范围 = 实体所在格 ± 2 圈。</td></tr>
+    <tr><td><code>kViewRadiusY</code></td><td>50.0m</td><td>高度视野阈值。AOI 结果出来后按 |dy| 过滤。</td></tr>
+    <tr><td><code>kHotThreshold</code></td><td>200</td><td>格子内实体 ≥ 200 → 升级为热点模式。</td></tr>
+    <tr><td><code>kCoolThreshold</code></td><td>50</td><td>格子内实体 ≤ 50 → 降级回普通模式。</td></tr>
+    <tr><td><code>kSubGrids</code></td><td>4</td><td>每维 4 份，热点模式内部共 16 个子格。</td></tr>
+    <tr><td><code>kMaxPacketSize</code></td><td>64KB</td><td>与 S7 一致，单次 AOI 广播包上限。</td></tr>
+  </table>
+
+  <h3>12.3 核心数据结构</h3>
+
+  <pre><code><span class="cm">// GridAoiSystem.h</span>
+
+<span class="kw">struct</span> <span class="tp">CellIndex</span> { <span class="kt">int</span> x, z; };        <span class="cm">// 格子坐标（整数索引）</span>
+<span class="kw">struct</span> <span class="tp">SubCellKey</span> { <span class="kt">int</span> sx, sz; };     <span class="cm">// 子格坐标（0..kSubGrids-1）</span>
+
+<span class="cm">// 热-点模式：子格 &rarr; 实体列表</span>
+<span class="kw">using</span> <span class="tp">SubCellMap</span> = <span class="tp">std::unordered_map</span>&lt;<span class="tp">uint64_t</span>, <span class="tp">std::vector</span>&lt;<span class="tp">Entity</span>&gt;&gt;;
+
+<span class="kw">class</span> <span class="tp">GridCell</span> {
+<span class="kw">public</span>:
+    <span class="tp">std::vector</span>&lt;<span class="tp">Entity</span>&gt; entities;         <span class="cm">// 普通模式：直接存实体列表</span>
+    <span class="tp">SubCellMap</span> hotSubCells;          <span class="cm">// 热点模式：子格 &rarr; 实体列表</span>
+    <span class="kt">bool</span> isHot = <span class="nb">false</span>;
+
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="tp">size_t</span> kHotThreshold = <span class="num">200</span>;
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="tp">size_t</span> kCoolThreshold = <span class="num">50</span>;
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="tp">uint32_t</span> kSubGrids = <span class="num">4</span>;  <span class="cm">// 每维 4 份，共 16 子格</span>
+};
+
+<span class="kw">class</span> <span class="tp">GridAoiSystem</span> {
+<span class="kw">public</span>:
+    <span class="fn">GridAoiSystem</span>(<span class="kp">uint32_t</span> sceneId, <span class="kt">float</span> gridSize, <span class="kt">float</span> viewRadiusXZ, <span class="kt">float</span> viewRadiusY);
+
+    <span class="cm">// &mdash;&mdash; 实体位置更新（每 Tick 调用）&mdash;&mdash;</span>
+    <span class="kt">void</span> <span class="fn">UpdateEntityPosition</span>(<span class="tp">Entity</span> entity, <span class="kt">float</span> x, <span class="kt">float</span> y, <span class="kt">float</span> z);
+
+    <span class="cm">// &mdash;&mdash; 查询 &mdash;&mdash;</span>
+    <span class="tp">std::vector</span>&lt;<span class="tp">Entity</span>&gt; <span class="fn">GetWatchers</span>(<span class="tp">Entity</span> entity);  <span class="cm">// 返回 entity 的 AOI 范围内所有其他实体（去重+排除自身）</span>
+    <span class="tp">std::vector</span>&lt;<span class="tp">Entity</span>&gt; <span class="fn">GetEntitiesInRadius</span>(<span class="kt">float</span> x, <span class="kt">float</span> z, <span class="kt">float</span> radius);
+
+    <span class="cm">// &mdash;&mdash; 事件 &mdash;&mdash;</span>
+    <span class="tp">std::vector</span>&lt;<span class="tp">Entity</span>&gt; <span class="fn">GetEnteredEntities</span>(<span class="tp">Entity</span> entity);   <span class="cm">// 本 Tick 新进入 entity 视野的实体</span>
+    <span class="tp">std::vector</span>&lt;<span class="tp">Entity</span>&gt; <span class="fn">GetLeftEntities</span>(<span class="tp">Entity</span> entity);      <span class="cm">// 本 Tick 离开 entity 视野的实体</span>
+
+    <span class="cm">// &mdash;&mdash; 热点管理 &mdash;&mdash;</span>
+    <span class="kt">void</span> <span class="fn">CheckHotSpotDowngrade</span>();  <span class="cm">// 每 Tick 检查是否有热点格子可以降级</span>
+
+<span class="kw">private</span>:
+    <span class="cm">// 位置 &rarr; 格子索引</span>
+    <span class="tp">CellIndex</span> <span class="fn">GetCellIndex</span>(<span class="kt">float</span> x, <span class="kt">float</span> z) <span class="kw">const</span>;
+    <span class="kt">bool</span>     <span class="fn">IsValidCell</span>(<span class="kw">const</span> <span class="tp">CellIndex</span>&amp; c) <span class="kw">const</span>;
+
+    <span class="cm">// 子格索引</span>
+    <span class="tp">SubCellKey</span> <span class="fn">GetSubCellKey</span>(<span class="kt">float</span> x, <span class="kt">float</span> z, <span class="kw">const</span> <span class="tp">CellIndex</span>&amp; cell) <span class="kw">const</span>;
+    <span class="tp">uint64_t</span>   <span class="fn">EncodeSubCellKey</span>(<span class="kw">const</span> <span class="tp">SubCellKey</span>&amp; key, <span class="kw">const</span> <span class="tp">CellIndex</span>&amp; cell) <span class="kw">const</span>;
+
+    <span class="cm">// 升降级</span>
+    <span class="kt">void</span> <span class="fn">UpgradeToHotCell</span>(<span class="kw">const</span> <span class="tp">CellIndex</span>&amp; cell);
+    <span class="kt">void</span> <span class="fn">DowngradeFromHotCell</span>(<span class="kw">const</span> <span class="tp">CellIndex</span>&amp; cell);
+
+    <span class="cm">// 添加/移除实体</span>
+    <span class="kt">void</span> <span class="fn">AddToCell</span>(<span class="tp">Entity</span> entity, <span class="kw">const</span> <span class="tp">CellIndex</span>&amp; cell, <span class="kt">float</span> x, <span class="kt">float</span> z);
+    <span class="kt">void</span> <span class="fn">RemoveFromCell</span>(<span class="tp">Entity</span> entity, <span class="kw">const</span> <span class="tp">CellIndex</span>&amp; cell);
+
+    <span class="tp">uint32_t</span> <span class="kw">_sceneId</span>;
+    <span class="kt">float</span>    <span class="kw">_gridSize</span>;
+    <span class="kt">float</span>    <span class="kw">_subGridSize</span>;    <span class="cm">// _gridSize / kSubGrids</span>
+    <span class="kt">float</span>    <span class="kw">_viewRadiusXZ</span>;
+    <span class="kt">float</span>    <span class="kw">_viewRadiusY</span>;
+    <span class="kt">int</span>      <span class="kw">_viewRangeCells</span>;  <span class="cm">// ceil(_viewRadiusXZ / _gridSize)</span>
+
+    <span class="cm">// 2D 网格（稀疏——只分配有实体的格子）</span>
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">uint64_t</span>, <span class="tp">GridCell</span>&gt; <span class="kw">_cells</span>;  <span class="cm">// key = EncodeCellKey(x,z)</span>
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">Entity</span>, <span class="tp">CellIndex</span>&gt; <span class="kw">_entityCells</span>;   <span class="cm">// entity &rarr; 当前格子</span>
+
+    <span class="cm">// 各实体在上个 Tick 的可见集——用于计算 enter/leave 事件</span>
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">Entity</span>, <span class="tp">std::unordered_set</span>&lt;<span class="tp">Entity</span>&gt;&gt; <span class="kw">_prevVisible</span>;
+};</code></pre>
+
+  <h3>12.4 核心算法</h3>
+
+  <h4>12.4.1 实体位置更新</h4>
+  <pre><code><span class="kt">void</span> <span class="tp">GridAoiSystem</span>::<span class="fn">UpdateEntityPosition</span>(<span class="tp">Entity</span> entity, <span class="kt">float</span> x, <span class="kt">float</span> y, <span class="kt">float</span> z) {
+    <span class="kw">auto</span> newCell = <span class="fn">GetCellIndex</span>(x, z);  <span class="cm">// 水平面: cellX = floor(x / _gridSize), cellZ = floor(z / _gridSize)</span>
+    <span class="kw">auto</span> it = <span class="kw">_entityCells</span>.find(entity);
+
+    <span class="kw">if</span> (it == <span class="kw">_entityCells</span>.end()) {
+        <span class="cm">// 新实体——首次添加到 AOI</span>
+        <span class="fn">AddToCell</span>(entity, newCell, x, z);
+        <span class="kw">_entityCells</span>[entity] = newCell;
+    }
+    <span class="kw">else</span> <span class="kw">if</span> (it-&gt;second.x != newCell.x || it-&gt;second.z != newCell.z) {
+        <span class="cm">// 跨格移动</span>
+        <span class="kw">auto</span> oldCell = it-&gt;second;
+        <span class="fn">RemoveFromCell</span>(entity, oldCell);
+        <span class="fn">AddToCell</span>(entity, newCell, x, z);
+        <span class="kw">_entityCells</span>[entity] = newCell;
+    }
+    <span class="kw">else</span> <span class="kw">if</span> (<span class="kw">_cells</span>[<span class="fn">EncodeCellKey</span>(newCell)].isHot) {
+        <span class="cm">// 同一热点格子内移动——更新子格归属</span>
+        <span class="fn">UpdateHotCellPosition</span>(entity, x, z, newCell);
+    }
+
+    <span class="kw">_entityPositions</span>[entity] = {x, y, z};
+}
+
+<span class="cm">// 添加实体到格子，自动检测热点阈值</span>
+<span class="kt">void</span> <span class="tp">GridAoiSystem</span>::<span class="fn">AddToCell</span>(<span class="tp">Entity</span> entity, <span class="kw">const</span> <span class="tp">CellIndex</span>&amp; cell, <span class="kt">float</span> x, <span class="kt">float</span> z) {
+    <span class="kw">auto</span> key = <span class="fn">EncodeCellKey</span>(cell);  <span class="cm">// key = (uint64_t(cellX) &lt;&lt; 32) | uint32_t(cellZ)</span>
+    <span class="kw">auto</span>&amp; c = <span class="kw">_cells</span>[key];  <span class="cm">// 格子不存在时自动创建</span>
+
+    <span class="kw">if</span> (c.isHot) {
+        <span class="kw">auto</span> subKey = <span class="fn">GetSubCellKey</span>(x, z, cell);
+        c.hotSubCells[<span class="fn">EncodeSubCellKey</span>(subKey, cell)].push_back(entity);
+    } <span class="kw">else</span> {
+        c.entities.push_back(entity);
+        <span class="kw">if</span> (c.entities.size() &gt;= GridCell::kHotThreshold)
+            <span class="fn">UpgradeToHotCell</span>(cell);
+    }
+}</code></pre>
+
+  <h4>12.4.2 GetWatchers — 九宫格查询</h4>
+  <pre><code><span class="tp">std::vector</span>&lt;<span class="tp">Entity</span>&gt; <span class="tp">GridAoiSystem</span>::<span class="fn">GetWatchers</span>(<span class="tp">Entity</span> entity) {
+    <span class="kw">auto</span> itPos = <span class="kw">_entityPositions</span>.find(entity);
+    <span class="kw">if</span> (itPos == <span class="kw">_entityPositions</span>.end()) <span class="kw">return</span> {};
+
+    <span class="kw">auto</span> cellIt = <span class="kw">_entityCells</span>.find(entity);
+    <span class="kw">if</span> (cellIt == <span class="kw">_entityCells</span>.end()) <span class="kw">return</span> {};
+
+    <span class="kw">auto</span>&amp; pos  = itPos-&gt;second;
+    <span class="kw">auto</span>&amp; cell = cellIt-&gt;second;
+
+    <span class="tp">std::unordered_set</span>&lt;<span class="tp">Entity</span>&gt; resultSet;  <span class="cm">// 自动去重</span>
+
+    <span class="cm">// 遍历九宫格 (±_viewRangeCells 格)</span>
+    <span class="kw">for</span> (<span class="kt">int</span> dx = -<span class="kw">_viewRangeCells</span>; dx &lt;= <span class="kw">_viewRangeCells</span>; dx++) {
+        <span class="kw">for</span> (<span class="kt">int</span> dz = -<span class="kw">_viewRangeCells</span>; dz &lt;= <span class="kw">_viewRangeCells</span>; dz++) {
+            <span class="tp">CellIndex</span> neighbor{cell.x + dx, cell.z + dz};
+
+            <span class="kw">auto</span> cit = <span class="kw">_cells</span>.find(<span class="fn">EncodeCellKey</span>(neighbor));
+            <span class="kw">if</span> (cit == <span class="kw">_cells</span>.end()) <span class="kw">continue</span>;  <span class="cm">// 空格子，跳过</span>
+
+            <span class="kw">auto</span>&amp; gc = cit-&gt;second;
+            <span class="kw">if</span> (gc.isHot) {
+                <span class="cm">// 热点模式：只查与 entity 所在子格相邻的子格（九宫格内的九宫格）</span>
+                <span class="kw">auto</span> subKey = <span class="fn">GetSubCellKey</span>(pos.x, pos.z, neighbor);
+                <span class="kw">for</span> (<span class="kt">int</span> sdx = -<span class="num">1</span>; sdx &lt;= <span class="num">1</span>; sdx++)
+                    <span class="kw">for</span> (<span class="kt">int</span> sdz = -<span class="num">1</span>; sdz &lt;= <span class="num">1</span>; sdz++) {
+                        <span class="kw">auto</span> hit = gc.hotSubCells.find(
+                            <span class="fn">EncodeSubCellKey</span>({subKey.sx + sdx, subKey.sz + sdz}, neighbor));
+                        <span class="kw">if</span> (hit != gc.hotSubCells.end())
+                            resultSet.insert(hit-&gt;second.begin(), hit-&gt;second.end());
+                    }
+            } <span class="kw">else</span> {
+                <span class="cm">// 普通模式：直接取全部</span>
+                resultSet.insert(gc.entities.begin(), gc.entities.end());
+            }
+        }
+    }
+
+    <span class="cm">// 排除自身</span>
+    resultSet.erase(entity);
+
+    <span class="kw">return</span> {resultSet.begin(), resultSet.end()};
+}</code></pre>
+
+  <h4>12.4.3 AOI 事件计算 (Enter / Leave)</h4>
+  <p>
+    每 Tick 在各实体的 GetWatchers 结果和上一 Tick 的可见集之间做 diff，计算出新进入视野和离开视野的实体列表，
+    通过 DasLang 桥接 API 投递事件给脚本处理（发 EntityCreateNtf / EntityDestroyNtf 给对应客户端）。
+  </p>
+
+  <pre><code><span class="cm">// C++ 引擎在 SystemAOI 中调用，每 Tick</span>
+<span class="kt">void</span> <span class="tp">GridAoiSystem</span>::<span class="fn">FlushAoiEvents</span>(<span class="tp">Scene</span>&amp; scene) {
+    <span class="kw">for</span> (<span class="kw">auto</span>&amp; [entity, prevSet] : <span class="kw">_prevVisible</span>) {
+        <span class="kw">auto</span> nowSet = <span class="fn">GetWatchersAsSet</span>(entity);
+        <span class="kw">auto</span> entered = std::set_difference(nowSet, prevSet);
+        <span class="kw">auto</span> left    = std::set_difference(prevSet, nowSet);
+
+        <span class="kw">for</span> (<span class="kw">auto</span> e : entered)
+            <span class="fn">OnEntityEnterAoi</span>(entity, e);  <span class="cm">// &rarr; DasLang 回调</span>
+        <span class="kw">for</span> (<span class="kw">auto</span> e : left)
+            <span class="fn">OnEntityLeaveAoi</span>(entity, e);
+
+        prevSet = std::move(nowSet);
+    }
+}</code></pre>
+
+  <h4>12.4.4 热点升级 / 降级</h4>
+  <pre><code><span class="kt">void</span> <span class="tp">GridAoiSystem</span>::<span class="fn">UpgradeToHotCell</span>(<span class="kw">const</span> <span class="tp">CellIndex</span>&amp; cellIdx) {
+    <span class="kw">auto</span>&amp; cell = <span class="kw">_cells</span>[<span class="fn">EncodeCellKey</span>(cellIdx)];
+    cell.isHot = <span class="nb">true</span>;
+
+    <span class="cm">// 将所有实体按精细坐标分配到 16 个子格</span>
+    <span class="kw">for</span> (<span class="kw">auto</span> e : cell.entities) {
+        <span class="kw">auto</span> itPos = <span class="kw">_entityPositions</span>.find(e);
+        <span class="kw">if</span> (itPos == <span class="kw">_entityPositions</span>.end()) <span class="kw">continue</span>;
+        <span class="kw">auto</span> subKey = <span class="fn">GetSubCellKey</span>(itPos-&gt;second.x, itPos-&gt;second.z, cellIdx);
+        cell.hotSubCells[<span class="fn">EncodeSubCellKey</span>(subKey, cellIdx)].push_back(e);
+    }
+
+    cell.entities.clear();  <span class="cm">// 释放普通列表</span>
+}
+
+<span class="kt">void</span> <span class="tp">GridAoiSystem</span>::<span class="fn">DowngradeFromHotCell</span>(<span class="kw">const</span> <span class="tp">CellIndex</span>&amp; cellIdx) {
+    <span class="kw">auto</span>&amp; cell = <span class="kw">_cells</span>[<span class="fn">EncodeCellKey</span>(cellIdx)];
+
+    <span class="cm">// 收集所有子格的实体回到普通列表</span>
+    <span class="kw">for</span> (<span class="kw">auto</span>&amp; [key, entities] : cell.hotSubCells)
+        cell.entities.insert(cell.entities.end(), entities.begin(), entities.end());
+
+    <span class="kw">auto</span> [it, _] = cell.hotSubCells.clear();  <span class="cm">// 或直接 cell.hotSubCells = {} 触发析</span>
+    <span class="kw">auto</span> temp = <span class="tp">SubCellMap</span>{};
+    cell.hotSubCells.swap(temp);             <span class="cm">// 释放内存</span>
+    cell.isHot = <span class="nb">false</span>;
+}</code></pre>
+
+  <h3>12.5 与 Scene / ECS 集成</h3>
+  <p>
+    每个 <code>Scene</code> 持有自己的 <code>GridAoiSystem</code>。Scene::OnEntityMove 同时更新 EnTT Position 组件和 AOI 位置。
+    <code>ecs_stage "aoi"</code> 阶段调用 Scene::FlushAoiEvents，diff 计算 Enter/Leave 事件并投递给 DasLang 脚本。
+  </p>
+
+  <pre><code><span class="cm">// Scene.h — AOI 集成</span>
+<span class="kw">class</span> <span class="tp">Scene</span> {
+<span class="kw">public</span>:
+    <span class="kt">void</span> <span class="fn">OnEntityMove</span>(<span class="tp">Entity</span> entity, <span class="kt">float</span> x, <span class="kt">float</span> y, <span class="kt">float</span> z) {
+        <span class="cm">// 1. 更新 EnTT Position 组件</span>
+        <span class="kw">auto</span>&amp; pos = <span class="kw">_ecsRegistry</span>.get&lt;<span class="tp">Position</span>&gt;(entt::entity(entity.EntityId()));
+        pos.x = x; pos.y = y; pos.z = z;
+
+        <span class="cm">// 2. 更新 AOI 系统</span>
+        <span class="kw">_aoi</span>.UpdateEntityPosition(entity, x, y, z);
+    }
+
+    <span class="kt">void</span> <span class="fn">FlushAoiEvents</span>() {
+        <span class="kw">_aoi</span>.FlushAoiEvents(*<span class="kw">this</span>);  <span class="cm">// 内部调 OnEntityEnterAoi / OnEntityLeaveAoi &rarr; DasLang</span>
+    }
+
+    <span class="tp">GridAoiSystem</span>&amp; <span class="fn">GetAoi</span>() { <span class="kw">return</span> <span class="kw">_aoi</span>; }
+
+<span class="kw">private</span>:
+    <span class="tp">entt::registry</span> <span class="kw">_ecsRegistry</span>;
+    <span class="tp">GridAoiSystem</span> <span class="kw">_aoi</span>;
+};</code></pre>
+
+  <h3>12.6 DasLang 桥接 API</h3>
+  <pre><code><span class="cm">// C++ 侧注册给 DasLang</span>
+<span class="fn">GetAoiWatchers</span>(sceneId: uint32; entityId: Entity): array&lt;Entity&gt;
+<span class="fn">GetEntitiesInAoiRadius</span>(sceneId: uint32; x: float; z: float; radius: float): array&lt;Entity&gt;
+
+<span class="cm">// AOI 事件回调（C++ 引擎调用）</span>
+<span class="fn">OnEntityEnterAoi</span>(observer: Entity; target: Entity)   <span class="cm">// observer 的视野中进入了 target</span>
+<span class="fn">OnEntityLeaveAoi</span>(observer: Entity; target: Entity)   <span class="cm">// target 离开 observer 的视野</span>
+
+<span class="cm">// DasLang 侧使用——发送网络消息给客户端</span>
+<span class="kw">def</span> <span class="fn">OnEntityEnterAoi</span>(observer : Entity; target : Entity)
+{
+    <span class="kw">let</span> msg = EntityCreateNtf{ entityId = target, entityType = GetEntityType(target) }
+    SendToClient(observer, MSG_ENTITY_CREATE_NTF, SerializeProto(msg))
+}
+
+<span class="kw">def</span> <span class="fn">OnEntityLeaveAoi</span>(observer : Entity; target : Entity)
+{
+    <span class="kw">let</span> msg = EntityDestroyNtf{ entityId = target }
+    SendToClient(observer, MSG_ENTITY_DESTROY_NTF, SerializeProto(msg))
+}</code></pre>
+
+  <h3>12.7 3D 兼容说明</h3>
+  <p>
+    AOI 水平面（x, z）用九宫格 + 空间哈希做空间索引。高度（y）在 GetWatchers 结果集上做后过滤：
+    <code>|entity.y - observer.y| &lt; _viewRadiusY</code>。这不是性能瓶颈——AOI 结果集通常在 50-200 个实体，
+    遍历一次做高度过滤是 O(n) 的，成本远低于格子索引本身。
+  </p>
+
+  <h3>12.8 性能特征</h3>
+  <table>
+    <tr><th>操作</th><th>复杂度</th><th>说明</th></tr>
+    <tr><td>UpdateEntityPosition</td><td>O(1) 或 O(log n)</td><td>hash map 查格子 + vector push。跨格时为旧格 O(1) 删除（无序遍历交换）。</td></tr>
+    <tr><td>GetWatchers</td><td>O(K × M)</td><td>K = 九宫格格数（通常 9 或 25），M = 每格平均实体数。热点模式为子格查询。</td></tr>
+    <tr><td>FlushAoiEvents</td><td>O(N × M)</td><td>N = 实体数。每 Tick 对所有有 AOI 关注的实体做可见集 diff。</td></tr>
+    <tr><td>UpgradeToHotCell</td><td>O(E)</td><td>E = 格子内实体数（一次性）。触发频率极低（每格子一次）。</td></tr>
+  </table>
+
+  <div class="callout info">
+    <strong>设计验证</strong>：本方案参考了 WoW (TrinityCore) 的九宫格 AOI、MOBA 视野筛减技术（广播量可降低 90%+）、
+    及空间哈希的轻量化空间索引实践。与纯九宫格相比，热点模式在主城广场场景下将查询范围从 2000 实体缩小到 ~50 实体的子格范围，
+    避免了 O(n&sup2;) 退化。
+  </div>
+
+</div>
+
+<nav class="breadcrumb" style="margin-top:24px;"><a href="../Design.html">🏠 返回总目录</a></nav>
+<div class="footer">MMO Server Architecture Design Document · Version 1.2</div>
+</body>
+</html>

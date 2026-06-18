@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>17. 寻路与移动校验 — MMO 服务器架构设计 v1</title>
+<link rel="stylesheet" href="../shared.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="../Design.html">🏠 总目录</a></nav>
+<div class="container">
+<span class="badge confirmed">✔ 已确认</span>
+
+<div class="section" id="s17">
+  <h2>17. 寻路与移动校验</h2>
+
+  <h3>17.1 NavMesh 库：Recast/Detour</h3>
+  <p>
+    离线用 Recast 烘焙场景 .obj → .navmesh 二进制文件。运行时 Detour 加载 .navmesh 做 A* 寻路 + 射线检测。
+    支持多层地形（楼梯/桥梁/洞穴）、动态障碍（临时阻挡）、多 Agent 类型（步行/飞行/游泳）。
+    WoW、Unreal Engine、Unity NavMesh 底层都用 Recast/Detour。
+  </p>
+
+  <table>
+    <tr><th>工具</th><th>阶段</th><th>输出</th></tr>
+    <tr><td>Recast</td><td>离线烘焙（美术场景导出后）</td><td><code>scene_1001.navmesh</code></td></tr>
+    <tr><td>Detour</td><td>运行时加载 + 查询</td><td>路径点列表 / 射线检测结果</td></tr>
+  </table>
+
+  <h3>17.2 基础类型</h3>
+  <pre><code><span class="cm">// 所有寻路 API 使用的三维向量</span>
+<span class="kw">struct</span> <span class="tp">Vector3</span> { <span class="kt">float</span> x; <span class="kt">float</span> y; <span class="kt">float</span> z; };</code></pre>
+
+  <h3>17.3 NavMesh 数据管理</h3>
+  <pre><code><span class="kw">class</span> <span class="tp">NavMeshManager</span> {
+<span class="kw">public</span>:
+    <span class="kt">bool</span> <span class="fn">Load</span>(<span class="tp">uint32_t</span> sceneId, <span class="kw">const</span> <span class="tp">std::string</span>&amp; filePath);  <span class="cm">// Scene 创建时调用</span>
+    <span class="kt">void</span> <span class="fn">Unload</span>(<span class="tp">uint32_t</span> sceneId);                            <span class="cm">// Scene 销毁时调用</span>
+
+    <span class="cm">// 寻路 — A* 返回完整路径点</span>
+    <span class="tp">std::vector</span>&lt;<span class="tp">Vector3</span>&gt; <span class="fn">FindPath</span>(<span class="tp">uint32_t</span> sceneId,
+                                 <span class="kw">const</span> <span class="tp">Vector3</span>&amp; from, <span class="kw">const</span> <span class="tp">Vector3</span>&amp; to,
+                                 <span class="tp">int</span> maxIters = <span class="num">0</span>);  <span class="cm">// 0 = 不限迭代，&gt;0 = 分帧</span>
+
+    <span class="cm">// 射线检测（开发期调试用）</span>
+    <span class="kt">bool</span> <span class="fn">Raycast</span>(<span class="tp">uint32_t</span> sceneId,
+                 <span class="kw">const</span> <span class="tp">Vector3</span>&amp; from, <span class="kw">const</span> <span class="tp">Vector3</span>&amp; to);
+
+    <span class="cm">// 点是否在 NavMesh 上</span>
+    <span class="kt">bool</span> <span class="fn">IsOnNavMesh</span>(<span class="tp">uint32_t</span> sceneId, <span class="kw">const</span> <span class="tp">Vector3</span>&amp; point);
+
+<span class="kw">private</span>:
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">uint32_t</span>, <span class="tp">dtNavMesh</span>*&gt; <span class="kw">_navMeshes</span>;
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">uint32_t</span>, <span class="tp">dtNavMeshQuery</span>*&gt; <span class="kw">_queries</span>;
+};</code></pre>
+
+  <h3>17.4 寻路缓存策略</h3>
+  <p><strong>静态缓存</strong>：NPC 巡逻路径、打卡点间预计算一次，后续复用。<strong>动态分帧</strong>：怪物追击玩家时分帧计算 A*（每 Tick 限制 maxIters），不卡 Tick。</p>
+
+  <h3>17.5 移动校验：全权服务器校验</h3>
+  <p>
+    之前的方案在步骤 ③ 用 Raycast 做穿墙检测——这对直线移动足够了，但对曲线路径（绕墙走）不成立。
+    修正后的方案：用 <strong>FindPath 验证路径可达性</strong>，而非简单 Raycast。
+  </p>
+
+  <pre>
+Client → MSG_MOVE_REQ(targetX, targetY, targetZ)
+  │
+  ├── ① IsOnNavMesh(from) && IsOnNavMesh(to) ?
+  │       任一不在 NavMesh 上 → MOVE_RSP(rejected, "not on navmesh")
+  │
+  ├── ② 距离检查: dist(from, to) ≤ maxSpeed × dt × tolerance(1.2) ?
+  │       超过最大移速 → rejected ("speed hack suspected")
+  │       tolerance=1.2 容忍网络抖动和客户端预测误差
+  │
+  ├── ③ FindPath(from, to) 返回非空路径 ?
+  │       路径不可达（穿墙/跨越不可行走地形）→ rejected ("no valid path")
+  │
+  ├── ④ 路径合理性检查: pathLength ≤ dist(from, to) × 2.0 ?
+  │       路径长度异常（弯曲程度超过 2 倍直线距离）→ rejected ("path too long")
+  │
+  └── ⑤ 全部通过 → 更新 Position → 标记脏 → 广播 Nearby → MOVE_RSP(accepted)</pre>
+
+  <table>
+    <tr><th>步骤</th><th>校验内容</th><th>阻止的作弊类型</th></tr>
+    <tr><td>①</td><td>起点和终点都在 NavMesh 上</td><td>飞天（y 坐标异常高）、遁地（y 坐标异常低）</td></tr>
+    <tr><td>②</td><td>移动距离 ≤ 最大速度 × 时间</td><td>加速挂、瞬移挂</td></tr>
+    <tr><td>③</td><td>起点到终点可达</td><td>穿墙（直接穿过不可行走区域）</td></tr>
+    <tr><td>④</td><td>路径长度合理</td><td>绕远路绕过 distance 检查（3D 空间绕行后路径极长）</td></tr>
+  </table>
+
+  <div class="callout warn">
+    <strong>⚠ 性能注意</strong>：FindPath 每次调用的成本约为 0.1-0.5ms（取决于路径长度和 NavMesh 复杂度）。
+    每 Tick 有 500-1000 个移动玩家时，总寻路开销约为 50-500ms，超出 50ms Tick 预算。
+    <strong>缓解策略</strong>：只对移动请求做 FindPath 校验，不是每个 entity 每 Tick 都校验。
+    玩家发 MSG_MOVE_REQ 的频率远低于每 Tick（通常每秒 4-10 次）。500 个在线玩家 × 每秒 5 次 = 每秒 2500 次 FindPath，单次 0.1ms = 250ms/s，分摊到 20 个 Tick 后每 Tick 约 12.5ms，可接受。
+  </div>
+
+  <h3>17.6 DasLang 桥接 API</h3>
+  <pre><code><span class="cm">// C++ 侧注册给 DasLang — 3 个函数</span>
+<span class="fn">CheckCanMove</span>(sceneId: uint32; fromX, fromY, fromZ: float; toX, toY, toZ: float): bool
+<span class="fn">FindPath</span>(sceneId: uint32; fromX, fromY, fromZ: float; toX, toY, toZ: float): array&lt;Vector3&gt;
+<span class="fn">IsOnNavMesh</span>(sceneId: uint32; x: float; y: float; z: float): bool
+
+<span class="cm">// DasLang 侧使用</span>
+<span class="kw">def</span> <span class="fn">HandleMoveRequest</span>(player : Entity; targetX : float; targetY : float; targetZ : float)
+{
+    <span class="kw">let</span> pos = ecs_get(player, type&lt;<span class="tp">Position</span>&gt;)
+    <span class="kw">if</span> !CheckCanMove(currentSceneId, pos.x, pos.y, pos.z, targetX, targetY, targetZ)
+    {
+        SendToClient(player, MSG_MOVE_RSP, BuildRejectResponse(<span class="str">"invalid move"</span>))
+        <span class="kw">return</span>
+    }
+    ecs_set(player, type&lt;<span class="tp">Position</span>&gt;, Position{targetX, targetY, targetZ})
+    <span class="fn">BroadcastMoveToNearby</span>(player, targetX, targetY, targetZ)
+}</code></pre>
+
+  <h3>17.7 离线烘焙流程</h3>
+  <pre>
+美术导出场景 OBJ/FBX
+  │
+  ▼
+RecastDemo / recast_builder CLI
+  │  输入：scene_mesh.obj + 配置（cellSize=0.3m, agentHeight=2m, agentRadius=0.6m）
+  │  输出：scene_1001.navmesh（二进制）
+  ▼
+data/navmesh/scene_1001.navmesh
+  │
+  ▼
+WorldServer 启动 → Scene::Init() → NavMeshManager::Load(1001, "data/navmesh/scene_1001.navmesh")</pre>
+
+</div>
+
+</div>
+<nav class="breadcrumb" style="margin-top:24px;"><a href="../Design.html">🏠 返回总目录</a></nav>
+<div class="footer">MMO Server Architecture Design Document · Version 1.2</div>
+</body>
+</html>

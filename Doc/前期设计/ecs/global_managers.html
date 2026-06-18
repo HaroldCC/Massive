@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>全局 Manager 单例 — GuildMgr / ChatChannelMgr / BossScheduler / MailMgr — MMO 服务器架构设计 v1.2</title>
+<link rel="stylesheet" href="../shared.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="../Design.html">🏠 总目录</a></nav>
+<div class="container">
+<span class="badge confirmed">✔ 已确认</span>
+
+<div class="section">
+  <h2>全局 Manager 单例</h2>
+
+  <p>
+    替代原先 GlobalRegistry（EnTT registry）的设计。每个跨场景子系统独立为一个 C++ 单例 Manager，
+    内部使用最简单的容器（<code>unordered_map</code> 或 <code>vector</code>），不引入 ECS 开销。
+  </p>
+
+  <h3>Mgr_1: GuildMgr — 公会管理</h3>
+  <pre><code><span class="kw">class</span> <span class="tp">GuildMgr</span> {
+<span class="kw">public</span>:
+    <span class="kw">static</span> <span class="tp">GuildMgr</span>&amp; <span class="fn">Instance</span>();
+
+    <span class="cm">// 生命周期</span>
+    <span class="tp">uint32_t</span> <span class="fn">CreateGuild</span>(<span class="kw">const</span> <span class="tp">std::string</span>&amp; name, <span class="tp">uint32_t</span> founderId);
+    <span class="kt">void</span>     <span class="fn">DisbandGuild</span>(<span class="tp">uint32_t</span> guildId);
+    <span class="kw">const</span> <span class="tp">Guild</span>* <span class="fn">FindByName</span>(<span class="kw">const</span> <span class="tp">std::string</span>&amp; name);
+
+    <span class="cm">// 成员管理</span>
+    <span class="kt">void</span> <span class="fn">AddMember</span>(<span class="tp">uint32_t</span> guildId, <span class="tp">uint32_t</span> playerId);
+    <span class="kt">void</span> <span class="fn">RemoveMember</span>(<span class="tp">uint32_t</span> guildId, <span class="tp">uint32_t</span> playerId);
+    <span class="kw">const</span> <span class="tp">std::vector</span>&lt;<span class="tp">uint32_t</span>&gt;&amp; <span class="fn">GetMembers</span>(<span class="tp">uint32_t</span> guildId);
+
+    <span class="cm">// 公会仓库（第一阶段只保留占位，后续扩展）</span>
+    <span class="kw">const</span> <span class="tp">GuildBank</span>* <span class="fn">GetBank</span>(<span class="tp">uint32_t</span> guildId);
+
+    <span class="cm">// 持久化</span>
+    <span class="kt">void</span> <span class="fn">SaveGuild</span>(<span class="tp">uint32_t</span> guildId);
+    <span class="kt">void</span> <span class="fn">LoadAllGuilds</span>(<span class="tp">DbService</span>&amp; db);
+
+<span class="kw">private</span>:
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">uint32_t</span>, <span class="tp">Guild</span>&gt; <span class="kw">_guilds</span>;        <span class="cm">// guildId → 公会对象</span>
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">std::string</span>, <span class="tp">uint32_t</span>&gt; <span class="kw">_nameToId</span>;  <span class="cm">// 公会名 → guildId</span>
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">uint32_t</span>, <span class="tp">uint32_t</span>&gt; <span class="kw">_playerToGuild</span>; <span class="cm">// playerId → guildId</span>
+};
+
+<span class="kw">struct</span> <span class="tp">Guild</span> {
+    <span class="tp">uint32_t</span> id;
+    <span class="tp">std::string</span> name;
+    <span class="tp">uint32_t</span> leaderId;
+    <span class="tp">std::vector</span>&lt;<span class="tp">uint32_t</span>&gt; members;
+    <span class="tp">GuildBank</span> bank;
+    <span class="tp">uint32_t</span> level = <span class="num">1</span>;
+    <span class="tp">uint32_t</span> experience = <span class="num">0</span>;
+};</code></pre>
+
+  <h3>Mgr_2: ChatChannelMgr — 聊天频道管理</h3>
+  <pre><code><span class="kw">enum class</span> <span class="tp">ChatChannelType</span> { World, Guild, Party, Private, System };
+
+<span class="kw">class</span> <span class="tp">ChatChannelMgr</span> {
+<span class="kw">public</span>:
+    <span class="kw">static</span> <span class="tp">ChatChannelMgr</span>&amp; <span class="fn">Instance</span>();
+
+    <span class="cm">// 发送消息——路由到正确的频道 + 在线玩家</span>
+    <span class="kt">void</span> <span class="fn">SendMessage</span>(<span class="tp">ChatChannelType</span> type, <span class="tp">uint32_t</span> senderId,
+                     <span class="kw">const</span> <span class="tp">std::string</span>&amp; message, <span class="tp">uint32_t</span> targetId = <span class="num">0</span>);
+
+    <span class="cm">// 订阅/取消</span>
+    <span class="kt">void</span> <span class="fn">Subscribe</span>(<span class="tp">uint32_t</span> playerId, <span class="tp">ChatChannelType</span> type, <span class="tp">uint32_t</span> channelId = <span class="num">0</span>);
+    <span class="kt">void</span> <span class="fn">Unsubscribe</span>(<span class="tp">uint32_t</span> playerId, <span class="tp">ChatChannelType</span> type, <span class="tp">uint32_t</span> channelId = <span class="num">0</span>);
+
+<span class="kw">private</span>:
+    <span class="cm">// 频道ID → 订阅者列表</span>
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">uint32_t</span>, <span class="tp">std::vector</span>&lt;<span class="tp">uint32_t</span>&gt;&gt; <span class="kw">_subscribers</span>;
+
+    <span class="tp">uint32_t</span> <span class="fn">ChannelKey</span>(<span class="tp">ChatChannelType</span> type, <span class="tp">uint32_t</span> channelId) {
+        <span class="kw">return</span> (<span class="kw">uint32_t</span>(type) &lt;&lt; <span class="num">24</span>) | (channelId &amp; <span class="num">0xFFFFFF</span>);
+    }
+};</code></pre>
+
+  <h3>Mgr_3: BossScheduler — 世界 Boss 调度</h3>
+  <pre><code><span class="kw">enum class</span> <span class="tp">BossState</span> { Pending, Alive, Dead };
+
+<span class="kw">struct</span> <span class="tp">BossEntry</span> {
+    <span class="tp">uint32_t</span> bossTemplateId;
+    <span class="tp">BossState</span> state = BossState::Pending;
+    <span class="tp">std::chrono::steady_clock::time_point</span> nextSpawnTime;
+    <span class="tp">uint32_t</span> sceneId = <span class="num">0</span>;           <span class="cm">// Boss 所在的场景 ID</span>
+    <span class="tp">Entity</span> bossEntity;               <span class="cm">// Boss 在 Scene 中的 Entity</span>
+    <span class="tp">std::vector</span>&lt;<span class="tp">Participant</span>&gt; participants; <span class="cm">// 参与战斗的玩家（伤害/DPS 等）</span>
+};
+
+<span class="kw">class</span> <span class="tp">BossScheduler</span> {
+<span class="kw">public</span>:
+    <span class="kw">static</span> <span class="tp">BossScheduler</span>&amp; <span class="fn">Instance</span>();
+
+    <span class="cm">// 每 Tick 检查 Boss 刷新，由逻辑线程调用</span>
+    <span class="kt">void</span> <span class="fn">Update</span>();
+
+    <span class="cm">// Boss 死亡——调度下次刷新时间</span>
+    <span class="kt">void</span> <span class="fn">OnBossDefeated</span>(<span class="tp">uint32_t</span> bossTemplateId);
+
+    <span class="cm">// Boss 血量变化（转发到所有参战玩家）</span>
+    <span class="kt">void</span> <span class="fn">OnBossHpChanged</span>(<span class="tp">uint32_t</span> bossTemplateId, <span class="tp">int</span> current, <span class="tp">int</span> maximum);
+
+<span class="kw">private</span>:
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">uint32_t</span>, <span class="tp">BossEntry</span>&gt; <span class="kw">_bosses</span>;  <span class="cm">// bossTemplateId → 状态</span>
+};</code></pre>
+
+  <h3>Mgr_4: MailMgr — 邮件系统</h3>
+  <pre><code><span class="kw">struct</span> <span class="tp">MailMessage</span> {
+    <span class="tp">uint32_t</span> mailId;      <span class="cm">// 全局唯一邮件 ID</span>
+    <span class="tp">uint32_t</span> senderId;    <span class="cm">// 发送者 PlayerId（0 = 系统）</span>
+    <span class="tp">uint32_t</span> recipientId;
+    <span class="tp">std::string</span> title;
+    <span class="tp">std::string</span> body;
+    <span class="tp">std::vector</span>&lt;<span class="tp">ItemAttachment</span>&gt; attachments;
+    <span class="tp">bool</span> read = <span class="nb">false</span>;
+    <span class="tp">bool</span> claimed = <span class="nb">false</span>;      <span class="cm">// 附件是否已领取</span>
+    <span class="tp">std::chrono::steady_clock::time_point</span> sentTime;
+    <span class="tp">std::chrono::steady_clock::time_point</span> expireTime;  <span class="cm">// 30 天后系统自动删除</span>
+};
+
+<span class="kw">class</span> <span class="tp">MailMgr</span> {
+<span class="kw">public</span>:
+    <span class="kw">static</span> <span class="tp">MailMgr</span>&amp; <span class="fn">Instance</span>();
+
+    <span class="kt">void</span>    <span class="fn">SendMail</span>(<span class="kw">const</span> <span class="tp">MailMessage</span>&amp; mail);
+    <span class="kt">void</span>    <span class="fn">ClaimAttachment</span>(<span class="tp">uint32_t</span> mailId, <span class="tp">uint32_t</span> playerId);
+    <span class="kt">void</span>    <span class="fn">DeleteMail</span>(<span class="tp">uint32_t</span> mailId);
+    <span class="kw">auto</span>    <span class="fn">GetInbox</span>(<span class="tp">uint32_t</span> playerId) -&gt; <span class="tp">std::vector</span>&lt;<span class="kw">const</span> <span class="tp">MailMessage</span>*&gt;;
+    <span class="kt">void</span>    <span class="fn">CheckExpiredMails</span>();  <span class="cm">// 每 5 分钟 Tick 清理过期邮件</span>
+
+<span class="kw">private</span>:
+    <span class="tp">std::vector</span>&lt;<span class="tp">MailMessage</span>&gt; <span class="kw">_mails</span>;                        <span class="cm">// 所有邮件</span>
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">uint32_t</span>, <span class="tp">std::vector</span>&lt;<span class="tp">uint32_t</span>&gt;&gt; <span class="kw">_inboxIndex</span>;  <span class="cm">// playerId → mailId 列表</span>
+    <span class="tp">std::atomic</span>&lt;<span class="tp">uint32_t</span>&gt; <span class="kw">_nextMailId</span>{<span class="num">1</span>};
+};</code></pre>
+
+  <h3>Mgr_5: ConfigTable&lt;T&gt; — 配置表</h3>
+  <pre><code><span class="kw">template</span>&lt;<span class="kw">typename</span> T&gt;
+<span class="kw">class</span> <span class="tp">ConfigTable</span> {
+<span class="kw">public</span>:
+    <span class="kt">void</span> <span class="fn">Load</span>(<span class="tp">DbService</span>&amp; db, <span class="kw">const</span> <span class="tp">std::string</span>&amp; tableName);
+    <span class="kt">void</span> <span class="fn">Reload</span>(<span class="tp">DbService</span>&amp; db);   <span class="cm">// 热重载：加载到 temp shared_ptr → 原子 swap</span>
+    <span class="kw">const</span> <span class="tp">T</span>* <span class="fn">Find</span>(<span class="tp">uint32_t</span> templateId) <span class="kw">const</span>;
+    <span class="kw">const</span> <span class="tp">std::vector</span>&lt;<span class="tp">T</span>&gt;&amp; <span class="fn">All</span>() <span class="kw">const</span>;  <span class="cm">// 遍历（运营工具用）</span>
+
+<span class="kw">private</span>:
+    <span class="tp">std::shared_ptr</span>&lt;<span class="tp">std::vector</span>&lt;<span class="tp">T</span>&gt;&gt; <span class="kw">_data</span>;               <span class="cm">// 紧凑数组，按 templateId 排序</span>
+    <span class="tp">std::shared_ptr</span>&lt;<span class="tp">std::unordered_map</span>&lt;<span class="tp">uint32_t</span>, <span class="tp">uint32_t</span>&gt;&gt; <span class="kw">_index</span>;  <span class="cm">// templateId → 数组索引</span>
+};
+
+<span class="cm">// 全局实例——每个模板表一个</span>
+ConfigTable&lt;SkillTemplate&gt;   g_skillTemplates;
+ConfigTable&lt;ItemTemplate&gt;    g_itemTemplates;
+ConfigTable&lt;MonsterTemplate&gt; g_monsterTemplates;
+ConfigTable&lt;QuestTemplate&gt;   g_questTemplates;
+ConfigTable&lt;EventTemplate&gt;   g_eventTemplates;     <span class="cm">// 活动/节日配置</span>
+ConfigTable&lt;MapTemplate&gt;     g_mapTemplates;       <span class="cm">// 副本/战场模板</span></code></pre>
+
+  <h3>DasLang 桥接</h3>
+  <pre><code><span class="cm">// 公会</span>
+<span class="fn">GuildCreate</span>(name: string; founderId: uint32): uint32
+<span class="fn">GuildGetMembers</span>(guildId: uint32): array&lt;uint32&gt;
+
+<span class="cm">// 聊天</span>
+<span class="fn">ChatSend</span>(type: int; senderId: uint32; message: string; targetId: uint32)
+
+<span class="cm">// 配置表</span>
+<span class="fn">ConfigGet</span>(type&lt;SkillTemplate&gt;, templateId: uint32): SkillTemplate
+<span class="fn">ConfigGet</span>(type&lt;ItemTemplate&gt;, templateId: uint32): ItemTemplate</code></pre>
+
+</div>
+
+</div>
+<nav class="breadcrumb" style="margin-top:24px;"><a href="../Design.html">🏠 返回总目录</a></nav>
+<div class="footer">MMO Server Architecture Design Document · Version 1.2</div>
+</body>
+</html>

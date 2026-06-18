@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>18. GM 指令系统 — MMO 服务器架构设计 v1</title>
+<link rel="stylesheet" href="../shared.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="../Design.html">🏠 总目录</a></nav>
+<div class="container">
+<span class="badge confirmed">✔ 已确认</span>
+
+<div class="section" id="s18">
+  <h2>18. GM 指令系统</h2>
+
+  <h3>18.1 注册机制：DasLang 侧注册</h3>
+  <p>
+    GM 指令在 <strong>DasLang 脚本中注册</strong>，不需要改 C++ 或重启服务器。新增 GM 指令 = 在 gm.das 加 3 行 + 热重载。
+  </p>
+
+  <pre><code><span class="cm">// gm.das — 所有 GM 指令集中注册</span>
+[export]
+<span class="kw">def</span> <span class="fn">InitGmCommands</span>()
+{
+    <span class="cm">// gm_add_level(playerId, amount)  → minLevel=3（仅开发GM）</span>
+    RegisterGmCommand(<span class="str">"add_level"</span>, <span class="num">3</span>, <span class="kw">@</span>(callerId: uint32; args: array&lt;string&gt;) {
+        <span class="kw">let</span> targetId = int(args[<span class="num">0</span>])
+        <span class="kw">let</span> amount   = int(args[<span class="num">1</span>])
+        ecs_edit(targetId) $(<span class="kw">var</span> cmp) { cmp.playerData.level += amount }
+        <span class="kw">return</span> <span class="str">"player {targetId} level +{amount}"</span>
+    })
+
+    <span class="cm">// gm_spawn_monster(sceneId, monsterTypeId, x, y, z)</span>
+    RegisterGmCommand(<span class="str">"spawn_monster"</span>, <span class="num">3</span>, <span class="kw">@</span>(callerId: uint32; args: array&lt;string&gt;) {
+        <span class="kw">let</span> sceneId   = int(args[<span class="num">0</span>])
+        <span class="kw">let</span> monsterId = int(args[<span class="num">1</span>])
+        <span class="kw">let</span> x = float(args[<span class="num">2</span>]); <span class="kw">let</span> y = float(args[<span class="num">3</span>]); <span class="kw">let</span> z = float(args[<span class="num">4</span>])
+        <span class="kw">let</span> e = SpawnMonster(sceneId, monsterId, x, y, z)
+        <span class="kw">return</span> <span class="str">"spawned monster {e}"</span>
+    })
+
+    <span class="cm">// gm_kick(playerId)  → minLevel=2（运营+）</span>
+    RegisterGmCommand(<span class="str">"kick_player"</span>, <span class="num">2</span>, <span class="kw">@</span>(callerId: uint32; args: array&lt;string&gt;) {
+        <span class="kw">let</span> targetId = int(args[<span class="num">0</span>])
+        GmKickPlayer(targetId)
+        <span class="kw">return</span> <span class="str">"player {targetId} kicked"</span>
+    })
+}</code></pre>
+
+  <h3>18.2 路由：MSG_GM_COMMAND_REQ / MSG_GM_COMMAND_RSP</h3>
+  <div class="flow-diagram">
+    <div class="flow-box">客户端<br>/add_level 1001 5</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-box" style="border-color:#e65100;background:#fff3e0;">MSG_GM_COMMAND_REQ<br>（Protobuf + AES-GCM）</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-box" style="border-color:#1a73e8;background:#e8f0fe;">GateServer<br>识别 MsgID 透传</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-box" style="border-color:#2e7d32;background:#e8f5e9;">WorldServer<br>GmCommandDispatcher</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-box" style="border-color:#6a1b9a;background:#f3e5f5;">DasLang Handler<br>执行业务逻辑</div>
+  </div>
+
+  <pre><code><span class="cm">// Proto 定义</span>
+message GmCommandReq {
+    string command = 1;              <span class="cm">// 指令名 "add_level"</span>
+    repeated string args = 2;        <span class="cm">// 参数列表 ["1001", "5"]</span>
+    uint64 clientTraceId = 3;        <span class="cm">// 可选</span>
+}
+message GmCommandRsp {
+    uint32 errorCode = 1;            <span class="cm">// 0=成功</span>
+    string message = 2;              <span class="cm">// 返回给客户端的消息</span>
+}
+
+<span class="cm">// C++ 侧 — GM 指令分发</span>
+<span class="kw">class</span> <span class="tp">GmCommandDispatcher</span> {
+<span class="kw">public</span>:
+    <span class="kw">struct</span> <span class="tp">Entry</span> {
+        <span class="tp">int</span> minLevel;
+        <span class="tp">TLambda</span>&lt;<span class="kt">void</span>, <span class="tp">uint32_t</span>, <span class="kw">const</span> <span class="tp">std::vector</span>&lt;<span class="tp">std::string</span>&gt;&amp;, <span class="kw">const</span> <span class="tp">TBlock</span>&lt;<span class="kt">void</span>, <span class="tp">std::string</span>&gt;&amp;&gt; handler;
+    };
+
+    <span class="kt">void</span> <span class="fn">Register</span>(<span class="kw">const</span> <span class="tp">std::string</span>&amp; name, <span class="tp">int</span> minLevel,
+                  <span class="tp">TLambda</span>&lt;...&gt; handler) {
+        <span class="kw">_commands</span>[name] = Entry{minLevel, handler};
+    }
+
+    <span class="kt">void</span> <span class="fn">Dispatch</span>(<span class="tp">uint32_t</span> callerId, <span class="kw">const</span> <span class="tp">std::string</span>&amp; command,
+                   <span class="kw">const</span> <span class="tp">std::vector</span>&lt;<span class="tp">std::string</span>&gt;&amp; args,
+                   <span class="kw">const</span> <span class="tp">TBlock</span>&lt;<span class="kt">void</span>, <span class="tp">std::string</span>&gt;&amp; respond);
+
+<span class="kw">private</span>:
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">std::string</span>, <span class="tp">Entry</span>&gt; <span class="kw">_commands</span>;
+};</code></pre>
+
+  <h3>18.3 权限分级</h3>
+  <table>
+    <tr><th>级别</th><th>角色</th><th>可用指令示例</th></tr>
+    <tr><td>0</td><td>普通玩家</td><td>/help, /time, /who</td></tr>
+    <tr><td>1</td><td>客服</td><td>/query_player, /view_log, /send_compensation</td></tr>
+    <tr><td>2</td><td>运营</td><td>/broadcast, /start_event, /reload_config</td></tr>
+    <tr><td>3</td><td>开发 GM</td><td>/add_level, /spawn_monster, /teleport, /reload_script, /restart_scene</td></tr>
+  </table>
+  <p>
+    权限检查在 C++ 桥接层统一执行——从 <code>_accountToSession</code> 查到 account 的 <code>gmLevel</code>，
+    小于 <code>RegisterGmCommand</code> 注册时指定的 <code>minLevel</code> 则拒绝执行。
+  </p>
+
+  <h3>18.5 安全与审计</h3>
+  <table>
+    <tr><th>机制</th><th>实现</th></tr>
+    <tr><td><strong>审计日志</strong></td><td>每条 GM 指令执行写 <code>gm_audit_log</code> 表：callerId, command, args, result, timestamp, sceneId, traceId。</td></tr>
+    <tr><td><strong>速率限制</strong></td><td>每个 GM 账号每秒最多 5 条指令（token bucket）。超过限制返回"rate limited"。</td></tr>
+    <tr><td><strong>IP 白名单</strong></td><td>GM 账号可绑定 IP 白名单（<code>gm_accounts</code> 表）。非白名单 IP 的 GM 登录直接拒绝。</td></tr>
+    <tr><td><strong>敏感操作二次确认</strong></td><td>级别 3 指令（/ban_player, /restart_scene）需要 GM 客户端二次确认弹窗。</td></tr>
+  </table>
+
+  <h3>18.6 GM 账号管理</h3>
+  <p>GM 权限存储在数据库 <code>gm_accounts</code> 表中：</p>
+  <pre><code><span class="kw">CREATE TABLE</span> gm_accounts (
+    account_id  <span class="kw">INT PRIMARY KEY</span>,
+    gm_level    <span class="kw">INT NOT NULL DEFAULT</span> 0,     <span class="cm">// 0-3</span>
+    allowed_ips <span class="kw">TEXT</span>,                           <span class="cm">// 逗号分隔白名单，NULL=不限制</span>
+    created_by  <span class="kw">INT</span>,
+    created_at  <span class="kw">TIMESTAMPTZ DEFAULT NOW</span>()
+);</code></pre>
+
+  <h3>18.7 GM 工具函数（DasLang 可调用）</h3>
+  <pre><code><span class="fn">GmBanPlayer</span>(playerId: uint32; reason: string)
+<span class="fn">GmMutePlayer</span>(playerId: uint32; durationSeconds: int)
+<span class="fn">GmSendMail</span>(targetId: uint32; title: string; body: string; items: array&lt;Item&gt;)
+<span class="fn">GmBroadcast</span>(msg: string)              <span class="cm">// 全服公告</span>
+<span class="fn">GmReloadConfig</span>(tableName: string)     <span class="cm">// 热重载配置表</span>
+<span class="fn">GmReloadScript</span>(moduleName: string)    <span class="cm">// 热重载脚本</span></code></pre>
+
+</div>
+
+</div>
+<nav class="breadcrumb" style="margin-top:24px;"><a href="../Design.html">🏠 返回总目录</a></nav>
+<div class="footer">MMO Server Architecture Design Document · Version 1.2</div>
+</body>
+</html>

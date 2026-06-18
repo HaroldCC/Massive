@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>20. EntityId 编码 — MMO 服务器架构设计 v1</title>
+<link rel="stylesheet" href="../shared.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="../Design.html">🏠 总目录</a></nav>
+<div class="container">
+<span class="badge confirmed">✔ 已确认</span>
+
+<div class="section" id="s20">
+  <h2>20. EntityId 编码方案</h2>
+
+  <h3>20.1 Entity 组件</h3>
+  <pre><code><span class="cm">// Entity.h</span>
+<span class="kw">struct</span> <span class="tp">Entity</span> {
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="tp">uint32_t</span> kSceneGlobal     = <span class="num">0</span>;
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="tp">uint32_t</span> kScenePersistent = <span class="num">0xFFFFFFFF</span>;
+
+    <span class="tp">uint64_t</span> id;  <span class="cm">// 高32位 = sceneId, 低32位 = EnTT entity id</span>
+
+    <span class="tp">uint32_t</span> <span class="fn">SceneId</span>()  <span class="kw">const</span> { <span class="kw">return</span> <span class="kw">uint32_t</span>(id &gt;&gt; <span class="num">32</span>); }
+    <span class="tp">uint32_t</span> <span class="fn">EntityId</span>() <span class="kw">const</span> { <span class="kw">return</span> <span class="kw">uint32_t</span>(id &amp; <span class="num">0xFFFFFFFF</span>); }
+
+    <span class="kw">static</span> <span class="tp">Entity</span> <span class="fn">Make</span>(<span class="tp">uint32_t</span> sceneId, <span class="tp">uint32_t</span> entityId) {
+        <span class="kw">return</span> Entity{(<span class="kw">uint64_t</span>(sceneId) &lt;&lt; <span class="num">32</span>) | entityId};
+    }
+
+    <span class="kw">auto</span> <span class="kw">operator</span>&lt;=&gt;(<span class="kw">const</span> <span class="tp">Entity</span>&amp;) <span class="kw">const</span> = <span class="kw">default</span>;
+};
+
+<span class="cm">// hash 支持——用于 unordered_set / unordered_map</span>
+<span class="kw">namespace</span> <span class="tp">std</span> {
+    <span class="kw">template</span>&lt;&gt; <span class="kw">struct</span> <span class="tp">hash</span>&lt;<span class="tp">Entity</span>&gt; {
+        <span class="tp">size_t</span> <span class="kw">operator</span>()(<span class="kw">const</span> <span class="tp">Entity</span>&amp; e) <span class="kw">const</span> { <span class="kw">return</span> e.id; }
+    };
+}</code></pre>
+
+  <h3>20.2 EnTT entity 位宽</h3>
+  <p>EnTT 4.0 默认 <code>uint32_t</code> entity，20bit index + 12bit version。支持同时存在最多 ~1M 实体。内部 version 由 EnTT 自动管理——entity 被销毁回收后 version 自增，旧 Entity 引用失效。</p>
+
+  <div class="callout info">
+    <strong>📌 命名说明</strong>：本项目的 <code>Entity</code> 结构体（sceneId + entityId 的 64 位复合键）与 EnTT 内部的 <code>entt::entity</code>（uint32_t typedef）不是同一类型。
+    桥接层在调 EnTT API 时做显式转换：<code>entt::entity(we.EntityId())</code>。这两者不会冲突——<code>Entity</code> 是 Mserv 层的概念，<code>entt::entity</code> 是 EnTT 库内的概念。
+  </div>
+
+  <h3>20.3 Entity 生命周期</h3>
+  <table>
+    <tr><th>操作</th><th>结果</th></tr>
+    <tr><td><code>ecs_create(sceneId)</code></td><td>Scene.EcsRegistry().create() → EnTT 分配 entity id + 初始 version → 包装为 Entity</td></tr>
+    <tr><td><code>ecs_destroy(entity)</code></td><td>Scene.EcsRegistry().destroy(entityId) → entity 进 free list，version 自增 → BlobStorage 同步清理</td></tr>
+    <tr><td><code>ecs_valid(entity)</code></td><td>Scene.EcsRegistry().valid(entityId) → EnTT 校验 index + version 是否匹配</td></tr>
+  </table>
+
+  <div class="callout warn">
+    <strong>⚠ 跨场景迁移</strong>：旧 entity 被 destroy，新 Registry 执行 create 生成新 entity id。外部的旧 Entity 引用自动失效（version 不匹配），需同步更新所有引用方。
+  </div>
+
+  <h3>20.4 跨场景实体迁移：Clone 过渡方案</h3>
+  <p>
+    当实体从一个场景迁移到另一个场景（如玩家从主城进入副本），采用 <strong>Clone 过渡模式</strong>。
+    源场景创建实体的镜像引用（只读 Clone），目标场景逐步接管实体控制权。
+    过渡完成后源场景的 Clone 自动销毁。
+  </p>
+
+  <h4>迁移时序</h4>
+  <pre>
+Player 在 Scene_A 触发跨场景移动 (Portal / Teleport)
+  │
+  ├── 1. 冻结阶段（停止 Player 的输入处理）
+  │     ecs_emplace(player, FrozenTag{})
+  │
+  ├── 2. 序列化阶段 Scene_A
+  │     Scene_A: 收集所有组件数据（Position, Health, Inventory, Buffs...）
+  │     → 序列化为 StateSnapshot（JSON blob + 二进制）
+  │
+  ├── 3. 迁移阶段 Scene_A→Scene_B
+  │     Scene_B: 创建新 Entity（全新 entityId）
+  │     Scene_B: 反序列化 StateSnapshot → 重建所有组件
+  │     如果序列化/反序列化失败 → 留在 Scene_A，解除冻结
+  │
+  ├── 4. Clone 阶段（双 Scene 共存，60s 内）
+  │     Scene_A: 旧 entity + DeprecatedTag（只读镜像，不可操作）
+  │     Scene_B: 新 entity（活跃、可操作）← DasLang 侧更新引用
+  │     GateServer: 更新路由表 → player 的消息转发到 Scene_B
+  │
+  ├── 5. 清理阶段（60s 或所有引用方已更新）
+  │     Scene_A: 监测 DeprecatedTag + 60s 超时 → destroy 旧 entity
+  │     Scene_B: 监测 FrozenTag → 移除 → 解冻 Player 输入
+  │
+  └── 6. 通知客户端
+        MSG_SCENE_SWITCH_RSP(sceneId=Scene_B, newEntityId, position)</pre>
+
+  <h4>核心数据结构</h4>
+  <pre><code><span class="cm">// StateSnapshot.h — 跨场景迁移的序列化载体</span>
+<span class="kw">struct</span> <span class="tp">StateSnapshot</span> {
+    <span class="tp">uint32_t</span> version = <span class="num">1</span>;
+
+    <span class="cm">// 组件数据（键值对——组件名 → 序列化数据）</span>
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">uint32_t</span>, <span class="tp">std::string</span>&gt; components;  <span class="cm">// componentBit → JSON blob</span>
+
+    <span class="cm">// 脚本 BlobStorage 数据</span>
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">std::string</span>, <span class="tp">std::vector</span>&lt;<span class="tp">uint8_t</span>&gt;&gt; scriptComponents;
+
+    <span class="cm">// 定时器恢复信息</span>
+    <span class="tp">std::vector</span>&lt;<span class="tp">TimerSnapshot</span>&gt; timers;  <span class="cm">// 恢复未到期的定时器</span>
+
+    <span class="cm">// 序列化/反序列化</span>
+    <span class="tp">std::string</span> <span class="fn">Serialize</span>() <span class="kw">const</span>;
+    <span class="kt">bool</span> <span class="fn">Deserialize</span>(<span class="kw">const</span> <span class="tp">std::string</span>&amp; data);
+  };</code></pre>
+
+  <h4>批量迁移处理</h4>
+  <p>
+    战场结束（80 人同时迁回主城）、公会集结（40 人同时迁往副本）等场景
+    如果全在同一帧内做序列化/反序列化/创建 entity，将造成严重的 CPU spike。
+    采用<strong>分批迁移策略</strong>——每 Tick 最多处理 K 个 entity（K=8），
+    超出部分排入迁移队列，后续 Tick 继续处理。
+  </p>
+
+  <pre><code><span class="cm">// MigrationManager.h — WorldServer 层面维护迁移队列</span>
+<span class="kw">class</span> <span class="tp">MigrationManager</span> {
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="tp">size_t</span> kMaxPerTick = <span class="num">8</span>;
+    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="kw">auto</span> kTimeout = std::chrono::seconds(<span class="num">30</span>);
+
+    <span class="kw">struct</span> <span class="tp">MigrationEntry</span> {
+        <span class="tp">Entity</span> entity;
+        <span class="tp">uint32_t</span> sourceScene;
+        <span class="tp">uint32_t</span> targetScene;
+        <span class="tp">std::chrono::steady_clock::time_point</span> queuedAt;
+    };
+
+    <span class="tp">std::deque</span>&lt;<span class="tp">MigrationEntry</span>&gt; <span class="kw">_pending</span>;
+
+<span class="kw">public</span>:
+    <span class="kt">void</span> <span class="fn">Enqueue</span>(<span class="tp">Entity</span> e, <span class="tp">uint32_t</span> src, <span class="tp">uint32_t</span> dst);
+    <span class="kt">void</span> <span class="fn">ProcessTick</span>();   <span class="cm">// 在 LogicThread 每 Tick 调用</span>
+};
+
+<span class="kt">void</span> <span class="tp">MigrationManager</span>::<span class="fn">ProcessTick</span>() {
+    <span class="kw">size_t</span> count = <span class="num">0</span>;
+    <span class="kw">auto</span> now = <span class="tp">std::chrono::steady_clock</span>::now();
+
+    <span class="kw">while</span> (!<span class="kw">_pending</span>.empty() &amp;&amp; count &lt; kMaxPerTick) {
+        <span class="kw">auto</span>&amp; entry = <span class="kw">_pending</span>.front();
+
+        <span class="kw">if</span> (now - entry.queuedAt &gt; kTimeout) {
+            LOG_WARN(<span class="str">"Migration timeout for entity"</span>);
+            <span class="fn">ForceCleanup</span>(entry);   <span class="cm">// 超时清理</span>
+            <span class="kw">_pending</span>.pop_front();
+            <span class="kw">continue</span>;
+        }
+
+        <span class="kw">if</span> (!<span class="fn">DoMigrate</span>(entry))     <span class="cm">// 目标 Scene 未就绪？等待下个 Tick</span>
+            <span class="kw">break</span>;
+
+        <span class="kw">_pending</span>.pop_front();
+        count++;
+    }
+}</code></pre>
+
+  <div class="callout info">
+    <strong>用户体验</strong>：80 人战场结束 → 每 Tick 8 人 → 最慢的 entity 需等 10 Tick ≈ 330ms。
+    客户端显示 "正在传送..." loading UI 即可完全掩盖。单个玩家切地图（非批量场景）不受影响——队列为空时一步完成。
+  </div>
+
+  <h4>DasLang 侧使用</h4>
+  <pre><code><span class="cm">// DasLang 侧——GM 传送 或 Portal 触发迁移</span>
+<span class="kw">def</span> <span class="fn">MigrateEntityToScene</span>(entity : Entity; targetSceneId : uint32) : Entity
+{
+    <span class="cm">// 1. 冻结</span>
+    ecs_emplace(entity, type&lt;<span class="tp">FrozenTag</span>&gt;, FrozenTag{})
+
+    <span class="cm">// 2. 序列化</span>
+    <span class="kw">let</span> snapshot = ecs_snapshot_export(entity)
+
+    <span class="cm">// 3. 在目标场景创建新实体</span>
+    <span class="kw">let</span> newEntity = ecs_create(targetSceneId)
+    ecs_snapshot_import(newEntity, snapshot)
+
+    <span class="cm">// 4. 标记旧实体为 Clone（等待清理）</span>
+    ecs_emplace(entity, type&lt;<span class="tp">DeprecatedTag</span>&gt;, DeprecatedTag{expireTime = GetTickTime() + <span class="num">60.0</span>})
+
+    <span class="kw">return</span> newEntity
+}</code></pre>
+
+  <h4>回滚场景</h4>
+  <p>如果步骤 3 创建新实体失败（目标场景不存在、内存不足），回滚流程：</p>
+  <pre><code><span class="kw">if</span> (newEntity == InvalidEntity) {
+    <span class="cm">// 失败回滚——留在原场景</span>
+    ecs_remove(entity, type&lt;<span class="tp">FrozenTag</span>&gt;)
+    SendToClient(entity, MSG_SCENE_SWITCH_RSP, BuildErrorResponse(<span class="str">"destination unreachable"</span>))
+    <span class="kw">return</span> InvalidEntity
+}</code></pre>
+
+</div>
+</div>
+
+</div>
+<nav class="breadcrumb" style="margin-top:24px;"><a href="../Design.html">🏠 返回总目录</a></nav>
+<div class="footer">MMO Server Architecture Design Document · Version 1.2</div>
+</body>
+</html>

@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Buff/Debuff 系统 — MMO 服务器架构设计 v1.2</title>
+<link rel="stylesheet" href="../shared.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="../Design.html">🏠 总目录</a></nav>
+<div class="container">
+<span class="badge confirmed">✔ 已确认</span>
+
+<div class="section" id="buff">
+  <h2>Buff/Debuff 系统 · Modifier + Tick + Event 三部曲</h2>
+
+  <h3>1. 设计概述</h3>
+  <p>
+    Buff 系统采用 <strong>Modifier 修饰器模式</strong>。每个 Buff 实例包含一组 Modifier（修改 BattleStats 的加减乘除），
+    由 BuffSystem 在每 Tick 统一结算。Modifier 在属性重算阶段统一应用，
+    而非每个 Buff 单独写公式——这保证了 <strong>属性计算的确定性</strong>（加法先于乘法，不受 Buff 添加顺序影响）。
+  </p>
+
+  <h3>2. 核心数据结构</h3>
+
+  <h4>2.1 脚本组件（BlobStorage——低频、业务逻辑重）</h4>
+  <pre><code><span class="cm">// Buff/BuffList defs —— DasLang 脚本组件</span>
+
+<span class="cm">// 修饰器类型</span>
+[script_component]
+<span class="kw">struct</span> <span class="tp">StatModifier</span> {
+    stat      : StatType          <span class="cm">// 修改的属性</span>
+    op        : ModOp             <span class="cm">// 操作类型</span>
+    value     : float             <span class="cm">// 数值</span>
+}
+
+<span class="kw">enum</span> <span class="tp">StatType</span> {
+    STAT_ATTACK, STAT_DEFENSE, STAT_MAXHP, STAT_MAXMP,
+    STAT_CRIT_RATE, STAT_CRIT_DMG, STAT_DODGE, STAT_HIT,
+    STAT_ATTACK_SPEED, STAT_MOVE_SPEED,
+    STAT_DAMAGE_INCREASE, STAT_DAMAGE_REDUCTION,
+    STAT_HEAL_INCREASE, STAT_HEAL_REDUCTION
+}
+
+<span class="kw">enum</span> <span class="tp">ModOp</span> {
+    MOD_ADD,           <span class="cm">// 加法：+value</span>
+    MOD_MUL,           <span class="cm">// 乘法：×(1 + value/10000)  value=500 → ×1.05</span>
+    MOD_SET_MIN,       <span class="cm">// 保底：max(current, value)</span>
+    MOD_SET_MAX        <span class="cm">// 封顶：min(current, value)</span>
+}
+
+<span class="cm">// Buff 触发时机</span>
+<span class="kw">enum</span> <span class="tp">BuffTrigger</span> {
+    TRIGGER_ON_APPLY,         <span class="cm">// 施加时触发一次（瞬发 Buff）</span>
+    TRIGGER_PERIODIC,         <span class="cm">// 每隔 N 秒触发一次</span>
+    TRIGGER_ON_DAMAGE_DEALT,  <span class="cm">// 造成伤害时触发</span>
+    TRIGGER_ON_DAMAGE_TAKEN,  <span class="cm">// 受到伤害时触发</span>
+    TRIGGER_ON_HEAL_DEALT,    <span class="cm">// 造成治疗时触发</span>
+    TRIGGER_ON_HEAL_TAKEN,    <span class="cm">// 受到治疗时触发</span>
+    TRIGGER_ON_KILL,          <span class="cm">// 击杀时触发</span>
+    TRIGGER_ON_DEATH,         <span class="cm">// 死亡时触发</span>
+    TRIGGER_ON_SKILL_CAST,    <span class="cm">// 施放技能时触发</span>
+}
+
+<span class="cm">// Buff 实例——每个实体身上的 1 个 Buff</span>
+[script_component]
+<span class="kw">struct</span> <span class="tp">BuffInstance</span> {
+    buffId        : uint32          <span class="cm">// Buff 模板 ID → ConfigTable 查参数</span>
+    casterEntity  : Entity          <span class="cm">// 施法者</span>
+    startTime     : float           <span class="cm">// 施加时间 (TickTime)</span>
+    duration      : float           <span class="cm">// 持续时长（秒），0 = 永久</span>
+    remainingTime : float           <span class="cm">// 剩余时间（秒）</span>
+    maxStacks     : int             <span class="cm">// 最大层数</span>
+    currentStacks : int             <span class="cm">// 当前层数</span>
+    modifiers     : array&lt;StatModifier&gt;  <span class="cm">// 属性修饰器列表（从模板拷贝）</span>
+    period        : float           <span class="cm">// 周期性触发间隔（秒），0 = 非周期</span>
+    timeSinceLastTick : float       <span class="cm">// 距离上次 Tick 的时间</span>
+}
+
+<span class="cm">// BuffList——实体持有的所有 Buff 列表</span>
+[script_component]
+<span class="kw">struct</span> <span class="tp">BuffList</span> {
+    buffs         : array&lt;BuffInstance&gt;
+    dirty         : bool                <span class="cm">// 需要重新收集 Modifier</span>
+    cachedMods    : array&lt;StatModifier&gt; <span class="cm">// 缓存：所有 Buff 的 Modifier 汇总</span>
+}</code></pre>
+
+  <h4>2.2 ConfigTable——Buff 模板</h4>
+  <pre><code><span class="kw">CREATE TABLE</span> buff_templates (
+    buff_id         <span class="kw">INT PRIMARY KEY</span>,
+    buff_name       <span class="kw">TEXT NOT NULL</span>,
+    buff_type       <span class="kw">INT NOT NULL</span>,       <span class="cm">// 0=Buff 1=Debuff</span>
+    max_stacks      <span class="kw">INT DEFAULT</span> 1,
+    duration_sec    <span class="kw">REAL DEFAULT</span> 0,      <span class="cm">// 0 = 永久</span>
+    period_sec      <span class="kw">REAL DEFAULT</span> 0,      <span class="cm">// 周期性触发间隔</span>
+    triggers        <span class="kw">INT[] DEFAULT</span> '{}',   <span class="cm">// 触发时机列表</span>
+    modifiers       <span class="kw">JSONB DEFAULT</span> '[]',   <span class="cm">// [{"stat":0,"op":0,"value":50},...]</span>
+    on_apply_script <span class="kw">TEXT</span>,                <span class="cm">// 施加时执行的 DasLang 脚本函数名</span>
+    on_tick_script  <span class="kw">TEXT</span>,                <span class="cm">// 周期性执行的 DasLang 脚本函数名</span>
+    on_remove_script <span class="kw">TEXT</span>                <span class="cm">// 移除时执行的 DasLang 脚本函数名</span>
+);
+
+<span class="cm">// C++ 侧：ConfigTable 实例</span>
+ConfigTable&lt;BuffTemplate&gt; <span class="kw">g_buffTemplates</span>;</code></pre>
+
+  <h3>3. BuffSystem 核心逻辑（DasLang）</h3>
+
+  <h4>3.1 施加 Buff</h4>
+  <pre><code><span class="kw">def</span> <span class="fn">ApplyBuff</span>(target : Entity; caster : Entity; buffId : uint32; stacks : int = <span class="num">1</span>) : bool
+{
+    <span class="kw">let</span> template = g_buffTemplates.Find(buffId)
+    <span class="kw">if</span> (template == <span class="nb">null</span>) <span class="kw">return</span> <span class="nb">false</span>
+
+    <span class="kw">var</span> applied = <span class="nb">false</span>
+    ecs_edit(target) $(<span class="kw">var</span> cmp)
+    {
+        <span class="cm">// 检查是否已存在同 ID Buff</span>
+        <span class="kw">for</span> <span class="kw">var</span> existing <span class="kw">in</span> cmp.buffList.buffs {
+            <span class="kw">if</span> (existing.buffId == buffId) {
+                <span class="cm">// 叠加：刷新持续时间 + 增加层数（不超过 maxStacks）</span>
+                existing.duration      = template.duration_sec
+                existing.remainingTime = template.duration_sec
+                existing.currentStacks = min(existing.currentStacks + stacks, template.max_stacks)
+                existing.startTime     = GetTickTime()
+                cmp.buffList.dirty = <span class="nb">true</span>
+                applied = <span class="nb">true</span>
+                <span class="kw">break</span>
+            }
+        }
+
+        <span class="kw">if</span> (!applied) {
+            <span class="cm">// 新 Buff——构造实例</span>
+            <span class="kw">let</span> mods : array&lt;StatModifier&gt;
+            <span class="kw">for</span> m <span class="kw">in</span> template.modifiers {
+                mods |> push(StatModifier{stat = m.stat, op = m.op, value = m.value})
+            }
+
+            <span class="kw">let</span> inst = BuffInstance{
+                buffId        = buffId,
+                casterEntity  = caster,
+                startTime     = GetTickTime(),
+                duration      = template.duration_sec,
+                remainingTime = template.duration_sec,
+                maxStacks     = template.max_stacks,
+                currentStacks = stacks,
+                modifiers     = mods,
+                period        = template.period_sec,
+                timeSinceLastTick = <span class="num">0.0</span>
+            }
+            cmp.buffList.buffs |> push(inst)
+            cmp.buffList.dirty = <span class="nb">true</span>
+        }
+    }
+
+    <span class="cm">// 触发 on_apply 脚本</span>
+    <span class="kw">if</span> (template.on_apply_script != <span class="str">""</span>) {
+        CallBuffScript(template.on_apply_script, target, caster, buffId)
+    }
+
+    <span class="kw">return</span> <span class="nb">true</span>
+}</code></pre>
+
+  <h4>3.2 移除 Buff</h4>
+  <pre><code><span class="kw">def</span> <span class="fn">RemoveBuff</span>(target : Entity; buffId : uint32) : bool
+{
+    <span class="kw">let</span> template = g_buffTemplates.Find(buffId)
+    <span class="kw">var</span> removed = <span class="nb">false</span>
+
+    ecs_edit(target) $(<span class="kw">var</span> cmp)
+    {
+        <span class="kw">for</span> <span class="kw">var</span> i <span class="kw">in</span> range(cmp.buffList.buffs |> length()) {
+            <span class="kw">if</span> (cmp.buffList.buffs[i].buffId == buffId) {
+                <span class="kw">let</span> inst = cmp.buffList.buffs[i]
+                cmp.buffList.buffs |> erase(i)
+                cmp.buffList.dirty = <span class="nb">true</span>
+                removed = <span class="nb">true</span>
+
+                <span class="cm">// 触发 on_remove 脚本</span>
+                <span class="kw">if</span> (template != <span class="nb">null</span> && template.on_remove_script != <span class="str">""</span>) {
+                    CallBuffScript(template.on_remove_script, target, inst.casterEntity, buffId)
+                }
+                <span class="kw">break</span>
+            }
+        }
+    }
+    <span class="kw">return</span> removed
+}
+
+<span class="kw">def</span> <span class="fn">RemoveAllDebuffs</span>(target : Entity)
+{
+    ecs_edit(target) $(<span class="kw">var</span> cmp)
+    {
+        <span class="kw">for</span> <span class="kw">var</span> i = cmp.buffList.buffs |> length() - <span class="num">1</span>; i &gt;= <span class="num">0</span>; i-- {
+            <span class="kw">let</span> template = g_buffTemplates.Find(cmp.buffList.buffs[i].buffId)
+            <span class="kw">if</span> (template != <span class="nb">null</span> && template.buff_type == <span class="num">1</span>) {  <span class="cm">// Debuff</span>
+                <span class="kw">if</span> (template.on_remove_script != <span class="str">""</span>) {
+                    CallBuffScript(template.on_remove_script, target, cmp.buffList.buffs[i].casterEntity, cmp.buffList.buffs[i].buffId)
+                }
+                cmp.buffList.buffs |> erase(i)
+            }
+        }
+        cmp.buffList.dirty = <span class="nb">true</span>
+    }
+}</code></pre>
+
+  <h4>3.3 每 Tick 更新</h4>
+  <pre><code><span class="cm">// SystemBuffTick — ecs_stage "buff" 中调用</span>
+[export]
+<span class="kw">def</span> <span class="fn">SystemBuffTick</span>(sceneId : uint32; dt : float)
+{
+    ecs_query(sceneId;
+        bl : BuffList&amp;;
+        <span class="kw">without</span> DeadTag
+    ) {
+        <span class="kw">for</span> <span class="kw">var</span> i = bl.buffs |> length() - <span class="num">1</span>; i &gt;= <span class="num">0</span>; i-- {
+            <span class="kw">let</span> template = g_buffTemplates.Find(bl.buffs[i].buffId)
+            <span class="kw">if</span> (template == <span class="nb">null</span>) {
+                bl.buffs |> erase(i)
+                <span class="kw">continue</span>
+            }
+
+            <span class="cm">// 1. 时长递减</span>
+            <span class="kw">if</span> (bl.buffs[i].duration &gt; <span class="num">0.0</span>) {
+                bl.buffs[i].remainingTime -= dt
+                <span class="kw">if</span> (bl.buffs[i].remainingTime &lt;= <span class="num">0.0</span>) {
+                    <span class="cm">// 到期移除</span>
+                    <span class="kw">if</span> (template.on_remove_script != <span class="str">""</span>) {
+                        CallBuffScript(template.on_remove_script, GetEntityFromBuff(bl, i), bl.buffs[i].casterEntity, bl.buffs[i].buffId)
+                    }
+                    bl.buffs |> erase(i)
+                    bl.dirty = <span class="nb">true</span>
+                    <span class="kw">continue</span>
+                }
+            }
+
+            <span class="cm">// 2. 周期性触发</span>
+            <span class="kw">if</span> (bl.buffs[i].period &gt; <span class="num">0.0</span>) {
+                bl.buffs[i].timeSinceLastTick += dt
+                <span class="kw">while</span> (bl.buffs[i].timeSinceLastTick &gt;= bl.buffs[i].period) {
+                    bl.buffs[i].timeSinceLastTick -= bl.buffs[i].period
+
+                    <span class="cm">// 执行周期性脚本（如 DoT 伤害、HoT 治疗）</span>
+                    <span class="kw">if</span> (template.on_tick_script != <span class="str">""</span>) {
+                        CallBuffScript(template.on_tick_script, GetEntityFromBuff(bl, i), bl.buffs[i].casterEntity, bl.buffs[i].buffId)
+                    }
+                }
+            }
+        }
+    }
+}</code></pre>
+
+  <h3>4. Modifier 应用——属性计算中的 Buff 加成</h3>
+  <pre><code><span class="cm">// 在属性重算 (SystemRecalcStats) 中调用</span>
+<span class="kw">def</span> <span class="fn">ApplyBuffModifiersToStats</span>(var stats : BattleStats; buffList : BuffList)
+{
+    <span class="cm">// 如果 dirty，重新收集所有 Modifier 并排序</span>
+    <span class="kw">if</span> (buffList.dirty) {
+        buffList.cachedMods |> clear()
+        <span class="kw">for</span> inst <span class="kw">in</span> buffList.buffs {
+            <span class="kw">for</span> mod <span class="kw">in</span> inst.modifiers {
+                <span class="cm">// 层数叠加：每层追加一次效果</span>
+                <span class="kw">for</span> s <span class="kw">in</span> range(inst.currentStacks) {
+                    buffList.cachedMods |> push(mod)
+                }
+            }
+        }
+        <span class="cm">// 排序：ADD 先于 MUL，保证计算确定性</span>
+        buffList.cachedMods |> sort($(a, b) =&gt; int(a.op) &lt; int(b.op))
+        buffList.dirty = <span class="nb">false</span>
+    }
+
+    <span class="cm">// 应用所有 Modifier 到 stats</span>
+    <span class="kw">for</span> mod <span class="kw">in</span> buffList.cachedMods {
+        <span class="kw">switch</span> (mod.stat)
+        {
+        STAT_ATTACK:
+            <span class="kw">if</span> (mod.op == MOD_ADD) { stats.attack += int(mod.value) }
+            <span class="kw">elif</span> (mod.op == MOD_MUL) { stats.attack = int(float(stats.attack) * (<span class="num">1.0</span> + mod.value / <span class="num">10000.0</span>)) }
+            <span class="kw">elif</span> (mod.op == MOD_SET_MIN) { stats.attack = max(stats.attack, int(mod.value)) }
+        STAT_DEFENSE:
+            <span class="kw">if</span> (mod.op == MOD_ADD) { stats.defense += int(mod.value) }
+            <span class="kw">elif</span> (mod.op == MOD_MUL) { stats.defense = int(float(stats.defense) * (<span class="num">1.0</span> + mod.value / <span class="num">10000.0</span>)) }
+        <span class="cm">// ... 其余属性同理</span>
+        }
+    }
+}</code></pre>
+
+  <h4>4.1 计算确定性保证</h4>
+  <div class="callout info">
+    <strong>🧠 为什么排序 Modifier</strong>：如果 Buff A 加 50 攻击（ADD）+ Buff B 乘 1.2 攻击（MUL），
+    不排序时结果取决于 A 和 B 的添加顺序（50×1.2=60 vs (base+50)×1.2=base×1.2+60）。
+    按 MOD_ADD 先于 MOD_MUL 排序后，结果恒定：<code>(base + ΣADD) × Π(1 + MUL/10000)</code>。
+    这保证了相同的 Buff 组合在不同时间施加得出的属性结果完全一致。
+  </div>
+
+  <h3>5. 事件驱动的 Buff 触发</h3>
+  <pre><code><span class="cm">// 战斗系统中——造成伤害后检查触发型 Buff</span>
+<span class="kw">def</span> <span class="fn">OnDamageDealt</span>(attacker : Entity; defender : Entity; damage : int)
+{
+    ecs_edit(attacker) $(<span class="kw">var</span> cmp)
+    {
+        <span class="kw">for</span> inst <span class="kw">in</span> cmp.buffList.buffs {
+            <span class="kw">let</span> template = g_buffTemplates.Find(inst.buffId)
+            <span class="kw">if</span> (template != <span class="nb">null</span> && template.triggers |> contains(int(TRIGGER_ON_DAMAGE_DEALT))) {
+                <span class="kw">if</span> (template.on_tick_script != <span class="str">""</span>) {
+                    CallBuffScriptWithContext(template.on_tick_script, attacker, defender, damage)
+                }
+            }
+        }
+    }
+}</code></pre>
+
+  <h3>6. Buff 叠加规则</h3>
+  <table>
+    <tr><th>规则</th><th>行为</th><th>用途</th></tr>
+    <tr><td><strong>Stack</strong></td><td>同 ID Buff 叠加层数，刷新持续时间</td><td>DOT 堆叠（每层独立计算伤害）</td></tr>
+    <tr><td><strong>Refresh</strong></td><td>同 ID Buff 只刷新持续时间，不叠加层数</td><td>Buff 补持续（如坦克的防御 Buff）</td></tr>
+    <tr><td><strong>Replace</strong></td><td>新 Buff 替换旧 Buff（旧立即失效）</td><td>强控技能（新晕眩替换旧晕眩）</td></tr>
+    <tr><td><strong>Independent</strong></td><td>多个同 ID Buff 可以共存</td><td>多来源 HOT（两个治疗分别加的血量恢复）</td></tr>
+  </table>
+
+  <h3>7. DasLang 桥接 API</h3>
+  <pre><code><span class="cm">// Buff 系统桥接——C++ 侧注册</span>
+<span class="fn">ApplyBuff</span>(target: Entity; caster: Entity; buffId: uint32; stacks: int): bool
+<span class="fn">RemoveBuff</span>(target: Entity; buffId: uint32): bool
+<span class="fn">RemoveAllDebuffs</span>(target: Entity)
+<span class="fn">HasBuff</span>(target: Entity; buffId: uint32): bool
+<span class="fn">GetBuffStackCount</span>(target: Entity; buffId: uint32): int
+<span class="fn">GetBuffRemainingTime</span>(target: Entity; buffId: uint32): float</code></pre>
+
+  <h3>8. Buff 互斥与免疫</h3>
+  <pre><code><span class="cm">// Buff 模板扩展——互斥组和免疫标签</span>
+<span class="kw">CREATE TABLE</span> buff_templates (
+    <span class="cm">// ... 原有字段 ...</span>
+    exclusive_group <span class="kw">INT DEFAULT</span> 0,       <span class="cm">// 互斥组 ID，同组内只允许存在一个。0 = 不互斥</span>
+    immunity_tags   <span class="kw">INT[] DEFAULT</span> '{}'    <span class="cm">// 拥有此 Buff 时免疫的 Buff 类型标签</span>
+);
+
+<span class="cm">// ApplyBuff 前置检查</span>
+<span class="kw">def</span> <span class="fn">CheckBuffApplicable</span>(target : Entity; template : BuffTemplate) : bool
+{
+    <span class="kw">var</span> applicable = <span class="nb">true</span>
+    ecs_edit(target) $(<span class="kw">var</span> cmp)
+    {
+        <span class="cm">// 互斥组检查</span>
+        <span class="kw">if</span> (template.exclusive_group != <span class="num">0</span>) {
+            <span class="kw">for</span> inst <span class="kw">in</span> cmp.buffList.buffs {
+                <span class="kw">let</span> t = g_buffTemplates.Find(inst.buffId)
+                <span class="kw">if</span> (t != <span class="nb">null</span> && t.exclusive_group == template.exclusive_group) {
+                    applicable = <span class="nb">false</span>
+                    <span class="kw">break</span>
+                }
+            }
+        }
+
+        <span class="cm">// 免疫标签检查</span>
+        <span class="kw">for</span> inst <span class="kw">in</span> cmp.buffList.buffs {
+            <span class="kw">let</span> t = g_buffTemplates.Find(inst.buffId)
+            <span class="kw">if</span> (t != <span class="nb">null</span>) {
+                <span class="kw">for</span> tag <span class="kw">in</span> t.immunity_tags {
+                    <span class="kw">if</span> (template.buff_type == tag) {
+                        applicable = <span class="nb">false</span>
+                        <span class="kw">break</span> <span class="kw">break</span>
+                    }
+                }
+            }
+        }
+    }
+    <span class="kw">return</span> applicable
+}</code></pre>
+
+  <h3>9. 性能分析</h3>
+  <table>
+    <tr><th>操作</th><th>频率</th><th>复杂度</th><th>说明</th></tr>
+    <tr><td>施加 Buff</td><td>技能命中时（10-50/sec）</td><td>O(B) B=已有Buff数</td><td>遍历检查重复；通常 ≤10 个 Buff</td></tr>
+    <tr><td>移除 Buff</td><td>到期/驱散时</td><td>O(B)</td><td>erase(i) 触发了 swap-with-last？不对——array erase 是 O(B)。但 B 很小</td></tr>
+    <tr><td>Buff 计时 Tick</td><td>每 Tick 遍历所有带 Buff 的实体</td><td>O(E×B)</td><td>E=战斗中的实体数(≈100)，B=平均Buff数(≈5)，总计 ~500 次操作</td></tr>
+    <tr><td>Modifier 重收集</td><td>仅 BuffList.dirty 时</td><td>O(B×M)</td><td>M=每个 Buff 的 Modifier 数(≈5)，排序 O(B×M log B×M)</td></tr>
+  </table>
+
+</div>
+
+</div>
+<nav class="breadcrumb" style="margin-top:24px;"><a href="../Design.html">🏠 返回总目录</a></nav>
+<div class="footer">MMO Server Architecture Design Document · Version 1.2</div>
+</body>
+</html>

@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI 框架 · 行为树 + 黑板 — MMO 服务器架构设计 v1.2</title>
+<link rel="stylesheet" href="../shared.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="../Design.html">🏠 总目录</a></nav>
+<div class="container">
+<span class="badge confirmed">✔ 已确认</span>
+
+<div class="section" id="ai">
+  <h2>AI 框架 · 行为树 + 黑板 + 日程调度</h2>
+
+  <h3>1. 设计概述</h3>
+  <p>
+    AI 系统负责所有非玩家实体（怪物、NPC、宠物、召唤物）的自主决策。采用 <strong>行为树（Behavior Tree）</strong> 做决策框架，
+    <strong>黑板（Blackboard）</strong> 做状态存储。行为树节点在 DasLang 中定义（可热更新），
+    Tick 由 C++ 调度器以固定频率驱动。支持分帧执行——一个复杂 AI 可分多 Tick 完成决策，保证 Tick 预算可控。
+  </p>
+
+  <h3>2. 架构分层</h3>
+  <table>
+    <tr><th>层级</th><th>职责</th><th>实现方</th></tr>
+    <tr><td><strong>调度器</strong></td><td>管理 AI Tick 频率、分帧、实体分组、LOD</td><td>C++</td></tr>
+    <tr><td><strong>行为树引擎</strong></td><td>节点 Tick/Reset、子树、并行节点、装饰器</td><td>C++（核心）+ DasLang（节点注册）</td></tr>
+    <tr><td><strong>行为树节点</strong></td><td>具体条件和动作（CheckDistance, MoveTo, CastSkill...）</td><td>DasLang</td></tr>
+    <tr><td><strong>黑板</strong></td><td>AI 状态存储（目标、仇恨、巡逻路径索引...）</td><td>ScriptComponent（BlobStorage）</td></tr>
+  </table>
+
+  <h3>3. 黑板（Blackboard）——ScriptComponent</h3>
+  <pre><code><span class="cm">// AI 黑板——每个 AI 实体各自独立的 ScriptComponent</span>
+[script_component]
+<span class="kw">struct</span> <span class="tp">AIBlackboard</span> {
+    <span class="cm">// 目标管理</span>
+    currentTarget     : Entity              <span class="cm">// 当前战斗目标</span>
+    threatTarget      : Entity              <span class="cm">// 仇恨最高目标</span>
+
+    <span class="cm">// 状态机状态</span>
+    aiState           : int                 <span class="cm">// 0=Idle 1=Patrol 2=Combat 3=Flee 4=Return 5=Dead</span>
+    lastStateChange   : float               <span class="cm">// TickTime</span>
+
+    <span class="cm">// 巡逻</span>
+    patrolPathId      : int                 <span class="cm">// 巡逻路径 ID（0=无巡逻）</span>
+    patrolIndex       : int                 <span class="cm">// 当前巡逻点索引</span>
+    patrolDirection   : int                 <span class="cm">// 1=正序 -1=逆序</span>
+    patrolWaitUntil   : float               <span class="cm">// 巡逻点等待到何时</span>
+
+    <span class="cm">// 出生点</span>
+    spawnPosition     : Vector3             <span class="cm">// 出生/返回位置</span>
+    chaseRange        : float               <span class="cm">// 追击范围（从模板初始化）</span>
+    leashRange        : float               <span class="cm">// 脱战范围（超出则回出生点）</span>
+
+    <span class="cm">// 技能选择</span>
+    availableSkillIds : array&lt;uint32&gt;        <span class="cm">// 可用技能列表</span>
+    lastSkillCastTime : float               <span class="cm">// 上次施法时间</span>
+
+    <span class="cm">// 临时数据（行为树节点间共享）</span>
+    tempFloats        : array&lt;float&gt;         <span class="cm">// 临时浮点值</span>
+    tempEntities      : array&lt;Entity&gt;        <span class="cm">// 临时实体引用</span>
+    tempInts          : array&lt;int&gt;
+
+    <span class="cm">// 行为树运行时</span>
+    btStack           : array&lt;int&gt;           <span class="cm">// 行为树调用栈（用于分帧恢复）</span>
+}</code></pre>
+
+  <h3>4. 行为树节点类型</h3>
+  <table>
+    <tr><th>类型</th><th>返回值</th><th>说明</th></tr>
+    <tr><td><strong>Sequence</strong>（顺序）</td><td>依次执行子节点，任一失败则失败</td><td>"且"逻辑——所有条件满足才继续</td></tr>
+    <tr><td><strong>Selector</strong>（选择）</td><td>依次执行子节点，任一成功则成功</td><td>"或"逻辑——优先选择第一个可执行的分支</td></tr>
+    <tr><td><strong>Parallel</strong>（并行）</td><td>同时执行所有子节点</td><td>移动+攻击 同时进行</td></tr>
+    <tr><td><strong>Condition</strong>（条件）</td><td>检查条件，成功→继续，失败→终止</td><td>距离检查、HP检查、Buff检查</td></tr>
+    <tr><td><strong>Action</strong>（动作）</td><td>执行动作，返回 Running/Success/Fail</td><td>移动、施法、巡逻、逃跑</td></tr>
+    <tr><td><strong>Decorator</strong>（装饰器）</td><td>包装子节点，修改其行为</td><td>Inverter、Repeater、Timeout、Cooldown</td></tr>
+  </table>
+
+  <h3>5. 行为树节点——DasLang 实现</h3>
+  <pre><code><span class="cm">// ai_nodes.das — 基础行为树节点</span>
+
+<span class="kw">enum</span> <span class="tp">BTStatus</span> { BT_SUCCESS, BT_FAIL, BT_RUNNING }
+
+<span class="cm">// ==== 条件节点 ====</span>
+
+<span class="cm">// 检查是否有仇恨目标</span>
+<span class="kw">def</span> <span class="fn">BTCond_HasThreatTarget</span>(entity : Entity) : BTStatus
+{
+    ecs_edit(entity) $(<span class="kw">var</span> cmp)
+    {
+        cmp.aiBlackboard.threatTarget = GetTopThreatTarget(entity)
+        <span class="kw">return</span> cmp.aiBlackboard.threatTarget != InvalidEntity ? BT_SUCCESS : BT_FAIL
+    }
+    <span class="kw">return</span> BT_FAIL
+}
+
+<span class="cm">// 检查目标是否在近战范围内</span>
+<span class="kw">def</span> <span class="fn">BTCond_InMeleeRange</span>(entity : Entity) : BTStatus
+{
+    ecs_edit(entity) $(<span class="kw">var</span> cmp)
+    {
+        <span class="kw">let</span> target = cmp.aiBlackboard.currentTarget
+        <span class="kw">if</span> (target == InvalidEntity) <span class="kw">return</span> BT_FAIL
+        <span class="kw">let</span> dist = DistanceBetween(entity, target)
+        <span class="kw">let</span> meleeRange = GetMeleeRange(entity)  <span class="cm">// 从 MonsterTemplate 查</span>
+        <span class="kw">return</span> dist &lt;= meleeRange ? BT_SUCCESS : BT_FAIL
+    }
+    <span class="kw">return</span> BT_FAIL
+}
+
+<span class="cm">// 检查目标是否在追击范围内</span>
+<span class="kw">def</span> <span class="fn">BTCond_InChaseRange</span>(entity : Entity) : BTStatus
+{
+    ecs_edit(entity) $(<span class="kw">var</span> cmp)
+    {
+        <span class="kw">let</span> target = cmp.aiBlackboard.currentTarget
+        <span class="kw">if</span> (target == InvalidEntity) <span class="kw">return</span> BT_FAIL
+        <span class="kw">let</span> dist = DistanceBetween(entity, target)
+        <span class="kw">return</span> dist &lt;= cmp.aiBlackboard.chaseRange ? BT_SUCCESS : BT_FAIL
+    }
+    <span class="kw">return</span> BT_FAIL
+}
+
+<span class="cm">// 检查 HP 低于阈值</span>
+<span class="kw">def</span> <span class="fn">BTCond_HpBelow</span>(entity : Entity; thresholdPct : int) : BTStatus
+{
+    ecs_edit(entity) $(<span class="kw">var</span> cmp)
+    {
+        <span class="kw">let</span> pct = cmp.battleStats.currentHp * <span class="num">100</span> / cmp.battleStats.maxHp
+        <span class="kw">return</span> pct &lt; thresholdPct ? BT_SUCCESS : BT_FAIL
+    }
+    <span class="kw">return</span> BT_FAIL
+}
+
+<span class="cm">// ==== 动作节点 ====</span>
+
+<span class="cm">// 向目标移动</span>
+<span class="kw">def</span> <span class="fn">BTAction_MoveToTarget</span>(entity : Entity) : BTStatus
+{
+    ecs_edit(entity) $(<span class="kw">var</span> cmp)
+    {
+        <span class="kw">let</span> target = cmp.aiBlackboard.currentTarget
+        <span class="kw">if</span> (target == InvalidEntity) <span class="kw">return</span> BT_FAIL
+
+        <span class="cm">// 寻路到目标位置</span>
+        <span class="kw">let</span> path = NavFindPath(GetSceneId(entity), GetPosition(entity), GetPosition(target))
+        <span class="kw">if</span> (path |> empty()) <span class="kw">return</span> BT_FAIL
+
+        <span class="cm">// 向路径第一个点移动</span>
+        MoveEntityToward(entity, path[<span class="num">0</span>], GetMoveSpeed(entity))
+        <span class="kw">return</span> BT_RUNNING
+    }
+    <span class="kw">return</span> BT_FAIL
+}
+
+<span class="cm">// 攻击目标（选择最优技能）</span>
+<span class="kw">def</span> <span class="fn">BTAction_AttackTarget</span>(entity : Entity) : BTStatus
+{
+    ecs_edit(entity) $(<span class="kw">var</span> cmp)
+    {
+        <span class="kw">let</span> target = cmp.aiBlackboard.currentTarget
+        <span class="kw">if</span> (target == InvalidEntity) <span class="kw">return</span> BT_FAIL
+
+        <span class="cm">// 选择可用技能（不在 CD 中、有资源的）</span>
+        <span class="kw">let</span> skillId = SelectBestSkill(entity, cmp.aiBlackboard.availableSkillIds)
+        <span class="kw">if</span> (skillId == <span class="num">0</span>) {
+            <span class="cm">// 没有可用技能——普攻</span>
+            <span class="kw">return</span> BTAction_AutoAttack(entity)
+        }
+
+        <span class="kw">let</span> result = HandleSkillCast(entity, skillId, target, <span class="num">0.0</span>, <span class="num">0.0</span>, <span class="num">0.0</span>)
+        <span class="kw">return</span> result == SKILL_OK ? BT_SUCCESS : BT_FAIL
+    }
+    <span class="kw">return</span> BT_FAIL
+}
+
+<span class="cm">// 巡逻——沿预设路径移动到下一个巡逻点</span>
+<span class="kw">def</span> <span class="fn">BTAction_Patrol</span>(entity : Entity) : BTStatus
+{
+    ecs_edit(entity) $(<span class="kw">var</span> cmp)
+    {
+        <span class="kw">let</span> bb = cmp.aiBlackboard
+
+        <span class="cm">// 检查是否正在等待</span>
+        <span class="kw">if</span> (bb.patrolWaitUntil &gt; GetTickTime()) <span class="kw">return</span> BT_RUNNING
+
+        <span class="cm">// 获取当前巡逻点</span>
+        <span class="kw">let</span> waypoint = GetPatrolWaypoint(bb.patrolPathId, bb.patrolIndex)
+        <span class="kw">let</span> dist = DistanceToPosition(entity, waypoint)
+
+        <span class="kw">if</span> (dist &lt; <span class="num">1.0</span>) {
+            <span class="cm">// 到达巡逻点——等待 2 秒，然后前进</span>
+            bb.patrolWaitUntil = GetTickTime() + <span class="num">2.0</span>
+            bb.patrolIndex = GetNextPatrolIndex(bb)
+        }
+
+        <span class="cm">// 向巡逻点移动</span>
+        MoveEntityTowardPosition(entity, waypoint, GetWalkSpeed(entity))
+        <span class="kw">return</span> BT_RUNNING
+    }
+    <span class="kw">return</span> BT_FAIL
+}
+
+<span class="cm">// 返回出生点</span>
+<span class="kw">def</span> <span class="fn">BTAction_ReturnToSpawn</span>(entity : Entity) : BTStatus
+{
+    ecs_edit(entity) $(<span class="kw">var</span> cmp)
+    {
+        <span class="kw">let</span> dist = DistanceToPosition(entity, cmp.aiBlackboard.spawnPosition)
+        <span class="kw">if</span> (dist &lt; <span class="num">1.0</span>) {
+            <span class="cm">// 到达出生点——重置 AI 状态</span>
+            cmp.aiBlackboard.aiState = AI_STATE_IDLE
+            cmp.aiBlackboard.currentTarget = InvalidEntity
+            ClearThreatTable(entity)
+            <span class="kw">return</span> BT_SUCCESS
+        }
+
+        <span class="cm">// 移向出生点</span>
+        MoveEntityTowardPosition(entity, cmp.aiBlackboard.spawnPosition, GetMoveSpeed(entity))
+        <span class="kw">return</span> BT_RUNNING
+    }
+    <span class="kw">return</span> BT_FAIL
+}</code></pre>
+
+  <h3>6. 行为树组装——通用怪物 AI 模板</h3>
+  <pre><code><span class="cm">// 怪物通用行为树（Selector 根节点）</span>
+<span class="cm">//</span>
+<span class="cm">// Root (Selector)</span>
+<span class="cm">//   ├── Sequence: 战斗</span>
+<span class="cm">//   │     ├── Cond: 有仇恨目标</span>
+<span class="cm">//   │     ├── Cond: 目标在追击范围内</span>
+<span class="cm">//   │     ├── Selector: 战斗行为</span>
+<span class="cm">//   │     │     ├── Sequence: 近战攻击</span>
+<span class="cm">//   │     │     │     ├── Cond: 在近战范围内</span>
+<span class="cm">//   │     │     │     └── Action: 攻击目标</span>
+<span class="cm">//   │     │     └── Action: 移向目标</span>
+<span class="cm">//   │     └── Action: 更新战斗状态</span>
+<span class="cm">//   ├── Sequence: 返回出生点</span>
+<span class="cm">//   │     ├── Cond: AI 状态为 "返回"</span>
+<span class="cm">//   │     └── Action: 返回出生点</span>
+<span class="cm">//   ├── Sequence: 巡逻</span>
+<span class="cm">//   │     ├── Cond: 有巡逻路径</span>
+<span class="cm">//   │     └── Action: 巡逻</span>
+<span class="cm">//   └── Action: 待机（播放 Idle 动画）</span>
+
+<span class="cm">// 行为树运行——DasLang 侧调度</span>
+<span class="kw">def</span> <span class="fn">RunBehaviorTree</span>(entity : Entity) : BTStatus
+{
+    <span class="cm">// Root Selector: 按优先级尝试各分支</span>
+
+    <span class="cm">// 分支 1: 战斗</span>
+    <span class="kw">if</span> (BTCond_HasThreatTarget(entity) == BT_SUCCESS) {
+        ecs_edit(entity) $(<span class="kw">var</span> cmp) {
+            cmp.aiBlackboard.currentTarget = cmp.aiBlackboard.threatTarget
+            cmp.aiBlackboard.aiState = AI_STATE_COMBAT
+        }
+
+        <span class="kw">if</span> (BTCond_InChaseRange(entity) == BT_SUCCESS) {
+            <span class="cm">// 检查是否需要逃跑</span>
+            <span class="kw">if</span> (ShouldFlee(entity)) {
+                FleeFromTarget(entity)
+                <span class="kw">return</span> BT_RUNNING
+            }
+
+            <span class="kw">if</span> (BTCond_InMeleeRange(entity) == BT_SUCCESS) {
+                BTAction_AttackTarget(entity)
+            } <span class="kw">else</span> {
+                BTAction_MoveToTarget(entity)
+            }
+            <span class="kw">return</span> BT_RUNNING
+        } <span class="kw">else</span> {
+            <span class="cm">// 超出追击范围——脱战，返回出生点</span>
+            ecs_edit(entity) $(<span class="kw">var</span> cmp) {
+                cmp.aiBlackboard.aiState = AI_STATE_RETURN
+                cmp.aiBlackboard.currentTarget = InvalidEntity
+            }
+            ClearThreatTable(entity)
+            <span class="kw">return</span> BT_RUNNING
+        }
+    }
+
+    <span class="cm">// 分支 2: 返回出生点</span>
+    <span class="kw">if</span> (GetAIState(entity) == AI_STATE_RETURN) {
+        <span class="kw">return</span> BTAction_ReturnToSpawn(entity)
+    }
+
+    <span class="cm">// 分支 3: 巡逻</span>
+    <span class="kw">if</span> (HasPatrolPath(entity)) {
+        <span class="kw">if</span> (GetAIState(entity) != AI_STATE_PATROL) {
+            SetAIState(entity, AI_STATE_PATROL)
+        }
+        <span class="kw">return</span> BTAction_Patrol(entity)
+    }
+
+    <span class="cm">// 分支 4: 待机</span>
+    <span class="kw">return</span> BT_SUCCESS
+}</code></pre>
+
+  <h3>7. AI 调度器（C++ 侧）</h3>
+  <pre><code><span class="cm">// AIScheduler.h — AI 调度器（C++ 引擎层）</span>
+<span class="kw">class</span> <span class="tp">AIScheduler</span> {
+<span class="kw">public</span>:
+    <span class="kw">struct</span> <span class="tp">Config</span> {
+        <span class="tp">int</span> aiTickIntervalMs = <span class="num">200</span>;      <span class="cm">// AI 决策间隔：200ms（每 4 个逻辑 Tick）</span>
+        <span class="tp">int</span> maxAiPerTick      = <span class="num">500</span>;      <span class="cm">// 每逻辑 Tick 最多处理 500 个 AI 实体</span>
+        <span class="tp">int</span> aiBatchSize       = <span class="num">50</span>;       <span class="cm">// 分帧——每 Tick 处理 50 个 AI 决策</span>
+        <span class="tp">int</span> maxBTDepth        = <span class="num">32</span>;       <span class="cm">// 行为树最大递归深度（防栈溢出）</span>
+    };
+
+    <span class="cm">// 每 Tick 由逻辑线程调用</span>
+    <span class="tp">void</span> <span class="fn">Tick</span>() {
+        <span class="cm">// Round-Robin 遍历所有 AI 实体，每个实体每 200ms 决策一次</span>
+        <span class="kw">if</span> (<span class="kw">_batchRemaining</span> &lt;= <span class="num">0</span>) <span class="kw">return</span>;  <span class="cm">// 本 Tick 预算用尽</span>
+
+        <span class="tp">int</span> processed = <span class="num">0</span>;
+        <span class="kw">while</span> (<span class="kw">_cursor</span> != <span class="kw">_aiEntities</span>.end() &amp;&amp; processed &lt; <span class="kw">_batchRemaining</span>) {
+            <span class="kw">auto</span> entity = *<span class="kw">_cursor</span>;
+            ++<span class="kw">_cursor</span>;
+
+            <span class="cm">// 检查是否到该实体的 AI Tick 时间</span>
+            <span class="kw">auto</span>&amp; lastTick = <span class="kw">_lastAiTick</span>[entity];
+            <span class="kw">if</span> (<span class="kw">_tickTime</span> - lastTick &gt;= <span class="kw">_config</span>.aiTickIntervalMs) {
+                lastTick = <span class="kw">_tickTime</span>;
+                <span class="fn">RunEntityAI</span>(entity);  <span class="cm">// → DasLang RunBehaviorTree</span>
+                processed++;
+            }
+        }
+
+        <span class="cm">// 游标回到起点——Round-Robin 公平调度</span>
+        <span class="kw">if</span> (<span class="kw">_cursor</span> == <span class="kw">_aiEntities</span>.end())
+            <span class="kw">_cursor</span> = <span class="kw">_aiEntities</span>.begin();
+    }
+
+    <span class="tp">void</span> <span class="fn">RegisterEntity</span>(<span class="tp">Entity</span> entity) { <span class="kw">_aiEntities</span>.push_back(entity); }
+    <span class="tp">void</span> <span class="fn">UnregisterEntity</span>(<span class="tp">Entity</span> entity) { <span class="cm">/* 标记删除，下 Tick 清理 */</span> }
+
+<span class="kw">private</span>:
+    <span class="tp">Config</span> <span class="kw">_config</span>;
+    <span class="tp">std::vector</span>&lt;<span class="tp">Entity</span>&gt; <span class="kw">_aiEntities</span>;
+    <span class="tp">std::vector</span>&lt;<span class="tp">Entity</span>&gt;::iterator <span class="kw">_cursor</span> = <span class="kw">_aiEntities</span>.begin();
+    <span class="tp">std::unordered_map</span>&lt;<span class="tp">Entity</span>, <span class="tp">std::chrono::milliseconds</span>&gt; <span class="kw">_lastAiTick</span>;
+    <span class="tp">int</span> <span class="kw">_batchRemaining</span> = <span class="kw">_config</span>.aiBatchSize;
+    <span class="tp">std::chrono::milliseconds</span> <span class="kw">_tickTime</span>;
+};</code></pre>
+
+  <h4>7.1 行为树深度保护</h4>
+  <p>
+    行为树节点的递归执行可能导致栈溢出——尤其是 DasLang 的实现栈小于 C++ 原生栈。
+    AI 调度器在每次 RunEntityAI 调用前重置 depth 计数器，
+    DasLang 侧的 BT 节点每次递归子节点时递增。超过硬上限（32 层）时截断并告警。
+  </p>
+
+  <pre><code><span class="cm">// C++ 层在调用 DasLang 前设置深度限制</span>
+<span class="kw">static</span> <span class="kw">constexpr</span> <span class="tp">int</span> kMaxBTDepth = <span class="num">32</span>;
+
+<span class="tp">NodeStatus</span> <span class="fn">EvaluateTree</span>(<span class="tp">BTNode</span>* node, <span class="tp">AIBlackboard</span>&amp; bb, <span class="tp">int</span> depth = <span class="num">0</span>) {
+    <span class="kw">if</span> (depth &gt; kMaxBTDepth) {
+        LOG_ERROR(<span class="str">"BT depth exceeded {} for entity"</span>, kMaxBTDepth);
+        TracyMessageL(<span class="str">"BT depth overflow"</span>);
+        <span class="kw">return</span> <span class="tp">NodeStatus::Failure</span>;  <span class="cm">// 截断——静默失败，不崩进程</span>
+    }
+
+    <span class="kw">switch</span> (node-&gt;type) {
+        <span class="kw">case</span> <span class="tp">NodeType::Selector</span>:
+            <span class="kw">for</span> (<span class="kw">auto</span>&amp; child : node-&gt;children) {
+                <span class="kw">auto</span> status = <span class="fn">EvaluateTree</span>(child, bb, depth + <span class="num">1</span>);
+                <span class="kw">if</span> (status == <span class="tp">NodeStatus::Success</span>) <span class="kw">return</span> <span class="tp">NodeStatus::Success</span>;
+            }
+            <span class="kw">return</span> <span class="tp">NodeStatus::Failure</span>;
+
+        <span class="kw">case</span> <span class="tp">NodeType::Sequence</span>:
+            <span class="kw">for</span> (<span class="kw">auto</span>&amp; child : node-&gt;children) {
+                <span class="kw">auto</span> status = <span class="fn">EvaluateTree</span>(child, bb, depth + <span class="num">1</span>);
+                <span class="kw">if</span> (status != <span class="tp">NodeStatus::Success</span>) <span class="kw">return</span> status;
+            }
+            <span class="kw">return</span> <span class="tp">NodeStatus::Success</span>;
+
+        <span class="kw">default</span>:
+            <span class="kw">return</span> node-&gt;<span class="fn">Execute</span>(bb);  <span class="cm">// 叶子节点——DasLang 实现</span>
+    }
+}</code></pre>
+
+  <div class="callout info">
+    <strong>深度限制 32 层</strong>：你的怪物通用 BT 模板只有 5 层深（Selector → Sequence → Selector → Sequence → Action）。
+    32 层对复杂 Boss AI 也绰绰有余——超过这个深度通常意味着设计错误而非需要更深的树。
+    截断时打 ERROR 日志 + Tracy 标记，立即引起注意。
+  </div>
+
+  <h3>8. AI LOD（细节层次）</h3>
+  <table>
+    <tr><th>LOD</th><th>距离范围</th><th>AI 频率</th><th>行为</th></tr>
+    <tr><td><strong>LOD 0</strong>（近）</td><td>0-50m</td><td>每 200ms</td><td>完整行为树：战斗/巡逻/技能选择</td></tr>
+    <tr><td><strong>LOD 1</strong>（中）</td><td>50-150m</td><td>每 1s</td><td>简化：只更新移动和状态机</td></tr>
+    <tr><td><strong>LOD 2</strong>（远）</td><td>150m+</td><td>每 5s</td><td>极简：只检查是否需要进入 LOD 1</td></tr>
+  </table>
+
+  <pre><code><span class="cm">// LOD 计算——基于与最近玩家的距离</span>
+<span class="kw">def</span> <span class="fn">GetAILOD</span>(entity : Entity) : int
+{
+    <span class="kw">let</span> nearestPlayerDist = GetDistanceToNearestPlayer(entity)
+    <span class="kw">if</span> (nearestPlayerDist &lt; <span class="num">50.0</span>)  <span class="kw">return</span> <span class="num">0</span>
+    <span class="kw">if</span> (nearestPlayerDist &lt; <span class="num">150.0</span>) <span class="kw">return</span> <span class="num">1</span>
+    <span class="kw">return</span> <span class="num">2</span>
+}</code></pre>
+
+  <h3>9. NPC 日程系统（Schedule System）</h3>
+  <p>
+    城镇 NPC 不跑行为树，跑 <strong>日程表</strong>——按时间切换位置和行为。比行为树更轻量。
+  </p>
+
+  <pre><code><span class="cm">// 脚本组件——NPC 日程</span>
+[script_component]
+<span class="kw">struct</span> <span class="tp">NPCSchedule</span> {
+    entries     : array&lt;NPCScheduleEntry&gt;
+}
+
+<span class="kw">struct</span> <span class="tp">NPCScheduleEntry</span> {
+    startHour   : int           <span class="cm">// 游戏内时间（小时）</span>
+    endHour     : int
+    sceneId     : uint32        <span class="cm">// 所在的场景</span>
+    position    : Vector3
+    animation   : int           <span class="cm">// 播放动画 ID（0=默认待机）</span>
+    dialogueId  : int           <span class="cm">// 可交互的对话 ID（0=不可交互）</span>
+}
+
+<span class="cm">// NPC AI Tick——简单日程切换</span>
+<span class="kw">def</span> <span class="fn">RunNPCSchedule</span>(entity : Entity)
+{
+    <span class="kw">let</span> gameHour = GetGameTimeHour()
+    ecs_edit(entity) $(<span class="kw">var</span> cmp)
+    {
+        <span class="kw">for</span> entry <span class="kw">in</span> cmp.npcSchedule.entries {
+            <span class="kw">if</span> (gameHour &gt;= entry.startHour &amp;&amp; gameHour &lt; entry.endHour) {
+                <span class="cm">// 检查是否需要切换</span>
+                <span class="kw">if</span> (cmp.npcSchedule.currentEntry != entry) {
+                    <span class="cm">// 跨场景移动（如从广场走入屋内）</span>
+                    <span class="kw">if</span> (entry.sceneId != GetSceneId(entity)) {
+                        MigrateEntityToScene(entity, entry.sceneId)
+                    }
+                    TeleportEntity(entity, entry.position)
+                    SetAnimation(entity, entry.animation)
+                    SetDialogue(entity, entry.dialogueId)
+                    cmp.npcSchedule.currentEntry = entry
+                }
+                <span class="kw">return</span>
+            }
+        }
+    }
+}</code></pre>
+
+  <h3>10. DasLang 桥接 API</h3>
+  <pre><code><span class="cm">// AI 桥接——C++ 侧注册</span>
+<span class="fn">MoveEntityToward</span>(entity: Entity; target: Vector3; speed: float)     <span class="cm">// 向目标点移动一帧</span>
+<span class="fn">MoveEntityTowardPosition</span>(entity: Entity; pos: Vector3; speed: float)
+<span class="fn">TeleportEntity</span>(entity: Entity; pos: Vector3)
+<span class="fn">GetDistanceToNearestPlayer</span>(entity: Entity): float
+<span class="fn">GetMeleeRange</span>(entity: Entity): float
+<span class="fn">GetWalkSpeed</span>(entity: Entity): float
+<span class="fn">GetMoveSpeed</span>(entity: Entity): float
+<span class="fn">SelectBestSkill</span>(entity: Entity; skillIds: array&lt;uint32&gt;): uint32
+<span class="fn">SetAIState</span>(entity: Entity; state: int)
+<span class="fn">GetAIState</span>(entity: Entity): int
+<span class="fn">ShouldFlee</span>(entity: Entity): bool
+<span class="fn">FleeFromTarget</span>(entity: Entity)
+<span class="fn">HasPatrolPath</span>(entity: Entity): bool
+<span class="fn">GetPatrolWaypoint</span>(pathId: int; index: int): Vector3
+<span class="fn">SetAnimation</span>(entity: Entity; animId: int)
+<span class="fn">SetDialogue</span>(entity: Entity; dialogueId: int)
+<span class="fn">GetGameTimeHour</span>(): int</code></pre>
+
+  <h3>11. 性能分析</h3>
+  <table>
+    <tr><th>场景</th><th>AI 实体数</th><th>LOD 0</th><th>LOD 1</th><th>LOD 2</th><th>每 Tick AI 消耗</th></tr>
+    <tr><td>主城</td><td>500 NPC</td><td>50</td><td>200</td><td>250</td><td>日程查询 ~0.1ms</td></tr>
+    <tr><td>野外</td><td>5000 怪物</td><td>100</td><td>500</td><td>4400</td><td>决策 ~2ms + 寻路 ~5ms</td></tr>
+    <tr><td>副本</td><td>200 怪物</td><td>200</td><td>0</td><td>0</td><td>决策 ~1ms + 寻路 ~2ms</td></tr>
+  </table>
+
+  <div class="callout warn">
+    <strong>⚠ AI 寻路开销</strong>：5000 怪物的野外场景中，LOD 0 的 100 个怪物每 200ms 做一次寻路(MoveToTarget)，
+    每次 0.1ms = 10ms/200ms = 均摊 ~2.5ms/Tick。LOD 1 只做状态更新不寻路。LOD 2 几乎零开销。
+    总体 AI 开销 ≤ 5ms/Tick，在 50ms 预算内可控。
+  </div>
+
+</div>
+
+</div>
+<nav class="breadcrumb" style="margin-top:24px;"><a href="../Design.html">🏠 返回总目录</a></nav>
+<div class="footer">MMO Server Architecture Design Document · Version 1.2</div>
+</body>
+</html>

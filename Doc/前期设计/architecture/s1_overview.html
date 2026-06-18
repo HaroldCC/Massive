@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>1. 整体架构总览 — MMO 服务器架构设计 v1.2</title>
+<link rel="stylesheet" href="../shared.css">
+</head>
+<body>
+
+<nav class="breadcrumb">
+  <a href="../Design.html">🏠 总目录</a>
+</nav>
+
+<div class="container">
+<span class="badge confirmed">✔ 已确认 · C2 分布式拓扑</span>
+
+<div class="section" id="s1">
+  <h2>1. 整体架构总览 · C2 多进程分布式</h2>
+
+  <h3>1.1 设计哲学</h3>
+  <p>
+    5 种独立进程，一步到位分布式架构。C++23 + EnTT ECS + DasLang 脚本 + PostgreSQL 持久化。
+    <strong>无状态 GateServer</strong> 做纯代理路由（零密钥、零加密、零 DB），WorldServer 隐藏在内网。
+    DB 访问通过各进程内置的 <strong>DBWorkerPool</strong>（共享 common 库组件），直连 PgBouncer。
+    不设独立 DBServer 进程——业界主流做法（TrinityCore / Mangos / 天堂2）。
+  </p>
+
+  <h3>1.2 进程拓扑</h3>
+  <pre>
+Client (公网)
+  │
+  ├── ① TLS ──────→ LoginServer (公网)      ───→ 签发 SessionToken
+  │
+  ├── ② TCP ──────→ GateServer × N (公网)   ───→ 读 SessionId 路由
+  │                     │
+  │                     │ 内部 TCP（内网）
+  │                     ▼
+  │                WorldServer × M (内网 ONLY)
+  │                  │ AES-GCM 加解密
+  │                  │ ECS + DasLang
+  │                  │ DBWorkerPool → PgBouncer → PostgreSQL
+  │                  │
+  │                  ├──→ CenterServer (服务发现 / 跨服路由)
+  │                  └──→ SocialServer (公会 / 邮件 / 拍卖行 / 匹配)
+
+LoginServer ──→ PgBouncer → PostgreSQL   (验证账号、查封禁)
+SocialServer ──→ PgBouncer → PostgreSQL  (公会/邮件/好友持久化)</pre>
+
+  <h3>1.3 WorldServer 内部线程模型</h3>
+  <pre>
+IOContextPool (N 线程, 接收 Gate/Center/Social 的内部 TCP 包)
+  │ Round-Robin
+  ▼
+IO 线程 → 收包 → 验证 SessionToken → 解密 → Enqueue(LogicMessage)
+                                                  │
+                                          MPSC Queue (无锁)
+                                                  │
+                                          LogicThread (单线程)
+                                            │ DrainAll → 消息分发
+                                            │ ecs_stage "movement" → ecs_stage "combat" → ...
+                                            │ ecs_stage "save" → DBWorkerPool.AsyncQuery(sql, callback)
+                                            │ ecs_stage "replicate" → 加密 → Gate
+                                            │
+                                            │ ProcessDBCallbacks() → 回调 lambda 在 LogicThread 执行
+
+DBWorkerPool (3-5 Worker 线程, 各持一个 libpq → PgBouncer 连接)
+  │ 收 SQL → 执行 → 结果塞回 MPSC Queue → LogicThread 下次 Tick 取</pre>
+
+  <h3>1.4 进程列表</h3>
+  <table>
+    <tr><th>进程</th><th>公网？</th><th>进程数</th><th>密钥</th><th>核心职责</th></tr>
+    <tr><td>LoginServer</td><td>✅ TLS</td><td>1-2</td><td>LSS + ECDH 私钥</td><td>账号认证 · ECDH · SessionToken 签发</td></tr>
+    <tr><td>GateServer</td><td>✅</td><td>2-8</td><td>无</td><td>TCP 连接保持 · SessionId 路由 · DDoS 吸收</td></tr>
+    <tr><td>WorldServer</td><td>❌ 内网</td><td>1-16</td><td>LSS + SessionKey</td><td>ECS + DasLang · 加解密 · 场景 · 逻辑 · DBWorkerPool</td></tr>
+    <tr><td>CenterServer</td><td>❌ 内网</td><td>1（主备）</td><td>无</td><td>服务发现 · 跨服路由 · 玩家位置索引</td></tr>
+    <tr><td>SocialServer</td><td>❌ 内网</td><td>1-2</td><td>无</td><td>公会 · 聊天 · 好友 · 邮件 · 拍卖行 · 匹配 · DBWorkerPool</td></tr>
+  </table>
+
+  <h3>1.5 开发环境——本地全进程</h3>
+  <pre>
+PgBouncer     → localhost:6432
+LoginServer   → localhost:8443  (TLS)
+GateServer_1  → localhost:9000
+WorldServer_1 → localhost:8001
+CenterServer  → localhost:7000
+SocialServer  → localhost:7001</pre>
+
+</div>
+
+<nav class="breadcrumb" style="margin-top:24px;">
+  <a href="../Design.html">🏠 返回总目录</a>
+</nav>
+
+</div>
+<div class="footer">
+  MMO Server Architecture Design Document · Version 1.2
+</div>
+</body>
+</html>
