@@ -25,6 +25,9 @@ __pycache__/
 **/AutoGen/*.gen.h
 **/AutoGen/*.gen.cpp
 !**/AutoGen/.gitignore
+# protoc 生成的 C++ 代码（由 Proto/xmake.lua 在构建时生成）
+**/AutoGen/*.pb.h
+**/AutoGen/*.pb.cc
 
 # ===== 测试残留 =====
 test_compiler_tmp/

@@ -1,0 +1,20 @@
+// Common.proto — 公共结构定义
+// 无 Req/Rsp/Ntf 后缀的结构不参与 MsgID 生成。
+syntax = "proto3";
+
+package MMO;
+
+// 三维坐标
+message Vector3
+{
+    float x = 1;
+    float y = 2;
+    float z = 3;
+}
+
+// 错误信息（通用响应携带）
+message ErrorInfo
+{
+    uint32 code = 1;     // EErrorCode 数值
+    string message = 2;  // 可读描述
+}

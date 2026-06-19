@@ -1,0 +1,17 @@
+// MsgID.proto — 客户端消息 ID 枚举
+// ⚠ 本文件由 Tools/Proto/GenMsgID.py 自动生成并维护——不要手动编辑 enum 值。
+//   已有消息 ID 永不变更，新消息追加，删除的消息保留为 [deprecated] 不复用 ID。
+syntax = "proto3";
+
+package MMO;
+
+enum EMsgID
+{
+    MSG_NONE = 0;
+    MSG_HEARTBEAT_REQ = 1;
+    MSG_HEARTBEAT_RSP = 2;
+    MSG_LOGIN_AUTH_REQ = 3;
+    MSG_LOGIN_AUTH_RSP = 4;
+    MSG_LOGIN_ENTER_WORLD_REQ = 5;
+    MSG_LOGIN_ENTER_WORLD_RSP = 6;
+}
