@@ -88,3 +88,7 @@ target("Spdlog")
 target("ConcurrentQueue")
     set_kind("headeronly")
     add_includedirs("$(projectdir)/ThirdParty/concurrentqueue", {public = true})
+
+target("TomlPlusPlus")
+    set_kind("headeronly")
+    add_includedirs("$(projectdir)/ThirdParty/tomlplusplus/include", {public = true})
