@@ -1,0 +1,5 @@
+# CenterServer 配置
+
+[network]
+port = 9000
+io_threads = 2
