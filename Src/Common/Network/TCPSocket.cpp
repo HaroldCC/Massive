@@ -1,0 +1,205 @@
+/**
+ * @file TCPSocket.cpp
+ * @brief TCP socket 异步收发 + 粘包拆包实现
+ */
+
+#include "Common/Network/TCPSocket.h"
+#include "Common/Log/Log.h"
+
+#include <asio/read.hpp>
+
+namespace MMO
+{
+
+TCPSocket::TCPSocket(asio::ip::tcp::socket socket)
+    : _socket(std::move(socket))
+{
+}
+
+TCPSocket::~TCPSocket()
+{
+    Close();
+}
+
+void TCPSocket::Start()
+{
+    if (_started.exchange(true, std::memory_order_acq_rel))
+    {
+        return;
+    }
+    _readBuffer.reserve(kMaxPacketSize);
+    DoRead();
+}
+
+void TCPSocket::Send(ByteBuffer data)
+{
+    if (_closed.load(std::memory_order_acquire))
+    {
+        Log::Warn("TCPSocket: Send on closed socket");
+        return;
+    }
+
+    bool needWrite = false;
+    {
+        std::lock_guard lock(_writeMutex);
+        _writeQueue.push_back(std::move(data));
+        if (!_writing)
+        {
+            _writing = true;
+            needWrite = true;
+        }
+    }
+    if (needWrite)
+    {
+        DoWrite();
+    }
+}
+
+void TCPSocket::Close()
+{
+    DoClose();
+}
+
+void TCPSocket::DoRead()
+{
+    auto self = shared_from_this();
+
+    // 确保读缓冲有空间：容量不足时扩容（上限 kMaxPacketSize * 4）
+    constexpr size_t kMaxReadBuffer = kMaxPacketSize * 4;
+    if (_readBuffer.capacity() < kMaxPacketSize)
+    {
+        _readBuffer.reserve(kMaxPacketSize);
+    }
+    if (_readBuffer.size() >= kMaxReadBuffer)
+    {
+        Log::Error("TCPSocket: Read buffer exhausted ({} bytes), closing", _readBuffer.size());
+        DoClose();
+        return;
+    }
+
+    // 至少有 4 KiB 空间可读
+    if (_readBuffer.capacity() - _readBuffer.size() < 4096)
+    {
+        size_t newCap = std::min(_readBuffer.capacity() + kMaxPacketSize, kMaxReadBuffer);
+        _readBuffer.reserve(newCap);
+    }
+
+    _socket.async_read_some(asio::buffer(_readBuffer.data() + _readBuffer.size(),
+                                         _readBuffer.capacity() - _readBuffer.size()),
+        [self](const asio::error_code& ec, size_t bytesTransferred)
+        {
+            if (ec)
+            {
+                self->HandleError(ec);
+                return;
+            }
+
+            self->_readBuffer.resize(self->_readBuffer.size() + bytesTransferred);
+            self->ProcessReadBuffer();
+
+            // 继续读
+            self->DoRead();
+        });
+}
+
+void TCPSocket::ProcessReadBuffer()
+{
+    while (_readBuffer.size() >= kHeaderSize)
+    {
+        // Zero-copy Wrap Buffer 避免拷贝，ByteBuffer::ReadUint32() 自动 big-endian→native
+        auto headerBuf = ByteBuffer::Wrap(_readBuffer.data(), kHeaderSize);
+        uint32 length    = headerBuf.ReadUint32();
+        uint32 msgID     = headerBuf.ReadUint32();
+        uint32 sessionID = headerBuf.ReadUint32();
+
+        if (length < kHeaderSize || length > kMaxPacketSize)
+        {
+            Log::Error("TCPSocket: Invalid packet length {}, closing", length);
+            DoClose();
+            return;
+        }
+
+        if (_readBuffer.size() < length)
+        {
+            break;
+        }
+
+        size_t bodyLen = length - kHeaderSize;
+        if (_onMessage)
+        {
+            _onMessage(msgID, sessionID, _readBuffer.data() + kHeaderSize, bodyLen);
+        }
+
+        _readBuffer.erase(_readBuffer.begin(), _readBuffer.begin() + length);
+    }
+
+    if (_readBuffer.size() > kMaxPacketSize * 2)
+    {
+        Log::Error("TCPSocket: Read buffer overflow ({} bytes), closing", _readBuffer.size());
+        DoClose();
+    }
+}
+
+void TCPSocket::DoWrite()
+{
+    auto self = shared_from_this();
+
+    std::lock_guard lock(_writeMutex);
+    if (_writeQueue.empty())
+    {
+        _writing = false;
+        return;
+    }
+
+    auto& buf = _writeQueue.front();
+    asio::async_write(_socket, asio::buffer(buf.Data(), buf.Size()),
+        [self](const asio::error_code& ec, size_t)
+        {
+            if (ec)
+            {
+                self->HandleError(ec);
+                return;
+            }
+
+            std::lock_guard lk(self->_writeMutex);
+            self->_writeQueue.pop_front();
+            self->DoWrite();  // 链式写下一个
+        });
+}
+
+void TCPSocket::DoClose()
+{
+    if (_closed.exchange(true, std::memory_order_acq_rel))
+    {
+        return;  // 已关闭，幂等
+    }
+
+    asio::error_code ec;
+    _socket.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
+    _socket.close(ec);
+
+    if (_onClose)
+    {
+        _onClose();
+    }
+}
+
+void TCPSocket::HandleError(const asio::error_code& ec)
+{
+    if (ec == asio::error::eof)
+    {
+        // 对端正常关闭
+        DoClose();
+    }
+    else if (ec == asio::error::operation_aborted)
+    {
+        // 主动关闭触发，不需要额外操作
+    }
+    else
+    {
+        Log::Error("TCPSocket: asio error: {}", ec.message());
+        DoClose();
+    }
+}
+
+} // namespace MMO
