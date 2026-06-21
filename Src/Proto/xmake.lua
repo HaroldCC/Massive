@@ -1,16 +1,18 @@
 --- @file xmake.lua
 --- @brief Proto — 协议库（GenMsgID + protoc 代码生成）
 ---
---- 构建流程（增量）:
----   1. proto_msgid rule: 业务 *.proto 变化 → GenMsgID.py 增量更新 MsgID.proto
----   2. proto_gen rule: *.proto 变化 → protoc 生成 AutoGen/*.pb.{h,cc}
----   3. 编译 AutoGen/*.pb.cc → Proto 静态库
+--- 仿照 xmake 内置 protobuf.cpp rule 的两阶段模式：
+---   1. after_load: 预注册 .pb.cc 的 objectfile + includedirs
+---   2. on_preparecmd_file: 调用 protoc 生成 .pb.{h,cc}
+---   3. on_buildcmd_file: 编译 .pb.cc
+---
+--- proto_msgid rule 在 on_config 阶段先跑，确保 MsgID.proto 在其它 proto 之前就位。
 
---- rule: 扫描业务 proto，增量生成 MsgID.proto（在 protoc 之前执行一次）
+--- rule: 扫描业务 proto，增量生成 MsgID.proto（on_config 阶段，早于 proto_gen）
 rule("proto_msgid")
     on_config(function (target)
-        local protoDir = path.join(os.projectdir(), "Src/Proto")
-        local genScript = path.join(os.projectdir(), "Tools/Proto/GenMsgID.py")
+        local protoDir   = path.join(os.projectdir(), "Src/Proto")
+        local genScript  = path.join(os.projectdir(), "Tools/Proto/GenMsgID.py")
         local msgidProto = path.join(protoDir, "MsgID.proto")
 
         -- 增量：业务 proto 比 MsgID.proto 新才重新生成
@@ -32,50 +34,65 @@ rule("proto_msgid")
         end
     end)
 
---- rule: protoc 生成 C++ 代码（增量，每个 .proto 文件）
+--- rule: 仿照 xmake 内置 protobuf.cpp 的两阶段模型
 rule("proto_gen")
     set_extensions(".proto")
 
-    on_buildcmd_file(function (target, batchcmds, sourcefile, opt)
-        import("core.project.depend")
-
-        local protoc = path.join(os.projectdir(), "ThirdParty/Bin/protobuf/bin/protoc.exe")
-        local protoDir = path.join(os.projectdir(), "Src/Proto")
+    -- 阶段 1: 预注册 .pb.cc 的 objectfile（编译前必须确定）
+    after_load(function (target)
         local autogenDir = path.join(os.projectdir(), "Src/Proto/AutoGen")
+        local sourcebatch = target:sourcebatches()["proto_gen"]
+        if not sourcebatch then
+            return
+        end
+        for _, sourcefile_proto in ipairs(sourcebatch.sourcefiles) do
+            local pbcc = path.join(autogenDir, path.basename(sourcefile_proto) .. ".pb.cc")
+            local objfile = target:objectfile(pbcc)
+            table.insert(target:objectfiles(), objfile)
+        end
+    end)
 
-        local basename = path.basename(sourcefile)
-        local pbcc = path.join(autogenDir, basename .. ".pb.cc")
-
-        -- protoc 要求传入的文件名以 --proto_path 为精确前缀，传文件名 + 在 protoDir 下运行
-        local protoFile = path.filename(sourcefile)
+    -- 阶段 2: protoc 生成 .pb.{h,cc}
+    on_preparecmd_file(function (target, batchcmds, sourcefile_proto, opt)
+        local protoc     = path.join(os.projectdir(), "ThirdParty/Bin/protobuf/bin/protoc.exe")
+        local protoDir   = path.join(os.projectdir(), "Src/Proto")
+        local autogenDir = path.join(os.projectdir(), "Src/Proto/AutoGen")
+        local protoFile  = path.filename(sourcefile_proto)
 
         batchcmds:mkdir(autogenDir)
-        batchcmds:show_progress(opt.progress, "${color.build.object}proto.gen %s", sourcefile)
+        batchcmds:show_progress(opt.progress, "${color.build.object}proto.gen %s", sourcefile_proto)
         batchcmds:vrunv(protoc, {
             "--proto_path=" .. protoDir,
             "--cpp_out=" .. autogenDir,
             protoFile
         }, {curdir = protoDir})
 
-        -- 编译生成的 .pb.cc
-        local objfile = target:objectfile(pbcc)
-        table.insert(target:objectfiles(), objfile)
-        batchcmds:compile(pbcc, objfile)
-
         -- 增量依赖
-        batchcmds:add_depfiles(sourcefile)
+        batchcmds:add_depfiles(sourcefile_proto)
+        batchcmds:set_depcache(target:dependfile(
+            path.join(autogenDir, path.basename(sourcefile_proto) .. ".pb.cc")))
+    end)
+
+    -- 阶段 3: 编译 .pb.cc
+    on_buildcmd_file(function (target, batchcmds, sourcefile_proto, opt)
+        local autogenDir = path.join(os.projectdir(), "Src/Proto/AutoGen")
+        local pbcc  = path.join(autogenDir, path.basename(sourcefile_proto) .. ".pb.cc")
+        local objfile = target:objectfile(pbcc)
+
+        batchcmds:show_progress(opt.progress, "${color.build.object}compiling.proto.$(mode) %s", pbcc)
+        batchcmds:compile(pbcc, objfile, {configs = {includedirs = autogenDir}})
         batchcmds:set_depmtime(os.mtime(objfile))
         batchcmds:set_depcache(target:dependfile(objfile))
     end)
 
 target("Proto")
     set_kind("static")
-    set_warnings("none")  -- protobuf 生成代码不参与项目警告策略
+    set_warnings("none")
 
-    --- MsgID.proto 必须在其它 proto 之前生成
+    -- proto_msgid 在 on_config 跑（生成 MsgID.proto），proto_gen 在构建时跑（protoc + 编译）
     add_rules("proto_msgid", "proto_gen")
 
-    --- 业务 proto（MsgID.proto 由 proto_msgid 生成后一并被 proto_gen 处理）
+    -- 业务 proto 和工具生成的 MsgID.proto
     add_files("*.proto")
 
     add_deps("Protobuf")
