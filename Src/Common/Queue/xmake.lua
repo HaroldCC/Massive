@@ -4,4 +4,5 @@
 target("CommonQueue")
     set_kind("headeronly")
     add_headerfiles("*.h")
-    add_deps("CommonCore", "ConcurrentQueue")
+    add_deps("CommonCore")
+    add_deps("concurrentqueue", {public = true})

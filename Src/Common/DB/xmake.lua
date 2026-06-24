@@ -39,5 +39,15 @@ target("CommonDB")
     add_files("*.cpp")
     add_headerfiles("*.h")
     add_headerfiles("AutoGen/*.gen.h")
-    add_deps("CommonCore", "CommonQueue", "CommonLog", "LibPQ")
+    add_deps("CommonCore", "CommonQueue", "CommonLog")
+    add_deps("libpq", {public = true})
     add_rules("db_gen")
+
+    after_build(function(target)
+        local libpq = path.join(os.projectdir(), "ThirdParty", "Bin", "libpq")
+        if is_plat("windows") then
+            os.trycp(path.join(libpq, "Win", "*.dll"), target:targetdir())
+        else
+            os.trycp(path.join(libpq, "Linux", "*.so"), target:targetdir())
+        end
+    end)

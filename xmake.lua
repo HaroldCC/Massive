@@ -13,17 +13,14 @@ if is_plat("windows") then
     add_cxflags("/utf-8")
 end
 
---- MSVC 需要 /utf-8 标志，否则 fmt 等第三方会报 C2338
-if is_plat("windows") then
-    add_cxflags("/utf-8")
-end
-
 --- 全局警告策略: 项目代码全开 Warning
 set_warnings("all")
 
 add_rules("plugin.compile_commands.autoupdate", {outputdir = "$(projectdir)/build", lsp='clangd'})
 
 set_targetdir(path.join("Bin", "$(plat)-$(arch)-$(mode)"))
+
+set_rundir(os.projectdir())
 
 --- 全局编译器标志
 if is_mode("debug") then
@@ -40,7 +37,7 @@ end
 --- 项目源码全局头文件路径
 add_includedirs("Src")
 
---- ThirdParty 依赖统一声明
+--- 第三方依赖全部由 ThirdParty/xmake.lua 管理
 includes("ThirdParty/xmake.lua")
 
 --- 聚合 Common 子 target
