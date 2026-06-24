@@ -15,7 +15,7 @@ int main()
         return 1;
     }
 
-    MMO::Log::Init("center");
+    MMO::Log::Init("center", cfg->log);
     MMO::CenterServer server;
     if (!server.Init(*cfg))
     {

@@ -3,3 +3,9 @@
 [network]
 port = 9000
 io_threads = 2
+
+[log]
+# 日志级别：0=trace 1=debug 2=info 3=warn 4=error 5=critical
+level = 0
+# 日志目录（空=仅控制台；相对路径相对于二进制所在目录）
+dir = "logs"
