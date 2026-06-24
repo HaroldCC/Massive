@@ -48,6 +48,9 @@ ThirdParty/Bin/*/
 !ThirdParty/Bin/openssl/
 !ThirdParty/Bin/libpq/
 
+# ===== 密钥（开发本地使用，不提交） =====
+Config/login.key
+
 # ===== 运行时 =====
 *.log
 core.*
