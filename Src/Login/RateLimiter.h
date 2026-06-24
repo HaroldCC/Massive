@@ -8,6 +8,7 @@
 #pragma once
 
 #include <chrono>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 
@@ -31,6 +32,7 @@ private:
     };
 
     std::unordered_map<std::string, Entry> _entries;
+    std::mutex                               _mutex;
     static constexpr int  kMaxFailures = 3;
     static constexpr auto kCooldown    = std::chrono::minutes(15);
 };

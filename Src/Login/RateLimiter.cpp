@@ -10,6 +10,8 @@ namespace MMO
 
 bool RateLimiter::Allow(const std::string& ip)
 {
+    std::lock_guard lock(_mutex);
+
     auto it = _entries.find(ip);
     if (it == _entries.end())
     {
@@ -34,6 +36,8 @@ bool RateLimiter::Allow(const std::string& ip)
 
 void RateLimiter::RecordFailure(const std::string& ip)
 {
+    std::lock_guard lock(_mutex);
+
     auto& entry = _entries[ip];
     entry.failCount++;
 

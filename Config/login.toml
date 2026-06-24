@@ -5,13 +5,19 @@ port = 8001
 io_threads = 4
 
 [database]
-conn_string = "host=127.0.0.1 port=6432 dbname=massive"
+conn_string = "host=127.0.0.1 port=5432 dbname=massive user=postgres password=cr11234"
 worker_count = 3
 
 [security]
 # LSS：与 WorldServer 共享，用于 SessionToken 加密/签名
 # 生产环境应通过环境变量 MASSIVE_LSS 注入
 login_server_secret = ""
+
+[log]
+# 日志级别：0=trace 1=debug 2=info 3=warn 4=error 5=critical
+level = 0
+# 日志目录（空=仅控制台；相对路径相对于二进制所在目录）
+dir = "logs"
 
 [world]
 gate_ips = ["127.0.0.1:9001"]
