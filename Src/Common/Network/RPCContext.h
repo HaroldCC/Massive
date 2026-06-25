@@ -29,23 +29,27 @@
 namespace MMO
 {
 
-struct RPCContext
-{
-    uint64  requestID = 0;  ///< RPC 请求 ID（由发起方分配）
-    uint32  msgID     = 0;  ///< EInternalMsgID（用于构建响应帧头）
-    std::shared_ptr<TCPSocket> socket;
-
-    /**
-     * @brief 回包：ByteSizeLong() 预计算 → SerializeToArray() 零拷⻉ → Send
-     *
-     * 可在 IO 线程或 LogicThread 中调用，Send 内部保证线程安全。
-     */
-    template <typename TMsg>
-    void Reply(const TMsg& msg) const
+    struct RPCContext
     {
-        auto frame = BuildRPCFrame(msgID, requestID, ERPCType::Response, 0, msg);
-        socket->Send(std::move(frame));
-    }
-};
+        uint64                     requestID = 0; ///< RPC 请求 ID（由发起方分配）
+        uint32                     msgID     = 0; ///< EInternalMsgID（用于构建响应帧头）
+        std::shared_ptr<TCPSocket> socket;
+
+        /**
+         * @brief 回包：ByteSizeLong() 预计算 → SerializeToArray() 零拷⻉ → Send
+         *
+         * 可在 IO 线程或 LogicThread 中调用，Send 内部保证线程安全。
+         */
+        template <typename TMsg>
+        void Reply(const TMsg &msg) const
+        {
+            auto frame = BuildRPCFrame(msgID, requestID, ERPCType::Response, 0, msg);
+            if (frame.Size() == 0)
+            {
+                return; // 序列化失败，不发送
+            }
+            socket->Send(std::move(frame));
+        }
+    };
 
 } // namespace MMO
