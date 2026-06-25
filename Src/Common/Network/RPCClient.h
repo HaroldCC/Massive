@@ -10,12 +10,11 @@
 #include <chrono>
 #include <functional>
 #include <memory>
-#include <string>
 #include <unordered_map>
-#include <vector>
 
 #include "Common/Core/ByteBuffer.h"
 #include "Common/Core/Types.h"
+#include "Common/Network/RPCFrame.h"
 #include "Common/Network/RPCHeader.h"
 #include "Common/Network/TCPSocket.h"
 #include "Common/Queue/MPSCQueue.h"
@@ -24,20 +23,6 @@ namespace MMO
 {
 
 class TCPSocket;
-
-// —————— 辅助：将 RPCHeader + protobuf body 序列化为 ByteBuffer ——————
-
-/**
- * @brief 构造完整的 RPC 帧（RPCHeader + protobuf body）
- * @param msgID     EInternalMsgID
- * @param requestID requestID
- * @param type      Request / Response / Notify
- * @param traceID   链路追踪 ID
- * @param body      protobuf 序列化字符串（move）
- * @return Own 模式的 ByteBuffer
- */
-ByteBuffer BuildRPCFrame(uint32 msgID, uint64 requestID, ERPCType type,
-                         uint64 traceID, std::string&& body);
 
 /**
  * @brief RPC 发起方
@@ -137,16 +122,14 @@ void RPCClient::Call(std::shared_ptr<TCPSocket> conn,
         std::chrono::steady_clock::now() + timeout
     };
 
-    auto body = req.SerializeAsString();
-    auto frame = BuildRPCFrame(msgID, id, ERPCType::Request, 0, std::move(body));
+    auto frame = BuildRPCFrame(msgID, id, ERPCType::Request, 0, req);
     conn->Send(std::move(frame));
 }
 
 template <typename TMsg>
 void RPCClient::Notify(std::shared_ptr<TCPSocket> conn, uint32 msgID, const TMsg& msg)
 {
-    auto body = msg.SerializeAsString();
-    auto frame = BuildRPCFrame(msgID, 0, ERPCType::Notify, 0, std::move(body));
+    auto frame = BuildRPCFrame(msgID, 0, ERPCType::Notify, 0, msg);
     conn->Send(std::move(frame));
 }
 

@@ -11,8 +11,9 @@
 namespace MMO
 {
 
-TCPSocket::TCPSocket(asio::ip::tcp::socket socket)
+TCPSocket::TCPSocket(asio::ip::tcp::socket socket, Framing framing)
     : _socket(std::move(socket))
+    , _framing(framing)
 {
 }
 
@@ -64,7 +65,7 @@ void TCPSocket::DoRead()
 {
     auto self = shared_from_this();
 
-    // 确保读缓冲有空间：容量不足时扩容（上限 kMaxPacketSize * 4）
+    // 确保读缓冲有空间
     constexpr size_t kMaxReadBuffer = kMaxPacketSize * 4;
     if (_readBuffer.capacity() < kMaxPacketSize)
     {
@@ -95,9 +96,16 @@ void TCPSocket::DoRead()
             }
 
             self->_readBuffer.resize(self->_readBuffer.size() + bytesTransferred);
-            self->ProcessReadBuffer();
 
-            // 继续读
+            if (self->_framing == Framing::LengthPrefix)
+            {
+                self->ProcessLengthPrefixed();
+            }
+            else
+            {
+                self->ProcessReadBuffer();
+            }
+
             self->DoRead();
         });
 }
@@ -106,7 +114,6 @@ void TCPSocket::ProcessReadBuffer()
 {
     while (_readBuffer.size() >= kHeaderSize)
     {
-        // Zero-copy Wrap Buffer 避免拷贝，ByteBuffer::ReadUint32() 自动 big-endian→native
         auto headerBuf = ByteBuffer::Wrap(_readBuffer.data(), kHeaderSize);
         uint32 length    = headerBuf.ReadUint32();
         uint32 msgID     = headerBuf.ReadUint32();
@@ -136,6 +143,48 @@ void TCPSocket::ProcessReadBuffer()
     if (_readBuffer.size() > kMaxPacketSize * 2)
     {
         Log::Error("TCPSocket: Read buffer overflow ({} bytes), closing", _readBuffer.size());
+        DoClose();
+    }
+}
+
+void TCPSocket::ProcessLengthPrefixed()
+{
+    static constexpr size_t kLenFieldSize = 4; // uint32, big-endian
+
+    while (_readBuffer.size() >= kLenFieldSize)
+    {
+        // 读取 4B 总长度
+        auto lenBuf = ByteBuffer::Wrap(_readBuffer.data(), kLenFieldSize);
+        uint32 totalLen = lenBuf.ReadUint32();
+
+        if (totalLen < kLenFieldSize || totalLen > kMaxPacketSize)
+        {
+            Log::Error("TCPSocket: Invalid length-prefixed packet length {}, closing", totalLen);
+            DoClose();
+            return;
+        }
+
+        if (_readBuffer.size() < totalLen)
+        {
+            break; // 等待更多数据
+        }
+
+        // totalLen 包含自身 4B + 后续数据
+        // 跳过 4B 长度字段，剩余为 RPCHeader + protobuf body
+        size_t bodyLen = totalLen - kLenFieldSize;
+        // msgID/sessionID 在 RPCHeader 中，不是 PacketHeader 格式
+        // 统一用 msgID=0, sessionID=0，由 RPC header 解析
+        if (_onMessage)
+        {
+            _onMessage(0, 0, _readBuffer.data() + kLenFieldSize, bodyLen);
+        }
+
+        _readBuffer.erase(_readBuffer.begin(), _readBuffer.begin() + totalLen);
+    }
+
+    if (_readBuffer.size() > kMaxPacketSize * 2)
+    {
+        Log::Error("TCPSocket: Length-read buffer overflow ({} bytes), closing", _readBuffer.size());
         DoClose();
     }
 }
@@ -171,7 +220,7 @@ void TCPSocket::DoClose()
 {
     if (_closed.exchange(true, std::memory_order_acq_rel))
     {
-        return;  // 已关闭，幂等
+        return;  // 幂等
     }
 
     asio::error_code ec;
@@ -188,7 +237,6 @@ void TCPSocket::HandleError(const asio::error_code& ec)
 {
     if (ec == asio::error::eof)
     {
-        // 对端正常关闭
         DoClose();
     }
     else if (ec == asio::error::operation_aborted)

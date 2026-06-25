@@ -11,9 +11,10 @@
 namespace MMO
 {
 
-TCPAcceptor::TCPAcceptor(IOContextPool& pool, uint16 port)
+TCPAcceptor::TCPAcceptor(IOContextPool& pool, uint16 port, Framing framing)
     : _pool(pool)
     , _acceptor(pool.GetNextContext(), asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port))
+    , _framing(framing)
 {
 }
 
@@ -66,7 +67,7 @@ void TCPAcceptor::DoAccept()
 
             Log::Info("TCPAcceptor: new connection from {}", peer.remote_endpoint().address().to_string());
 
-            auto sock = std::make_shared<TCPSocket>(std::move(peer));
+            auto sock = std::make_shared<TCPSocket>(std::move(peer), _framing);
             if (_onAccept)
             {
                 _onAccept(std::move(sock));

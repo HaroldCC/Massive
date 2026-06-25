@@ -1,6 +1,6 @@
 /**
  * @file RPCClient.cpp
- * @brief RPCClient 非模板实现 + BuildRPCFrame / RPCContext::Reply
+ * @brief RPCClient 非模板实现
  */
 
 #include "Common/Network/RPCClient.h"
@@ -9,26 +9,6 @@
 
 namespace MMO
 {
-
-// ===== BuildRPCFrame =====
-
-ByteBuffer BuildRPCFrame(uint32 msgID, uint64 requestID, ERPCType type,
-                         uint64 traceID, std::string&& body)
-{
-    size_t total = sizeof(RPCHeader) + body.size();
-    auto buf = ByteBuffer::Own(total);
-
-    // RPCHeader 大端序列化
-    buf.WriteUint32(msgID);           // [0..3]
-    buf.WriteUint64(requestID);       // [4..11]
-    buf.WriteUint64(traceID);         // [12..19]
-    buf.WriteUint8(static_cast<uint8>(type)); // [20]
-
-    // protobuf body
-    buf.WriteBytes(reinterpret_cast<const uint8*>(body.data()), body.size());
-
-    return buf;
-}
 
 // ===== RPCClient =====
 

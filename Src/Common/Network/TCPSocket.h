@@ -4,6 +4,12 @@
  *
  * shared_ptr 生命周期 + 异步回调，参照 TrinityCore Socket<T> 和 asio 官方范式。
  * 缓冲累积 + 批量切包：一次 async_read_some 处理多个完整包，摊薄 syscall 开销。
+ *
+ * 帧协议模式：
+ *   PacketHeader — 默认。12B PacketHeader(length+msgID+sessionID) + body。
+ *                  用于 Client<->Gate 的外部协议。
+ *   LengthPrefix — 4B 总长度（含自身，大端）+ 裸数据。
+ *                  用于 World<->Center 的内部 RPC。
  */
 #pragma once
 
@@ -26,6 +32,17 @@
 namespace MMO
 {
 
+enum class ERPCType : uint8;
+
+/**
+ * @brief TCPSocket 帧协议模式
+ */
+enum class Framing : uint8
+{
+    PacketHeader,  ///< 12B PacketHeader + body（Client<->Gate）
+    LengthPrefix,  ///< 4B 总长度 + 裸数据（内部 RPC）
+};
+
 class TCPSocket : public std::enable_shared_from_this<TCPSocket>
 {
 public:
@@ -38,8 +55,10 @@ public:
     /**
      * @brief 构造：接管已 accept 的 socket
      * @param socket  asio TCP socket（move）
+     * @param framing 帧协议模式（默认 PacketHeader）
      */
-    explicit TCPSocket(asio::ip::tcp::socket socket);
+    explicit TCPSocket(asio::ip::tcp::socket socket,
+                       Framing framing = Framing::PacketHeader);
 
     TCPSocket(const TCPSocket&) = delete;
     TCPSocket& operator=(const TCPSocket&) = delete;
@@ -65,17 +84,22 @@ public:
     // 底层 socket 引用（获取远程地址等）
     asio::ip::tcp::socket& Socket() { return _socket; }
 
+    // 获取帧协议模式
+    Framing GetFraming() const { return _framing; }
+
     // 是否为主动关闭（不含对端断开 / 网络错误）
     bool IsClosed() const { return _closed.load(std::memory_order_acquire); }
 
 private:
-    void DoRead();                               // async_read → 追加到 _readBuffer
-    void ProcessReadBuffer();                     // 循环切出完整包 → OnMessage
+    void DoRead();                               // async_read -> 追加到 _readBuffer
+    void ProcessReadBuffer();                     // PacketHeader 模式拆包
+    void ProcessLengthPrefixed();                 // LengthPrefix 模式拆包
     void DoWrite();                               // 链式 async_write
     void DoClose();                               // 关闭 socket + 触发 OnClose
     void HandleError(const asio::error_code& ec); // 统一错误处理
 
     asio::ip::tcp::socket _socket;
+    Framing                _framing;
 
     // 读缓冲
     std::vector<uint8> _readBuffer;    // 累积缓冲

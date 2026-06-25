@@ -80,6 +80,10 @@ target("asio")
     add_rules("Rules.ThirdParty")
     add_sysincludedirs(path.join(os.projectdir(), "ThirdParty/asio/asio/include"), {public = true})
 
+    if is_plat("windows") then
+        add_defines("_WIN32_WINDOWS", {public = true})
+    end
+
 target("entt")
     set_kind("headeronly")
     add_rules("Rules.ThirdParty")

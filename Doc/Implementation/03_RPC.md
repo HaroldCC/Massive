@@ -200,7 +200,7 @@ void OnRPCPacket(const RPCHeader& header, const uint8* body, size_t len)
 }
 ```
 
-## 7. 连接管理（CenterConnection）
+## 7. 连接管理（CenterClient）
 
 World 到 Center 的长连接需要：
 1. 建立连接（`TCPSocket`）
@@ -210,9 +210,9 @@ World 到 Center 的长连接需要：
 
 ```cpp
 // World 侧
-class CenterConnection
+class CenterClient
 {
-    void Start(const std::string& address, uint16 port);
+    void Connect(const std::string& host, uint16 port);
     void SendHeartbeat(uint32 currentPlayers);
     void SendRPC(...);                 // 通过 RPCClient 发起
 
@@ -267,7 +267,7 @@ Src/Common/Network/
 ├── RPCContext.h            # handler 回包上下文
 ├── RPCClient.h / .cpp      # RPC 发起方
 ├── RPCServerDispatcher.h   # RPC handler 注册（MessageDispatcher<RPCContext> 别名）
-├── CenterConnection.h/.cpp # World→Center 长连接管理（后续）
+├── CenterClient.h/.cpp       # World→Center 长连接客户端
 ```
 
 ## 11. 未决/后续
