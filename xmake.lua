@@ -6,7 +6,7 @@ set_project("Massive")
 set_version("0.1.0")
 
 set_languages("c++23")
-add_rules("mode.debug", "mode.release")
+add_rules("mode.debug", "mode.release", "mode.releasedbg")
 
 --- MSVC: /utf-8 是强制要求 (fmt base.h 会 static_assert 检查)
 if is_plat("windows") then
@@ -24,14 +24,18 @@ set_rundir(os.projectdir())
 
 --- 全局编译器标志
 if is_mode("debug") then
-    set_optimize("none")
     add_defines("MASSIVE_ENABLE_TRACY")
-    set_symbols("debug")
-end
-
-if is_mode("release") then
-    set_optimize("fastest")
-    set_symbols("hidden")
+elseif is_mode("releasedbg") then
+    -- releasedbg: -O2 + 完整调试符号 + NDEBUG, 线上可调试但性能接近 release
+    add_defines("MASSIVE_ENABLE_TRACY")
+    if is_plat("linux") then
+        add_ldflags("-rdynamic")
+    elseif is_plat("windows") then
+        -- /DEBUG:FULL: MSVC 生成完整 .pdb, 允许释放版本符号化
+        add_ldflags("/DEBUG:FULL")
+    end
+elseif is_mode("release") then
+    -- release 模式仅优化, 内置 rule 自动设置 symbols=hidden + NDEBUG
 end
 
 --- 项目源码全局头文件路径

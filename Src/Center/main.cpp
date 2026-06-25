@@ -5,9 +5,10 @@
 
 #include "Center/CenterConfig.h"
 #include "Center/CenterServer.h"
+#include "Common/Core/Stacktrace.h"
 #include "Common/Log/Log.h"
 
-int main()
+int main(int argc, char **argv)
 {
     auto cfg = MMO::CenterConfig::Load("Config/center.toml");
     if (!cfg)
@@ -16,6 +17,7 @@ int main()
     }
 
     MMO::Log::Init("center", cfg->log);
+    MMO::InstallStackTrace(argv[0]);
     MMO::CenterServer server;
     if (!server.Init(*cfg))
     {

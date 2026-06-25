@@ -11,10 +11,11 @@
 #include "Login/LoginConfig.h"
 #include "Login/LoginServer.h"
 
+#include "Common/Core/Stacktrace.h"
 #include "Common/DB/DBWorkerPool.h"
 #include "Common/Log/Log.h"
 
-int main()
+int main(int argc, char **argv)
 {
     auto cfg = MMO::LoginConfig::Load("Config/login.toml");
     if (!cfg)
@@ -23,6 +24,7 @@ int main()
     }
 
     MMO::Log::Init("login", cfg->log);
+    MMO::InstallStackTrace(argv[0]);
     MMO::DB::DBWorkerPool::Init(cfg->database.workerCount, cfg->database.connString);
 
     MMO::LoginServer server;
