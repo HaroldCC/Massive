@@ -51,5 +51,4 @@ Config/login.key
 
 # ===== 运行时 =====
 *.log
-core.*
 *.dmp
