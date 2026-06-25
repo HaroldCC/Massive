@@ -18,6 +18,7 @@
 ---   - 分到 "ThirdParty" group
 ---   - 默认不构建（set_default(false)），被 add_deps 引用时才编译
 ---   - 用 add_sysincludedirs 避免第三方警告泄漏
+---   - xmake clean 时跳过（on_clean 空操作），避免清理上游预编译产物
 
 -- =============================================================================
 -- rule: thirdparty — 统一第三方库设置
@@ -28,6 +29,10 @@ rule("Rules.ThirdParty")
         target:set("group", "ThirdParty")
         target:set("default", false)
         target:set("targetdir", path.join(target:targetdir(), "ThirdParty"))
+    end)
+    on_clean(function (target)
+        -- no-op: ThirdParty 产物不随 xmake clean 清理
+        -- 强制清理: 手动删除 Bin/{plat}-{mode}/ThirdParty/ 目录
     end)
 
 -- =============================================================================
