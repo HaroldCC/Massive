@@ -2,7 +2,7 @@
 // 顶层 Req/Rsp/Ntf 消息自动生成 MsgID（见 MsgID.proto）。
 syntax = "proto3";
 
-package MMO;
+package MMO.Proto;
 
 import "Common.proto";
 

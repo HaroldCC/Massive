@@ -117,7 +117,7 @@ def AssignIDs(
 def WriteMsgID(outputPath: Path, mapping: dict[str, int], deprecated: set[str],
                enumName: str, subdir: str = "") -> None:
     """生成 MsgID.proto（按 ID 升序，确定性输出）"""
-    pkg = "MMO.Internal" if subdir else "MMO"
+    pkg = "MMO.Proto.Internal" if subdir else "MMO.Proto"
 
     # 零值枚举项命名约定：
     #   EMsgID         → MSG_NONE

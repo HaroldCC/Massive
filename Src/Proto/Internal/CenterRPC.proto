@@ -3,7 +3,7 @@
 // 消息命名规则：Req/Rsp 后缀表示请求-响应对，Ntf 后缀表示单向通知。
 syntax = "proto3";
 
-package MMO.Internal;
+package MMO.Proto.Internal;
 
 // ── 服务注册与发现 ──
 

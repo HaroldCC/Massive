@@ -90,6 +90,8 @@ rule("proto_gen")
         local protocTarget = target:dep("protoc")
         local protoc = path.join(protocTarget:targetdir(), protocTarget:name())
 
+        assert(protoc, "protoc not found!")
+
         local protoDir   = path.join(os.projectdir(), "Src/Proto")
         local autogenDir = path.join(os.projectdir(), "Src/Proto/AutoGen")
 

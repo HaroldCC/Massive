@@ -2,7 +2,7 @@
 // 无 Req/Rsp/Ntf 后缀的结构不参与 MsgID 生成。
 syntax = "proto3";
 
-package MMO;
+package MMO.Proto;
 
 // 三维坐标
 message Vector3

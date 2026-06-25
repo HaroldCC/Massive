@@ -3,7 +3,7 @@
 //   已有消息 ID 永不变更，新消息追加，删除的消息保留为 [deprecated] 不复用 ID。
 syntax = "proto3";
 
-package MMO.Internal;
+package MMO.Proto.Internal;
 
 enum EInternalMsgID
 {
