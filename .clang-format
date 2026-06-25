@@ -4,7 +4,7 @@
 # 语言: None, Cpp, Java, JavaScript, ObjC, Proto, TableGen, TextProto, CSharp
 # Language: CSharp
 # 标准: c++03, c++11, c++14, c++17, c++20, Latest, Auto
-Standard: c++23
+Standard: Latest
 # 使用tab字符: Never, ForIndentation, ForContinuationAndIndentation, Always
 UseTab: Never
 # tab宽度
