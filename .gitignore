@@ -22,9 +22,7 @@ __pycache__/
 # ===== 自动生成代码 =====
 **/Generated/
 !**/Generated/.gitignore
-**/AutoGen/*.gen.h
-**/AutoGen/*.gen.cpp
-!**/AutoGen/.gitignore
+**/AutoGen/
 # protoc 生成的 C++ 代码（由 Proto/xmake.lua 在构建时生成）
 **/AutoGen/*.pb.h
 **/AutoGen/*.pb.cc
