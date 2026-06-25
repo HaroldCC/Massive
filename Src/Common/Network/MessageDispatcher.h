@@ -25,74 +25,73 @@
 namespace MMO
 {
 
-/**
- * @brief MsgID 函数表分发器
- *
- * @tparam TContext  分发上下文类型（Gate 用 sessionID，World 用 Entity）
- */
-template <typename TContext>
-class MessageDispatcher
-{
-public:
-    using Handler = std::function<void(TContext, const uint8*, size_t)>;
-
     /**
-     * @brief 注册消息处理器
-     * @tparam TMsg  protobuf 消息类型
-     * @param msgID    消息 ID（数组下标）
-     * @param handler  强类型处理回调 void(TContext, const TMsg&)
+     * @brief MsgID 函数表分发器
+     *
+     * @tparam TContext  分发上下文类型（Gate 用 sessionID，World 用 Entity）
      */
-    template <typename TMsg>
-    void Register(uint32 msgID, std::function<void(TContext, const TMsg&)> handler)
+    template <typename TContext>
+    class MessageDispatcher
     {
-        if (msgID >= kMaxHandlers)
-        {
-            Log::Error("MessageDispatcher: msgID {} exceeds kMaxHandlers {}", msgID, kMaxHandlers);
-            return;
-        }
-        if (_handlers[msgID])
-        {
-            Log::Warn("MessageDispatcher: msgID {} already registered, overwriting", msgID);
-        }
+    public:
+        using Handler = std::function<void(TContext, const uint8 *, size_t)>;
 
-        _handlers[msgID] = [handler = std::move(handler)](TContext ctx, const uint8* body, size_t len)
+        /**
+         * @brief 注册消息处理器
+         * @tparam TMsg  protobuf 消息类型
+         * @param msgID    消息 ID（数组下标）
+         * @param handler  强类型处理回调 void(TContext, const TMsg&)
+         */
+        template <typename TMsg>
+        void Register(uint32 msgID, std::function<void(TContext, const TMsg &)> handler)
         {
-            TMsg msg;
-            if (!msg.ParseFromArray(body, static_cast<int>(len)))
+            if (msgID >= kMaxHandlers)
             {
-                Log::Error("MessageDispatcher: protobuf parse failed ({} bytes)", len);
+                Log::Error("MessageDispatcher: msgID {} exceeds kMaxHandlers {}", msgID, kMaxHandlers);
                 return;
             }
-            handler(ctx, msg);
-        };
-    }
+            if (_handlers[msgID])
+            {
+                Log::Warn("MessageDispatcher: msgID {} already registered, overwriting", msgID);
+            }
 
-    /**
-     * @brief 分发消息到对应处理器
-     * @param ctx    分发上下文
-     * @param msgID  消息 ID
-     * @param body   protobuf 序列化数据
-     * @param len    数据长度
-     * @return 找到并分发返回 true；无对应处理器返回 false
-     */
-    bool Dispatch(TContext ctx, uint32 msgID, const uint8* body, size_t len) const
-    {
-        if (msgID >= kMaxHandlers || !_handlers[msgID])
-        {
-            return false;
+            _handlers[msgID] = [handler = std::move(handler)](TContext ctx, const uint8 *body, size_t len) {
+                TMsg msg;
+                if (!msg.ParseFromArray(body, static_cast<int>(len)))
+                {
+                    Log::Error("MessageDispatcher: protobuf parse failed ({} bytes)", len);
+                    return;
+                }
+                handler(ctx, msg);
+            };
         }
-        _handlers[msgID](ctx, body, len);
-        return true;
-    }
 
-    // 是否已注册某 msgID
-    bool IsRegistered(uint32 msgID) const
-    {
-        return msgID < kMaxHandlers && static_cast<bool>(_handlers[msgID]);
-    }
+        /**
+         * @brief 分发消息到对应处理器
+         * @param ctx    分发上下文
+         * @param msgID  消息 ID
+         * @param body   protobuf 序列化数据
+         * @param len    数据长度
+         * @return 找到并分发返回 true；无对应处理器返回 false
+         */
+        bool Dispatch(TContext ctx, uint32 msgID, const uint8 *body, size_t len) const
+        {
+            if (msgID >= kMaxHandlers || !_handlers[msgID])
+            {
+                return false;
+            }
+            _handlers[msgID](ctx, body, len);
+            return true;
+        }
 
-private:
-    std::array<Handler, kMaxHandlers> _handlers;
-};
+        // 是否已注册某 msgID
+        bool IsRegistered(uint32 msgID) const
+        {
+            return msgID < kMaxHandlers && static_cast<bool>(_handlers[msgID]);
+        }
+
+    private:
+        std::array<Handler, kMaxHandlers> _handlers;
+    };
 
 } // namespace MMO

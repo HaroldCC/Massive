@@ -16,24 +16,24 @@
 namespace MMO
 {
 
-class PlayerLocationIndex
-{
-public:
-    // 玩家上线（注册到某 World）
-    void RegisterPlayer(uint32 accountID, const std::string& serviceID);
+    class PlayerLocationIndex
+    {
+    public:
+        // 玩家上线（注册到某 World）
+        void RegisterPlayer(uint32 accountID, const std::string &serviceID);
 
-    // 玩家下线
-    void UnregisterPlayer(uint32 accountID);
+        // 玩家下线
+        void UnregisterPlayer(uint32 accountID);
 
-    // 查询玩家所在 World
-    std::optional<std::string> GetServiceID(uint32 accountID) const;
+        // 查询玩家所在 World
+        std::optional<std::string> GetServiceID(uint32 accountID) const;
 
-    // 总在线玩家数
-    uint32 GetTotalOnline() const;
+        // 总在线玩家数
+        uint32 GetTotalOnline() const;
 
-private:
-    mutable std::shared_mutex _mutex;
-    std::unordered_map<uint32, std::string> _accountToService;
-};
+    private:
+        mutable std::shared_mutex               _mutex;
+        std::unordered_map<uint32, std::string> _accountToService;
+    };
 
 } // namespace MMO

@@ -15,26 +15,26 @@
 namespace MMO
 {
 
-class RateLimiter
-{
-public:
-    // 检查是否允许（返回 false 表示被限制，应直接关闭不回应）
-    bool Allow(const std::string& ip);
-
-    // 记录一次认证失败
-    void RecordFailure(const std::string& ip);
-
-private:
-    struct Entry
+    class RateLimiter
     {
-        int failCount = 0;
-        std::chrono::steady_clock::time_point cooldownUntil;
-    };
+    public:
+        // 检查是否允许（返回 false 表示被限制，应直接关闭不回应）
+        bool Allow(const std::string &ip);
 
-    std::unordered_map<std::string, Entry> _entries;
-    std::mutex                               _mutex;
-    static constexpr int  kMaxFailures = 3;
-    static constexpr auto kCooldown    = std::chrono::minutes(15);
-};
+        // 记录一次认证失败
+        void RecordFailure(const std::string &ip);
+
+    private:
+        struct Entry
+        {
+            int                                   failCount = 0;
+            std::chrono::steady_clock::time_point cooldownUntil;
+        };
+
+        std::unordered_map<std::string, Entry> _entries;
+        std::mutex                             _mutex;
+        static constexpr int                   kMaxFailures = 3;
+        static constexpr auto                  kCooldown    = std::chrono::minutes(15);
+    };
 
 } // namespace MMO

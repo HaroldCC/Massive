@@ -32,94 +32,109 @@
 namespace MMO
 {
 
-enum class ERPCType : uint8;
-
-/**
- * @brief TCPSocket 帧协议模式
- */
-enum class Framing : uint8
-{
-    PacketHeader,  ///< 12B PacketHeader + body（Client<->Gate）
-    LengthPrefix,  ///< 4B 总长度 + 裸数据（内部 RPC）
-};
-
-class TCPSocket : public std::enable_shared_from_this<TCPSocket>
-{
-public:
-    // 收到完整包的回调
-    using MessageHandler = std::function<void(uint32 msgID, uint32 sessionID,
-                                              const uint8* body, size_t len)>;
-    // 连接关闭回调（对端断开 / 主动 Close / 错误）
-    using CloseHandler   = std::function<void()>;
+    enum class ERPCType : uint8;
 
     /**
-     * @brief 构造：接管已 accept 的 socket
-     * @param socket  asio TCP socket（move）
-     * @param framing 帧协议模式（默认 PacketHeader）
+     * @brief TCPSocket 帧协议模式
      */
-    explicit TCPSocket(asio::ip::tcp::socket socket,
-                       Framing framing = Framing::PacketHeader);
+    enum class Framing : uint8
+    {
+        PacketHeader, ///< 12B PacketHeader + body（Client<->Gate）
+        LengthPrefix, ///< 4B 总长度 + 裸数据（内部 RPC）
+    };
 
-    TCPSocket(const TCPSocket&) = delete;
-    TCPSocket& operator=(const TCPSocket&) = delete;
+    class TCPSocket : public std::enable_shared_from_this<TCPSocket>
+    {
+    public:
+        // 收到完整包的回调
+        using MessageHandler =
+            std::function<void(uint32 msgID, uint32 sessionID, const uint8 *body, size_t len)>;
+        // 连接关闭回调（对端断开 / 主动 Close / 错误）
+        using CloseHandler = std::function<void()>;
 
-    ~TCPSocket();
+        /**
+         * @brief 构造：接管已 accept 的 socket
+         * @param socket  asio TCP socket（move）
+         * @param framing 帧协议模式（默认 PacketHeader）
+         */
+        explicit TCPSocket(asio::ip::tcp::socket socket, Framing framing = Framing::PacketHeader);
 
-    // 启动异步读循环（在 io_context 线程中调用）
-    void Start();
+        TCPSocket(const TCPSocket &)            = delete;
+        TCPSocket &operator=(const TCPSocket &) = delete;
 
-    /**
-     * @brief 异步发送数据（线程安全，所有 IO 线程均可调用）
-     * @param data  ByteBuffer（Own 模式，内部 move）
-     */
-    void Send(ByteBuffer data);
+        ~TCPSocket();
 
-    // 关闭连接（幂等，可多次调用）
-    void Close();
+        // 启动异步读循环（在 io_context 线程中调用）
+        void Start();
 
-    // 设置回调
-    void SetMessageHandler(MessageHandler handler) { _onMessage = std::move(handler); }
-    void SetCloseHandler(CloseHandler handler)     { _onClose = std::move(handler); }
+        /**
+         * @brief 异步发送数据（线程安全，所有 IO 线程均可调用）
+         * @param data  ByteBuffer（Own 模式，内部 move）
+         */
+        void Send(ByteBuffer data);
 
-    // 底层 socket 引用（获取远程地址等）
-    asio::ip::tcp::socket& Socket() { return _socket; }
+        // 关闭连接（幂等，可多次调用）
+        void Close();
 
-    // 获取帧协议模式
-    Framing GetFraming() const { return _framing; }
+        // 设置回调
+        void SetMessageHandler(MessageHandler handler)
+        {
+            _onMessage = std::move(handler);
+        }
 
-    // 是否为主动关闭（不含对端断开 / 网络错误）
-    bool IsClosed() const { return _closed.load(std::memory_order_acquire); }
+        void SetCloseHandler(CloseHandler handler)
+        {
+            _onClose = std::move(handler);
+        }
 
-private:
-    void DoRead();                               // async_read -> 追加到 _readBuffer
-    void ProcessReadBuffer();                     // PacketHeader 模式拆包
-    void ProcessLengthPrefixed();                 // LengthPrefix 模式拆包
-    void DoWrite();                               // 链式 async_write
-    void DoClose();                               // 关闭 socket + 触发 OnClose
-    void HandleError(const asio::error_code& ec); // 统一错误处理
+        // 底层 socket 引用（获取远程地址等）
+        asio::ip::tcp::socket &Socket()
+        {
+            return _socket;
+        }
 
-    asio::ip::tcp::socket _socket;
-    Framing                _framing;
+        // 获取帧协议模式
+        Framing GetFraming() const
+        {
+            return _framing;
+        }
 
-    // 读缓冲
-    std::vector<uint8> _readBuffer;    // 累积缓冲
-    static constexpr size_t kMaxPacketSize = 1024 * 1024;  // 1 MiB
+        // 是否为主动关闭（不含对端断开 / 网络错误）
+        bool IsClosed() const
+        {
+            return _closed.load(std::memory_order_acquire);
+        }
 
-    // 写缓冲
-    std::mutex            _writeMutex;
-    std::deque<ByteBuffer> _writeQueue;
-    bool                   _writing = false;
+    private:
+        void DoRead();                                // async_read -> 追加到 _readBuffer
+        void ProcessReadBuffer();                     // PacketHeader 模式拆包
+        void ProcessLengthPrefixed();                 // LengthPrefix 模式拆包
+        void DoWrite();                               // 链式 async_write
+        void DoClose();                               // 关闭 socket + 触发 OnClose
+        void HandleError(const asio::error_code &ec); // 统一错误处理
 
-    // 状态
-    std::atomic<bool> _closed{false};
-    std::atomic<bool> _started{false};
+        asio::ip::tcp::socket _socket;
+        Framing               _framing;
 
-    // 回调
-    MessageHandler _onMessage;
-    CloseHandler   _onClose;
+        // 读缓冲
+        std::vector<uint8>      _readBuffer;                  // 累积缓冲
+        static constexpr size_t kMaxPacketSize = 1024 * 1024; // 1 MiB
 
-    // 拆包中间状态
-    static constexpr size_t kHeaderSize = sizeof(PacketHeader);
-};
+        // 写缓冲
+        std::mutex             _writeMutex;
+        std::deque<ByteBuffer> _writeQueue;
+        bool                   _writing = false;
+
+        // 状态
+        std::atomic<bool> _closed {false};
+        std::atomic<bool> _started {false};
+
+        // 回调
+        MessageHandler _onMessage;
+        CloseHandler   _onClose;
+
+        // 拆包中间状态
+        static constexpr size_t kHeaderSize = sizeof(PacketHeader);
+    };
 
 } // namespace MMO

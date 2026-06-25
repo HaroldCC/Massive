@@ -21,44 +21,43 @@
 namespace MMO
 {
 
-class IOContextPool;
+    class IOContextPool;
 
-class TCPAcceptor
-{
-public:
-    using AcceptHandler = std::function<void(std::shared_ptr<TCPSocket>)>;
+    class TCPAcceptor
+    {
+    public:
+        using AcceptHandler = std::function<void(std::shared_ptr<TCPSocket>)>;
 
-    /**
-     * @brief 构造接受器
-     * @param pool    IOContextPool 引用（分配新连接的 io_context）
-     * @param port    监听端口
-     * @param framing 帧协议模式（默认 PacketHeader）
-     */
-    TCPAcceptor(IOContextPool& pool, uint16 port,
-                Framing framing = Framing::PacketHeader);
+        /**
+         * @brief 构造接受器
+         * @param pool    IOContextPool 引用（分配新连接的 io_context）
+         * @param port    监听端口
+         * @param framing 帧协议模式（默认 PacketHeader）
+         */
+        TCPAcceptor(IOContextPool &pool, uint16 port, Framing framing = Framing::PacketHeader);
 
-    TCPAcceptor(const TCPAcceptor&) = delete;
-    TCPAcceptor& operator=(const TCPAcceptor&) = delete;
+        TCPAcceptor(const TCPAcceptor &)            = delete;
+        TCPAcceptor &operator=(const TCPAcceptor &) = delete;
 
-    ~TCPAcceptor();
+        ~TCPAcceptor();
 
-    /**
-     * @brief 启动异步 accept 循环
-     * @param onAccept  新连接回调（在 io_context 线程中触发）
-     */
-    void Start(AcceptHandler onAccept);
+        /**
+         * @brief 启动异步 accept 循环
+         * @param onAccept  新连接回调（在 io_context 线程中触发）
+         */
+        void Start(AcceptHandler onAccept);
 
-    // 停止接受新连接
-    void Stop();
+        // 停止接受新连接
+        void Stop();
 
-private:
-    void DoAccept();
+    private:
+        void DoAccept();
 
-    IOContextPool&            _pool;
-    asio::ip::tcp::acceptor   _acceptor;
-    AcceptHandler             _onAccept;
-    Framing                   _framing;
-    bool                      _started = false;
-};
+        IOContextPool          &_pool;
+        asio::ip::tcp::acceptor _acceptor;
+        AcceptHandler           _onAccept;
+        Framing                 _framing;
+        bool                    _started = false;
+    };
 
 } // namespace MMO

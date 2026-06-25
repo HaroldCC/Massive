@@ -32,61 +32,60 @@
 namespace MMO
 {
 
-class TCPSocket;
+    class TCPSocket;
 
-namespace DB
-{
-    class DBResult;
-}
+    namespace DB
+    {
+        class DBResult;
+    } // namespace DB
 
-class LoginServer
-{
-public:
-    bool Init(const LoginConfig& cfg);
-    void Run();
-    void Stop();
+    class LoginServer
+    {
+    public:
+        bool Init(const LoginConfig &cfg);
+        void Run();
+        void Stop();
 
-private:
-    /**
-     * @brief IO 线程：处理认证请求（RateLimiter → 发起 DB 异步查询）
-     */
-    void HandleLoginAuthReq(std::shared_ptr<TCPSocket> socket,
-                            const LoginAuthReq& req,
-                            const std::string& clientIP);
+    private:
+        /**
+         * @brief IO 线程：处理认证请求（RateLimiter → 发起 DB 异步查询）
+         */
+        void HandleLoginAuthReq(std::shared_ptr<TCPSocket> socket,
+                                const Proto::LoginAuthReq &req,
+                                const std::string         &clientIP);
 
-    /**
-     * @brief 主线程（DB 回调）：验证密码 + ECDH + SessionToken + 回包
-     */
-    void OnAuthDBCallback(std::shared_ptr<TCPSocket> socket,
-                          std::string clientIP,
-                          const std::string& username,
-                          const std::string& password,
-                          const std::string& clientDHKey,
-                          const DB::DBResult& result);
+        /**
+         * @brief 主线程（DB 回调）：验证密码 + ECDH + SessionToken + 回包
+         */
+        void OnAuthDBCallback(std::shared_ptr<TCPSocket> socket,
+                              std::string                clientIP,
+                              const std::string         &username,
+                              const std::string         &password,
+                              const std::string         &clientDHKey,
+                              const DB::DBResult        &result);
 
-    /**
-     * @brief IO 线程：认证成功 → 构建 LoginAuthRsp + Send + Close
-     */
-    void SendAuthSuccess(std::shared_ptr<TCPSocket> socket,
-                         const Crypto::EcdhKeyPair& keyPair,
-                         const Crypto::SessionToken& token);
+        /**
+         * @brief IO 线程：认证成功 → 构建 LoginAuthRsp + Send + Close
+         */
+        void SendAuthSuccess(std::shared_ptr<TCPSocket>  socket,
+                             const Crypto::EcdhKeyPair  &keyPair,
+                             const Crypto::SessionToken &token);
 
-    /**
-     * @brief IO 线程：认证失败 → 构建错误响应 + Send + Close
-     */
-    void SendAuthFailure(std::shared_ptr<TCPSocket> socket,
-                         uint32 errorCode);
+        /**
+         * @brief IO 线程：认证失败 → 构建错误响应 + Send + Close
+         */
+        void SendAuthFailure(std::shared_ptr<TCPSocket> socket, uint32 errorCode);
 
-    static constexpr uint32 kTokenExpireSec = 7200;  ///< SessionToken 过期时间（2 小时）
+        static constexpr uint32 kTokenExpireSec = 7200; ///< SessionToken 过期时间（2 小时）
 
-    std::unique_ptr<IOContextPool> _ioPool;
-    std::unique_ptr<TCPAcceptor>   _acceptor;
-    MessageDispatcher<std::shared_ptr<TCPSocket>> _dispatcher;
-    RateLimiter                    _rateLimiter;
-    uint8                          _lss[LoginConfig::kLSSSize] = {};  ///< 32B LSS
-    uint16                         _worldServerID = 1;
-    std::vector<std::string>       _gateIPs;
-    std::atomic<bool>              _running{false};
-};
+        std::unique_ptr<IOContextPool>                _ioPool;
+        std::unique_ptr<TCPAcceptor>                  _acceptor;
+        MessageDispatcher<std::shared_ptr<TCPSocket>> _dispatcher;
+        RateLimiter                                   _rateLimiter;
+        uint8                                         _lss[LoginConfig::kLSSSize] = {}; ///< 32B LSS
+        uint16                                        _worldServerID              = 1;
+        std::vector<std::string>                      _gateIPs;
+        std::atomic<bool>                             _running {false};
+    };
 
 } // namespace MMO

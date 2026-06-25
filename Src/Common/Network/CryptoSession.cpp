@@ -12,65 +12,62 @@
 namespace MMO
 {
 
-void CryptoSession::Init(const uint8* sessionKey, uint64 clientRandom)
-{
-    std::memcpy(_sessionKey, sessionKey, 32);
-    _clientRandom = clientRandom;
-    // 序列号从 0 开始，首次 Encrypt 返回 1
-    _lastSequence = 0;
-    _sendSequence = 0;
-}
-
-ByteBuffer CryptoSession::Encrypt(const uint8* plaintext, size_t len)
-{
-    uint32 seq = ++_sendSequence;
-
-    uint8 nonce[12];
-    BuildNonce(seq, nonce);
-
-    auto result = Crypto::Aes256Gcm::Encrypt(_sessionKey, nonce, plaintext, len);
-    if (!result)
+    void CryptoSession::Init(const uint8 *sessionKey, uint64 clientRandom)
     {
-        return ByteBuffer{};
+        std::memcpy(_sessionKey, sessionKey, 32);
+        _clientRandom = clientRandom;
+        // 序列号从 0 开始，首次 Encrypt 返回 1
+        _lastSequence = 0;
+        _sendSequence = 0;
     }
 
-    return std::move(*result);
-}
-
-std::optional<ByteBuffer> CryptoSession::Decrypt(
-    const uint8* ciphertext,
-    size_t len,
-    uint32 seq)
-{
-    if (!ValidateSequence(seq))
+    ByteBuffer CryptoSession::Encrypt(const uint8 *plaintext, size_t len)
     {
-        return std::nullopt;
+        uint32 seq = ++_sendSequence;
+
+        uint8 nonce[12];
+        BuildNonce(seq, nonce);
+
+        auto result = Crypto::Aes256Gcm::Encrypt(_sessionKey, nonce, plaintext, len);
+        if (!result)
+        {
+            return ByteBuffer {};
+        }
+
+        return std::move(*result);
     }
 
-    uint8 nonce[12];
-    BuildNonce(seq, nonce);
-
-    auto result = Crypto::Aes256Gcm::Decrypt(_sessionKey, nonce, ciphertext, len);
-    if (!result)
+    std::optional<ByteBuffer> CryptoSession::Decrypt(const uint8 *ciphertext, size_t len, uint32 seq)
     {
-        return std::nullopt;
+        if (!ValidateSequence(seq))
+        {
+            return std::nullopt;
+        }
+
+        uint8 nonce[12];
+        BuildNonce(seq, nonce);
+
+        auto result = Crypto::Aes256Gcm::Decrypt(_sessionKey, nonce, ciphertext, len);
+        if (!result)
+        {
+            return std::nullopt;
+        }
+
+        _lastSequence = seq;
+        return std::move(*result);
     }
 
-    _lastSequence = seq;
-    return std::move(*result);
-}
+    bool CryptoSession::ValidateSequence(uint32 seq)
+    {
+        // 序列号回绕处理：允许 seq 比 lastSequence 最多小 2^31
+        constexpr uint32 kHalfRange = 0x80000000u;
+        uint32           diff       = seq - _lastSequence;
+        return diff > 0 && diff < kHalfRange;
+    }
 
-bool CryptoSession::ValidateSequence(uint32 seq)
-{
-    // 序列号回绕处理：允许 seq 比 lastSequence 最多小 2^31
-    constexpr uint32 kHalfRange = 0x80000000u;
-    uint32 diff = seq - _lastSequence;
-    return diff > 0 && diff < kHalfRange;
-}
-
-void CryptoSession::BuildNonce(uint32 sequence, uint8* out) const
-{
-    MMO::BuildNonce(sequence, _clientRandom, out);
-}
+    void CryptoSession::BuildNonce(uint32 sequence, uint8 *out) const
+    {
+        MMO::BuildNonce(sequence, _clientRandom, out);
+    }
 
 } // namespace MMO

@@ -36,12 +36,12 @@ inline constexpr uint32 kInvalidID = 0xFFFFFFFF;
 // ── Tracy 性能追踪宏（零开销 —— Release 编译为空白） ──
 
 #ifdef MASSIVE_ENABLE_TRACY
-  #include <tracy/Tracy.hpp>
-  #define MASSIVE_PROFILE()       ZoneScoped
-  #define MASSIVE_PROFILE_NAME(x) ZoneScopedN(x)
-  #define MASSIVE_FRAME_MARK()    FrameMark
+    #include <tracy/Tracy.hpp>
+    #define MASSIVE_PROFILE()       ZoneScoped
+    #define MASSIVE_PROFILE_NAME(x) ZoneScopedN(x)
+    #define MASSIVE_FRAME_MARK()    FrameMark
 #else
-  #define MASSIVE_PROFILE()       (void)0
-  #define MASSIVE_PROFILE_NAME(x) (void)0
-  #define MASSIVE_FRAME_MARK()    (void)0
+    #define MASSIVE_PROFILE()       (void)0
+    #define MASSIVE_PROFILE_NAME(x) (void)0
+    #define MASSIVE_FRAME_MARK()    (void)0
 #endif

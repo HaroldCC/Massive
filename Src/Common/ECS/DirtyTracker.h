@@ -14,33 +14,47 @@
 namespace MMO
 {
 
-/**
- * @brief Per-Component 脏标记
- * @tparam T  组件类型（每个组件类型独立的脏标记集）
- */
-template <typename T>
-class DirtyTracker
-{
-public:
-    void Mark(uint32 entityID) { _dirty.insert(entityID); }
-    void Clear(uint32 entityID) { _dirty.erase(entityID); }
-    bool IsDirty(uint32 entityID) const { return _dirty.contains(entityID); }
-
     /**
-     * @brief 获取所有脏 entity 并清空
-     * @return 脏 entity 集合
+     * @brief Per-Component 脏标记
+     * @tparam T  组件类型（每个组件类型独立的脏标记集）
      */
-    std::unordered_set<uint32> Drain()
+    template <typename T>
+    class DirtyTracker
     {
-        std::unordered_set<uint32> result;
-        result.swap(_dirty);
-        return result;
-    }
+    public:
+        void Mark(uint32 entityID)
+        {
+            _dirty.insert(entityID);
+        }
 
-    size_t Count() const { return _dirty.size(); }
+        void Clear(uint32 entityID)
+        {
+            _dirty.erase(entityID);
+        }
 
-private:
-    std::unordered_set<uint32> _dirty;
-};
+        bool IsDirty(uint32 entityID) const
+        {
+            return _dirty.contains(entityID);
+        }
+
+        /**
+         * @brief 获取所有脏 entity 并清空
+         * @return 脏 entity 集合
+         */
+        std::unordered_set<uint32> Drain()
+        {
+            std::unordered_set<uint32> result;
+            result.swap(_dirty);
+            return result;
+        }
+
+        size_t Count() const
+        {
+            return _dirty.size();
+        }
+
+    private:
+        std::unordered_set<uint32> _dirty;
+    };
 
 } // namespace MMO

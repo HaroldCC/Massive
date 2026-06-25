@@ -28,79 +28,81 @@
 namespace MMO::DB
 {
 
-// 异步 DB 任务
-struct DBTask
-{
-    std::string                                 sql;
-    std::vector<DBValue>                        params;
-    std::function<void(const DBResult&)>        callback;
-};
-
-// 已完成回调包装
-struct DBCallback
-{
-    std::function<void(const DBResult&)>        callback;
-    std::unique_ptr<DBResult>                   result;
-};
-
-/**
- * @brief DBWorkerPool — libpq 异步 Worker 线程池
- *
- * 单例模式，所有进程共用。
- * 逻辑线程每 Tick 调用 ProcessCallbacks() 处理已完成查询的回调。
- */
-class DBWorkerPool
-{
-public:
-    /**
-     * @brief 初始化连接池
-     * @param workerCount  Worker 线程数（建议 3-5）
-     * @param connString   libpq 连接字符串
-     * @return true 初始化成功
-     */
-    static bool Init(int workerCount, const std::string& connString);
-
-    // 获取单例
-    static DBWorkerPool& Instance();
-
-    /**
-     * @brief 异步执行参数化 SQL
-     * @param sql      参数化 SQL（$1, $2 占位符）
-     * @param params   参数列表
-     * @param callback 逻辑线程回调
-     */
-    void AsyncQuery(
-        std::string sql,
-        std::vector<DBValue> params,
-        std::function<void(const DBResult&)> callback);
-
-    // 逻辑线程每 Tick 调用，处理已完成查询的回调
-    void ProcessCallbacks();
-
-    // 是否已初始化
-    bool IsInitialized() const { return !_workers.empty(); }
-
-    // 停止所有 Worker 并清理
-    void Shutdown();
-
-private:
-    DBWorkerPool() = default;
-    ~DBWorkerPool();
-    DBWorkerPool(const DBWorkerPool&) = delete;
-    DBWorkerPool& operator=(const DBWorkerPool&) = delete;
-
-    // 单个 Worker 线程
-    struct Worker
+    // 异步 DB 任务
+    struct DBTask
     {
-        void*               conn = nullptr;       // PGconn*
-        std::thread         thread;
-        MPSCQueue<DBTask>   taskQueue;
-        std::atomic<bool>   stop{false};
+        std::string                           sql;
+        std::vector<DBValue>                  params;
+        std::function<void(const DBResult &)> callback;
     };
 
-    std::vector<std::unique_ptr<Worker>> _workers;
-    MPSCQueue<DBCallback>                _completedCallbacks;
-    bool                                 _shutdown = false;
-};
+    // 已完成回调包装
+    struct DBCallback
+    {
+        std::function<void(const DBResult &)> callback;
+        std::unique_ptr<DBResult>             result;
+    };
+
+    /**
+     * @brief DBWorkerPool — libpq 异步 Worker 线程池
+     *
+     * 单例模式，所有进程共用。
+     * 逻辑线程每 Tick 调用 ProcessCallbacks() 处理已完成查询的回调。
+     */
+    class DBWorkerPool
+    {
+    public:
+        /**
+         * @brief 初始化连接池
+         * @param workerCount  Worker 线程数（建议 3-5）
+         * @param connString   libpq 连接字符串
+         * @return true 初始化成功
+         */
+        static bool Init(int workerCount, const std::string &connString);
+
+        // 获取单例
+        static DBWorkerPool &Instance();
+
+        /**
+         * @brief 异步执行参数化 SQL
+         * @param sql      参数化 SQL（$1, $2 占位符）
+         * @param params   参数列表
+         * @param callback 逻辑线程回调
+         */
+        void AsyncQuery(std::string                           sql,
+                        std::vector<DBValue>                  params,
+                        std::function<void(const DBResult &)> callback);
+
+        // 逻辑线程每 Tick 调用，处理已完成查询的回调
+        void ProcessCallbacks();
+
+        // 是否已初始化
+        bool IsInitialized() const
+        {
+            return !_workers.empty();
+        }
+
+        // 停止所有 Worker 并清理
+        void Shutdown();
+
+    private:
+        DBWorkerPool() = default;
+        ~DBWorkerPool();
+        DBWorkerPool(const DBWorkerPool &)            = delete;
+        DBWorkerPool &operator=(const DBWorkerPool &) = delete;
+
+        // 单个 Worker 线程
+        struct Worker
+        {
+            void             *conn = nullptr; // PGconn*
+            std::thread       thread;
+            MPSCQueue<DBTask> taskQueue;
+            std::atomic<bool> stop {false};
+        };
+
+        std::vector<std::unique_ptr<Worker>> _workers;
+        MPSCQueue<DBCallback>                _completedCallbacks;
+        bool                                 _shutdown = false;
+    };
 
 } // namespace MMO::DB

@@ -15,44 +15,44 @@
 namespace MMO
 {
 
-struct LoginConfig
-{
-    static constexpr size_t kLSSSize = 32;  ///< LoginServerSecret 长度（AES-256 key）
-
-    struct Network
+    struct LoginConfig
     {
-        uint16 port      = 8001;
-        int    ioThreads = 4;
-    } network;
+        static constexpr size_t kLSSSize = 32; ///< LoginServerSecret 长度（AES-256 key）
 
-    struct Database
-    {
-        std::string connString  = "host=127.0.0.1 port=6432 dbname=massive";
-        int         workerCount = 3;
-    } database;
+        struct Network
+        {
+            uint16 port      = 8001;
+            int    ioThreads = 4;
+        } network;
 
-    struct Security
-    {
-        uint8 loginServerSecret[kLSSSize] = {};  ///< 32B LSS
-    } security;
+        struct Database
+        {
+            std::string connString  = "host=127.0.0.1 port=6432 dbname=massive";
+            int         workerCount = 3;
+        } database;
 
-    struct World
-    {
-        std::vector<std::string> gateIPs;
-        uint16 worldServerID = 1;
-    } world;
+        struct Security
+        {
+            uint8 loginServerSecret[kLSSSize] = {}; ///< 32B LSS
+        } security;
 
-    /// @brief 日志配置（Log::Init 入参）
-    Log::Config log;
+        struct World
+        {
+            std::vector<std::string> gateIPs;
+            uint16                   worldServerID = 1;
+        } world;
 
-    /**
-     * @brief 从 toml 文件加载
-     * @param path       配置路径
-     * @param keyPath    LSS 密钥文件路径（toml 中为空时 fallback）
-     * @return LoginConfig，失败返回 nullopt
-     */
-    static std::optional<LoginConfig> Load(const std::string& path,
-                                           const std::string& keyPath = "Config/login.key");
-};
+        /// @brief 日志配置（Log::Init 入参）
+        Log::Config log;
+
+        /**
+         * @brief 从 toml 文件加载
+         * @param path       配置路径
+         * @param keyPath    LSS 密钥文件路径（toml 中为空时 fallback）
+         * @return LoginConfig，失败返回 nullopt
+         */
+        static std::optional<LoginConfig> Load(const std::string &path,
+                                               const std::string &keyPath = "Config/login.key");
+    };
 
 } // namespace MMO

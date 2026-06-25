@@ -11,49 +11,47 @@
 namespace MMO
 {
 
-TCPAcceptor::TCPAcceptor(IOContextPool& pool, uint16 port, Framing framing)
-    : _pool(pool)
-    , _acceptor(pool.GetNextContext(), asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port))
-    , _framing(framing)
-{
-}
-
-TCPAcceptor::~TCPAcceptor()
-{
-    Stop();
-}
-
-void TCPAcceptor::Start(AcceptHandler onAccept)
-{
-    if (_started)
+    TCPAcceptor::TCPAcceptor(IOContextPool &pool, uint16 port, Framing framing)
+        : _pool(pool)
+        , _acceptor(pool.GetNextContext(), asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port))
+        , _framing(framing)
     {
-        return;
-    }
-    _started = true;
-    _onAccept = std::move(onAccept);
-    DoAccept();
-}
-
-void TCPAcceptor::Stop()
-{
-    asio::error_code ec;
-    _acceptor.close(ec);
-    _started = false;
-}
-
-void TCPAcceptor::DoAccept()
-{
-    if (!_started)
-    {
-        return;
     }
 
-    // 从池中取下一个 io_context 给新连接
-    auto& ctx = _pool.GetNextContext();
+    TCPAcceptor::~TCPAcceptor()
+    {
+        Stop();
+    }
 
-    _acceptor.async_accept(ctx,
-        [this](const asio::error_code& ec, asio::ip::tcp::socket peer)
+    void TCPAcceptor::Start(AcceptHandler onAccept)
+    {
+        if (_started)
         {
+            return;
+        }
+        _started  = true;
+        _onAccept = std::move(onAccept);
+        DoAccept();
+    }
+
+    void TCPAcceptor::Stop()
+    {
+        asio::error_code ec;
+        _acceptor.close(ec);
+        _started = false;
+    }
+
+    void TCPAcceptor::DoAccept()
+    {
+        if (!_started)
+        {
+            return;
+        }
+
+        // 从池中取下一个 io_context 给新连接
+        auto &ctx = _pool.GetNextContext();
+
+        _acceptor.async_accept(ctx, [this](const asio::error_code &ec, asio::ip::tcp::socket peer) {
             if (ec)
             {
                 Log::Error("TCPAcceptor: accept error: {}", ec.message());
@@ -76,6 +74,6 @@ void TCPAcceptor::DoAccept()
             // 继续接受下一个连接
             DoAccept();
         });
-}
+    }
 
 } // namespace MMO

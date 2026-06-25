@@ -16,44 +16,44 @@
 namespace MMO
 {
 
-class ServiceRegistry
-{
-public:
-    struct ServiceInfo
+    class ServiceRegistry
     {
-        std::string serviceID;
-        std::string address;
-        uint32      maxPlayers   = 0;
-        uint32      currentPlayers = 0;
-        bool        online = false;
-        std::chrono::steady_clock::time_point lastHeartbeat;
+    public:
+        struct ServiceInfo
+        {
+            std::string                           serviceID;
+            std::string                           address;
+            uint32                                maxPlayers     = 0;
+            uint32                                currentPlayers = 0;
+            bool                                  online         = false;
+            std::chrono::steady_clock::time_point lastHeartbeat;
+        };
+
+        // World/Social 上线注册
+        void Register(const ServiceInfo &info);
+
+        // 心跳上报（更新 currentPlayers + lastHeartbeat）
+        void Heartbeat(const std::string &serviceID, uint32 currentPlayers);
+
+        // 主动下线
+        void Deregister(const std::string &serviceID);
+
+        // TCP 断线标记离线
+        void OnSocketLost(const std::string &serviceID);
+
+        // 最少负载 World 选择（LoginServer 调用）
+        const ServiceInfo *PickLeastLoadedWorld() const;
+
+        // 检查超时 World（每 Tick 调用）
+        void CheckTimeouts();
+
+        // 获取所有在线 World 列表
+        std::vector<ServiceInfo> GetOnlineServices() const;
+
+    private:
+        mutable std::shared_mutex                    _mutex;
+        std::unordered_map<std::string, ServiceInfo> _services;
+        static constexpr auto                        kHeartbeatTimeout = std::chrono::seconds(30);
     };
-
-    // World/Social 上线注册
-    void Register(const ServiceInfo& info);
-
-    // 心跳上报（更新 currentPlayers + lastHeartbeat）
-    void Heartbeat(const std::string& serviceID, uint32 currentPlayers);
-
-    // 主动下线
-    void Deregister(const std::string& serviceID);
-
-    // TCP 断线标记离线
-    void OnSocketLost(const std::string& serviceID);
-
-    // 最少负载 World 选择（LoginServer 调用）
-    const ServiceInfo* PickLeastLoadedWorld() const;
-
-    // 检查超时 World（每 Tick 调用）
-    void CheckTimeouts();
-
-    // 获取所有在线 World 列表
-    std::vector<ServiceInfo> GetOnlineServices() const;
-
-private:
-    mutable std::shared_mutex _mutex;
-    std::unordered_map<std::string, ServiceInfo> _services;
-    static constexpr auto kHeartbeatTimeout = std::chrono::seconds(30);
-};
 
 } // namespace MMO
