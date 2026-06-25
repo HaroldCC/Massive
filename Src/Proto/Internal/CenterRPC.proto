@@ -1,0 +1,65 @@
+// CenterRPC.proto — CenterServer 内部 RPC 消息
+// 所有消息均走 EInternalMsgID（不与客户端 EMsgID 共用 ID 空间）。
+// 消息命名规则：Req/Rsp 后缀表示请求-响应对，Ntf 后缀表示单向通知。
+syntax = "proto3";
+
+package MMO.Internal;
+
+// ── 服务注册与发现 ──
+
+message RegisterWorldReq
+{
+    string service_id = 1;   // WorldServer 唯一标识
+    string address    = 2;   // 公网地址（Gate 用）
+    uint32 max_players = 3;  // 最大承载玩家数
+}
+
+message RegisterWorldRsp
+{
+    bool ok = 1;
+}
+
+message HeartbeatReq
+{
+    uint32 current_players = 1;
+}
+
+message HeartbeatRsp
+{
+    bool ok = 1;
+}
+
+// ── 玩家位置路由 ──
+
+message PlayerOnlineNtf
+{
+    uint32 account_id = 1;
+    string world_server_id = 2;
+}
+
+message PlayerOfflineNtf
+{
+    uint32 account_id = 1;
+}
+
+message QueryPlayerLocationReq
+{
+    uint32 account_id = 1;
+}
+
+message QueryPlayerLocationRsp
+{
+    string world_server_id = 1;
+}
+
+// ── 负载均衡 ──
+
+message PickWorldReq
+{
+}
+
+message PickWorldRsp
+{
+    string world_server_id = 1;
+    string address         = 2;
+}

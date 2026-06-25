@@ -468,6 +468,7 @@ target("protoc")
     set_kind("binary")
     set_warnings("none")
     add_rules("Rules.ThirdParty")
+    set_policy("build.fence", true)
 
     add_deps("libprotoc", "protobuf", "upb", "abseil", "utf8_range")
 

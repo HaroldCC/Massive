@@ -5,16 +5,21 @@
 --- 构建时序 (build.fence + add_deps):
 ---   1. protoc target 全量编译（含链接 protoc.exe）
 ---   2. Proto build 阶段开始
----      a. on_preparecmd_file: 注册 .obj（pb.cc 尚未生成）
----      b. on_buildcmd_file: 运行 protoc 生成 .pb.{h,cc} → 编译 .pb.cc
+---      a. on_buildcmd_file: 运行 protoc 生成 .pb.{h,cc} → 编译 .pb.cc
+---
+--- 客户端协议（*.proto）+ 内部 RPC 协议（Internal/*.proto）共用规则。
+--- protoc 输出结构：
+---   Common.proto → AutoGen/Common.pb.cc
+---   Internal/CenterRPC.proto → AutoGen/Internal/CenterRPC.pb.cc
+--- (protoc 自动在 --cpp_out 中保留 --proto_path 剥离后的子目录)
 
 rule("proto_msgid")
     on_config(function (target)
         local protoDir   = path.join(os.projectdir(), "Src/Proto")
         local genScript  = path.join(os.projectdir(), "Tools/Proto/GenMsgID.py")
-        local msgidProto = path.join(protoDir, "MsgID.proto")
 
-        -- 增量：业务 proto 比 MsgID.proto 新才重新生成
+        -- 客户端 MsgID.proto
+        local msgidProto = path.join(protoDir, "MsgID.proto")
         local depfiles = os.files(path.join(protoDir, "*.proto"))
         local dirty = not os.isfile(msgidProto)
         if not dirty then
@@ -26,18 +31,39 @@ rule("proto_msgid")
                 end
             end
         end
-
         if dirty then
-            os.vrunv("python", {genScript, "--proto-dir", protoDir, "--output", msgidProto})
+            os.vrunv("python", {genScript, "--proto-dir", protoDir, "--enum-name", "EMsgID",
+                                "--output", "MsgID.proto"})
             cprint("${color.success}[proto] MsgID.proto 已更新")
+        end
+
+        -- 内部 InternalMsgID.proto
+        local internalProto = path.join(protoDir, "Internal", "InternalMsgID.proto")
+        local internalFiles = os.files(path.join(protoDir, "Internal", "*.proto"))
+        local internalDirty = not os.isfile(internalProto)
+        if not internalDirty then
+            local internalMtime = os.mtime(internalProto)
+            for _, f in ipairs(internalFiles) do
+                if path.filename(f) ~= "InternalMsgID.proto" and os.mtime(f) > internalMtime then
+                    internalDirty = true
+                    break
+                end
+            end
+        end
+        if internalDirty then
+            os.vrunv("python", {genScript, "--proto-dir", protoDir,
+                                "--subdir", "Internal",
+                                "--enum-name", "EInternalMsgID",
+                                "--output", "Internal/InternalMsgID.proto"})
+            cprint("${color.success}[proto] InternalMsgID.proto 已更新")
         end
     end)
 
---- rule: 仿照 xmake 内置 protobuf.cpp 的两阶段模型
+--- rule: protoc 生成 .pb.{h,cc} + 编译
 rule("proto_gen")
     set_extensions(".proto")
 
-    add_deps("protoc")
+    add_deps("c++", "protoc")
 
     -- 阶段 1: 预注册 .pb.cc 的 objectfile（编译前必须确定）
     after_load(function (target)
@@ -46,62 +72,50 @@ rule("proto_gen")
         if not sourcebatch then
             return
         end
+        -- protoc 输出到 AutoGen/ 下保留子目录结构，所以 pbcc 用相对路径
+        -- path.basename(protoRel) 会丢掉子目录，直接让 protoc 决定输出路径
+        local protoDir = target:scriptdir()
         for _, sourcefile_proto in ipairs(sourcebatch.sourcefiles) do
-            local pbcc = path.join(autogenDir, path.basename(sourcefile_proto) .. ".pb.cc")
+            local protoRel = path.relative(sourcefile_proto, protoDir):gsub("\\", "/")
+            -- 去掉 .proto 后缀，保留子目录：Internal/CenterRPC.proto → Internal/CenterRPC.pb.cc
+            local noExt = protoRel:gsub("%.proto$", "")
+            local pbcc = path.join(autogenDir, noExt .. ".pb.cc")
             local objfile = target:objectfile(pbcc)
             table.insert(target:objectfiles(), objfile)
         end
     end)
 
-    -- 阶段 2: protoc 生成 .pb.{h,cc}
-    -- on_preparecmd_file(function (target, batchcmds, sourcefile_proto, opt)
-    --     local protocTarget = target:dep("protoc")
-    --     local protoc = path.join(protocTarget:targetdir(), protocTarget:name())
-
-    --     local protoDir   = path.join(os.projectdir(), "Src/Proto")
-    --     local autogenDir = path.join(os.projectdir(), "Src/Proto/AutoGen")
-    --     local protoFile  = path.filename(sourcefile_proto)
-
-    --     batchcmds:mkdir(autogenDir)
-
-    --     batchcmds:show_progress(opt.progress, "${color.build.object}proto.gen %s", sourcefile_proto)
-    --     batchcmds:vrunv(protoc, {
-    --         "--proto_path=" .. protoDir,
-    --         "--cpp_out=" .. autogenDir,
-    --         protoFile
-    --     }, {curdir = protoDir})
-
-    --     -- 增量依赖
-    --     batchcmds:add_depfiles(sourcefile_proto)
-    --     batchcmds:set_depcache(target:dependfile(
-    --         path.join(autogenDir, path.basename(sourcefile_proto) .. ".pb.cc")))
-    -- end)
-
-    -- 阶段 3: 编译 .pb.cc
+    -- 阶段 2: protoc 生成 .pb.{h,cc} + 编译
     on_buildcmd_file(function (target, batchcmds, sourcefile_proto, opt)
         local protocTarget = target:dep("protoc")
         local protoc = path.join(protocTarget:targetdir(), protocTarget:name())
 
         local protoDir   = path.join(os.projectdir(), "Src/Proto")
         local autogenDir = path.join(os.projectdir(), "Src/Proto/AutoGen")
-        local protoFile  = path.filename(sourcefile_proto)
 
-        batchcmds:show_progress(opt.progress, "${color.build.object}proto.gen %s", sourcefile_proto)
+        -- 传相对路径（如 Internal/CenterRPC.proto），
+        -- protoc 剥离 --proto_path 前缀后输出到 AutoGen/Internal/CenterRPC.pb.cc
+        local protoRel = path.relative(sourcefile_proto, protoDir):gsub("\\", "/")
+        local pbccBase = protoRel:gsub("%.proto$", "")
+        local pbcc = path.join(autogenDir, pbccBase .. ".pb.cc")
+
+        batchcmds:show_progress(opt.progress, "${color.build.object}proto.gen %s", protoRel)
+        batchcmds:mkdir(autogenDir)
+        -- 声明 protoc 本身为依赖文件，若不存在则触发重新链接
+        batchcmds:add_depfiles(protoc)
         batchcmds:vrunv(protoc, {
             "--proto_path=" .. protoDir,
             "--cpp_out=" .. autogenDir,
-            protoFile
+            protoRel
         }, {curdir = protoDir})
 
-        -- 增量依赖
+        -- 增量依赖（.pb.cc 生成步骤）
         batchcmds:add_depfiles(sourcefile_proto)
-        batchcmds:set_depcache(target:dependfile(
-            path.join(autogenDir, path.basename(sourcefile_proto) .. ".pb.cc")))
+        -- 用 set_depmtime 记录 .pb.cc 的 mtime，文件被删时 depcache 会失效
+        batchcmds:set_depmtime(os.mtime(pbcc))
+        batchcmds:set_depcache(target:dependfile(pbcc))
 
-        local autogenDir = path.join(os.projectdir(), "Src/Proto/AutoGen")
-        local pbcc  = path.join(autogenDir, path.basename(sourcefile_proto) .. ".pb.cc")
         local objfile = target:objectfile(pbcc)
-
         batchcmds:show_progress(opt.progress, "${color.build.object}compiling.proto.$(mode) %s", pbcc)
         batchcmds:compile(pbcc, objfile, {configs = {includedirs = autogenDir}})
         batchcmds:set_depmtime(os.mtime(objfile))
@@ -113,6 +127,7 @@ target("Proto")
     set_warnings("none")
     add_rules("proto_msgid", "proto_gen")
     add_deps("protobuf", "protoc")
-    -- set_policy("build.across_targets_in_parallel", false)
     add_files("*.proto")
+    add_files("Internal/**.proto")
     add_includedirs("$(projectdir)/Src/Proto/AutoGen", {public = true})
+    set_policy("build.fence", true)

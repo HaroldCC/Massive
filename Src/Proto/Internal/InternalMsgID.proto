@@ -1,0 +1,21 @@
+// InternalMsgID.proto — 消息 ID 枚举
+// ⚠ 本文件由 Tools/Proto/GenMsgID.py 自动生成并维护——不要手动编辑 enum 值。
+//   已有消息 ID 永不变更，新消息追加，删除的消息保留为 [deprecated] 不复用 ID。
+syntax = "proto3";
+
+package MMO.Internal;
+
+enum EInternalMsgID
+{
+    INTERNAL_MSG_NONE = 0;
+    MSG_REGISTER_WORLD_REQ = 1;
+    MSG_REGISTER_WORLD_RSP = 2;
+    MSG_HEARTBEAT_REQ = 3;
+    MSG_HEARTBEAT_RSP = 4;
+    MSG_PLAYER_ONLINE_NTF = 5;
+    MSG_PLAYER_OFFLINE_NTF = 6;
+    MSG_QUERY_PLAYER_LOCATION_REQ = 7;
+    MSG_QUERY_PLAYER_LOCATION_RSP = 8;
+    MSG_PICK_WORLD_REQ = 9;
+    MSG_PICK_WORLD_RSP = 10;
+}
