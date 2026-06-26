@@ -1,0 +1,22 @@
+// GateRPC.proto — GateServer ↔ WorldServer 控制消息
+syntax = "proto3";
+
+package MMO.Proto.Internal;
+
+// 客户端断线通知（World 侧进入 60s 重连等待）
+message DisconnectNtf
+{
+    uint32 session_id = 1;
+}
+
+// 重连后，Gate 批量通知 World 哪些 sessionId 已恢复
+message SessionRebindReq
+{
+    uint32 world_server_id = 1;
+    repeated uint32 session_ids = 2;
+}
+
+message SessionRebindRsp
+{
+    bool ok = 1;
+}

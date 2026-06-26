@@ -1,0 +1,23 @@
+# Config/gate.toml — GateServer 配置
+# 客户端接入端口、World 内网地址、限流、日志
+
+[network]
+port = 9001
+io_threads = 8
+max_connections = 20000
+
+[world]
+# WorldServer 内网地址列表（MVP 阶段静态配置）
+servers = ["127.0.0.1:8001", "127.0.0.1:8002"]
+
+[heartbeat]
+client_timeout_sec = 60
+
+[dos]
+max_conns_per_ip = 10
+
+[log]
+# 日志级别：0=trace 1=debug 2=info 3=warn 4=error 5=critical
+level = 0
+# 日志目录（空=仅控制台；相对路径相对于二进制所在目录）
+dir = "logs"
