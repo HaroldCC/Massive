@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <memory>
+#include <optional>
 
 #include <asio/post.hpp>
 
@@ -29,15 +30,15 @@
 
 #include "Login.pb.h"
 
+namespace MMO::DB::AutoGen
+{
+    struct accounts_row;
+} // namespace MMO::DB::AutoGen
+
 namespace MMO
 {
 
     class TCPSocket;
-
-    namespace DB
-    {
-        class DBResult;
-    } // namespace DB
 
     class LoginServer
     {
@@ -57,12 +58,12 @@ namespace MMO
         /**
          * @brief 主线程（DB 回调）：验证密码 + ECDH + SessionToken + 回包
          */
-        void OnAuthDBCallback(std::shared_ptr<TCPSocket> socket,
-                              std::string                clientIP,
-                              const std::string         &username,
-                              const std::string         &password,
-                              const std::string         &clientDHKey,
-                              const DB::DBResult        &result);
+        void OnAuthDBCallback(std::shared_ptr<TCPSocket>    socket,
+                              std::string                   clientIP,
+                              const std::string            &username,
+                              const std::string            &password,
+                              const std::string            &clientDHKey,
+                              std::optional<DB::AutoGen::accounts_row> row);
 
         /**
          * @brief IO 线程：认证成功 → 构建 LoginAuthRsp + Send + Close
