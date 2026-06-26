@@ -6,6 +6,11 @@
  * 负责：
  *   - 出站加密：sequence + clientRandom → 12B nonce → AES-256-GCM
  *   - 入站解密：序列号防重放 + AES-256-GCM 验证
+ *
+ * ── 重连安全 ──
+ * 断线重连时 TCP 断开但 CryptoSession 保留。客户端在新的 EnterWorldReq
+ * 中携带 reconnectSeed，服务端调用 RotateReconnectKey() 派生新密钥 + 新
+ * clientRandom，序列号从 0 开始。新 nonce 空间不与旧 nonce 空间碰撞。
  */
 #pragma once
 
@@ -36,23 +41,25 @@ namespace MMO
          */
         void Init(const uint8 *sessionKey, uint64 clientRandom);
 
-        // 32B AES-256 密钥
-        const uint8 *SessionKey() const
-        {
-            return _sessionKey;
-        }
+        /**
+         * @brief 重连密钥旋转——派生新 key + newRandom，序列号归零
+         *
+         * 新密钥   = HMAC-SHA256(oldKey, "massive-reconnect-key-v1" || reconnectSeed)
+         * 新随机数 = HMAC-SHA256(oldKey, "massive-reconnect-rand-v1" || reconnectSeed)[0..7]
+         *
+         * @param reconnectSeed  客户端提供的重连种子
+         * @param seedLen        种子长度
+         */
+        void RotateReconnectKey(const uint8 *reconnectSeed, size_t seedLen);
 
-        // 客户端随机前缀
-        uint64 ClientRandom() const
-        {
-            return _clientRandom;
-        }
+        const uint8 *SessionKey() const { return _sessionKey; }
+        uint64       ClientRandom() const { return _clientRandom; }
 
         /**
          * @brief 出站加密
          * @param plaintext  明文数据
          * @param len        明文长度
-         * @return ciphertext + 16B GCM tag 的 ByteBuffer，失败返回空 ByteBuffer
+         * @return ciphertext + 16B GCM tag 的 ByteBuffer，失败返回空
          */
         ByteBuffer Encrypt(const uint8 *plaintext, size_t len);
 
@@ -65,20 +72,15 @@ namespace MMO
          */
         std::optional<ByteBuffer> Decrypt(const uint8 *ciphertext, size_t len, uint32 seq);
 
-        /**
-         * @brief 验证序列号是否有效（防重放）
-         * @param seq  消息序列号
-         * @return 有效返回 true
-         */
         bool ValidateSequence(uint32 seq);
 
     private:
         void BuildNonce(uint32 sequence, uint8 *out) const;
 
-        uint8  _sessionKey[32] = {}; // AES-256 密钥
-        uint64 _clientRandom   = 0;  // 客户端随机前缀
-        uint32 _lastSequence   = 0;  // 已收到的最大序列号
-        uint32 _sendSequence   = 0;  // 已发送的序列号
+        uint8  _sessionKey[32] = {};
+        uint64 _clientRandom   = 0;
+        uint32 _lastSequence   = 0;
+        uint32 _sendSequence   = 0;
     };
 
 } // namespace MMO

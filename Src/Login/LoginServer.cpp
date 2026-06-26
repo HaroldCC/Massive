@@ -3,7 +3,7 @@
  * @brief LoginServer 实现——完整认证主逻辑
  *
  * 认证链路（3 线程参与）：
- *   IO 线程: RateLimiter.Allow → DB::AsyncQuery(username) → return
+ *   IO 线程: RateLimiter.Allow → DB::Range<AccountsTable>().SingleOrDefault → return
  *   主线程: DB 回调 → argon2id 验密码 → 封禁检查 → ECDH → SessionToken 签发 → asio::post
  *   IO 线程: asio::post 回调 → LoginAuthRsp 序列化 → Send → Close
  */
@@ -13,7 +13,9 @@
 
 #include "Common/Crypto/Argon2id.h"
 #include "Common/Crypto/SessionToken.h"
+#include "Common/DB/AutoGen/AccountsTable.gen.h"
 #include "Common/DB/DBWorkerPool.h"
+#include "Common/DB/Range.h"
 #include "Common/DB/Types.h"
 #include "Common/Log/Log.h"
 #include "Common/Network/TCPSocket.h"
@@ -50,7 +52,7 @@ namespace MMO
                 std::string clientIP = "0.0.0.0";
                 try
                 {
-                    clientIP = socket->Socket().remote_endpoint().address().to_string();
+                    clientIP = socket->LowestLayer().remote_endpoint().address().to_string();
                 }
                 catch (...)
                 {
@@ -116,59 +118,61 @@ namespace MMO
 
         Log::Info("LoginServer auth request from {} ({})", req.username(), clientIP);
 
-        // 2. 参数化 SQL：根据用户名查询
-        // 提前提取 protobuf 字段（避免值捕获 protobuf 对象到 std::function 中）
+        // 2. 类型安全查询（Range<AccountsTable>），只读取认证所需的列
         std::string username    = req.username();
         std::string password    = req.password();
         std::string clientDHKey = req.client_dh_key();
 
-        DB::DBWorkerPool::Instance().AsyncQuery(
-            "SELECT account_id, password_hash, ban_until FROM accounts WHERE username = $1",
-            {DB::DBValue(username)},
-            [this,
-             socket = std::move(socket),
-             clientIP,
-             username    = std::move(username),
-             password    = std::move(password),
-             clientDHKey = std::move(clientDHKey)](const DB::DBResult &result) {
-                OnAuthDBCallback(std::move(socket), clientIP, username, password, clientDHKey, result);
-            });
+        DB::Range<DB::AutoGen::AccountsTable>()
+            .Select(DB::AutoGen::AccountsTable::account_id,
+                    DB::AutoGen::AccountsTable::password_hash,
+                    DB::AutoGen::AccountsTable::ban_until)
+            .Where(DB::AutoGen::AccountsTable::username == username)
+            .SingleOrDefault(
+                [this,
+                 socket = std::move(socket),
+                 clientIP,
+                 username    = std::move(username),
+                 password    = std::move(password),
+                 clientDHKey = std::move(clientDHKey)](std::optional<DB::AutoGen::accounts_row> row) mutable {
+                    OnAuthDBCallback(std::move(socket),
+                                     std::move(clientIP),
+                                     std::move(username),
+                                     std::move(password),
+                                     std::move(clientDHKey),
+                                     std::move(row));
+                });
     }
 
     // ── Step 2: 主线程 — DB 回调: 验密码 + ECDH + SessionToken 签发 ──
 
-    void LoginServer::OnAuthDBCallback(std::shared_ptr<TCPSocket> socket,
-                                       std::string                clientIP,
-                                       const std::string         &username,
-                                       const std::string         &password,
-                                       const std::string         &clientDHKey,
-                                       const DB::DBResult        &result)
+    void LoginServer::OnAuthDBCallback(std::shared_ptr<TCPSocket>              socket,
+                                       std::string                             clientIP,
+                                       const std::string                      &username,
+                                       const std::string                      &password,
+                                       const std::string                      &clientDHKey,
+                                       std::optional<DB::AutoGen::accounts_row> row)
     {
-        // --- DB 查询失败 / 用户不存在 ---
-        if (!result.IsOK() || result.RowCount() == 0)
+        // --- 用户不存在 ---
+        if (!row.has_value())
         {
             Log::Debug("LoginServer: auth failed for '{}' — user not found", username);
             _rateLimiter.RecordFailure(clientIP);
 
-            asio::post(socket->Socket().get_executor(),
+            asio::post(socket->LowestLayer().get_executor(),
                        [this, socket, errorCode = static_cast<uint32>(1001)]() {
                            SendAuthFailure(socket, errorCode);
                        });
             return;
         }
 
-        // 读取 DB 字段
-        auto    passwordHashHex = result.Get(0, 1).Text();    // column 1: password_hash
-        int32_t accountId       = result.Get(0, 0).AsInt32(); // column 0: account_id
-        auto    banUntilRaw     = result.Get(0, 2);           // column 2: ban_until
-
         // --- argon2id 密码验证 ---
-        if (!Crypto::Argon2id::VerifyPassword(password, passwordHashHex))
+        if (!Crypto::Argon2id::VerifyPassword(password, row->password_hash))
         {
             Log::Debug("LoginServer: auth failed for '{}' — wrong password", username);
             _rateLimiter.RecordFailure(clientIP);
 
-            asio::post(socket->Socket().get_executor(),
+            asio::post(socket->LowestLayer().get_executor(),
                        [this, socket, errorCode = static_cast<uint32>(1001)]() {
                            SendAuthFailure(socket, errorCode);
                        });
@@ -176,23 +180,32 @@ namespace MMO
         }
 
         // --- 封禁检查 ---
-        if (!banUntilRaw.IsNull())
+        if (row->ban_until.unix_ms > 0)
         {
-            // ban_until 是 TIMESTAMPTZ，libpq text 格式如 "2025-06-20 12:00:00+00"
-            const auto &banStr = banUntilRaw.Text();
-            if (!banStr.empty())
+            auto now = DB::Timestamp::Now();
+            if (row->ban_until.unix_ms > now.unix_ms)
             {
-                // 简单解析：取年份和月份等... 简化处理：IsNull 检查即可
-                // 正式实现用 DB::Timestamp 转换
+                Log::Debug("LoginServer: auth failed for '{}' — account banned until {}",
+                           username,
+                           row->ban_until.ToPGText());
+                _rateLimiter.RecordFailure(clientIP);
+
+                asio::post(socket->LowestLayer().get_executor(),
+                           [this, socket, errorCode = static_cast<uint32>(1002)]() {
+                               SendAuthFailure(socket, errorCode);
+                           });
+                return;
             }
         }
+
+        int32_t accountId = row->account_id;
 
         // --- ECDH 密钥协商 ---
         auto keyPairOpt = Crypto::EcdhX25519::GenerateKeyPair();
         if (!keyPairOpt)
         {
             Log::Error("LoginServer: ECDH key generation failed for '{}'", username);
-            asio::post(socket->Socket().get_executor(),
+            asio::post(socket->LowestLayer().get_executor(),
                        [this, socket, errorCode = static_cast<uint32>(1003)]() {
                            SendAuthFailure(socket, errorCode);
                        });
@@ -206,7 +219,7 @@ namespace MMO
             Log::Error("LoginServer: client DH key size mismatch (got {}, expected {})",
                        clientDHKey.size(),
                        Crypto::EcdhX25519::kKeySize);
-            asio::post(socket->Socket().get_executor(),
+            asio::post(socket->LowestLayer().get_executor(),
                        [this, socket, errorCode = static_cast<uint32>(1003)]() {
                            SendAuthFailure(socket, errorCode);
                        });
@@ -219,7 +232,7 @@ namespace MMO
         if (!sharedSecretOpt)
         {
             Log::Error("LoginServer: ECDH shared secret derivation failed for '{}'", username);
-            asio::post(socket->Socket().get_executor(),
+            asio::post(socket->LowestLayer().get_executor(),
                        [this, socket, errorCode = static_cast<uint32>(1003)]() {
                            SendAuthFailure(socket, errorCode);
                        });
@@ -239,7 +252,7 @@ namespace MMO
         if (!tokenOpt)
         {
             Log::Error("LoginServer: SessionToken issue failed for '{}'", username);
-            asio::post(socket->Socket().get_executor(),
+            asio::post(socket->LowestLayer().get_executor(),
                        [this, socket, errorCode = static_cast<uint32>(1003)]() {
                            SendAuthFailure(socket, errorCode);
                        });
@@ -249,7 +262,7 @@ namespace MMO
         // --- asio::post 回到 IO 线程，发送成功响应 ---
         Log::Info("LoginServer: auth success for '{}' (accountId={})", username, accountId);
 
-        asio::post(socket->Socket().get_executor(),
+        asio::post(socket->LowestLayer().get_executor(),
                    [this, socket, keyPair = std::move(keyPair), token = std::move(*tokenOpt)]() mutable {
                        SendAuthSuccess(socket, keyPair, token);
                    });

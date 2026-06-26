@@ -87,8 +87,8 @@ namespace MMO
             _onClose = std::move(handler);
         }
 
-        // 底层 socket 引用（获取远程地址等）
-        asio::ip::tcp::socket &Socket()
+        // 底层 socket 引用（预留 TLS：将来 LowestLayer() 返回 ssl::stream 的 lowest_layer）
+        asio::ip::tcp::socket &LowestLayer()
         {
             return _socket;
         }

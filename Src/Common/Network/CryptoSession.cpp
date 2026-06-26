@@ -6,6 +6,8 @@
 #include "Common/Network/CryptoSession.h"
 #include "Common/Network/PacketHeader.h"
 #include "Common/Crypto/Aes256Gcm.h"
+#include "Common/Crypto/HmacSha256.h"
+#include "Common/Log/Log.h"
 
 #include <cstring>
 
@@ -16,7 +18,46 @@ namespace MMO
     {
         std::memcpy(_sessionKey, sessionKey, 32);
         _clientRandom = clientRandom;
-        // 序列号从 0 开始，首次 Encrypt 返回 1
+        _lastSequence = 0;
+        _sendSequence = 0;
+    }
+
+    void CryptoSession::RotateReconnectKey(const uint8 *reconnectSeed, size_t seedLen)
+    {
+        // 先保存旧 key——两个派生都用同一个旧 key，避免第一个派生改了 _sessionKey 影响第二个
+        uint8 oldKey[32];
+        std::memcpy(oldKey, _sessionKey, 32);
+
+        constexpr char kKeyDomain[]  = "massive-reconnect-key-v1";
+        constexpr char kRandDomain[] = "massive-reconnect-rand-v1";
+        uint8          combined[64 + sizeof(kKeyDomain)];
+        size_t copyLen = seedLen;
+        if (seedLen > 64)
+        {
+            Log::Warn("CryptoSession: reconnect seed too large ({} > 64), truncating", seedLen);
+            copyLen = 64;
+        }
+
+        // 派生新密钥
+        std::memcpy(combined, kKeyDomain, sizeof(kKeyDomain));
+        std::memcpy(combined + sizeof(kKeyDomain), reconnectSeed, copyLen);
+        auto newKey = Crypto::HmacSha256::Sign(oldKey, 32, combined, sizeof(kKeyDomain) + copyLen);
+        if (newKey && newKey->Size() == 32)
+        {
+            std::memcpy(_sessionKey, newKey->Data(), 32);
+        }
+
+        // 派生新 clientRandom（用同一个旧 key）
+        std::memcpy(combined, kRandDomain, sizeof(kRandDomain));
+        std::memcpy(combined + sizeof(kRandDomain), reconnectSeed, copyLen);
+        auto newRandom = Crypto::HmacSha256::Sign(oldKey, 32, combined, sizeof(kRandDomain) + copyLen);
+        if (newRandom && newRandom->Size() >= 8)
+        {
+            uint64 randVal = 0;
+            std::memcpy(&randVal, newRandom->Data(), 8);
+            _clientRandom = randVal;
+        }
+
         _lastSequence = 0;
         _sendSequence = 0;
     }

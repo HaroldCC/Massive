@@ -112,7 +112,7 @@ namespace MMO
         std::string clientIP = "0.0.0.0";
         try
         {
-            clientIP = socket->Socket().remote_endpoint().address().to_string();
+            clientIP = socket->LowestLayer().remote_endpoint().address().to_string();
         }
         catch (...)
         {
@@ -133,7 +133,7 @@ namespace MMO
         // 注册消息回调
         auto weakSession = std::weak_ptr<GateSession>(session);
 
-        session->Socket()->SetMessageHandler(
+        session->LowestLayer()->SetMessageHandler(
             [this, weakSession](uint32 msgID, uint32 /*packetSessionID*/, const uint8 *body, size_t len) {
                 auto s = weakSession.lock();
                 if (s)
@@ -143,7 +143,7 @@ namespace MMO
             });
 
         // 注册断线回调
-        session->Socket()->SetCloseHandler([this, sessionID, clientIP]() {
+        session->LowestLayer()->SetCloseHandler([this, sessionID, clientIP]() {
             OnSessionDisconnect(sessionID);
             OnConnectionClosed(clientIP);
         });
@@ -497,7 +497,7 @@ namespace MMO
             return;
         }
 
-        socket->Socket().async_connect(*endpoints.begin(), [this, addr, socket](const asio::error_code &ec) {
+        socket->LowestLayer().async_connect(*endpoints.begin(), [this, addr, socket](const asio::error_code &ec) {
             if (ec)
             {
                 Log::Error("GateServer: connect to '{}' failed: {}", addr, ec.message());
