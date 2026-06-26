@@ -32,37 +32,60 @@
     <tr><th>参数</th><th>默认值</th><th>说明</th></tr>
     <tr><td><code>kGridSize</code></td><td>50.0m</td><td>格子边长。应 ≈ viewRadius，使九宫格正好覆盖视野。</td></tr>
     <tr><td><code>kViewRadiusXZ</code></td><td>100.0m</td><td>水平视野半径。AOI 查询范围 = 实体所在格 ± 2 圈。</td></tr>
-    <tr><td><code>kViewRadiusY</code></td><td>50.0m</td><td>高度视野阈值。AOI 结果出来后按 |dy| 过滤。</td></tr>
-    <tr><td><code>kHotThreshold</code></td><td>200</td><td>格子内实体 ≥ 200 → 升级为热点模式。</td></tr>
-    <tr><td><code>kCoolThreshold</code></td><td>50</td><td>格子内实体 ≤ 50 → 降级回普通模式。</td></tr>
-    <tr><td><code>kSubGrids</code></td><td>4</td><td>每维 4 份，热点模式内部共 16 个子格。</td></tr>
+    <tr><td><code>kViewRadiusY</code></td><td>15.0m</td><td>高度视野阈值。AOI 结果出来后按 |dy| 过滤。缩短至 15m（原 50m 对应 15 层楼，超出合理游戏空间）</td></tr>
+    <tr><td><code>kHotThreshold</code></td><td>220</td><td>格子内实体 ≥ 220 → 升级为热点模式（原 200，提高小边缘抖动容忍度）</td></tr>
+    <tr><td><code>kCoolThreshold</code></td><td>180</td><td>格子内实体 ≤ 180 → 降级回普通模式（原 50，温差从 150 缩小到 40）</td></tr>
+    <tr><td><code>kCoolCooldownTicks</code></td><td>30</td><td>降级冷却：实体数必须连续 30 Tick 保持在 ≤ coolThreshold 才触发降级（20ms Tick → 600ms）</td></tr>
+    <tr><td><code>config.subGrids</code></td><td>4</td><td>每维 4 份，热点模式内部共 16 个子格。</td></tr>
     <tr><td><code>kMaxPacketSize</code></td><td>64KB</td><td>与 S7 一致，单次 AOI 广播包上限。</td></tr>
   </table>
 
-  <h3>12.3 核心数据结构</h3>
+  <h3>12.3 场景类型与推荐配置</h3>
+  <table>
+    <tr><th>场景类型</th><th>hotThreshold</th><th>coolThreshold</th><th>viewRadiusY</th><th>layerHeight</th><th>说明</th></tr>
+    <tr><td>主城</td><td>500</td><td>450</td><td>15m</td><td>0</td><td>人流量大，升级门槛高；单一平面</td></tr>
+    <tr><td>野外</td><td>220</td><td>180</td><td>20m</td><td>30m</td><td>默认值；多层地形场景可用 layer 隔离</td></tr>
+    <tr><td>副本</td><td>80</td><td>60</td><td>30m</td><td>15m</td><td>人少但可能有垂直跨度（多层副本）</td></tr>
+    <tr><td>战场</td><td>300</td><td>260</td><td>20m</td><td>0</td><td>大规模对抗，适度放宽</td></tr>
+  </table>
+  <div class="callout info">
+    <strong>配置选择建议</strong>：场景创建时根据 <code>SceneType</code> 选择对应 <code>AoiConfig</code> 预设。
+    副本类场景的 <code>layerHeight=15m</code> 意味着 0-14m 为 layer 0、15-29m 为 layer 1——不同层的实体互不可见，
+    避免多层副本中楼上楼下互相看见的不合理情况。
+  </div>
+
+  <h3>12.4 核心数据结构</h3>
 
   <pre><code><span class="cm">// GridAoiSystem.h</span>
 
 <span class="kw">struct</span> <span class="tp">CellIndex</span> { <span class="kt">int</span> x, z; };        <span class="cm">// 格子坐标（整数索引）</span>
-<span class="kw">struct</span> <span class="tp">SubCellKey</span> { <span class="kt">int</span> sx, sz; };     <span class="cm">// 子格坐标（0..kSubGrids-1）</span>
+<span class="kw">struct</span> <span class="tp">SubCellKey</span> { <span class="kt">int</span> sx, sz; };     <span class="cm">// 子格坐标（0..config.subGrids-1）</span>
 
 <span class="cm">// 热-点模式：子格 &rarr; 实体列表</span>
 <span class="kw">using</span> <span class="tp">SubCellMap</span> = <span class="tp">std::unordered_map</span>&lt;<span class="tp">uint64_t</span>, <span class="tp">std::vector</span>&lt;<span class="tp">Entity</span>&gt;&gt;;
+
+<span class="kw">struct</span> <span class="tp">AoiConfig</span> {
+    <span class="kt">float</span>   gridSize             = <span class="num">50.0f</span>;
+    <span class="kt">float</span>   viewRadiusXZ         = <span class="num">100.0f</span>;
+    <span class="kt">float</span>   viewRadiusY          = <span class="num">15.0f</span>;
+    <span class="kt">float</span>   layerHeight          = <span class="num">0.0f</span>;
+    <span class="tp">size_t</span>  hotThreshold         = <span class="num">220</span>;
+    <span class="tp">size_t</span>  coolThreshold        = <span class="num">180</span>;
+    <span class="kt">uint32_t</span> coolCooldownTicks   = <span class="num">30</span>;
+    <span class="kt">uint32_t</span> subGrids            = <span class="num">4</span>;
+};
 
 <span class="kw">class</span> <span class="tp">GridCell</span> {
 <span class="kw">public</span>:
     <span class="tp">std::vector</span>&lt;<span class="tp">Entity</span>&gt; entities;         <span class="cm">// 普通模式：直接存实体列表</span>
     <span class="tp">SubCellMap</span> hotSubCells;          <span class="cm">// 热点模式：子格 &rarr; 实体列表</span>
     <span class="kt">bool</span> isHot = <span class="nb">false</span>;
-
-    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="tp">size_t</span> kHotThreshold = <span class="num">200</span>;
-    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="tp">size_t</span> kCoolThreshold = <span class="num">50</span>;
-    <span class="kw">static</span> <span class="kw">constexpr</span> <span class="tp">uint32_t</span> kSubGrids = <span class="num">4</span>;  <span class="cm">// 每维 4 份，共 16 子格</span>
+    <span class="kt">uint32_t</span> coolCooldown = <span class="num">0</span>;
 };
 
 <span class="kw">class</span> <span class="tp">GridAoiSystem</span> {
 <span class="kw">public</span>:
-    <span class="fn">GridAoiSystem</span>(<span class="kp">uint32_t</span> sceneId, <span class="kt">float</span> gridSize, <span class="kt">float</span> viewRadiusXZ, <span class="kt">float</span> viewRadiusY);
+    <span class="fn">GridAoiSystem</span>(<span class="kp">uint32_t</span> sceneId, <span class="kw">const</span> <span class="tp">AoiConfig</span>&amp; config);
 
     <span class="cm">// &mdash;&mdash; 实体位置更新（每 Tick 调用）&mdash;&mdash;</span>
     <span class="kt">void</span> <span class="fn">UpdateEntityPosition</span>(<span class="tp">Entity</span> entity, <span class="kt">float</span> x, <span class="kt">float</span> y, <span class="kt">float</span> z);
@@ -79,9 +102,10 @@
     <span class="kt">void</span> <span class="fn">CheckHotSpotDowngrade</span>();  <span class="cm">// 每 Tick 检查是否有热点格子可以降级</span>
 
 <span class="kw">private</span>:
-    <span class="cm">// 位置 &rarr; 格子索引</span>
-    <span class="tp">CellIndex</span> <span class="fn">GetCellIndex</span>(<span class="kt">float</span> x, <span class="kt">float</span> z) <span class="kw">const</span>;
+    <span class="cm">// 位置 &rarr; 格子索引（含 layer，layerHeight > 0 时有效）</span>
+    <span class="tp">CellIndex</span> <span class="fn">GetCellIndex</span>(<span class="kt">float</span> x, <span class="kt">float</span> y, <span class="kt">float</span> z) <span class="kw">const</span>;
     <span class="kt">bool</span>     <span class="fn">IsValidCell</span>(<span class="kw">const</span> <span class="tp">CellIndex</span>&amp; c) <span class="kw">const</span>;
+    <span class="kt">int</span>      <span class="fn">GetLayer</span>(<span class="kt">float</span> y) <span class="kw">const</span>;        <span class="cm">// layerHeight > 0 时返回 floor(y / layerHeight)</span>
 
     <span class="cm">// 子格索引</span>
     <span class="tp">SubCellKey</span> <span class="fn">GetSubCellKey</span>(<span class="kt">float</span> x, <span class="kt">float</span> z, <span class="kw">const</span> <span class="tp">CellIndex</span>&amp; cell) <span class="kw">const</span>;
@@ -96,11 +120,9 @@
     <span class="kt">void</span> <span class="fn">RemoveFromCell</span>(<span class="tp">Entity</span> entity, <span class="kw">const</span> <span class="tp">CellIndex</span>&amp; cell);
 
     <span class="tp">uint32_t</span> <span class="kw">_sceneId</span>;
-    <span class="kt">float</span>    <span class="kw">_gridSize</span>;
-    <span class="kt">float</span>    <span class="kw">_subGridSize</span>;    <span class="cm">// _gridSize / kSubGrids</span>
-    <span class="kt">float</span>    <span class="kw">_viewRadiusXZ</span>;
-    <span class="kt">float</span>    <span class="kw">_viewRadiusY</span>;
-    <span class="kt">int</span>      <span class="kw">_viewRangeCells</span>;  <span class="cm">// ceil(_viewRadiusXZ / _gridSize)</span>
+    <span class="tp">AoiConfig</span> <span class="kw">_config</span>;
+    <span class="kt">float</span>    <span class="kw">_subGridSize</span>;    <span class="cm">// _config.gridSize / _config.subGrids</span>
+    <span class="kt">int</span>      <span class="kw">_viewRangeCells</span>;  <span class="cm">// ceil(_config.viewRadiusXZ / _config.gridSize)</span>
 
     <span class="cm">// 2D 网格（稀疏——只分配有实体的格子）</span>
     <span class="tp">std::unordered_map</span>&lt;<span class="tp">uint64_t</span>, <span class="tp">GridCell</span>&gt; <span class="kw">_cells</span>;  <span class="cm">// key = EncodeCellKey(x,z)</span>
@@ -110,9 +132,9 @@
     <span class="tp">std::unordered_map</span>&lt;<span class="tp">Entity</span>, <span class="tp">std::unordered_set</span>&lt;<span class="tp">Entity</span>&gt;&gt; <span class="kw">_prevVisible</span>;
 };</code></pre>
 
-  <h3>12.4 核心算法</h3>
+  <h3>12.5 核心算法</h3>
 
-  <h4>12.4.1 实体位置更新</h4>
+  <h4>12.5.1 实体位置更新</h4>
   <pre><code><span class="kt">void</span> <span class="tp">GridAoiSystem</span>::<span class="fn">UpdateEntityPosition</span>(<span class="tp">Entity</span> entity, <span class="kt">float</span> x, <span class="kt">float</span> y, <span class="kt">float</span> z) {
     <span class="kw">auto</span> newCell = <span class="fn">GetCellIndex</span>(x, z);  <span class="cm">// 水平面: cellX = floor(x / _gridSize), cellZ = floor(z / _gridSize)</span>
     <span class="kw">auto</span> it = <span class="kw">_entityCells</span>.find(entity);
@@ -139,20 +161,19 @@
 
 <span class="cm">// 添加实体到格子，自动检测热点阈值</span>
 <span class="kt">void</span> <span class="tp">GridAoiSystem</span>::<span class="fn">AddToCell</span>(<span class="tp">Entity</span> entity, <span class="kw">const</span> <span class="tp">CellIndex</span>&amp; cell, <span class="kt">float</span> x, <span class="kt">float</span> z) {
-    <span class="kw">auto</span> key = <span class="fn">EncodeCellKey</span>(cell);  <span class="cm">// key = (uint64_t(cellX) &lt;&lt; 32) | uint32_t(cellZ)</span>
-    <span class="kw">auto</span>&amp; c = <span class="kw">_cells</span>[key];  <span class="cm">// 格子不存在时自动创建</span>
+    <span class="kw">auto</span> key = <span class="fn">EncodeCellKey</span>(cell);
+    <span class="kw">auto</span>&amp; c = <span class="kw">_cells</span>[key];
 
     <span class="kw">if</span> (c.isHot) {
         <span class="kw">auto</span> subKey = <span class="fn">GetSubCellKey</span>(x, z, cell);
         c.hotSubCells[<span class="fn">EncodeSubCellKey</span>(subKey, cell)].push_back(entity);
     } <span class="kw">else</span> {
         c.entities.push_back(entity);
-        <span class="kw">if</span> (c.entities.size() &gt;= GridCell::kHotThreshold)
+        <span class="kw">if</span> (c.entities.size() &gt;= <span class="kw">_config</span>.hotThreshold)
             <span class="fn">UpgradeToHotCell</span>(cell);
     }
 }</code></pre>
-
-  <h4>12.4.2 GetWatchers — 九宫格查询</h4>
+  <h4>12.5.2 GetWatchers — 九宫格查询</h4>
   <pre><code><span class="tp">std::vector</span>&lt;<span class="tp">Entity</span>&gt; <span class="tp">GridAoiSystem</span>::<span class="fn">GetWatchers</span>(<span class="tp">Entity</span> entity) {
     <span class="kw">auto</span> itPos = <span class="kw">_entityPositions</span>.find(entity);
     <span class="kw">if</span> (itPos == <span class="kw">_entityPositions</span>.end()) <span class="kw">return</span> {};
@@ -197,7 +218,7 @@
     <span class="kw">return</span> {resultSet.begin(), resultSet.end()};
 }</code></pre>
 
-  <h4>12.4.3 AOI 事件计算 (Enter / Leave)</h4>
+  <h4>12.5.3 AOI 事件计算 (Enter / Leave)</h4>
   <p>
     每 Tick 在各实体的 GetWatchers 结果和上一 Tick 的可见集之间做 diff，计算出新进入视野和离开视野的实体列表，
     通过 DasLang 桥接 API 投递事件给脚本处理（发 EntityCreateNtf / EntityDestroyNtf 给对应客户端）。
@@ -219,7 +240,7 @@
     }
 }</code></pre>
 
-  <h4>12.4.4 热点升级 / 降级</h4>
+  <h4>12.5.4 热点升级 / 降级</h4>
   <pre><code><span class="kt">void</span> <span class="tp">GridAoiSystem</span>::<span class="fn">UpgradeToHotCell</span>(<span class="kw">const</span> <span class="tp">CellIndex</span>&amp; cellIdx) {
     <span class="kw">auto</span>&amp; cell = <span class="kw">_cells</span>[<span class="fn">EncodeCellKey</span>(cellIdx)];
     cell.isHot = <span class="nb">true</span>;
@@ -235,20 +256,36 @@
     cell.entities.clear();  <span class="cm">// 释放普通列表</span>
 }
 
+<span class="kt">void</span> <span class="tp">GridAoiSystem</span>::<span class="fn">CheckHotSpotDowngrade</span>() {
+    <span class="kw">for</span> (<span class="kw">auto</span>&amp; [key, cell] : <span class="kw">_cells</span>) {
+        <span class="kw">if</span> (!cell.isHot) <span class="kw">continue</span>;
+
+        <span class="tp">size_t</span> total = <span class="num">0</span>;
+        <span class="kw">for</span> (<span class="kw">auto</span>&amp; [sk, ents] : cell.hotSubCells)
+            total += ents.size();
+
+        <span class="kw">if</span> (total &lt;= <span class="kw">_config</span>.coolThreshold) {
+            cell.coolCooldown++;
+            <span class="kw">if</span> (cell.coolCooldown &gt;= <span class="kw">_config</span>.coolCooldownTicks)
+                <span class="fn">DowngradeFromHotCell</span>(<span class="fn">DecodeCellKey</span>(key));
+        } <span class="kw">else</span> {
+            cell.coolCooldown = <span class="num">0</span>;  <span class="cm">// 实体回升，重置冷却</span>
+        }
+    }
+}
+
 <span class="kt">void</span> <span class="tp">GridAoiSystem</span>::<span class="fn">DowngradeFromHotCell</span>(<span class="kw">const</span> <span class="tp">CellIndex</span>&amp; cellIdx) {
     <span class="kw">auto</span>&amp; cell = <span class="kw">_cells</span>[<span class="fn">EncodeCellKey</span>(cellIdx)];
 
-    <span class="cm">// 收集所有子格的实体回到普通列表</span>
-    <span class="kw">for</span> (<span class="kw">auto</span>&amp; [key, entities] : cell.hotSubCells)
+    <span class="kw">for</span> (<span class="kw">auto</span>&amp; [sk, entities] : cell.hotSubCells)
         cell.entities.insert(cell.entities.end(), entities.begin(), entities.end());
 
-    <span class="kw">auto</span> [it, _] = cell.hotSubCells.clear();  <span class="cm">// 或直接 cell.hotSubCells = {} 触发析</span>
-    <span class="kw">auto</span> temp = <span class="tp">SubCellMap</span>{};
-    cell.hotSubCells.swap(temp);             <span class="cm">// 释放内存</span>
+    cell.hotSubCells = {};
     cell.isHot = <span class="nb">false</span>;
+    cell.coolCooldown = <span class="num">0</span>;
 }</code></pre>
 
-  <h3>12.5 与 Scene / ECS 集成</h3>
+  <h3>12.6 与 Scene / ECS 集成</h3>
   <p>
     每个 <code>Scene</code> 持有自己的 <code>GridAoiSystem</code>。Scene::OnEntityMove 同时更新 EnTT Position 组件和 AOI 位置。
     <code>ecs_stage "aoi"</code> 阶段调用 Scene::FlushAoiEvents，diff 计算 Enter/Leave 事件并投递给 DasLang 脚本。
@@ -277,7 +314,7 @@
     <span class="tp">GridAoiSystem</span> <span class="kw">_aoi</span>;
 };</code></pre>
 
-  <h3>12.6 DasLang 桥接 API</h3>
+  <h3>12.7 DasLang 桥接 API</h3>
   <pre><code><span class="cm">// C++ 侧注册给 DasLang</span>
 <span class="fn">GetAoiWatchers</span>(sceneId: uint32; entityId: Entity): array&lt;Entity&gt;
 <span class="fn">GetEntitiesInAoiRadius</span>(sceneId: uint32; x: float; z: float; radius: float): array&lt;Entity&gt;
@@ -299,14 +336,14 @@
     SendToClient(observer, MSG_ENTITY_DESTROY_NTF, SerializeProto(msg))
 }</code></pre>
 
-  <h3>12.7 3D 兼容说明</h3>
+  <h3>12.8 3D 兼容说明</h3>
   <p>
     AOI 水平面（x, z）用九宫格 + 空间哈希做空间索引。高度（y）在 GetWatchers 结果集上做后过滤：
     <code>|entity.y - observer.y| &lt; _viewRadiusY</code>。这不是性能瓶颈——AOI 结果集通常在 50-200 个实体，
     遍历一次做高度过滤是 O(n) 的，成本远低于格子索引本身。
   </p>
 
-  <h3>12.8 性能特征</h3>
+  <h3>12.9 性能特征</h3>
   <table>
     <tr><th>操作</th><th>复杂度</th><th>说明</th></tr>
     <tr><td>UpdateEntityPosition</td><td>O(1) 或 O(log n)</td><td>hash map 查格子 + vector push。跨格时为旧格 O(1) 删除（无序遍历交换）。</td></tr>
