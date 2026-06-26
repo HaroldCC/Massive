@@ -103,8 +103,8 @@ rule("proto_gen")
 
         batchcmds:show_progress(opt.progress, "${color.build.object}proto.gen %s", protoRel)
         batchcmds:mkdir(autogenDir)
-        -- 声明 protoc 本身为依赖文件，若不存在则触发重新链接
-        batchcmds:add_depfiles(protoc)
+        -- -- 声明 protoc 本身为依赖文件，若不存在则触发重新链接
+        -- batchcmds:add_depfiles(protoc)
         batchcmds:vrunv(protoc, {
             "--proto_path=" .. protoDir,
             "--cpp_out=" .. autogenDir,
@@ -114,8 +114,8 @@ rule("proto_gen")
         -- 增量依赖（.pb.cc 生成步骤）
         batchcmds:add_depfiles(sourcefile_proto)
         -- 用 set_depmtime 记录 .pb.cc 的 mtime，文件被删时 depcache 会失效
-        batchcmds:set_depmtime(os.mtime(pbcc))
-        batchcmds:set_depcache(target:dependfile(pbcc))
+        -- batchcmds:set_depmtime(os.mtime(pbcc))
+        -- batchcmds:set_depcache(target:dependfile(pbcc))
 
         local objfile = target:objectfile(pbcc)
         batchcmds:show_progress(opt.progress, "${color.build.object}compiling.proto.$(mode) %s", pbcc)
