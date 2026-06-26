@@ -1,8 +1,8 @@
 /**
  * @file TimingWheel.h
- * @brief 三级时间轮定时器
+ * @brief 四级时间轮定时器
  *
- * 轮0: 50ms×60=3s    轮1: 3s×60=3min    轮2: 3min×60=3h
+ * 轮0: 20ms×60=1.2s   轮1: 1.2s×60=72s    轮2: 72s×60=72min    轮3: 72min×60=72h
  * O(1) Schedule / Cancel（惰性删除）/ Tick
  * 单线程专用——仅在逻辑线程调用
  */
@@ -20,10 +20,10 @@ namespace MMO
 {
 
     /**
-     * @brief 三级时间轮定时器
+     * @brief 四级时间轮定时器
      *
      * 基于分级时间轮算法，支持 O(1) 插入/取消，惰性删除。
-     * 最大延迟 3h，超出则 clamp 到 3h。
+     * 最大延迟 72h，超出则 clamp 到 72h。
      */
     class TimingWheel
     {
@@ -39,7 +39,7 @@ namespace MMO
 
         /**
          * @brief 调度一个定时器
-         * @param delay  延迟时间（上限 3h，超出则 clamp）
+         * @param delay  延迟时间（上限 72h，超出则 clamp）
          * @param cb     到期回调
          * @return 唯一 TimerID
          */
@@ -52,7 +52,7 @@ namespace MMO
         void Cancel(TimerID timerID);
 
         /**
- * @brief 每逻辑帧调用一次（50ms），推进时间轮并触发到期回调
+ * @brief 每逻辑帧调用一次（20ms），推进时间轮并触发到期回调
  */
         void Tick();
 
@@ -61,9 +61,9 @@ namespace MMO
  */
         size_t ActiveCount() const;
 
-        static constexpr std::chrono::milliseconds kMaxDelay {3 * 60 * 60 * 1000}; // 最大延迟 3h
+        static constexpr std::chrono::milliseconds kMaxDelay {3 * 24 * 60 * 60 * 1000}; // 最大延迟 72h
         static constexpr int                       kSlots  = 60;                   // 每层槽位数
-        static constexpr int                       kLevels = 3;                    // 层级数
+        static constexpr int                       kLevels = 4;                    // 层级数
 
         /**
  * @brief 活跃定时器告警阈值（可能泄漏）
@@ -88,9 +88,10 @@ namespace MMO
         void  InsertToWheel(int level, int slot, Node *node);
 
         static constexpr std::chrono::milliseconds kTickSizes[kLevels] = {
-            std::chrono::milliseconds(50),    // 轮0: 50ms
-            std::chrono::milliseconds(3000),  // 轮1: 3s
-            std::chrono::milliseconds(180000) // 轮2: 3min
+            std::chrono::milliseconds(20),     // 轮0: 20ms
+            std::chrono::milliseconds(1200),   // 轮1: 1.2s
+            std::chrono::milliseconds(72000),  // 轮2: 72s
+            std::chrono::milliseconds(4320000) // 轮3: 72min
         };
 
         static TimerID GenTimerID();

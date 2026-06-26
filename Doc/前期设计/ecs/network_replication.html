@@ -209,7 +209,7 @@
   <h4>参数配置</h4>
   <table>
     <tr><th>参数</th><th>值</th><th>说明</th></tr>
-    <tr><td>预测发送频率</td><td>15Hz（~67ms）</td><td>配合 50ms Tick 的移动变化率</td></tr>
+    <tr><td>预测发送频率</td><td>25Hz（~40ms）</td><td>配合 20ms Tick 的移动变化率</td></tr>
     <tr><td>最大 pending moves</td><td>3</td><td>覆盖 ~200ms 的未确认窗口</td></tr>
     <tr><td>平滑纠正阈值</td><td>0.5m</td><td>差值小于此值时 lerp 纠正（无感知）</td></tr>
     <tr><td>立即 Snap 阈值</td><td>3m</td><td>差值大于此值时直接 teleport（异常/瞬移）</td></tr>

@@ -43,11 +43,11 @@
     （EnTT registry 天然 per-Scene 隔离）。此升级路径已在设计中预留。
   </div>
 
-  <h3>4.2 核心循环：固定 50ms Tick + 防死亡螺旋 Clamp</h3>
+  <h3>4.2 核心循环：固定 20ms Tick + 防死亡螺旋 Clamp</h3>
   <pre><code><span class="kt">void</span> <span class="tp">LogicServer</span>::<span class="fn">Run</span>() {
     <span class="kw">auto</span> lastTime = <span class="tp">std::chrono::steady_clock</span>::now();
-    <span class="kw">constexpr</span> <span class="kw">auto</span> tickInterval = <span class="tp">std::chrono::milliseconds</span>(<span class="num">50</span>);
-    <span class="kw">constexpr</span> <span class="kw">auto</span> maxElapsed   = <span class="tp">std::chrono::milliseconds</span>(<span class="num">200</span>);
+    <span class="kw">constexpr</span> <span class="kw">auto</span> tickInterval = <span class="tp">std::chrono::milliseconds</span>(<span class="num">20</span>);
+    <span class="kw">constexpr</span> <span class="kw">auto</span> maxElapsed   = <span class="tp">std::chrono::milliseconds</span>(<span class="num">50</span>);
 
     <span class="kw">while</span> (!<span class="kw">_stopped</span>.load()) {
         <span class="fn">ProcessMessages</span>();                <span class="cm">// Drain Gate 队列 + MsgID 查表分发</span>

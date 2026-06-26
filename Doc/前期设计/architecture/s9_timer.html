@@ -12,8 +12,8 @@
 <span class="badge confirmed">✔ 已确认</span>
 <div class="section" id="s9">
   <h2>9. 定时器 · 多级时间轮</h2>
-  <h3>9.1 三级时间轮</h3>
-  <p>每轮 60 槽：轮0=3s(50ms×60)、轮1=3min(3s×60)、轮2=3h(3min×60)。O(1) 插入/触发/取消。</p>
+  <h3>9.1 四级时间轮</h3>
+  <p>每轮 60 槽：轮0=1.2s(20ms×60)、轮1=72s(1.2s×60)、轮2=72min(72s×60)。O(1) 插入/触发/取消。</p>
   <pre><code><span class="kw">class</span> <span class="tp">TimingWheel</span> {
 <span class="kw">public</span>:
     <span class="kw">struct</span> <span class="tp">TimerNode</span> {

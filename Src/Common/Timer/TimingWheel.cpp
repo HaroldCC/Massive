@@ -1,6 +1,6 @@
 /**
  * @file TimingWheel.cpp
- * @brief 三级时间轮定时器实现
+ * @brief 四级时间轮定时器实现
  */
 
 #include "Common/Timer/TimingWheel.h"
@@ -126,20 +126,22 @@ namespace MMO
 
         TimerID id = GenTimerID();
 
-        // 确定层级和槽偏移
+        // 确定层级——从低到高，找到第一个 slotOffset < kSlots 的层级
         int level      = 0;
-        int slotOffset = static_cast<int>(delay / kTickSizes[0]);
-
-        if (slotOffset >= kSlots)
+        int slotOffset = 0;
+        for (int i = 0; i < kLevels; ++i)
         {
-            slotOffset = static_cast<int>(delay / kTickSizes[1]);
-            level      = 1;
-
-            if (slotOffset >= kSlots)
+            slotOffset = static_cast<int>(delay / kTickSizes[i]);
+            if (slotOffset < kSlots)
             {
-                slotOffset = static_cast<int>(delay / kTickSizes[2]);
-                level      = 2;
+                level = i;
+                break;
             }
+        }
+        if (level >= kLevels)
+        {
+            level      = kLevels - 1;
+            slotOffset = kSlots - 1; // 兜底：clamp 到最大槽
         }
 
         int targetSlot = (_currentSlot[level] + slotOffset) % kSlots;
@@ -178,7 +180,7 @@ namespace MMO
     }
 
     /**
- * @brief 推进轮0 + 级联，每逻辑帧调用一次（50ms）
+ * @brief 推进轮0 + 级联，每逻辑帧调用一次（20ms）
  */
     void TimingWheel::Tick()
     {
@@ -186,23 +188,21 @@ namespace MMO
         _currentSlot[0] = (_currentSlot[0] + 1) % kSlots;
         ProcessSlot(0, _currentSlot[0]);
 
-        // 轮0 走完一圈 → 推进轮1 并级联
+        // 轮0 走完一圈 → 逐级向上推进
         if (_currentSlot[0] == 0)
         {
-            _currentSlot[1] = (_currentSlot[1] + 1) % kSlots;
-            CascadeToLower(0);
-
-            // 轮1 走完一圈 → 推进轮2 并级联
-            if (_currentSlot[1] == 0)
+            for (int level = 1; level < kLevels; ++level)
             {
-                _currentSlot[2] = (_currentSlot[2] + 1) % kSlots;
-                CascadeToLower(1);
+                _currentSlot[level] = (_currentSlot[level] + 1) % kSlots;
+                CascadeToLower(level - 1);
+                if (_currentSlot[level] != 0)
+                    break;
             }
         }
 
         // 定期健康检查
         _tickCount++;
-        if (_tickCount % (kSlots * 60) == 0) // 每 ~3min
+        if (_tickCount % (kSlots * 60) == 0) // 每 ~72s
         {
             size_t count = ActiveCount();
             if (count > kWarnThreshold)

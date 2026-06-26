@@ -407,7 +407,7 @@ DamageEvent{attacker, defender, skillId, baseDamage, damageType}
     <tr><td>战斗状态检查</td><td>100 实体 × 每 Tick</td><td>~0.1μs</td><td>~0.01ms</td></tr>
   </table>
   <div class="callout info">
-    <strong>📌 结论</strong>：战斗管线每 Tick 总开销 &lt; 1ms，远低于 50ms Tick 预算。伤害管线走 C++ 纯数学路径，零堆分配，
+    <strong>📌 结论</strong>：战斗管线每 Tick 总开销 &lt; 1ms，远低于 20ms Tick 预算。伤害管线走 C++ 纯数学路径，零堆分配，
     最高频的操作（命中判定、暴击判定、护甲减伤）都在静态函数内完成。
   </div>
 

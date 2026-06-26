@@ -92,7 +92,7 @@ TEST_CASE(<span class="str">"100 clients join world and move"</span>) {
     <span class="tp">TestClientPool</span> pool;
     pool.ConnectClients(<span class="num">100</span>);
     <span class="kw">for</span> (<span class="kt">int</span> tick = <span class="num">0</span>; tick &lt; <span class="num">20</span>; tick++) {
-        server.Tick(<span class="tp">std::chrono::milliseconds</span>(<span class="num">50</span>));
+        server.Tick(<span class="tp">std::chrono::milliseconds</span>(<span class="num">20</span>));
         <span class="kw">for</span> (<span class="kw">auto</span>&amp; client : pool.Clients()) {
             <span class="fn">VerifyReceivedPacketCount</span>(client);  <span class="cm">// 检查收到 AOI 广播</span>
         }
