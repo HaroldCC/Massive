@@ -250,8 +250,36 @@ DB::Range<AccountsTable>()
     });
 ```
 
-## 6. 未决/后续
+## 6. 变更记录 (2026-06-26)
 
-- **DDL 迁移工具**：SQL 文件只追加不修改，靠编号版本化。Schema 变更 = 新编号 SQL 文件（`ALTER TABLE`），生成器重新解析最新状态。
-- **Default 值提取**：`DEFAULT NOW()` → 由生成器提取为 `Timestamp::Now()`，本期先跳过。
-- **Enum 列**：PG enum → C++ `enum class` 自动生成，后续。
+### 改进点
+
+#### DeserializeRow 按列名匹配
+
+原设计按列索引 (`res.Get(i, 0)`) 反序列化，现改为按列名匹配。生成的 DeserializeRow 遍历 DBResult.Columns()，用 if-else 链匹配列名到 struct 字段，不依赖 SELECT 子句列顺序。
+
+#### 三件套生成
+
+每张表生成三个静态方法：
+1. `DeserializeRow(res, rowIdx)` — 反序列化（Range::ToArray 调用）
+2. `SerializeInsert(row)` → `(sql, params)` — INSERT（Range::Insert 调用）
+3. `SerializeUpdateByPK(row)` → `(sql, params)` — UPDATE（Range::UpdateByPK 调用）
+
+#### Timestamp 双向序列化
+
+Timestamp 新增 `FromPGText(pgText)` 和 `ToPGText()` 方法，支持 PG TIMESTAMPTZ text 格式的解析和格式化。  
+INSERT/UPDATE 中 Timestamp 列通过 `to_timestamp($N::bigint / 1000.0)` 写入，避免 libpq text 格式的时区歧义。
+
+#### DBValue 支持 Timestamp
+
+`DBValue` 新增 `DBValue(const Timestamp &)` 构造函数（在 Types.cpp 中实现，不内联）。
+
+#### Range.h 修复
+
+- `ToArray` 中反序列化空壳 → 调用 `Table::DeserializeRow(res, i)`
+- `BuildInsertSingle` / `BuildInsertSQL` 空壳 → 调用 `Table::SerializeInsert(row)` 的 `InsertOne`
+- 新增 `UpdateByPK(row)` 方法
+
+#### players 表 DDL
+
+新增 `Tools/DB/SQL/002_players.sql`，包含角色所需字段（account_id, name, level, class, gold, position 等）。

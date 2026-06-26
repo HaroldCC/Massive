@@ -172,7 +172,6 @@ namespace MMO::DB
     {
         const char *name;  // PostgreSQL 列名
         ColumnFlags flags; // kPK / kRequired / kNullable / kDefaulted 等
-        T           default_value {};
 
         // SQL 参数占位符索引（构建参数化 SQL 时自增）
         mutable int paramIndex = -1;

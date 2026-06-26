@@ -118,7 +118,7 @@ namespace MMO::DB
                                  rows.reserve(static_cast<size_t>(res.RowCount()));
                                  for (int i = 0; i < res.RowCount(); ++i)
                                  {
-                                     // DeserializeRow 需要表结构体实现，待生成代码集成
+                                     rows.push_back(Table::DeserializeRow(res, i));
                                  }
                                  cb(std::move(rows));
                              });
@@ -144,13 +144,24 @@ namespace MMO::DB
         }
 
         /**
-         * @brief 异步 INSERT
-         * @param rows  要插入的行
+         * @brief 异步 INSERT（调用 Table::SerializeInsert）
+         * @param rows  要插入的行（变参）
          */
         template <typename... Rows>
-        void Insert(Rows &...rows)
+        void Insert(const Rows &...rows)
         {
-            (BuildInsertSingle(rows), ...);
+            (InsertOne(rows), ...);
+        }
+
+        /**
+         * @brief 按 PK 异步 UPDATE（调用 Table::SerializeUpdateByPK）
+         * @param row  要更新的行
+         */
+        void UpdateByPK(const RowType &row)
+        {
+            auto [sql, params] = Table::SerializeUpdateByPK(row);
+            auto pool = _pool ? _pool : &DBWorkerPool::Instance();
+            pool->AsyncQuery(std::move(sql), std::move(params), nullptr);
         }
 
         // 构建 SQL（用于调试/日志）
@@ -299,22 +310,14 @@ namespace MMO::DB
             return result;
         }
 
-        template <typename R>
-        void BuildInsertSingle(const R &row)
+        /**
+         * @brief 插入单行（由 Insert 变参展开调用）
+         */
+        void InsertOne(const RowType &row)
         {
-            std::vector<DBValue> params;
-            std::string          sql  = BuildInsertSQL(row, params);
-            auto                 pool = _pool ? _pool : &DBWorkerPool::Instance();
+            auto [sql, params] = Table::SerializeInsert(row);
+            auto pool = _pool ? _pool : &DBWorkerPool::Instance();
             pool->AsyncQuery(std::move(sql), std::move(params), nullptr);
-        }
-
-        template <typename R>
-        std::string BuildInsertSQL(const R &row, std::vector<DBValue> &params) const
-        {
-            // 默认实现——需要实际表定义，由代码生成填充
-            (void)row;
-            (void)params;
-            return {};
         }
 
         const char *_tableName;

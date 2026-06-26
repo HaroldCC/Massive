@@ -4,12 +4,19 @@
  */
 
 #include "Common/DB/Types.h"
+#include "Common/DB/Timestamp.h"
 
 #include <cstdlib>
 #include <libpq-fe.h>
 
 namespace MMO::DB
 {
+
+    // ── 构造函数实现 ──
+
+    DBValue::DBValue(const Timestamp &v) : _text(v.ToPGText()), _isNull(false)
+    {
+    }
 
     // ── DBValue 转换 ──
 

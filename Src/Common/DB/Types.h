@@ -13,6 +13,8 @@
 namespace MMO::DB
 {
 
+    struct Timestamp; // 前向声明，用于 DBValue(Timestamp) 构造函数
+
     /**
      * @brief 数据库值类型（参数化 SQL 传参 + 结果读取）
      *
@@ -46,6 +48,8 @@ namespace MMO::DB
         explicit DBValue(const char *v) : _text(v), _isNull(false)
         {
         }
+
+        explicit DBValue(const Timestamp &v);
 
         explicit DBValue(std::nullptr_t) : _isNull(true)
         {
