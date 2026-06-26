@@ -21,29 +21,53 @@
  */
 enum class EErrorCode : uint32
 {
-    /** @brief 成功 */
+    /**
+ * @brief 成功
+ */
     OK = 0,
-    /** @brief 未分类错误 */
+    /**
+ * @brief 未分类错误
+ */
     UNKNOWN = 1,
-    /** @brief 非法参数 */
+    /**
+ * @brief 非法参数
+ */
     INVALID_ARGUMENT = 2,
-    /** @brief 越界 */
+    /**
+ * @brief 越界
+ */
     OUT_OF_RANGE = 3,
-    /** @brief 实体/资源不存在 */
+    /**
+ * @brief 实体/资源不存在
+ */
     NOT_FOUND = 4,
-    /** @brief 不支持的操作 */
+    /**
+ * @brief 不支持的操作
+ */
     NOT_SUPPORTED = 5,
-    /** @brief 内部错误（不应发生） */
+    /**
+ * @brief 内部错误（不应发生）
+ */
     INTERNAL = 6,
-    /** @brief 超时 */
+    /**
+ * @brief 超时
+ */
     TIMEOUT = 7,
-    /** @brief 重复创建 */
+    /**
+ * @brief 重复创建
+ */
     ALREADY_EXISTS = 8,
-    /** @brief 权限不足 */
+    /**
+ * @brief 权限不足
+ */
     PERMISSION_DENIED = 9,
-    /** @brief 尚未初始化 */
+    /**
+ * @brief 尚未初始化
+ */
     NOT_INITIALIZED = 10,
-    /** @brief 资源耗尽（内存/连接/句柄） */
+    /**
+ * @brief 资源耗尽（内存/连接/句柄）
+ */
     RESOURCE_EXHAUSTED = 11,
 };
 

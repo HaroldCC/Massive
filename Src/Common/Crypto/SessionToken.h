@@ -23,16 +23,18 @@ namespace MMO::Crypto
      */
     struct SessionToken
     {
-        static constexpr size_t kTotalSize  = 46; ///< 总大小
-        static constexpr size_t kPlainSize  = 10; ///< worldServerId(2B) + accountId(4B) + expireTime(4B)
-        static constexpr size_t kKeyEncSize = 32; ///< AES-256-ECB 加密的 SessionKey
-        static constexpr size_t kHmacSize   = 4;  ///< HMAC-SHA256 截断
+        static constexpr size_t kTotalSize  = 46; // 总大小
+        static constexpr size_t kPlainSize  = 10; // worldServerId(2B) + accountId(4B) + expireTime(4B)
+        static constexpr size_t kKeyEncSize = 32; // AES-256-ECB 加密的 SessionKey
+        static constexpr size_t kHmacSize   = 4;  // HMAC-SHA256 截断
 
         uint8 data[kTotalSize] = {};
 
         // ── 明文段读取 ──
 
-        /** @brief 读取 WorldServerId */
+        /**
+ * @brief 读取 WorldServerId
+ */
         uint16 WorldServerId() const
         {
             uint16 id;
@@ -40,7 +42,9 @@ namespace MMO::Crypto
             return id;
         }
 
-        /** @brief 读取 AccountId */
+        /**
+ * @brief 读取 AccountId
+ */
         uint32 AccountId() const
         {
             uint32 id;
@@ -48,7 +52,9 @@ namespace MMO::Crypto
             return id;
         }
 
-        /** @brief 读取过期时间 */
+        /**
+ * @brief 读取过期时间
+ */
         uint32 ExpireTime() const
         {
             uint32 t;
@@ -58,19 +64,25 @@ namespace MMO::Crypto
 
         // ── 明文段写入（LoginServer 签发时内部使用）──
 
-        /** @brief 设置 WorldServerId */
+        /**
+ * @brief 设置 WorldServerId
+ */
         void SetWorldServerId(uint16 id)
         {
             std::memcpy(data, &id, 2);
         }
 
-        /** @brief 设置 AccountId */
+        /**
+ * @brief 设置 AccountId
+ */
         void SetAccountId(uint32 id)
         {
             std::memcpy(data + 2, &id, 4);
         }
 
-        /** @brief 设置过期时间 */
+        /**
+ * @brief 设置过期时间
+ */
         void SetExpireTime(uint32 t)
         {
             std::memcpy(data + 6, &t, 4);
@@ -102,7 +114,9 @@ namespace MMO::Crypto
 
         // ── 序列化 ──
 
-        /** @brief 序列化为 ByteBuffer */
+        /**
+ * @brief 序列化为 ByteBuffer
+ */
         ByteBuffer ToBuffer() const
         {
             return ByteBuffer::Copy(data, kTotalSize);
@@ -148,12 +162,14 @@ namespace MMO::Crypto
                                                  uint32       accountId,
                                                  uint32       expireTime);
 
-        /** @brief Verify 的解密结果 */
+        /**
+ * @brief Verify 的解密结果
+ */
         struct TokenPayload
         {
-            uint32     accountId;  ///< 玩家账号 ID
-            uint32     expireTime; ///< 过期时间戳
-            ByteBuffer sessionKey; ///< 32B SessionKey
+            uint32     accountId;  // 玩家账号 ID
+            uint32     expireTime; // 过期时间戳
+            ByteBuffer sessionKey; // 32B SessionKey
         };
 
         /**

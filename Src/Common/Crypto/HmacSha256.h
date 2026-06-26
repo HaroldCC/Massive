@@ -31,7 +31,7 @@ namespace MMO::Crypto
         static std::optional<ByteBuffer>
         Sign(const uint8 *key, size_t keyLen, const uint8 *data, size_t dataLen);
 
-        static constexpr size_t kHashSize = 32; ///< SHA-256 output
+        static constexpr size_t kHashSize = 32; // SHA-256 output
     };
 
 } // namespace MMO::Crypto

@@ -234,10 +234,8 @@ namespace MMO
 
         // 从 SessionToken[0..1] 读取 worldServerId（大端）
         const auto *tokenRaw = reinterpret_cast<const uint8 *>(tokenBytes.data());
-        uint16      worldId =
+        uint16 worldId =
             static_cast<uint16>((static_cast<uint16>(tokenRaw[0]) << 8) | static_cast<uint16>(tokenRaw[1]));
-
-        static_cast<void>(worldId);
 
         // 找对应 WorldServer 地址（MVP：第一个可用的）
         std::string worldAddr = PickWorldServer();
@@ -319,9 +317,8 @@ namespace MMO
      * @param session  客户端会话
      * @param req      心跳请求
      */
-    void GateServer::OnHeartbeatReq(std::shared_ptr<GateSession> session, const Proto::HeartbeatReq &req)
+    void GateServer::OnHeartbeatReq(std::shared_ptr<GateSession> session, [[maybe_unused]] const Proto::HeartbeatReq &req)
     {
-        static_cast<void>(req);
 
         Proto::HeartbeatRsp rsp;
         auto nowMs = static_cast<uint64>(std::chrono::duration_cast<std::chrono::milliseconds>(

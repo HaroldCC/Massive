@@ -42,8 +42,8 @@ namespace MMO::Crypto
          */
         static std::optional<ByteBuffer> Decrypt(const uint8 *key, const uint8 *ciphertext, size_t len);
 
-        static constexpr size_t kKeySize   = 32; ///< AES-256
-        static constexpr size_t kBlockSize = 16; ///< AES block
+        static constexpr size_t kKeySize   = 32; // AES-256
+        static constexpr size_t kBlockSize = 16; // AES block
     };
 
 } // namespace MMO::Crypto

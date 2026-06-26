@@ -28,8 +28,8 @@ namespace MMO
     class TimingWheel
     {
     public:
-        using TimerID  = uint64;                ///< 定时器唯一 ID
-        using Callback = std::function<void()>; ///< 定时器回调
+        using TimerID  = uint64;                // 定时器唯一 ID
+        using Callback = std::function<void()>; // 定时器回调
 
         TimingWheel();
         ~TimingWheel();
@@ -51,21 +51,29 @@ namespace MMO
          */
         void Cancel(TimerID timerID);
 
-        /** @brief 每逻辑帧调用一次（50ms），推进时间轮并触发到期回调 */
+        /**
+ * @brief 每逻辑帧调用一次（50ms），推进时间轮并触发到期回调
+ */
         void Tick();
 
-        /** @brief 当前活跃定时器数量 */
+        /**
+ * @brief 当前活跃定时器数量
+ */
         size_t ActiveCount() const;
 
-        static constexpr std::chrono::milliseconds kMaxDelay {3 * 60 * 60 * 1000}; ///< 最大延迟 3h
-        static constexpr int                       kSlots  = 60;                   ///< 每层槽位数
-        static constexpr int                       kLevels = 3;                    ///< 层级数
+        static constexpr std::chrono::milliseconds kMaxDelay {3 * 60 * 60 * 1000}; // 最大延迟 3h
+        static constexpr int                       kSlots  = 60;                   // 每层槽位数
+        static constexpr int                       kLevels = 3;                    // 层级数
 
-        /** @brief 活跃定时器告警阈值（可能泄漏） */
+        /**
+ * @brief 活跃定时器告警阈值（可能泄漏）
+ */
         static constexpr size_t kWarnThreshold = 10000;
 
     private:
-        /** @brief 槽位链表节点 */
+        /**
+ * @brief 槽位链表节点
+ */
         struct Node
         {
             TimerID  id              = 0;
@@ -80,9 +88,9 @@ namespace MMO
         void  InsertToWheel(int level, int slot, Node *node);
 
         static constexpr std::chrono::milliseconds kTickSizes[kLevels] = {
-            std::chrono::milliseconds(50),    ///< 轮0: 50ms
-            std::chrono::milliseconds(3000),  ///< 轮1: 3s
-            std::chrono::milliseconds(180000) ///< 轮2: 3min
+            std::chrono::milliseconds(50),    // 轮0: 50ms
+            std::chrono::milliseconds(3000),  // 轮1: 3s
+            std::chrono::milliseconds(180000) // 轮2: 3min
         };
 
         static TimerID GenTimerID();

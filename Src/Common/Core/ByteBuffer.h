@@ -27,15 +27,23 @@ namespace MMO
     public:
         // ── 工厂方法 ──
 
-        /** @brief 创建拥有内存的缓冲区，自动扩容 */
+        /**
+ * @brief 创建拥有内存的缓冲区，自动扩容
+ */
         static ByteBuffer Own(size_t initialCapacity = 256);
 
-        /** @brief 借用外部只读内存，零 copy，不可扩容 */
+        /**
+ * @brief 借用外部只读内存，零 copy，不可扩容
+ */
         static ByteBuffer Wrap(const uint8 *data, size_t len);
-        /** @brief 借用外部可写内存，零 copy，不可扩容 */
+        /**
+ * @brief 借用外部可写内存，零 copy，不可扩容
+ */
         static ByteBuffer Wrap(uint8 *data, size_t len);
 
-        /** @brief 拷贝外部数据，拥有所有权 */
+        /**
+ * @brief 拷贝外部数据，拥有所有权
+ */
         static ByteBuffer Copy(const uint8 *data, size_t len);
 
         // ── 生命周期 ──
@@ -87,14 +95,18 @@ namespace MMO
 
         // ── 读操作（big-endian → native）──
 
-        /** @brief 读取 uint8 */
+        /**
+ * @brief 读取 uint8
+ */
         uint8 ReadUint8()
         {
             CheckRead(1);
             return _data[_readPos++];
         }
 
-        /** @brief 读取 uint16（big-endian → native） */
+        /**
+ * @brief 读取 uint16（big-endian → native）
+ */
         uint16 ReadUint16()
         {
             CheckRead(2);
@@ -104,7 +116,9 @@ namespace MMO
             return result;
         }
 
-        /** @brief 读取 uint32（big-endian → native） */
+        /**
+ * @brief 读取 uint32（big-endian → native）
+ */
         uint32 ReadUint32()
         {
             CheckRead(4);
@@ -116,7 +130,9 @@ namespace MMO
             return result;
         }
 
-        /** @brief 读取 uint64（big-endian → native） */
+        /**
+ * @brief 读取 uint64（big-endian → native）
+ */
         uint64 ReadUint64()
         {
             CheckRead(8);
@@ -132,7 +148,9 @@ namespace MMO
             return result;
         }
 
-        /** @brief 读取 float（big-endian → native） */
+        /**
+ * @brief 读取 float（big-endian → native）
+ */
         float ReadFloat()
         {
             uint32 bits = ReadUint32();
@@ -141,7 +159,9 @@ namespace MMO
             return result;
         }
 
-        /** @brief 读取 double（big-endian → native） */
+        /**
+ * @brief 读取 double（big-endian → native）
+ */
         double ReadDouble()
         {
             uint64 bits = ReadUint64();
@@ -150,7 +170,9 @@ namespace MMO
             return result;
         }
 
-        /** @brief 读取指定字节数到输出缓冲区 */
+        /**
+ * @brief 读取指定字节数到输出缓冲区
+ */
         void ReadBytes(uint8 *out, size_t count)
         {
             CheckRead(count);
@@ -160,14 +182,18 @@ namespace MMO
 
         // ── 写操作（native → big-endian）──
 
-        /** @brief 写入 uint8 */
+        /**
+ * @brief 写入 uint8
+ */
         void WriteUint8(uint8 v)
         {
             EnsureWrite(1);
             _data[_writePos++] = v;
         }
 
-        /** @brief 写入 uint16（native → big-endian） */
+        /**
+ * @brief 写入 uint16（native → big-endian）
+ */
         void WriteUint16(uint16 v)
         {
             EnsureWrite(2);
@@ -176,7 +202,9 @@ namespace MMO
             _writePos += 2;
         }
 
-        /** @brief 写入 uint32（native → big-endian） */
+        /**
+ * @brief 写入 uint32（native → big-endian）
+ */
         void WriteUint32(uint32 v)
         {
             EnsureWrite(4);
@@ -187,7 +215,9 @@ namespace MMO
             _writePos += 4;
         }
 
-        /** @brief 写入 uint64（native → big-endian） */
+        /**
+ * @brief 写入 uint64（native → big-endian）
+ */
         void WriteUint64(uint64 v)
         {
             EnsureWrite(8);
@@ -202,7 +232,9 @@ namespace MMO
             _writePos += 8;
         }
 
-        /** @brief 写入 float（native → big-endian） */
+        /**
+ * @brief 写入 float（native → big-endian）
+ */
         void WriteFloat(float v)
         {
             uint32 bits;
@@ -210,7 +242,9 @@ namespace MMO
             WriteUint32(bits);
         }
 
-        /** @brief 写入 double（native → big-endian） */
+        /**
+ * @brief 写入 double（native → big-endian）
+ */
         void WriteDouble(double v)
         {
             uint64 bits;
@@ -218,7 +252,9 @@ namespace MMO
             WriteUint64(bits);
         }
 
-        /** @brief 写入指定字节数 */
+        /**
+ * @brief 写入指定字节数
+ */
         void WriteBytes(const uint8 *data, size_t count)
         {
             EnsureWrite(count);
@@ -228,25 +264,33 @@ namespace MMO
 
         // ── 容量 ──
 
-        /** @brief 当前有效数据长度 */
+        /**
+ * @brief 当前有效数据长度
+ */
         size_t Size() const
         {
             return _writePos;
         }
 
-        /** @brief 剩余可读字节数 */
+        /**
+ * @brief 剩余可读字节数
+ */
         size_t ReadableBytes() const
         {
             return _writePos - _readPos;
         }
 
-        /** @brief 总容量 */
+        /**
+ * @brief 总容量
+ */
         size_t Capacity() const
         {
             return _capacity;
         }
 
-        /** @brief 扩容到指定容量（仅 Own 模式有效） */
+        /**
+ * @brief 扩容到指定容量（仅 Own 模式有效）
+ */
         void Reserve(size_t capacity);
 
         // ── 裸指针 ──
@@ -273,27 +317,35 @@ namespace MMO
 
         // ── 位置操作 ──
 
-        /** @brief 跳过读取指定字节数 */
+        /**
+ * @brief 跳过读取指定字节数
+ */
         void SkipRead(size_t bytes)
         {
             CheckRead(bytes);
             _readPos += bytes;
         }
 
-        /** @brief 重置读取位置 */
+        /**
+ * @brief 重置读取位置
+ */
         void ResetRead()
         {
             _readPos = 0;
         }
 
-        /** @brief 重置读写位置 */
+        /**
+ * @brief 重置读写位置
+ */
         void ResetWrite()
         {
             _writePos = 0;
             _readPos  = 0;
         }
 
-        /** @brief 手动设置写入位置 */
+        /**
+ * @brief 手动设置写入位置
+ */
         void SetWritePos(size_t pos)
         {
             _writePos = pos;
@@ -311,7 +363,9 @@ namespace MMO
 
         // ── 状态 ──
 
-        /** @brief 是否拥有内存所有权 */
+        /**
+ * @brief 是否拥有内存所有权
+ */
         bool IsOwner() const
         {
             return _ownsMemory;

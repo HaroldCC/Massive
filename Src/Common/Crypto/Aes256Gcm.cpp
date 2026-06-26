@@ -15,7 +15,9 @@ namespace MMO::Crypto
     namespace
     {
 
-        /** @brief EVP_CIPHER_CTX RAII 封装 */
+        /**
+ * @brief EVP_CIPHER_CTX RAII 封装
+ */
         class EvpCipherCtx
         {
         public:

@@ -47,9 +47,9 @@ namespace MMO::Crypto
         static std::optional<ByteBuffer>
         Decrypt(const uint8 *key, const uint8 *iv, const uint8 *ciphertext, size_t ciphertextLen);
 
-        static constexpr size_t kKeySize = 32; ///< AES-256
-        static constexpr size_t kIvSize  = 12; ///< GCM standard nonce
-        static constexpr size_t kTagSize = 16; ///< GCM authentication tag
+        static constexpr size_t kKeySize = 32; // AES-256
+        static constexpr size_t kIvSize  = 12; // GCM standard nonce
+        static constexpr size_t kTagSize = 16; // GCM authentication tag
     };
 
 } // namespace MMO::Crypto

@@ -10,7 +10,7 @@
 namespace MMO
 {
 
-    // ===== RPCClient =====
+    // ── RPCClient ──
 
     RPCClient::RPCClient(bool useLogicThread) : _useLogicThread(useLogicThread)
     {

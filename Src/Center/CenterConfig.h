@@ -21,7 +21,9 @@ namespace MMO
             int    ioThreads = 2;
         } network;
 
-        /** @brief 日志配置（Log::Init 入参） */
+        /**
+ * @brief 日志配置（Log::Init 入参）
+ */
         Log::Config log;
 
         static std::optional<CenterConfig> Load(const std::string &path);

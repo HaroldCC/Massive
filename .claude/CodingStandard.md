@@ -9,47 +9,47 @@
 
 ### 1.1 核心总表
 
-| 元素 | 规范 | 示例 | 说明 |
-|------|------|------|------|
-| 类名/结构体名 | 大驼峰 (PascalCase) | `LogicServer`, `Health` | 含首字母缩写全大写：`IOContextPool`, `DBWorkerPool` |
-| 抽象类/接口 | 大驼峰 + `I` 前缀 | `IScene`, `IModule` | 含纯虚函数的类型 |
-| 命名空间 | 大写缩写 | `MMO`, `MMO::Network`, `MMO::DB` | 顶层 `MMO`，二级全大写缩写 |
-| 函数名 | 大驼峰 | `GetNextContext()`, `HandleMove()` | 含成员函数和自由函数 |
-| 类成员变量 | 小驼峰 + `_` 前缀 | `_ioContexts`, `_sceneID` | 含 private/protected 非静态成员 |
-| 类静态变量 | 小驼峰 + `_` 前缀 | `_instance`, `_maxPoolSize` | 含 private/protected 静态成员 |
-| 类静态常量 | 大驼峰 + `k` 前缀 | `kHotThreshold`, `kMaxPacketSize` | constexpr / static const |
-| 结构体成员 | 小驼峰（无前缀） | `current`, `sessionID` | 公开的数据聚合 |
-| 局部变量 | 小驼峰 | `entityID`, `totalLength` | — |
-| 函数参数 | 小驼峰 | `sessionID`, `msgID` | — |
-| 全局变量 | 小驼峰 + `g_` 前缀 | `g_ConfigPath`, `g_IsRunning` | 仅限极少数全局单例入口 |
-| 枚举类型名 | 大驼峰 + `E` 前缀 | `EMsgID`, `ESceneType` | — |
-| 枚举值 | 全大写 + 下划线 | `MSG_MOVE_REQ`, `SCENE_MAIN_CITY` | 不带枚举类型名前缀 |
-| 宏 | 全大写 + 下划线 | `REGISTER_COMPONENT`, `MASSIVE_ASSERT` | 项目前缀 `MASSIVE_` |
-| 模板参数 | 大驼峰 | `typename T`, `typename TableSchema` | 单字母大写或描述性大驼峰 |
-| 类型别名 | 大驼峰 | `using WorkPtr = ...`, `using SessionMap = ...` | — |
-| 概念 (concept) | 大驼峰 | `template<typename T> concept IsComponent` | — |
+| 元素           | 规范                | 示例                                                | 说明                                                    |
+| -------------- | ------------------- | --------------------------------------------------- | ------------------------------------------------------- |
+| 类名/结构体名  | 大驼峰 (PascalCase) | `LogicServer`, `Health`                         | 含首字母缩写全大写：`IOContextPool`, `DBWorkerPool` |
+| 抽象类/接口    | 大驼峰 +`I` 前缀  | `IScene`, `IModule`                             | 含纯虚函数的类型                                        |
+| 命名空间       | 大写缩写            | `MMO`, `MMO::Network`, `MMO::DB`              | 顶层 `MMO`，二级全大写缩写                            |
+| 函数名         | 大驼峰              | `GetNextContext()`, `HandleMove()`              | 含成员函数和自由函数                                    |
+| 类成员变量     | 小驼峰 +`_` 前缀  | `_ioContexts`, `_sceneID`                       | 含 private/protected 非静态成员                         |
+| 类静态变量     | 小驼峰 +`_` 前缀  | `_instance`, `_maxPoolSize`                     | 含 private/protected 静态成员                           |
+| 类静态常量     | 大驼峰 +`k` 前缀  | `kHotThreshold`, `kMaxPacketSize`               | constexpr / static const                                |
+| 结构体成员     | 小驼峰（无前缀）    | `current`, `sessionID`                          | 公开的数据聚合                                          |
+| 局部变量       | 小驼峰              | `entityID`, `totalLength`                       | —                                                      |
+| 函数参数       | 小驼峰              | `sessionID`, `msgID`                            | —                                                      |
+| 全局变量       | 小驼峰 +`g_` 前缀 | `g_ConfigPath`, `g_IsRunning`                   | 仅限极少数全局单例入口                                  |
+| 枚举类型名     | 大驼峰 +`E` 前缀  | `EMsgID`, `ESceneType`                          | —                                                      |
+| 枚举值         | 全大写 + 下划线     | `MSG_MOVE_REQ`, `SCENE_MAIN_CITY`               | 不带枚举类型名前缀                                      |
+| 宏             | 全大写 + 下划线     | `REGISTER_COMPONENT`, `MASSIVE_ASSERT`          | 项目前缀 `MASSIVE_`                                   |
+| 模板参数       | 大驼峰              | `typename T`, `typename TableSchema`            | 单字母大写或描述性大驼峰                                |
+| 类型别名       | 大驼峰              | `using WorkPtr = ...`, `using SessionMap = ...` | —                                                      |
+| 概念 (concept) | 大驼峰              | `template<typename T> concept IsComponent`        | —                                                      |
 
 ### 1.2 ID 后缀规则
 
 所有标识符中的 `Id` 后缀统一写作 `ID`（大写）。适配所有常见组合：
 
-| 旧写法 | 新写法 | 出现场景 |
-|--------|--------|----------|
-| `sessionId` / `session_id` | `sessionID` / `session_id` | Session 标识 |
-| `sceneId` / `scene_id` | `sceneID` / `scene_id` | Scene 标识 |
-| `entityId` / `entity_id` | `entityID` / `entity_id` | Entity 标识 |
-| `msgId` / `msg_id` | `msgID` / `msg_id` | 消息 ID |
-| `traceId` / `trace_id` | `traceID` / `trace_id` | 分布式追踪 |
-| `playerId` / `player_id` | `playerID` / `player_id` | 玩家 |
-| `accountId` / `account_id` | `accountID` / `account_id` | 账号 |
-| `guildId` / `guild_id` | `guildID` / `guild_id` | 公会 |
-| `templateId` / `template_id` | `templateID` / `template_id` | 模板 |
-| `classId` / `class_id` | `classID` / `class_id` | 职业 |
-| `skillId` / `skill_id` | `skillID` / `skill_id` | 技能 |
-| `questId` / `quest_id` | `questID` / `quest_id` | 任务 |
-| `itemId` / `item_id` | `itemID` / `item_id` | 物品 |
-| `dungeonId` / `dungeon_id` | `dungeonID` / `dungeon_id` | 副本 |
-| `instanceId` / `instance_id` | `instanceID` / `instance_id` | 实例 |
+| 旧写法                           | 新写法                           | 出现场景     |
+| -------------------------------- | -------------------------------- | ------------ |
+| `sessionId` / `session_id`   | `sessionID` / `session_id`   | Session 标识 |
+| `sceneId` / `scene_id`       | `sceneID` / `scene_id`       | Scene 标识   |
+| `entityId` / `entity_id`     | `entityID` / `entity_id`     | Entity 标识  |
+| `msgId` / `msg_id`           | `msgID` / `msg_id`           | 消息 ID      |
+| `traceId` / `trace_id`       | `traceID` / `trace_id`       | 分布式追踪   |
+| `playerId` / `player_id`     | `playerID` / `player_id`     | 玩家         |
+| `accountId` / `account_id`   | `accountID` / `account_id`   | 账号         |
+| `guildId` / `guild_id`       | `guildID` / `guild_id`       | 公会         |
+| `templateId` / `template_id` | `templateID` / `template_id` | 模板         |
+| `classId` / `class_id`       | `classID` / `class_id`       | 职业         |
+| `skillId` / `skill_id`       | `skillID` / `skill_id`       | 技能         |
+| `questId` / `quest_id`       | `questID` / `quest_id`       | 任务         |
+| `itemId` / `item_id`         | `itemID` / `item_id`         | 物品         |
+| `dungeonId` / `dungeon_id`   | `dungeonID` / `dungeon_id`   | 副本         |
+| `instanceId` / `instance_id` | `instanceID` / `instance_id` | 实例         |
 
 > **注意**：Protobuf 字段名使用 `snake_case`，其中的 `_id` 保持小写（如 `session_id`），
 > C++ 生成代码自动转为 `sessionID`（PascalCase accessor）。
@@ -58,40 +58,40 @@
 
 类名/类型名中的常见缩写（2-4 个字母）保持全大写：
 
-| 缩写 | 示例 | 说明 |
-|------|------|------|
-| IO | `IOContextPool` | I/O 上下文池 |
-| DB | `DBWorkerPool`, `DBRange`, `DBResult` | 数据库相关 |
-| ECS | `ECSSystem`, `RegisterECSComponent()` | ECS 框架 |
-| AOI | `AOIManager`, `AOIGrid` | 兴趣区域 |
-| ID | `EMsgID`, 各 ID 后缀 | 标识符 |
-| RPC | `RPCHandler`, `RPCClient` | 远程调用 |
-| GM | `GMCommand`, `GMPermission` | 游戏管理 |
-| AI | `AIBlackboard`, `AIBehaviorTree` | 人工智能 |
-| HP | `HPCurrent` → 推荐 `CurrentHP` | 生命值（放后面更自然） |
-| MP | `MPCurrent` → 推荐 `CurrentMP` | 魔法值 |
-| NPC | `NPCTemplate`, `NPCSpawner` | 非玩家角色 |
+| 缩写 | 示例                                        | 说明                   |
+| ---- | ------------------------------------------- | ---------------------- |
+| IO   | `IOContextPool`                           | I/O 上下文池           |
+| DB   | `DBWorkerPool`, `DBRange`, `DBResult` | 数据库相关             |
+| ECS  | `ECSSystem`, `RegisterECSComponent()`   | ECS 框架               |
+| AOI  | `AOIManager`, `AOIGrid`                 | 兴趣区域               |
+| ID   | `EMsgID`, 各 ID 后缀                      | 标识符                 |
+| RPC  | `RPCHandler`, `RPCClient`               | 远程调用               |
+| GM   | `GMCommand`, `GMPermission`             | 游戏管理               |
+| AI   | `AIBlackboard`, `AIBehaviorTree`        | 人工智能               |
+| HP   | `HPCurrent` → 推荐 `CurrentHP`         | 生命值（放后面更自然） |
+| MP   | `MPCurrent` → 推荐 `CurrentMP`         | 魔法值                 |
+| NPC  | `NPCTemplate`, `NPCSpawner`             | 非玩家角色             |
 
 ### 1.4 协议消息命名
 
-| 方向 | 后缀 | 示例 |
-|------|------|------|
-| 客户端 → 服务器 | `_Req` | `MSG_MOVE_REQ` |
-| 服务器 → 客户端 | `_Rsp` | `MSG_MOVE_RSP` |
-| 服务器主动推送 | `_Ntf` | `MSG_ENTITY_CREATE_NTF` |
+| 方向             | 后缀     | 示例                      |
+| ---------------- | -------- | ------------------------- |
+| 客户端 → 服务器 | `_Req` | `MSG_MOVE_REQ`          |
+| 服务器 → 客户端 | `_Rsp` | `MSG_MOVE_RSP`          |
+| 服务器主动推送   | `_Ntf` | `MSG_ENTITY_CREATE_NTF` |
 
 ### 1.5 文件命名（全部大驼峰）
 
-| 文件类型 | 命名 | 示例 |
-|----------|------|------|
-| C++ 头文件 | 大驼峰 `.h` | `LogicServer.h`, `IOContextPool.h` |
-| C++ 源文件 | 大驼峰 `.cpp` | `LogicServer.cpp`, `IOContextPool.cpp` |
-| 自动生成头文件 | 大驼峰 `.gen.h` | `PlayersTable.gen.h`, `GuildsTable.gen.h` |
-| 自动生成源文件 | 大驼峰 `.gen.cpp` | `AllTables.gen.cpp` |
-| DasLang 脚本 | 大驼峰 `.das` | `ServerTick.das`, `CombatSystem.das` |
-| Protobuf 文件 | 大驼峰 `.proto` | `MsgMove.proto`, `Common.proto`, `MsgID.proto` |
-| 配置文件 | 大驼峰 `.toml` | `Server.toml`, `WorldConfig.toml` |
-| CMake/Xmake | `xmake.lua`, `CMakeLists.txt` | — |
+| 文件类型       | 命名                              | 示例                                                 |
+| -------------- | --------------------------------- | ---------------------------------------------------- |
+| C++ 头文件     | 大驼峰 `.h`                     | `LogicServer.h`, `IOContextPool.h`               |
+| C++ 源文件     | 大驼峰 `.cpp`                   | `LogicServer.cpp`, `IOContextPool.cpp`           |
+| 自动生成头文件 | 大驼峰 `.gen.h`                 | `PlayersTable.gen.h`, `GuildsTable.gen.h`        |
+| 自动生成源文件 | 大驼峰 `.gen.cpp`               | `AllTables.gen.cpp`                                |
+| DasLang 脚本   | 大驼峰 `.das`                   | `ServerTick.das`, `CombatSystem.das`             |
+| Protobuf 文件  | 大驼峰 `.proto`                 | `MsgMove.proto`, `Common.proto`, `MsgID.proto` |
+| 配置文件       | 大驼峰 `.toml`                  | `Server.toml`, `WorldConfig.toml`                |
+| CMake/Xmake    | `xmake.lua`, `CMakeLists.txt` | —                                                   |
 
 > **统一原则**：除构建系统固定文件名外，所有文件一律大驼峰。
 
@@ -161,6 +161,7 @@ Massive/
 ```
 
 > **xmake target 依赖拓扑**：
+>
 > ```
 > CommonCore ───────────────────────────── 无依赖，最底层
 > CommonDB ──────→ CommonCore
@@ -171,7 +172,7 @@ Massive/
 > CommonTimer ─── 无依赖
 > CommonLog ─────→ CommonCore
 > Proto ───────── 无依赖
-> 
+>
 > LoginServer ───→ CommonCore, CommonDB, CommonCrypto, Proto
 > GateServer ────→ CommonCore, CommonNetwork, CommonQueue, CommonCrypto, Proto
 > WorldServer ───→ CommonCore, CommonDB, CommonNetwork, CommonQueue,
@@ -218,14 +219,14 @@ public:
 
 ### 2.2 缩进与空格
 
-| 项目 | 设置 |
-|------|------|
-| 缩进宽度 | 4 空格 |
-| Tab 字符 | 禁止（UseTab: Never） |
-| 每行最大字符数 | 110 |
-| 指针/引用对齐 | 靠右 `int* p`, `const std::string& s` |
-| 限定符顺序 | `inline static const type` |
-| 访问修饰符偏移 | -4（与 class 关键字对齐） |
+| 项目           | 设置                                      |
+| -------------- | ----------------------------------------- |
+| 缩进宽度       | 4 空格                                    |
+| Tab 字符       | 禁止（UseTab: Never）                     |
+| 每行最大字符数 | 110                                       |
+| 指针/引用对齐  | 靠右 `int* p`, `const std::string& s` |
+| 限定符顺序     | `inline static const type`              |
+| 访问修饰符偏移 | -4（与 class 关键字对齐）                 |
 
 ### 2.3 空格规则
 
@@ -331,23 +332,35 @@ class GateSession
 功能模块分组使用 `/** @name 分组名 */` + `/** @{ */` `/** @} */` 形式。当分组名足以自解释时，可省略 `@name` 直接用 `/** @defgroup ... */`：
 
 ```cpp
-    /** @name 生命周期 */
+    /** 
+     * @name 生命周期
+     */
 
     /**
      * @brief 初始化 spdlog
      * @param name  日志器名称
      */
     static void Init(const std::string& name);
-    
-    /** @brief 关闭 spdlog */
+  
+    /** 
+     * @brief 关闭 spdlog
+     */
     static void Shutdown();
-    
-    /** @name traceID 上下文 */
+  
+    /** 
+     * @name traceID 上下文 
+     */
 
-    /** @brief 设置当前线程的 traceID */
+    /**
+     * @brief 设置当前线程的 traceID
+     */
     static void SetTraceID(uint64 traceID);
-    /** @brief 获取当前线程的 traceID */
+
+    /**
+     * @brief 获取当前线程的 traceID
+     */
     static uint64 GetTraceID();
+
 ```
 
 ### 3.3 文件头注释
@@ -392,7 +405,9 @@ public:
      */
     asio::io_context& GetNextContext();
 
-    /** @brief 停止所有 io_context 并 join 所有工作线程 */
+    /**
+     * @brief 停止所有 io_context 并 join 所有工作线程
+     */
     void Stop();
 };
 ```
@@ -444,7 +459,7 @@ struct FormatWithLocation
 };
 ```
 
-#### 枚举注释（行尾 `/**<`）
+#### 枚举注释（行尾 `//`）
 
 ```cpp
 /**
@@ -455,10 +470,10 @@ struct FormatWithLocation
  */
 enum class EErrorCode : uint32
 {
-    OK                 = 0,  /**< 成功 */
-    UNKNOWN            = 1,  /**< 未分类错误 */
-    INVALID_ARGUMENT   = 2,  /**< 非法参数 */
-    OUT_OF_RANGE       = 3,  /**< 越界 */
+    OK                 = 0,  // 成功
+    UNKNOWN            = 1,  // 未分类错误
+    INVALID_ARGUMENT   = 2,  // 非法参数
+    OUT_OF_RANGE       = 3,  // 越界
 };
 ```
 
@@ -470,10 +485,14 @@ enum class EErrorCode : uint32
  * @brief 三级时间轮定时器实现
  */
 
-/** @brief 全局 TimerID 生成器（永不回绕） */
+/**
+ * @brief 全局 TimerID 生成器（永不回绕） 
+ */
 std::atomic<TimingWheel::TimerID> TimingWheel::_nextTimerID{1};
 
-/** @brief 生成唯一 TimerID */
+/**
+ * @brief 生成唯一 TimerID
+ */
 TimingWheel::TimerID TimingWheel::GenTimerID()
 {
     return _nextTimerID.fetch_add(1, std::memory_order_relaxed);
@@ -492,12 +511,12 @@ TimingWheel::Node* TimingWheel::AllocNode(TimerID id, int rounds, Callback cb)
 }
 ```
 
-| 注解位置 | 规则 |
-|----------|------|
-| 顶格不缩进的 `/** @brief` | 文件作用域实现（静态变量、函数实现） |
-| 缩进的 `/** @brief` | 方法实现 |
-| 匿名命名空间中的类 | 类前加 `/** @brief */`，内部函数用 `//` |
-| `// =====` 分隔线 | **不允许**——改用 `/** @brief */` 直接标注 |
+| 注解位置                    | 规则                                                |
+| --------------------------- | --------------------------------------------------- |
+| 顶格不缩进的 `/** @brief` | 文件作用域实现（静态变量、函数实现）                |
+| 缩进的 `/** @brief`       | 方法实现                                            |
+| 匿名命名空间中的类          | 类前加 `/** @brief */`，内部函数用 `//`         |
+| `// =====` 分隔线         | **不允许**——改用 `/** @brief */` 直接标注 |
 
 ### 3.6 xmake.lua 注释
 
@@ -510,7 +529,6 @@ TimingWheel::Node* TimingWheel::AllocNode(TimerID id, int rounds, Callback cb)
 --- C 组: 纯头文件 (Asio, EnTT, Spdlog, ConcurrentQueue)
 
 --- @section A 组: 外部编译产物
-
 target("OpenSSL")
     set_kind("headeronly")
     if is_plat("windows") then
@@ -764,34 +782,53 @@ Log::Debug("Entity {} Pos: ({:.2f}, {:.2f}, {:.2f})", entityID, x, y, z);
 //  时间戳             |  级别 | traceID   | file:line func              | message
 ```
 
-| 级别 | API | 场景 |
-|------|-----|------|
-| ERROR | `Log::Error(...)` | DB断开、registry损坏（需立即响应） |
-| WARN | `Log::Warn(...)` | 队列接近上限、认证失败、消息超时 |
-| INFO | `Log::Info(...)` | 登录/登出、等级提升、交易、场景切换 |
-| DEBUG | `Log::Debug(...)` | 组件值变化、AOI 事件、循环计数 |
-| TRACE | `Log::Trace(...)` | 网络包内容 dump（仅本机开发） |
-| CRITICAL | `Log::Critical(...)` | 内存耗尽、不可恢复的内部错误 |
+| 级别     | API                    | 场景                                |
+| -------- | ---------------------- | ----------------------------------- |
+| ERROR    | `Log::Error(...)`    | DB断开、registry损坏（需立即响应）  |
+| WARN     | `Log::Warn(...)`     | 队列接近上限、认证失败、消息超时    |
+| INFO     | `Log::Info(...)`     | 登录/登出、等级提升、交易、场景切换 |
+| DEBUG    | `Log::Debug(...)`    | 组件值变化、AOI 事件、循环计数      |
+| TRACE    | `Log::Trace(...)`    | 网络包内容 dump（仅本机开发）       |
+| CRITICAL | `Log::Critical(...)` | 内存耗尽、不可恢复的内部错误        |
 
 > **注意**：忘记 SetTraceID 时 traceID 默认为 `kInvalidID`（0xFFFFFFFF），输出 `[FFFFFFFF]`。
 > 不崩溃，但日志不可追踪——入口处必须显式设置 TraceScope 或 SetTraceID。
 
 ### 5.3 错误恢复策略
 
-| 场景 | 策略 |
-|------|------|
-| C++ 引擎内部不变量 | `MASSIVE_ASSERT` → Debug abort / Release 继续 |
-| DasLang 脚本逻辑错误 | `panic` → ERROR 日志 + 行号 → 返回错误给客户端 |
-| DB 写入失败 | 重试 3 次（间隔 100ms）→ 仍失败则 ERROR 日志 + 继续服务 |
-| Protobuf 解析失败 | ERROR 日志 + 跳过消息 + 不 crash |
-| 内存耗尽 | 主动 `std::abort()` → core dump → systemd 自动重启 |
-| EnTT registry 损坏 | panic → 全量 debug_dump → abort → 重启恢复 |
+| 场景                 | 策略                                                     |
+| -------------------- | -------------------------------------------------------- |
+| C++ 引擎内部不变量   | `MASSIVE_ASSERT` → Debug abort / Release 继续         |
+| DasLang 脚本逻辑错误 | `panic` → ERROR 日志 + 行号 → 返回错误给客户端       |
+| DB 写入失败          | 重试 3 次（间隔 100ms）→ 仍失败则 ERROR 日志 + 继续服务 |
+| Protobuf 解析失败    | ERROR 日志 + 跳过消息 + 不 crash                         |
+| 内存耗尽             | 主动 `std::abort()` → core dump → systemd 自动重启   |
+| EnTT registry 损坏   | panic → 全量 debug_dump → abort → 重启恢复            |
 
 ### 5.4 异常规范
 
 - **不使用 C++ 异常**（与 Boost.Asio 默认设置一致）
 - 用 `std::optional`、`std::expected`、错误码替代
 - 仅在构造阶段可抛异常并在进程启动层捕获
+
+### 5.5 未使用变量规范
+
+函数参数或局部变量因接口约束（如函数签名匹配、虚函数重写、回调签名）未使用时，用 `[[maybe_unused]]` 属性标注，禁止使用以下写法：
+
+```cpp
+// ✅ 正确
+void OnHeartbeatReq(std::shared_ptr<GateSession> session,
+                    [[maybe_unused]] const Proto::HeartbeatReq &req)
+{
+    // req 因接口约束存在但本实现未使用
+}
+
+// ❌ 禁止
+(void)req;               // C 风格转换
+static_cast<void>(req);  // static_cast 空转换
+```
+
+例外：宏定义中 `(void)0` 用于表达式空展开，不受此限。
 
 ---
 
@@ -835,11 +872,11 @@ struct entt::component_traits<Health>
 
 ### 6.2 Component 分类
 
-| 类别 | 存储 | 删除策略 | 写入权 | 示例 |
-|------|------|----------|--------|------|
-| C++ 高频组件 | EnTT SoA | swap_and_pop | C++ System | Position, Velocity, Health |
-| C++ 持久组件 | EnTT SoA | in_place + compact | C++ System | Inventory, SkillBar |
-| 脚本组件 | BlobStorage SoA | swap_with_last O(1) | DasLang System | QuestProgress, BuffState |
+| 类别         | 存储            | 删除策略            | 写入权         | 示例                       |
+| ------------ | --------------- | ------------------- | -------------- | -------------------------- |
+| C++ 高频组件 | EnTT SoA        | swap_and_pop        | C++ System     | Position, Velocity, Health |
+| C++ 持久组件 | EnTT SoA        | in_place + compact  | C++ System     | Inventory, SkillBar        |
+| 脚本组件     | BlobStorage SoA | swap_with_last O(1) | DasLang System | QuestProgress, BuffState   |
 
 ### 6.3 ECS 操作
 
@@ -981,15 +1018,15 @@ def SystemCombat(sceneID: uint32; dt: float)
 
 ### 8.2 命名规范
 
-| 元素 | 规范 | 示例 |
-|------|------|------|
-| 脚本文件名 | 大驼峰 `.das` | `CombatSystem.das`, `ServerTick.das` |
-| require 引用 | 大驼峰 | `require "StatsCore"` |
-| 导出函数 | 大驼峰 | `ServerTick`, `SystemCombat` |
-| 脚本组件 | 大驼峰 | `QuestProgress`, `BuffState` |
-| 局部变量 | 小驼峰 | `entityID`, `damageDealt` |
-| 脚本组件成员 | 小驼峰 | `questID`, `currentStage` |
-| 函数参数 | 小驼峰 | `sceneID`, `deltaTime` |
+| 元素         | 规范            | 示例                                     |
+| ------------ | --------------- | ---------------------------------------- |
+| 脚本文件名   | 大驼峰 `.das` | `CombatSystem.das`, `ServerTick.das` |
+| require 引用 | 大驼峰          | `require "StatsCore"`                  |
+| 导出函数     | 大驼峰          | `ServerTick`, `SystemCombat`         |
+| 脚本组件     | 大驼峰          | `QuestProgress`, `BuffState`         |
+| 局部变量     | 小驼峰          | `entityID`, `damageDealt`            |
+| 脚本组件成员 | 小驼峰          | `questID`, `currentStage`            |
+| 函数参数     | 小驼峰          | `sceneID`, `deltaTime`               |
 
 ### 8.3 Stage 组织
 
@@ -1034,13 +1071,13 @@ struct QuestProgress
 
 ### 9.1 表命名（SQL 层 snake_case）
 
-| 元素 | 命名 | 示例 |
-|------|------|------|
+| 元素       | 命名                      | 示例                                    |
+| ---------- | ------------------------- | --------------------------------------- |
 | 玩家数据表 | `players`, `player_*` | `player_inventory`, `player_skills` |
-| 模板配置表 | `*_templates` | `item_templates`, `skill_templates` |
-| 全局系统表 | 直接命名 | `guilds`, `accounts` |
-| 系统表 | `schema_*` | `schema_migrations` |
-| 列名 | snake_case | `player_id`, `last_login_at` |
+| 模板配置表 | `*_templates`           | `item_templates`, `skill_templates` |
+| 全局系统表 | 直接命名                  | `guilds`, `accounts`                |
+| 系统表     | `schema_*`              | `schema_migrations`                   |
+| 列名       | snake_case                | `player_id`, `last_login_at`        |
 
 ### 9.2 C++ 层查询（自动生成的 Column 用 PascalCase + ID）
 
@@ -1151,11 +1188,11 @@ _metrics.IncrementCounter("massive_messages_processed_total");
 
 ### 11.1 测试三层金字塔
 
-| 层级 | 位置 | 占比 | 内容 |
-|------|------|------|------|
-| **单元测试** | `Test/Unit/` | 60% | 各模块独立测试：队列、加密、Entity、定时器 |
-| **集成测试** | `Test/Integration/` | 30% | 多模块协作：完整消息流、ECS 管线、DB 读写 |
-| **性能基准** | `Test/Benchmark/` | 10% | BenchmarkScene 10000 entity 压测 |
+| 层级               | 位置                  | 占比 | 内容                                       |
+| ------------------ | --------------------- | ---- | ------------------------------------------ |
+| **单元测试** | `Test/Unit/`        | 60%  | 各模块独立测试：队列、加密、Entity、定时器 |
+| **集成测试** | `Test/Integration/` | 30%  | 多模块协作：完整消息流、ECS 管线、DB 读写  |
+| **性能基准** | `Test/Benchmark/`   | 10%  | BenchmarkScene 10000 entity 压测           |
 
 ### 11.2 测试文件与命名
 
@@ -1176,15 +1213,15 @@ TEST_CASE("MpscQueue::DrainAll returns all enqueued messages", "[queue]")
 
 ## 12. 配套工具链
 
-| 工具 | 用途 | 配置文件 |
-|------|------|----------|
-| **clang-format** | 自动格式化 | `.clang-format` |
-| **clang-tidy** | 静态分析 + 命名检查 | `.clang-tidy` |
-| **xmake** | 构建系统 | `xmake.lua` |
-| **spdlog** | 日志库 | 代码内配置 |
-| **Tracy** | 性能分析 | 编译宏 `MASSIVE_ENABLE_TRACY` |
-| **Protobuf** | 序列化 | `Proto/*.proto` |
-| **pg_bouncer** | 数据库连接池 | `pgbouncer.ini` |
+| 工具                   | 用途                | 配置文件                        |
+| ---------------------- | ------------------- | ------------------------------- |
+| **clang-format** | 自动格式化          | `.clang-format`               |
+| **clang-tidy**   | 静态分析 + 命名检查 | `.clang-tidy`                 |
+| **xmake**        | 构建系统            | `xmake.lua`                   |
+| **spdlog**       | 日志库              | 代码内配置                      |
+| **Tracy**        | 性能分析            | 编译宏 `MASSIVE_ENABLE_TRACY` |
+| **Protobuf**     | 序列化              | `Proto/*.proto`               |
+| **pg_bouncer**   | 数据库连接池        | `pgbouncer.ini`               |
 
 ---
 
@@ -1193,6 +1230,7 @@ TEST_CASE("MpscQueue::DrainAll returns all enqueued messages", "[queue]")
 > **适用范围**: Massive MMO Server 全部 C++ / DasLang / Protobuf 代码
 >
 > **v2.0 变更摘要**：
+>
 > - 大括号 Allman 风格（开括号换行）
 > - `xxxId` → `xxxID` 全局替换（含变量名、字段名、类型名）
 > - 命名空间 `Mmo` → `MMO`, `Db` → `DB`

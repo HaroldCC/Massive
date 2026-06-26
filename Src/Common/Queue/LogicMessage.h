@@ -19,12 +19,12 @@ namespace MMO
      */
     struct LogicMessage
     {
-        uint32                                sessionID     = 0; ///< 来源连接 ID
-        uint32                                msgID         = 0; ///< 消息协议 ID
-        uint64                                traceID       = 0; ///< 链路追踪 ID
-        uint64                                clientTraceID = 0; ///< 客户端链路追踪 ID
-        ByteBuffer                            body;              ///< 消息体（Wrap 模式，零 copy）
-        std::chrono::steady_clock::time_point recvTime;          ///< 接收时间戳
+        uint32                                sessionID     = 0; // 来源连接 ID
+        uint32                                msgID         = 0; // 消息协议 ID
+        uint64                                traceID       = 0; // 链路追踪 ID
+        uint64                                clientTraceID = 0; // 客户端链路追踪 ID
+        ByteBuffer                            body;              // 消息体（Wrap 模式，零 copy）
+        std::chrono::steady_clock::time_point recvTime;          // 接收时间戳
     };
 
 } // namespace MMO

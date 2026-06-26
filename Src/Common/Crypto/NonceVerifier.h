@@ -43,18 +43,24 @@ namespace MMO::Crypto
         void EvictOld(std::chrono::hours maxAge);
 
     private:
-        /** @brief Bloom filter 碰撞检测 */
+        /**
+ * @brief Bloom filter 碰撞检测
+ */
         bool ProbablySeen(uint64 nonce) const;
-        /** @brief 插入 Bloom filter */
+        /**
+ * @brief 插入 Bloom filter
+ */
         void Insert(uint64 nonce);
 
-        /** @brief 基于 splitmix64 的 3 个哈希函数 */
+        /**
+ * @brief 基于 splitmix64 的 3 个哈希函数
+ */
         uint32 Hash1(uint64 v) const;
         uint32 Hash2(uint64 v) const;
         uint32 Hash3(uint64 v) const;
 
-        static constexpr size_t kFilterBits = 1 << 20; ///< 1M bits = 128KB
-        static constexpr size_t kHashFuncs  = 3;       ///< 哈希函数数量
+        static constexpr size_t kFilterBits = 1 << 20; // 1M bits = 128KB
+        static constexpr size_t kHashFuncs  = 3;       // 哈希函数数量
 
         std::bitset<kFilterBits>                                             _filter;
         std::deque<std::pair<std::chrono::steady_clock::time_point, uint64>> _recent;

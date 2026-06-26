@@ -39,8 +39,8 @@ namespace MMO
      */
     enum class Framing : uint8
     {
-        PacketHeader, ///< 12B PacketHeader + body（Client<->Gate）
-        LengthPrefix, ///< 4B 总长度 + 裸数据（内部 RPC）
+        PacketHeader, // 12B PacketHeader + body（Client<->Gate）
+        LengthPrefix, // 4B 总长度 + 裸数据（内部 RPC）
     };
 
     class TCPSocket : public std::enable_shared_from_this<TCPSocket>

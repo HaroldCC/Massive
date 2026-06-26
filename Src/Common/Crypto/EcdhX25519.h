@@ -20,8 +20,8 @@ namespace MMO::Crypto
      */
     struct EcdhKeyPair
     {
-        ByteBuffer privateKey; ///< 32B 私钥
-        ByteBuffer publicKey;  ///< 32B 公钥
+        ByteBuffer privateKey; // 32B 私钥
+        ByteBuffer publicKey;  // 32B 公钥
     };
 
     /**
@@ -52,7 +52,7 @@ namespace MMO::Crypto
          */
         static ByteBuffer DeriveSessionKey(const uint8 *sharedSecret);
 
-        static constexpr size_t kKeySize = 32; ///< X25519 密钥长度
+        static constexpr size_t kKeySize = 32; // X25519 密钥长度
     };
 
 } // namespace MMO::Crypto

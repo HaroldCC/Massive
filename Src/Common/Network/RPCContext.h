@@ -31,8 +31,8 @@ namespace MMO
 
     struct RPCContext
     {
-        uint64                     requestID = 0; ///< RPC 请求 ID（由发起方分配）
-        uint32                     msgID     = 0; ///< EInternalMsgID（用于构建响应帧头）
+        uint64                     requestID = 0; // RPC 请求 ID（由发起方分配）
+        uint32                     msgID     = 0; // EInternalMsgID（用于构建响应帧头）
         std::shared_ptr<TCPSocket> socket;
 
         /**

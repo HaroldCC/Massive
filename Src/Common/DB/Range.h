@@ -39,7 +39,9 @@ namespace MMO::DB
         {
         }
 
-        /** @brief 显式指定 DBWorkerPool */
+        /**
+ * @brief 显式指定 DBWorkerPool
+ */
         explicit Range(DBWorkerPool *pool) : _tableName(Table::kTableName), _pool(pool)
         {
         }

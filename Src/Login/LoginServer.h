@@ -76,13 +76,13 @@ namespace MMO
          */
         void SendAuthFailure(std::shared_ptr<TCPSocket> socket, uint32 errorCode);
 
-        static constexpr uint32 kTokenExpireSec = 7200; ///< SessionToken 过期时间（2 小时）
+        static constexpr uint32 kTokenExpireSec = 7200; // SessionToken 过期时间（2 小时）
 
         std::unique_ptr<IOContextPool>                _ioPool;
         std::unique_ptr<TCPAcceptor>                  _acceptor;
         MessageDispatcher<std::shared_ptr<TCPSocket>> _dispatcher;
         RateLimiter                                   _rateLimiter;
-        uint8                                         _lss[LoginConfig::kLSSSize] = {}; ///< 32B LSS
+        uint8                                         _lss[LoginConfig::kLSSSize] = {}; // 32B LSS
         uint16                                        _worldServerID              = 1;
         std::vector<std::string>                      _gateIPs;
         std::atomic<bool>                             _running {false};

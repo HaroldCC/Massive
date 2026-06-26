@@ -57,7 +57,9 @@ namespace MMO
         void OnPlayerOnline(RPCContext ctx, const Proto::Internal::PlayerOnlineNtf &req);
         void OnPlayerOffline(RPCContext ctx, const Proto::Internal::PlayerOfflineNtf &req);
 
-        /** @brief 将 socket remote endpoint 映射到 serviceID */
+        /**
+ * @brief 将 socket remote endpoint 映射到 serviceID
+ */
         std::string ServiceIDForSocket(const TCPSocket &socket) const;
 
         std::unique_ptr<IOContextPool> _ioPool;
@@ -66,7 +68,9 @@ namespace MMO
         ServiceRegistry                _services;
         PlayerLocationIndex            _playerIndex;
 
-        /** @brief socket 指针 → serviceID（用于断线感知） */
+        /**
+ * @brief socket 指针 → serviceID（用于断线感知）
+ */
         std::unordered_map<const TCPSocket *, std::string> _socketToService;
 
         bool _running = false;

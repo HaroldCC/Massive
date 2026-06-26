@@ -17,7 +17,7 @@ namespace MMO
 
     struct LoginConfig
     {
-        static constexpr size_t kLSSSize = 32; ///< LoginServerSecret 长度（AES-256 key）
+        static constexpr size_t kLSSSize = 32; // LoginServerSecret 长度（AES-256 key）
 
         struct Network
         {
@@ -33,7 +33,7 @@ namespace MMO
 
         struct Security
         {
-            uint8 loginServerSecret[kLSSSize] = {}; ///< 32B LSS
+            uint8 loginServerSecret[kLSSSize] = {}; // 32B LSS
         } security;
 
         struct World

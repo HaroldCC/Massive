@@ -21,16 +21,24 @@ using uint64 = uint64_t;
 
 // ── 编译期常量 ───────────────────────────────
 
-/** @brief MsgID 函数表最大容量 */
+/**
+ * @brief MsgID 函数表最大容量
+ */
 inline constexpr size_t kMaxHandlers = 4096;
 
-/** @brief 逻辑帧间隔 50ms = 20 ticks/s */
+/**
+ * @brief 逻辑帧间隔 50ms = 20 ticks/s
+ */
 inline constexpr auto kTickInterval = std::chrono::milliseconds(50);
 
-/** @brief MPSC 队列容量上限（防内存打爆） */
+/**
+ * @brief MPSC 队列容量上限（防内存打爆）
+ */
 inline constexpr size_t kMaxQueueDepth = 65536;
 
-/** @brief 无效 ID 哨兵值 */
+/**
+ * @brief 无效 ID 哨兵值
+ */
 inline constexpr uint32 kInvalidID = 0xFFFFFFFF;
 
 // ── Tracy 性能追踪宏（零开销 —— Release 编译为空白） ──
