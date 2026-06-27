@@ -52,13 +52,24 @@ namespace MMO
          */
         void OnGateMessage(uint32 sessionID, const uint8 *data, size_t len);
 
-        // 注册/注销 IO 线程可访问的 _sessions 指针（由 WorldServer::Init 设置）
+        /**
+         * @brief 处理未路由的 EnterWorldReq（IO 线程）
+         *
+         * 当 sessionID 在 _sessions 中不存在时，Extract 并 Enqueue 到一个
+         * 专用 Fallback 队列，由 LogicThread 在处理 EnterWorldReq 时消费。
+         */
+        void HandleUnroutedEnterWorld(uint32 sessionID, const uint8 *data, size_t len);
+
+        // 注册/注销 IO 线程可访问的 _sessions 指针
         void SetSessionsPtr(std::shared_mutex *mtx,
                             std::unordered_map<uint32, WorldSession> *sessions)
         {
             _sessionsMtx  = mtx;
             _sessions     = sessions;
         }
+
+        // 取 Fallback 队列（LogicThread 调用）
+        MPSCQueue<LogicMessage> &GetUnroutedQueue() { return _unroutedQueue; }
 
     private:
         struct GateConnection
@@ -73,6 +84,9 @@ namespace MMO
         // 指向 WorldServer::_sessions 的指针（IO 线程读锁访问）
         std::shared_mutex                              *_sessionsMtx  = nullptr;
         std::unordered_map<uint32, WorldSession>        *_sessions     = nullptr;
+
+        // EnterWorldReq Fallback 队列（IO 线程写，LogicThread 读）
+        MPSCQueue<LogicMessage> _unroutedQueue;
     };
 
 } // namespace MMO

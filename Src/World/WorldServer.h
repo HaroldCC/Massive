@@ -20,6 +20,7 @@
 
 #include "World/CenterClient.h"
 #include "World/GateConnection.h"
+#include "World/Handler/EnterWorldHandler.h"
 #include "World/LogicThread.h"
 #include "World/WorldConfig.h"
 #include "World/WorldSession.h"
@@ -39,13 +40,19 @@ namespace MMO
         bool InitCenterClient(const WorldConfig &cfg);
         bool InitGateAcceptor(const WorldConfig &cfg);
 
+        // ── 消息分发注册 ──
+        void RegisterHandlers();
+
         // ── LogicThread 回调 ──
         void OnTick(std::chrono::milliseconds elapsed);
         void OnMessage(uint32 sessionID, WorldSession &ws, const LogicMessage &msg);
         void OnPreProcess();
         void OnPostFlush();
 
-        // ── 消息分发（按 msgID 查表，handler 内部通过 sessionID 查 _sessions）──
+        // ── 未路由消息处理（EnterWorldReq Fallback）──
+        void ProcessUnroutedMessages();
+
+        // ── 消息分发（按 msgID 查表）──
         MessageDispatcher<uint32> _dispatcher;  // context = sessionID
 
         // ── 组件 ──
@@ -58,6 +65,9 @@ namespace MMO
         // ── Session 存储（IO 线程读锁 + LogicThread 独占写）──
         std::shared_mutex                        _sessionsMtx;
         std::unordered_map<uint32, WorldSession> _sessions;
+
+        // ── 场景 ──
+        ECS::Scene _defaultScene {1};  // 默认场景（id=1）
 
         // ── 配置 ──
         WorldConfig _config;

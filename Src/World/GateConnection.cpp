@@ -7,6 +7,8 @@
 #include "Common/Log/Log.h"
 #include "Common/Network/PacketHeader.h"
 
+#include <MsgID.pb.h>
+
 namespace MMO
 {
 
@@ -49,25 +51,41 @@ namespace MMO
         }
 
         // IO 线程：读锁查找 session → Enqueue 到其 inbox
-        std::shared_lock lock(*_sessionsMtx);
-        auto it = _sessions->find(sessionID);
-        if (it == _sessions->end())
+        uint32 msgID = ByteBuffer::Wrap(data, sizeof(uint32)).ReadUint32();
+
         {
-            Log::Debug("GateConnection: no session {} (disconnected)", sessionID);
-            return;
+            std::shared_lock lock(*_sessionsMtx);
+            auto it = _sessions->find(sessionID);
+            if (it != _sessions->end())
+            {
+                auto &ws = it->second;
+
+                LogicMessage logicMsg;
+                logicMsg.sessionID = sessionID;
+                logicMsg.msgID     = msgID;
+                logicMsg.body      = ByteBuffer::Copy(data, len);
+                logicMsg.recvTime  = std::chrono::steady_clock::now();
+
+                ws.inbox.Enqueue(std::move(logicMsg));
+                return;
+            }
         }
 
-        auto &ws = it->second;
-
-        // 构造 LogicMessage
-        LogicMessage msg;
-        msg.sessionID = sessionID;
-        msg.msgID     = ByteBuffer::Wrap(data, sizeof(uint32)).ReadUint32();
-        msg.body      = ByteBuffer::Copy(data, len);
-        msg.recvTime  = std::chrono::steady_clock::now();
-
-        // Enqueue 到 Per-Session inbox（无锁，MPSCQueue 多生产者单消费者安全）
-        ws.inbox.Enqueue(std::move(msg));
+        // session 未找到——可能是首条 EnterWorldReq，走 Fallback 队列
+        if (msgID == Proto::MSG_LOGIN_ENTER_WORLD_REQ)
+        {
+            // 直接 Enqueue 到一个特殊队列，LogicThread 在 ProcessMessages 额外处理
+            LogicMessage logicMsg;
+            logicMsg.sessionID = sessionID;
+            logicMsg.msgID     = msgID;
+            logicMsg.body      = ByteBuffer::Copy(data, len);
+            logicMsg.recvTime  = std::chrono::steady_clock::now();
+            _unroutedQueue.Enqueue(std::move(logicMsg));
+        }
+        else
+        {
+            Log::Debug("GateConnection: no session {} for msgID={}", sessionID, msgID);
+        }
     }
 
     void GateConnectionMgr::SendToGate(uint16 gateID, uint32 sessionID, ByteBuffer payload)

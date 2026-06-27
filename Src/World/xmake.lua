@@ -4,6 +4,7 @@
 target("WorldServer")
     set_kind("binary")
     add_files("*.cpp")
+    add_files("Handler/*.cpp")
     add_headerfiles("*.h")
     add_deps(
         "CommonCore",

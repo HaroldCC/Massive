@@ -8,6 +8,9 @@
 #include "Common/Log/Log.h"
 #include "Common/Network/TCPSocket.h"
 
+#include <Login.pb.h>
+#include <MsgID.pb.h>
+
 #include <chrono>
 #include <thread>
 
@@ -35,6 +38,9 @@ namespace MMO
             Log::Error("WorldServer: GateAcceptor init failed");
             return false;
         }
+
+        // 注册消息分发
+        RegisterHandlers();
 
         // 注册 LogicThread 回调
         _gateConnMgr->SetSessionsPtr(&_sessionsMtx, &_sessions);
@@ -118,13 +124,52 @@ namespace MMO
         Log::Info("WorldServer: stopped");
     }
 
+    // ── 消息分发注册 ──
+
+    void WorldServer::RegisterHandlers()
+    {
+        // EnterWorldReq 由 OnTick 中消费 _unroutedQueue 直接处理
+        // 不走 dispatcher（因为 session 未创建时没有 WorldSession）
+    }
+
     // ── LogicThread 回调 ──
 
     void WorldServer::OnTick(std::chrono::milliseconds elapsed)
     {
-        // 游戏逻辑入口（DasLang 脚本）
-        // MVP: 空实现，后续通过 ecs_stage 组织各 System
+        // 1. 处理未路由的 EnterWorldReq
+        ProcessUnroutedMessages();
+
+        // 2. 游戏逻辑（后续 ecs_stage）
         (void)elapsed;
+    }
+
+    void WorldServer::ProcessUnroutedMessages()
+    {
+        auto &unrouted = _gateConnMgr->GetUnroutedQueue();
+
+        std::vector<LogicMessage> batch;
+        unrouted.DrainAll(batch);
+
+        for (auto &msg : batch)
+        {
+            if (msg.msgID != Proto::MSG_LOGIN_ENTER_WORLD_REQ)
+            {
+                Log::Warn("WorldServer: unexpected unrouted msgID={}", msg.msgID);
+                continue;
+            }
+
+            EnterWorldHandler::Handle(
+                msg.sessionID,
+                msg.body.Data(), msg.body.Size(),
+                _sessions,
+                _config.security.loginServerSecret,
+                1, // gateID（MVP：固定 1）
+                _defaultScene,
+                [this](uint32 targetSessionID, ByteBuffer data) {
+                    // 出站：通过 GateConnectionMgr 发回客户端
+                    _gateConnMgr->SendToGate(1, targetSessionID, std::move(data));
+                });
+        }
     }
 
     void WorldServer::OnMessage(uint32 sessionID, WorldSession &ws, const LogicMessage &msg)
