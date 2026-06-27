@@ -9,6 +9,7 @@
 #include "Common/Network/TCPSocket.h"
 
 #include <Login.pb.h>
+#include <Move.pb.h>
 #include <MsgID.pb.h>
 
 #include <chrono>
@@ -129,7 +130,40 @@ namespace MMO
     void WorldServer::RegisterHandlers()
     {
         // EnterWorldReq 由 OnTick 中消费 _unroutedQueue 直接处理
-        // 不走 dispatcher（因为 session 未创建时没有 WorldSession）
+
+        // MoveReq
+        _dispatcher.Register<Proto::MoveReq>(
+            Proto::MSG_MOVE_REQ,
+            [this](uint32 sessionID, const Proto::MoveReq &req) {
+                auto it = _sessions.find(sessionID);
+                if (it == _sessions.end())
+                {
+                    return;
+                }
+
+                // 速度校验（服务器权威）
+                if (req.speed() < 0.0f || req.speed() > 50.0f)
+                {
+                    Log::Debug("MoveHandler: invalid speed={} session={}", req.speed(), sessionID);
+                    return;
+                }
+
+                Log::Debug("MoveHandler: session={} pos=({:.1f},{:.1f},{:.1f})",
+                           sessionID, req.position().x(), req.position().y(), req.position().z());
+
+                // 回包
+                auto nowMs = static_cast<uint32>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count());
+
+                Proto::MoveRsp rsp;
+                rsp.set_sequence(req.sequence());
+                rsp.mutable_position()->CopyFrom(req.position());
+                rsp.set_server_time(nowMs);
+
+                // 加密出站
+                SendToClient(sessionID, Proto::MSG_MOVE_RSP, rsp);
+            });
     }
 
     // ── LogicThread 回调 ──

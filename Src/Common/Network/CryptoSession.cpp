@@ -69,13 +69,17 @@ namespace MMO
         uint8 nonce[12];
         BuildNonce(seq, nonce);
 
-        auto result = Crypto::Aes256Gcm::Encrypt(_sessionKey, nonce, plaintext, len);
-        if (!result)
+        auto cipherResult = Crypto::Aes256Gcm::Encrypt(_sessionKey, nonce, plaintext, len);
+        if (!cipherResult)
         {
             return ByteBuffer {};
         }
 
-        return std::move(*result);
+        // 返回值 = [Seq:4B][ciphertext + 16B GCM tag]
+        auto out = ByteBuffer::Own(sizeof(uint32) + cipherResult->Size());
+        out.WriteUint32(seq);
+        out.WriteBytes(cipherResult->Data(), cipherResult->Size());
+        return out;
     }
 
     std::optional<ByteBuffer> CryptoSession::Decrypt(const uint8 *ciphertext, size_t len, uint32 seq)

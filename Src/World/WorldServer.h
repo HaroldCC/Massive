@@ -14,13 +14,16 @@
 #include <string>
 #include <unordered_map>
 
+#include "Common/Log/Log.h"
 #include "Common/Network/IOContextPool.h"
 #include "Common/Network/MessageDispatcher.h"
+#include "Common/Network/PacketHeader.h"
 #include "Common/Network/TCPAcceptor.h"
 
 #include "World/CenterClient.h"
 #include "World/GateConnection.h"
 #include "World/Handler/EnterWorldHandler.h"
+#include "World/Handler/MoveHandler.h"
 #include "World/LogicThread.h"
 #include "World/WorldConfig.h"
 #include "World/WorldSession.h"
@@ -51,6 +54,45 @@ namespace MMO
 
         // ── 未路由消息处理（EnterWorldReq Fallback）──
         void ProcessUnroutedMessages();
+
+        /**
+         * @brief 加密 protobuf 消息并发送到客户端
+         * @tparam TMsg protobuf 消息类型
+         * @param sessionID  目标 Session
+         * @param msgID      消息 ID（EMsgID）
+         * @param msg        消息
+         */
+        template <typename TMsg>
+        void SendToClient(uint32 sessionID, uint32 msgID, const TMsg &msg)
+        {
+            auto data = msg.SerializeAsString();
+            auto buf  = ByteBuffer::Copy(
+                reinterpret_cast<const uint8 *>(data.data()), data.size());
+
+            auto it = _sessions.find(sessionID);
+            if (it == _sessions.end())
+            {
+                Log::Warn("SendToClient: session {} not found", sessionID);
+                return;
+            }
+
+            // 加密 = [Seq:4B][Ciphertext+Tag]
+            auto encrypted = it->second.crypto.Encrypt(buf.Data(), buf.Size());
+            if (encrypted.Size() == 0)
+            {
+                return;
+            }
+
+            // 构建完整包: [PacketHeader:12B][encrypted]
+            uint32 totalLen = static_cast<uint32>(sizeof(PacketHeader) + encrypted.Size());
+            auto   frame    = ByteBuffer::Own(totalLen + sizeof(uint32)); // +4 for LengthPrefix
+            frame.WriteUint32(totalLen);
+            frame.WriteUint32(msgID);
+            frame.WriteUint32(sessionID);
+            frame.WriteBytes(encrypted.Data(), encrypted.Size());
+
+            _gateConnMgr->SendToGate(it->second.gateServerID, sessionID, std::move(frame));
+        }
 
         // ── 消息分发（按 msgID 查表）──
         MessageDispatcher<uint32> _dispatcher;  // context = sessionID

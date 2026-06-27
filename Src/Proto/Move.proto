@@ -1,0 +1,23 @@
+// Move.proto — 移动同步协议
+// 验证完整加密→解密→处理→加密→响应的游戏内协议管线。
+syntax = "proto3";
+
+package MMO.Proto;
+
+import "Common.proto";
+
+message MoveReq
+{
+    uint32 sequence = 1;       // 客户端移动序列号（防重放 + Dead Reckoning）
+    Vector3 position = 2;      // 当前位置
+    Vector3 direction = 3;     // 朝向（单位向量）
+    float speed = 4;           // 移动速度（m/s）
+    uint32 timestamp = 5;      // 客户端时间戳（ms）
+}
+
+message MoveRsp
+{
+    uint32 sequence = 1;       // 响应对应的序列号
+    Vector3 position = 2;      // 服务器纠正后的位置（0,0,0 表示无需纠正）
+    uint32 server_time = 3;    // 服务器时间戳（ms）
+}

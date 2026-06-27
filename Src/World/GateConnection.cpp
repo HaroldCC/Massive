@@ -60,10 +60,30 @@ namespace MMO
             {
                 auto &ws = it->second;
 
+                // 入站帧: [PacketHeader:12B][Seq:4B][Ciphertext+Tag]
+                if (len <= sizeof(PacketHeader) + sizeof(uint32))
+                {
+                    Log::Warn("GateConnection: undersized business msg session={} msgID={}", sessionID, msgID);
+                    return;
+                }
+
+                // 提取 Seq
+                uint32     seq     = ByteBuffer::Wrap(data + sizeof(PacketHeader), sizeof(uint32)).ReadUint32();
+                size_t     encLen  = len - sizeof(PacketHeader) - sizeof(uint32);
+                const uint8 *encBody = data + sizeof(PacketHeader) + sizeof(uint32);
+
+                // AES-GCM 解密
+                auto plaintext = ws.crypto.Decrypt(encBody, encLen, seq);
+                if (!plaintext)
+                {
+                    Log::Debug("GateConnection: decrypt failed session={} msgID={}", sessionID, msgID);
+                    return;
+                }
+
                 LogicMessage logicMsg;
                 logicMsg.sessionID = sessionID;
                 logicMsg.msgID     = msgID;
-                logicMsg.body      = ByteBuffer::Copy(data, len);
+                logicMsg.body      = std::move(*plaintext);
                 logicMsg.recvTime  = std::chrono::steady_clock::now();
 
                 ws.inbox.Enqueue(std::move(logicMsg));
