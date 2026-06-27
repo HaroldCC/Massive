@@ -59,7 +59,9 @@ namespace MMO
          * @brief 出站加密
          * @param plaintext  明文数据
          * @param len        明文长度
-         * @return ciphertext + 16B GCM tag 的 ByteBuffer，失败返回空
+         * @return [Seq:4B][ciphertext + 16B GCM tag] 的 ByteBuffer，失败返回空
+         *
+         * Seq 明文附加在密文之前，接收方提取后构造 nonce 解密。
          */
         ByteBuffer Encrypt(const uint8 *plaintext, size_t len);
 
