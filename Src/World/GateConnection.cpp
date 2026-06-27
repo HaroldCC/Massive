@@ -118,14 +118,13 @@ namespace MMO
 
     void GateConnectionMgr::HandleControlMessage(uint32 ctrlMsgID, const uint8 *data, size_t len)
     {
-        if (_controlHandler)
-        {
-            _controlHandler(ctrlMsgID, data, len);
-        }
-        else
-        {
-            Log::Warn("GateConnection: no control handler for msgID={}", ctrlMsgID);
-        }
+        // Enqueue 到 _ctrlQueue，由 LogicThread 在 OnTick 中消费
+        LogicMessage msg;
+        msg.sessionID = 0;
+        msg.msgID     = ctrlMsgID;
+        msg.body      = ByteBuffer::Copy(data, len);
+        msg.recvTime  = std::chrono::steady_clock::now();
+        _ctrlQueue.Enqueue(std::move(msg));
     }
 
     void GateConnectionMgr::SendToGate(uint16 gateID, uint32 sessionID, ByteBuffer payload)

@@ -54,12 +54,8 @@ namespace MMO
         // 注册消息分发
         RegisterHandlers();
 
-        // 注册 Gate 控制消息处理
+        // 注册 Gate 指向 _sessions
         _gateConnMgr->SetSessionsPtr(&_sessionsMtx, &_sessions);
-        _gateConnMgr->SetControlHandler(
-            [this](uint32 ctrlMsgID, const uint8 *data, size_t len) {
-                OnControlMessage(ctrlMsgID, data, len);
-            });
 
         _logicThread.Start(
             &_sessions, &_sessionsMtx,
@@ -183,13 +179,13 @@ namespace MMO
 
     // ── LogicThread 回调 ──
 
-    void WorldServer::OnTick(std::chrono::milliseconds elapsed)
+    void WorldServer::OnTick([[maybe_unused]] std::chrono::milliseconds elapsed)
     {
         // 1. 处理未路由的 EnterWorldReq
         ProcessUnroutedMessages();
 
-        // 2. 定时器推进
-        _timingWheel.Tick();
+        // 2. 控制消息（DisconnectNtf / SessionRebindReq）
+        ProcessControlMessages();
 
         // 3. 过载保护
         size_t queueDepth = 0;
@@ -197,12 +193,9 @@ namespace MMO
         {
             queueDepth += ws.inbox.SizeApprox();
         }
-        // 只在 DEBUG 模式下做（WARNING/DEGRADED 状态打印日志）
-        auto level = UpdateLoadLevel(_sessions.size(), queueDepth);
-        ApplyLoadLevel(level);
+        UpdateLoadLevel(_sessions.size(), queueDepth);
 
         // 4. 游戏逻辑（后续 ecs_stage）
-        (void)elapsed;
     }
 
     void WorldServer::ProcessUnroutedMessages()
@@ -284,27 +277,35 @@ namespace MMO
         }
     }
 
-    // ── Gate 控制消息处理 ──
+    // ── 控制消息处理（LogicThread 消费 _ctrlQueue）──
 
-    void WorldServer::OnControlMessage(uint32 ctrlMsgID, const uint8 *data, size_t len)
+    void WorldServer::ProcessControlMessages()
     {
-        switch (ctrlMsgID)
+        auto &ctrlQueue = _gateConnMgr->GetCtrlQueue();
+
+        std::vector<LogicMessage> batch;
+        ctrlQueue.DrainAll(batch);
+
+        for (auto &msg : batch)
         {
-            case Proto::Internal::MSG_DISCONNECT_NTF:
+            switch (msg.msgID)
             {
-                Proto::Internal::DisconnectNtf ntf;
-                if (ntf.ParseFromArray(data, static_cast<int>(len)))
+                case Proto::Internal::MSG_DISCONNECT_NTF:
                 {
-                    OnDisconnectNtf(ntf.session_id());
+                    Proto::Internal::DisconnectNtf ntf;
+                    if (ntf.ParseFromArray(msg.body.Data(), static_cast<int>(msg.body.Size())))
+                    {
+                        OnDisconnectNtf(ntf.session_id());
+                    }
+                    break;
                 }
-                break;
+                case Proto::Internal::MSG_SESSION_REBIND_REQ:
+                    OnSessionRebindReq(msg.body.Data(), msg.body.Size());
+                    break;
+                default:
+                    Log::Debug("WorldServer: unhandled control msgID={}", msg.msgID);
+                    break;
             }
-            case Proto::Internal::MSG_SESSION_REBIND_REQ:
-                OnSessionRebindReq(data, len);
-                break;
-            default:
-                Log::Debug("WorldServer: unhandled control msgID={}", ctrlMsgID);
-                break;
         }
     }
 
@@ -321,10 +322,10 @@ namespace MMO
 
         Log::Info("WorldServer: client disconnected session={} account={}", sessionID, accountID);
 
-        // 注册 30s 超时定时器（使用 LogicThread 的 _timingWheel）
-        _timingWheel.Schedule(std::chrono::seconds(30), [this, accountID]() {
-            OnDisconnectTimeout(accountID);
-        });
+        // 注册 30s 超时定时器（LogicThread 独占，TimingWheel 由 RunLoop 驱动 Tick）
+        _logicThread.GetTimingWheel().Schedule(
+            std::chrono::seconds(30),
+            [this, accountID]() { OnDisconnectTimeout(accountID); });
     }
 
     void WorldServer::OnDisconnectTimeout(uint32 accountID)
@@ -408,12 +409,14 @@ namespace MMO
 
     // ── 过载保护 ──
 
-    WorldServer::ELoadLevel WorldServer::UpdateLoadLevel(size_t sessionCount, size_t pendingMessages)
+    void WorldServer::UpdateLoadLevel(size_t sessionCount, size_t pendingMessages)
     {
         static constexpr size_t kWarnSessionCount   = 5000;
         static constexpr size_t kWarnPendingMessages = 10000;
         static constexpr size_t kDegradeSessionCount  = 8000;
         static constexpr size_t kDegradePendingMsgs   = 20000;
+
+        ELoadLevel oldLevel = _loadLevel;
 
         if (sessionCount >= kDegradeSessionCount || pendingMessages >= kDegradePendingMsgs)
         {
@@ -428,16 +431,20 @@ namespace MMO
             _loadLevel = ELoadLevel::NORMAL;
         }
 
-        return _loadLevel;
+        if (oldLevel != _loadLevel)
+        {
+            ApplyLoadLevel(oldLevel, _loadLevel);
+        }
     }
 
-    void WorldServer::ApplyLoadLevel(ELoadLevel level)
+    void WorldServer::ApplyLoadLevel(ELoadLevel oldLevel, ELoadLevel newLevel)
     {
-        if (level == ELoadLevel::DEGRADED && _loadLevel != ELoadLevel::DEGRADED)
+        (void)oldLevel;
+        if (newLevel == ELoadLevel::DEGRADED)
         {
             Log::Error("WorldServer: DEGRADED — stopping new enters");
         }
-        else if (level == ELoadLevel::WARNING && _loadLevel != ELoadLevel::WARNING)
+        else if (newLevel == ELoadLevel::WARNING)
         {
             Log::Warn("WorldServer: WARNING — sessions={}", _sessions.size());
         }

@@ -21,8 +21,6 @@
 #include "Common/Network/MessageDispatcher.h"
 #include "Common/Network/PacketHeader.h"
 #include "Common/Network/TCPAcceptor.h"
-#include "Common/Timer/TimingWheel.h"
-
 #include "World/CenterClient.h"
 #include "World/GateConnection.h"
 #include "World/SceneManager.h"
@@ -70,12 +68,15 @@ namespace MMO
 
         // ── 过载保护 ──
         enum class ELoadLevel : uint8 { NORMAL, WARNING, DEGRADED };
-        ELoadLevel UpdateLoadLevel(size_t sessionCount, size_t pendingMessages);
-        void       ApplyLoadLevel(ELoadLevel level);
+        void UpdateLoadLevel(size_t sessionCount, size_t pendingMessages);
+        void ApplyLoadLevel(ELoadLevel oldLevel, ELoadLevel newLevel);
         ELoadLevel _loadLevel = ELoadLevel::NORMAL;
 
         // ── 未路由消息处理（EnterWorldReq Fallback）──
         void ProcessUnroutedMessages();
+
+        // ── 控制消息处理（_ctrlQueue 消费）──
+        void ProcessControlMessages();
 
         /**
          * @brief 加密 protobuf 消息并发送到客户端
@@ -132,9 +133,6 @@ namespace MMO
 
         // ── 场景 ──
         SceneManager _sceneMgr;
-
-        // ── TimingWheel ──
-        TimingWheel _timingWheel;
 
         // ── 过载统计 ──
         size_t _prevQueueDepth = 0;

@@ -59,6 +59,9 @@ namespace MMO
         // 供外部调用的统计
         size_t LastTickProcessed() const { return _lastProcessed.load(std::memory_order_relaxed); }
 
+        // 供 WorldServer 注册定时器（LogicThread 独占，非线程安全）
+        TimingWheel &GetTimingWheel() { return _timingWheel; }
+
     private:
         void RunLoop(
             std::unordered_map<uint32, WorldSession> *sessions,
