@@ -40,6 +40,13 @@ namespace MMO
             return false;
         }
 
+        // 加载常驻场景
+        if (!_sceneMgr.LoadPersistentScenes(cfg.world.persistentScenes))
+        {
+            Log::Error("WorldServer: no scenes loaded");
+            return false;
+        }
+
         // 注册消息分发
         RegisterHandlers();
 
@@ -192,13 +199,20 @@ namespace MMO
                 continue;
             }
 
+            auto *scene = _sceneMgr.GetDefaultScene();
+            if (!scene)
+            {
+                Log::Warn("WorldServer: no default scene for EnterWorld");
+                continue;
+            }
+
             EnterWorldHandler::Handle(
                 msg.sessionID,
                 msg.body.Data(), msg.body.Size(),
                 _sessions,
                 _config.security.loginServerSecret,
                 1, // gateID（MVP：固定 1）
-                _defaultScene,
+                *scene,
                 [this](uint32 targetSessionID, ByteBuffer data) {
                     // 出站：通过 GateConnectionMgr 发回客户端
                     _gateConnMgr->SendToGate(1, targetSessionID, std::move(data));

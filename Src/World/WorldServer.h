@@ -22,6 +22,7 @@
 
 #include "World/CenterClient.h"
 #include "World/GateConnection.h"
+#include "World/SceneManager.h"
 #include "World/Handler/EnterWorldHandler.h"
 #include "World/Handler/MoveHandler.h"
 #include "World/LogicThread.h"
@@ -109,7 +110,7 @@ namespace MMO
         std::unordered_map<uint32, WorldSession> _sessions;
 
         // ── 场景 ──
-        ECS::Scene _defaultScene {1};  // 默认场景（id=1）
+        SceneManager _sceneMgr;
 
         // ── 配置 ──
         WorldConfig _config;

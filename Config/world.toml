@@ -15,6 +15,7 @@ worker_count = 3
 id = 1
 max_players = 10000
 # gate_addresses = ["127.0.0.1:9001"]
+persistent_scenes = [1]
 
 [log]
 level = 0
