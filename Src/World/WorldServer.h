@@ -9,16 +9,19 @@
  */
 #pragma once
 
+#include <chrono>
 #include <memory>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
 
+#include "Common/Core/Types.h"
 #include "Common/Log/Log.h"
 #include "Common/Network/IOContextPool.h"
 #include "Common/Network/MessageDispatcher.h"
 #include "Common/Network/PacketHeader.h"
 #include "Common/Network/TCPAcceptor.h"
+#include "Common/Timer/TimingWheel.h"
 
 #include "World/CenterClient.h"
 #include "World/GateConnection.h"
@@ -52,6 +55,24 @@ namespace MMO
         void OnMessage(uint32 sessionID, WorldSession &ws, const LogicMessage &msg);
         void OnPreProcess();
         void OnPostFlush();
+
+        // ── Gate 控制消息处理 ──
+        void OnControlMessage(uint32 ctrlMsgID, const uint8 *data, size_t len);
+        void OnDisconnectNtf(uint32 sessionID);
+        void OnSessionRebindReq(const uint8 *data, size_t len);
+
+        // ── 断线超时 ──
+        void OnDisconnectTimeout(uint32 accountID);
+
+        // ── Center 通知 ──
+        void NotifyCenterPlayerOnline(uint32 accountID);
+        void NotifyCenterPlayerOffline(uint32 accountID);
+
+        // ── 过载保护 ──
+        enum class ELoadLevel : uint8 { NORMAL, WARNING, DEGRADED };
+        ELoadLevel UpdateLoadLevel(size_t sessionCount, size_t pendingMessages);
+        void       ApplyLoadLevel(ELoadLevel level);
+        ELoadLevel _loadLevel = ELoadLevel::NORMAL;
 
         // ── 未路由消息处理（EnterWorldReq Fallback）──
         void ProcessUnroutedMessages();
@@ -111,6 +132,12 @@ namespace MMO
 
         // ── 场景 ──
         SceneManager _sceneMgr;
+
+        // ── TimingWheel ──
+        TimingWheel _timingWheel;
+
+        // ── 过载统计 ──
+        size_t _prevQueueDepth = 0;
 
         // ── 配置 ──
         WorldConfig _config;

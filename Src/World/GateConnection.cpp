@@ -50,7 +50,15 @@ namespace MMO
             return;
         }
 
-        // IO 线程：读锁查找 session → Enqueue 到其 inbox
+        // 控制消息（sessionID == 0）：DisconnectNtf 等
+        if (sessionID == 0 && len >= sizeof(uint32))
+        {
+            uint32 ctrlMsgID = ByteBuffer::Wrap(data, sizeof(uint32)).ReadUint32();
+            HandleControlMessage(ctrlMsgID, data + sizeof(uint32), len - sizeof(uint32));
+            return;
+        }
+
+        // 业务消息：读锁查找 session
         uint32 msgID = ByteBuffer::Wrap(data, sizeof(uint32)).ReadUint32();
 
         {
@@ -105,6 +113,18 @@ namespace MMO
         else
         {
             Log::Debug("GateConnection: no session {} for msgID={}", sessionID, msgID);
+        }
+    }
+
+    void GateConnectionMgr::HandleControlMessage(uint32 ctrlMsgID, const uint8 *data, size_t len)
+    {
+        if (_controlHandler)
+        {
+            _controlHandler(ctrlMsgID, data, len);
+        }
+        else
+        {
+            Log::Warn("GateConnection: no control handler for msgID={}", ctrlMsgID);
         }
     }
 

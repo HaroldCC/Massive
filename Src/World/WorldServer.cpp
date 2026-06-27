@@ -8,11 +8,15 @@
 #include "Common/Log/Log.h"
 #include "Common/Network/TCPSocket.h"
 
+#include <Internal/CenterRPC.pb.h>
+#include <Internal/GateRPC.pb.h>
+#include <Internal/InternalMsgID.pb.h>
 #include <Login.pb.h>
 #include <Move.pb.h>
 #include <MsgID.pb.h>
 
 #include <chrono>
+#include <ctime>
 #include <thread>
 
 using namespace std::chrono_literals;
@@ -50,8 +54,12 @@ namespace MMO
         // 注册消息分发
         RegisterHandlers();
 
-        // 注册 LogicThread 回调
+        // 注册 Gate 控制消息处理
         _gateConnMgr->SetSessionsPtr(&_sessionsMtx, &_sessions);
+        _gateConnMgr->SetControlHandler(
+            [this](uint32 ctrlMsgID, const uint8 *data, size_t len) {
+                OnControlMessage(ctrlMsgID, data, len);
+            });
 
         _logicThread.Start(
             &_sessions, &_sessionsMtx,
@@ -180,7 +188,20 @@ namespace MMO
         // 1. 处理未路由的 EnterWorldReq
         ProcessUnroutedMessages();
 
-        // 2. 游戏逻辑（后续 ecs_stage）
+        // 2. 定时器推进
+        _timingWheel.Tick();
+
+        // 3. 过载保护
+        size_t queueDepth = 0;
+        for (auto &[sid, ws] : _sessions)
+        {
+            queueDepth += ws.inbox.SizeApprox();
+        }
+        // 只在 DEBUG 模式下做（WARNING/DEGRADED 状态打印日志）
+        auto level = UpdateLoadLevel(_sessions.size(), queueDepth);
+        ApplyLoadLevel(level);
+
+        // 4. 游戏逻辑（后续 ecs_stage）
         (void)elapsed;
     }
 
@@ -217,6 +238,16 @@ namespace MMO
                     // 出站：通过 GateConnectionMgr 发回客户端
                     _gateConnMgr->SendToGate(1, targetSessionID, std::move(data));
                 });
+
+            // 如果 Handle 执行后创建了新 session，通知 Center
+            if (!_sessions.empty())
+            {
+                auto it = _sessions.find(msg.sessionID);
+                if (it != _sessions.end() && !it->second.disconnected)
+                {
+                    NotifyCenterPlayerOnline(it->second.accountID);
+                }
+            }
         }
     }
 
@@ -244,13 +275,171 @@ namespace MMO
     {
         if (_centerClient && _centerClient->IsConnected())
         {
-            // MVP: 每 Tick 都发心跳（后续用 TimingWheel 替代）
             static int tickCounter = 0;
             if (++tickCounter % (1000 / 20) == 0) // 每 ~1s
             {
                 uint32 online = static_cast<uint32>(_sessions.size());
                 _centerClient->SendHeartbeat(online);
             }
+        }
+    }
+
+    // ── Gate 控制消息处理 ──
+
+    void WorldServer::OnControlMessage(uint32 ctrlMsgID, const uint8 *data, size_t len)
+    {
+        switch (ctrlMsgID)
+        {
+            case Proto::Internal::MSG_DISCONNECT_NTF:
+            {
+                Proto::Internal::DisconnectNtf ntf;
+                if (ntf.ParseFromArray(data, static_cast<int>(len)))
+                {
+                    OnDisconnectNtf(ntf.session_id());
+                }
+                break;
+            }
+            case Proto::Internal::MSG_SESSION_REBIND_REQ:
+                OnSessionRebindReq(data, len);
+                break;
+            default:
+                Log::Debug("WorldServer: unhandled control msgID={}", ctrlMsgID);
+                break;
+        }
+    }
+
+    void WorldServer::OnDisconnectNtf(uint32 sessionID)
+    {
+        auto it = _sessions.find(sessionID);
+        if (it == _sessions.end())
+        {
+            return;
+        }
+
+        it->second.disconnected = true;
+        uint32 accountID = it->second.accountID;
+
+        Log::Info("WorldServer: client disconnected session={} account={}", sessionID, accountID);
+
+        // 注册 30s 超时定时器（使用 LogicThread 的 _timingWheel）
+        _timingWheel.Schedule(std::chrono::seconds(30), [this, accountID]() {
+            OnDisconnectTimeout(accountID);
+        });
+    }
+
+    void WorldServer::OnDisconnectTimeout(uint32 accountID)
+    {
+        for (auto it = _sessions.begin(); it != _sessions.end(); ++it)
+        {
+            if (it->second.accountID == accountID && it->second.disconnected)
+            {
+                Log::Info("WorldServer: disconnect timeout for account={}, destroying entity", accountID);
+
+                ECS::Scene *scene = _sceneMgr.GetScene(it->second.entity.sceneId);
+                if (scene)
+                {
+                    scene->DestroyEntity(it->second.entity);
+                }
+
+                // 通知 Center 玩家离线
+                NotifyCenterPlayerOffline(accountID);
+
+                _sessions.erase(it);
+                return;
+            }
+        }
+    }
+
+    void WorldServer::OnSessionRebindReq(const uint8 *data, size_t len)
+    {
+        Proto::Internal::SessionRebindReq req;
+        if (!req.ParseFromArray(data, static_cast<int>(len)))
+        {
+            return;
+        }
+
+        // MVP: Gate 批量通知 session 已恢复
+        for (int i = 0; i < req.session_ids_size(); ++i)
+        {
+            uint32 sid = req.session_ids(i);
+            auto it = _sessions.find(sid);
+            if (it != _sessions.end())
+            {
+                it->second.disconnected = false;
+                Log::Debug("WorldServer: session {} rebound (reconnected)", sid);
+            }
+        }
+    }
+
+    // ── Center 通知 ──
+
+    void WorldServer::NotifyCenterPlayerOnline(uint32 accountID)
+    {
+        if (!_centerClient || !_centerClient->IsConnected())
+        {
+            return;
+        }
+
+        Proto::Internal::PlayerOnlineNtf ntf;
+        ntf.set_account_id(accountID);
+        ntf.set_world_server_id(std::to_string(_config.world.worldServerID));
+
+        _centerClient->GetRPCClient().Notify(
+            _centerClient->GetSocket(),
+            Proto::Internal::MSG_PLAYER_ONLINE_NTF,
+            ntf);
+    }
+
+    void WorldServer::NotifyCenterPlayerOffline(uint32 accountID)
+    {
+        if (!_centerClient || !_centerClient->IsConnected())
+        {
+            return;
+        }
+
+        Proto::Internal::PlayerOfflineNtf ntf;
+        ntf.set_account_id(accountID);
+
+        _centerClient->GetRPCClient().Notify(
+            _centerClient->GetSocket(),
+            Proto::Internal::MSG_PLAYER_OFFLINE_NTF,
+            ntf);
+    }
+
+    // ── 过载保护 ──
+
+    WorldServer::ELoadLevel WorldServer::UpdateLoadLevel(size_t sessionCount, size_t pendingMessages)
+    {
+        static constexpr size_t kWarnSessionCount   = 5000;
+        static constexpr size_t kWarnPendingMessages = 10000;
+        static constexpr size_t kDegradeSessionCount  = 8000;
+        static constexpr size_t kDegradePendingMsgs   = 20000;
+
+        if (sessionCount >= kDegradeSessionCount || pendingMessages >= kDegradePendingMsgs)
+        {
+            _loadLevel = ELoadLevel::DEGRADED;
+        }
+        else if (sessionCount >= kWarnSessionCount || pendingMessages >= kWarnPendingMessages)
+        {
+            _loadLevel = ELoadLevel::WARNING;
+        }
+        else
+        {
+            _loadLevel = ELoadLevel::NORMAL;
+        }
+
+        return _loadLevel;
+    }
+
+    void WorldServer::ApplyLoadLevel(ELoadLevel level)
+    {
+        if (level == ELoadLevel::DEGRADED && _loadLevel != ELoadLevel::DEGRADED)
+        {
+            Log::Error("WorldServer: DEGRADED — stopping new enters");
+        }
+        else if (level == ELoadLevel::WARNING && _loadLevel != ELoadLevel::WARNING)
+        {
+            Log::Warn("WorldServer: WARNING — sessions={}", _sessions.size());
         }
     }
 

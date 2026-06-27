@@ -60,6 +60,19 @@ namespace MMO
          */
         void HandleUnroutedEnterWorld(uint32 sessionID, const uint8 *data, size_t len);
 
+        /**
+         * @brief 处理 Gate 控制消息（sessionID==0）
+         * @param ctrlMsgID  内部消息 ID（EInternalMsgID）
+         * @param data       消息体
+         * @param len        消息体长度
+         */
+        void HandleControlMessage(uint32 ctrlMsgID, const uint8 *data, size_t len);
+
+        // 注册 ControlMessage 处理回调（LogicThread 侧设置）
+        using ControlHandler =
+            std::function<void(uint32 ctrlMsgID, const uint8 *data, size_t len)>;
+        void SetControlHandler(ControlHandler handler) { _controlHandler = std::move(handler); }
+
         // 注册/注销 IO 线程可访问的 _sessions 指针
         void SetSessionsPtr(std::shared_mutex *mtx,
                             std::unordered_map<uint32, WorldSession> *sessions)
@@ -87,6 +100,9 @@ namespace MMO
 
         // EnterWorldReq Fallback 队列（IO 线程写，LogicThread 读）
         MPSCQueue<LogicMessage> _unroutedQueue;
+
+        // 控制消息回调（LogicThread 注册，IO 线程回调中执行）
+        ControlHandler _controlHandler;
     };
 
 } // namespace MMO

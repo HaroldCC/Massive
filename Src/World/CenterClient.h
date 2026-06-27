@@ -60,6 +60,9 @@ namespace MMO
             return _connected.load(std::memory_order_acquire);
         }
 
+        // 获取 Center TCPSocket（用于 Notify）
+        std::shared_ptr<TCPSocket> GetSocket() const { return _socket; }
+
     private:
         std::shared_ptr<TCPSocket> _socket;
         RPCClient                  _rpcClient;  // LogicThread 模式
