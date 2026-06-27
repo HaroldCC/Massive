@@ -29,7 +29,7 @@
     <tr><td>持有方</td><td>GateServer</td><td>WorldServer</td></tr>
     <tr><td>生命周期</td><td>TCP 连接建立 → 断开</td><td>Entity 创建 → Entity 销毁（可跨 TCP 重连保留）</td></tr>
     <tr><td>状态</td><td>sessionId, worldServerId, clientSocket</td><td>sessionId, playerEntity, CryptoSession</td></tr>
-    <tr><td>断线行为</td><td>通知 World → 销毁自身</td><td>保留 Entity 60s 等待重连</td></tr>
+    <tr><td>断线行为</td><td>通知 World → 销毁自身</td><td>保留 Entity 30s 等待重连</td></tr>
   </table>
 
   <h3>5.2 完整生命周期</h3>
@@ -45,8 +45,8 @@ Client TCP → GateServer
   │
   ├── World: HMAC 验证 SessionToken → 解密 → 提取 accountId + SessionKey
   │     World: 加载/创建 Entity → 绑定 WorldSession（sessionId → Entity）
-  │     World: _sessionToEntity[sessionId] = entity
-  │     World: _sessionKeys[sessionId] = CryptoSession{SessionKey}
+  │     World: _sessions[sessionId] = WorldSession{...}
+  │     World: 
   │     World → Gate → Client: MSG_LOGIN_ENTER_WORLD_RSP
   │
   ├── 正常运行
@@ -55,42 +55,57 @@ Client TCP → GateServer
   ├── TCP 断线（Gate 侧检测）
   │     Gate: GateSession 析构
   │     Gate → World: InternalHeader(MSG_DISCONNECT, sessionId)
-  │     World: 给 Entity 加 DisconnectedTag + 注册 60s 超时定时器
-  │     World: 保留 _sessionKeys[sessionId]（等待重连）
+  │     World: 给 Entity 加 DisconnectedTag + 注册 30s 超时定时器
+  │     World: 保留 crypto 保留在 WorldSession 中
   │
-  ├── 60s 内重连（客户端用同一个 SessionToken 连任意 Gate）
+  ├── 30s 内重连（客户端用同一个 SessionToken 连任意 Gate）
   │     Gate: 新 sessionId（新的 GateSession）
   │     Gate → World: MSG_LOGIN_ENTER_WORLD_REQ {新sessionId, 旧SessionToken}
   │     World: 从 SessionToken 还原 accountId → 找到原 Entity（DisconnectedTag 还在）
-  │     World: _sessionToEntity[新sessionId] = entity（切换 sessionId 绑定）
+  │     World: _sessions[新sessionId] = WorldSession{...}（切换 sessionId 绑定）
   │     World: ecs_remove(DisconnectedTag) → 定时器空转跳过
   │
-  └── 60s 超时
+  └── 30s 超时
         World: 定时器触发 → Entity 仍带 DisconnectedTag → SaveDB → Destroy</pre>
 
   <h3>5.3 WorldServer 侧关键数据</h3>
   <pre><code><span class="cm">// WorldServer 内</span>
-<span class="tp">std::unordered_map</span>&lt;<span class="tp">uint32_t</span>, <span class="tp">Entity</span>&gt;         <span class="kw">_sessionToEntity</span>;   <span class="cm">// sessionId → 玩家 Entity</span>
-<span class="tp">std::unordered_map</span>&lt;<span class="tp">uint32_t</span>, <span class="tp">CryptoSession</span>&gt;  <span class="kw">_sessionKeys</span>;       <span class="cm">// sessionId → 加密上下文</span>
-<span class="tp">std::unordered_map</span>&lt;<span class="tp">uint32_t</span>, <span class="tp">uint32_t</span>&gt;        <span class="kw">_accountToEntity</span>;    <span class="cm">// accountId → entity</span>
+<span class="tp">struct WorldSession</span> {
+    <span class="tp">uint32_t</span>     sessionID;          <span class="cm">// Gate 分配的 sessionId</span>
+    <span class="tp">uint32_t</span>     accountID;          <span class="cm">// 玩家账号 ID</span>
+    <span class="tp">Entity</span>       entity;             <span class="cm">// World 侧的玩家 Entity</span>
+    <span class="tp">CryptoSession</span> crypto;             <span class="cm">// AES-256-GCM 加解密上下文</span>
+    <span class="tp">uint16_t</span>     gateServerID;       <span class="cm">// 当前连接的 Gate 实例 ID</span>
+    <span class="tp">MPSCQueue</span>&lt;<span class="tp">LogicMessage</span>&gt; inbox;      <span class="cm">// IO 线程 → LogicThread 每 Session 独立队列</span>
+    <span class="tp">std::chrono::steady_clock::time_point</span> lastRecvTime;
+    <span class="kt">bool</span>         disconnected = <span class="nb">false</span>; <span class="cm">// 是否处于断线等待状态</span>
+};
+
+<span class="cm">// 真理之源：只用一个 map</span>
+<span class="tp">std::unordered_map</span>&lt;<span class="tp">uint32_t</span>, <span class="tp">WorldSession</span>&gt; <span class="kw">_sessions</span>;        <span class="cm">// sessionId → WorldSession</span>
+<span class="tp">std::unordered_map</span>&lt;<span class="tp">uint32_t</span>, <span class="tp">uint32_t</span>&gt;   <span class="kw">_accountToSession</span>;  <span class="cm">// accountId → sessionId</span>
 
 <span class="kt">void</span> <span class="fn">OnGateDisconnect</span>(<span class="tp">uint32_t</span> sessionId) {
-    <span class="kw">auto</span> it = <span class="kw">_sessionToEntity</span>.find(sessionId);
-    <span class="kw">if</span> (it == <span class="kw">_sessionToEntity</span>.end()) <span class="kw">return</span>;
+    <span class="kw">auto</span> it = <span class="kw">_sessions</span>.find(sessionId);
+    <span class="kw">if</span> (it == <span class="kw">_sessions</span>.end()) <span class="kw">return</span>;
 
-    <span class="kw">auto</span> entity = it-&gt;second;
-    ecs_emplace(entity, type&lt;<span class="tp">DisconnectedTag</span>&gt;, DisconnectedTag{GetTickTime()});
+    <span class="kw">auto</span>&amp; ws = it-&gt;second;
+    ws.disconnected = <span class="nb">true</span>;
+    ecs_emplace(ws.entity, type&lt;<span class="tp">DisconnectedTag</span>&gt;, DisconnectedTag{GetTickTime()});
 
-    <span class="cm">// 注册 60s 超时</span>
-    <span class="kw">_timingWheel</span>.Schedule(GenTimerId(), <span class="tp">std::chrono::seconds</span>(<span class="num">60</span>), [<span class="kw">this</span>, entity] {
-        <span class="kw">if</span> (ecs_has(entity, type&lt;<span class="tp">DisconnectedTag</span>&gt;)) {
-            SaveEntityToDb(entity);
-            ecs_destroy(entity);
+    <span class="cm">// 注册 30s 超时</span>
+    <span class="kw">_timingWheel</span>.Schedule(GenTimerId(), <span class="tp">std::chrono::seconds</span>(<span class="num">30</span>), [<span class="kw">this</span>, sessionId] {
+        <span class="kw">auto</span> it = <span class="kw">_sessions</span>.find(sessionId);
+        <span class="kw">if</span> (it == <span class="kw">_sessions</span>.end()) <span class="kw">return</span>;
+        <span class="kw">if</span> (it-&gt;second.disconnected) {
+            SaveEntityToDb(it-&gt;second.entity);
+            ecs_destroy(it-&gt;second.entity);
+            <span class="kw">_sessions</span>.erase(it);
         }
     });
 
-    <span class="cm">// 保留 CryptoSession 和 session→entity 映射，不立即删除</span>
-    <span class="cm">// 如果 60s 内重连，从 SessionToken 找到旧 entity 重新绑定新 sessionId</span>
+    <span class="cm">// 保留 WorldSession 和 inbox 队列，不断清理</span>
+    <span class="cm">// 如果 30s 内重连，从 SessionToken 找到旧 entity 重新绑定</span>
 }</code></pre>
 
   <h3>5.4 登录鉴权——两次 TCP</h3>

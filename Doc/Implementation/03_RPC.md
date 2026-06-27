@@ -237,7 +237,7 @@ class CenterClient
 void LogicServer::Run()
 {
     while (!_stopped.load()) {
-        ProcessMessages();           // Drain Gate 队列 + MsgID 查表分发
+        ProcessMessages();           // Per-Session inbox DrainAll + MsgID 查表分发
         _timingWheel.Tick();
         ProcessDBWorkerCallbacks();  // DBWorkerPool 的结果回调
         ProcessRPCResponses();       // ← RPCClient 的回调

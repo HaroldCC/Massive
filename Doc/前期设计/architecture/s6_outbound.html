@@ -37,18 +37,16 @@
   </div>
 
   <h3>6.2 WorldServer 侧：WorldSession::Send</h3>
-  <pre><code><span class="cm">// WorldSession.cpp — WorldServer 出站</span>
+  <pre><code><span class="cm">// WorldSession — WorldServer 出站</span>
 <span class="kt">void</span> <span class="tp">WorldSession</span>::<span class="fn">Send</span>(<span class="tp">std::vector</span>&lt;<span class="kt">char</span>&gt; body) {
-    <span class="cm">// 1. 加密 Body</span>
-    <span class="kw">auto</span> encrypted = <span class="kw">_crypto</span>.Encrypt(std::move(body));
+    <span class="cm">// 1. 加密 Body（CryptoSession 内维护 _sendSequence）</span>
+    <span class="kw">auto</span> encrypted = crypto.Encrypt(std::move(body));
 
-    <span class="cm">// 2. 包装为 InternalFrame: [InternalHeader | MsgID | EncryptedBody]</span>
-    <span class="tp">InternalFrame</span> frame;
-    frame.header.sessionId = <span class="kw">_sessionId</span>;
-    frame.payload = std::move(encrypted);
-
-    <span class="cm">// 3. 写入本 sessionId 对应的 Gate 内部 TCP 连接</span>
-    <span class="kw">_gateConn</span>-&gt;Send(frame.Serialize());
+    <span class="cm">// 2. 包装 InternalHeader + PacketHeader + 密文</span>
+    <span class="tp">InternalHeader</span> ih;
+    ih.sessionID = sessionID;
+    <span class="cm">// 3. 写入 gateServerID 对应的 Gate 内部 TCP 连接</span>
+    GateConnectionMgr::SendToGate(gateServerID, ih, std::move(encrypted));
 }</code></pre>
 
   <h3>6.3 GateServer 侧：收 World 包 → 转发 Client</h3>
@@ -92,17 +90,17 @@
 <span class="kw">public</span>:
     <span class="kw">struct</span> <span class="tp">GateConnection</span> {
         <span class="tp">uint16_t</span> gateId;
-        <span class="tp">TcpSocket</span> socket;               <span class="cm">// 到 Gate 的内部 TCP</span>
-        <span class="tp">std::mutex</span> writeMutex;
-        <span class="tp">std::vector</span>&lt;<span class="kt">char</span>&gt; writeBuffer;
-        <span class="kt">bool</span> writing = <span class="nb">false</span>;
+        <span class="tp">std::shared_ptr</span>&lt;<span class="tp">TCPSocket</span>&gt; socket;  <span class="cm">// 到 Gate 的内部 TCP</span>
     };
 
-    <span class="cm">// Gate 主动连接 WorldServer 时注册</span>
-    <span class="kt">void</span> <span class="fn">AcceptGateConnection</span>(<span class="tp">TcpSocket</span> sock);
+    <span class="cm">// Gate 建立世界时注册</span>
+    <span class="kt">void</span> <span class="fn">AcceptGateConnection</span>(<span class="tp">uint16_t</span> gateId, <span class="tp">std::shared_ptr</span>&lt;<span class="tp">TCPSocket</span>&gt; socket);
 
-    <span class="cm">// 按 sessionId → WorldSession → 找到对应 GateConnection → Send</span>
-    <span class="kt">void</span> <span class="fn">SendToGate</span>(<span class="tp">uint16_t</span> gateId, <span class="tp">std::vector</span>&lt;<span class="kt">char</span>&gt; data);
+    <span class="cm">// 业务消息：加密后带 InternalHeader 发送</span>
+    <span class="kt">void</span> <span class="fn">SendToGate</span>(<span class="tp">uint16_t</span> gateId, <span class="kw">const</span> <span class="tp">InternalHeader</span>&amp; hdr, <span class="tp">ByteBuffer</span> payload);
+
+    <span class="cm">// 控制消息：走 RPC Notify 协议统一通道（DisconnectNtf/SessionRebindReq 等）</span>
+    <span class="kt">void</span> <span class="fn">SendControlToGate</span>(<span class="tp">uint16_t</span> gateId, <span class="tp">uint32_t</span> msgID, <span class="tp">const</span> <span class="tp">google::protobuf::Message</span>&amp; msg);
 
 <span class="kw">private</span>:
     <span class="tp">std::unordered_map</span>&lt;<span class="tp">uint16_t</span>, <span class="tp">std::unique_ptr</span>&lt;<span class="tp">GateConnection</span>&gt;&gt; <span class="kw">_gateConns</span>;

@@ -50,7 +50,7 @@
     <span class="kw">constexpr</span> <span class="kw">auto</span> maxElapsed   = <span class="tp">std::chrono::milliseconds</span>(<span class="num">50</span>);
 
     <span class="kw">while</span> (!<span class="kw">_stopped</span>.load()) {
-        <span class="fn">ProcessMessages</span>();                <span class="cm">// Drain Gate 队列 + MsgID 查表分发</span>
+        <span class="fn">ProcessMessages</span>();                <span class="cm">// Per-Session inbox DrainAll + MsgID 查表分发</span>
         <span class="kw">_timingWheel</span>.Tick();                <span class="cm">// 时间轮推进</span>
         <span class="fn">ProcessDBWorkerCallbacks</span>();       <span class="cm">// DBWorkerPool 完成的查询结果回调</span>
         <span class="fn">ProcessRpcResponses</span>();            <span class="cm">// Center/Social 的异步 RPC 回包</span>
@@ -71,21 +71,44 @@
     }
 }</code></pre>
 
-  <h3>4.3 消息流完整时序（C2 拓扑）</h3>
+  <h3>4.3 ProcessMessages：Per-Session inbox + 消息预算</h3>
+  <p>
+    IO 线程收包后解密→按 sessionId 找到对应 WorldSession→Enqueue 到其独立 inbox 队列（Per-Session MPSCQueue）。
+    LogicThread 每 Tick 遍历所有活跃 WorldSession 的 inbox，Drain 最多 <code>kMaxMessagesPerTick</code> 条消息。
+  </p>
+  <pre><code><span class="kt">void</span> <span class="tp">LogicThread</span>::<span class="fn">ProcessMessages</span>() {
+    <span class="kw">constexpr</span> <span class="tp">size_t</span> kMaxPerTick = <span class="num">1000</span>;
+    <span class="tp">size_t</span> processed = <span class="num">0</span>;
+
+    <span class="kw">for</span> (<span class="kw">auto</span>&amp; [sessionId, ws] : <span class="kw">_sessions</span>) {
+        <span class="tp">std::vector</span>&lt;<span class="tp">LogicMessage</span>&gt; batch;
+        ws.inbox.DrainAll(batch);
+        <span class="kw">for</span> (<span class="kw">auto</span>&amp; msg : batch) {
+            <span class="kw">if</span> (processed &gt;= kMaxPerTick) <span class="kw">return</span>;  <span class="cm">// 预算耗尽，剩余积压</span>
+            <span class="kw">_dispatcher</span>.Dispatch(ws.entity, msg.msgID, msg.body);
+            processed++;
+        }
+    }
+
+    <span class="kw">if</span> (<span class="kw">_pendingMessageCount</span> &gt; <span class="num">5000</span>)
+        Log::Warn("LogicThread: incoming queue depth={}", <span class="kw">_pendingMessageCount</span>);
+}</code></pre>
+
+  <h3>4.4 消息流完整时序（C2 拓扑）</h3>
   <table>
     <tr><th>步骤</th><th>线程</th><th>进程</th><th>动作</th></tr>
     <tr><td>1-2</td><td>IO 线程</td><td>GateServer</td><td>TCP recv → 拆包 Length+MsgID+SessionId → 读 SessionId 查路由 → 写内部 TCP</td></tr>
-    <tr><td>3</td><td>IO 线程</td><td>WorldServer</td><td>内部 TCP recv → 读 InternalHeader → 按 sessionId 找 CryptoSession → AES-GCM 解密 → Enqueue</td></tr>
-    <tr><td>4-5</td><td>逻辑线程</td><td>WorldServer</td><td>DrainAll → 查 _sessionToEntity → MsgID 数组索引 → Handler(body)</td></tr>
+    <tr><td>3</td><td>IO 线程</td><td>WorldServer</td><td>内部 TCP recv → 读 InternalHeader → 按 sessionId 查 _sessions（shared_mutex 读锁）→ ws.inbox.Enqueue（Per-Session MPSCQueue，无锁）</td></tr>
+    <tr><td>4-5</td><td>逻辑线程</td><td>WorldServer</td><td>遍历 _sessions → ws.inbox.DrainAll → MsgID 数组索引 → Handler(body)。每 Tick 最多处理 kMaxPerTick 条消息</td></tr>
     <tr><td>6</td><td>逻辑线程</td><td>WorldServer</td><td>如需 DB：DBWorkerPool.AsyncQuery(sql, callback)——不阻塞 Tick</td></tr>
     <tr><td>7-8</td><td>逻辑线程</td><td>WorldServer</td><td>AES-GCM 加密 → InternalHeader → 写对应 Gate 的内部 TCP</td></tr>
     <tr><td>9</td><td>IO 线程</td><td>GateServer</td><td>内部 TCP recv → InternalHeader.sessionId → clientSocket → async_write</td></tr>
   </table>
 
-  <h3>4.4 过载保护：降频 + 降级（不变）</h3>
+  <h3>4.5 过载保护：降频 + 降级（不变）</h3>
   <p>同之前设计，3 状态机：Normal→Warning→Degraded。在所有 WorldServer 上各自独立运行。CenterServer 收集各 World 的过载状态做全局告警。</p>
 
-  <h3>4.5 各进程的线程模型对比</h3>
+  <h3>4.6 各进程的线程模型对比</h3>
   <table>
     <tr><th>进程</th><th>IO 线程</th><th>逻辑线程</th><th>DB Worker 线程</th></tr>
     <tr><td><strong>LoginServer</strong></td><td>IOContextPool (2-4)</td><td>—</td><td>—（同步查 PG）</td></tr>
@@ -95,7 +118,7 @@
     <tr><td><strong>SocialServer</strong></td><td>IOContextPool (2-4)</td><td>1 × LogicThread（低频）</td><td>2</td></tr>
   </table>
 
-  <h4>4.5.1 升级路径：Scene 级多线程</h4>
+  <h4>4.6.1 升级路径：Scene 级多线程</h4>
   <p>
     如果 BenchmarkScene 压测显示单线程无法满足目标 PCU，WorldServer 支持
     <strong>Scene 级并行</strong>——每个 Scene 一个独立的 LogicThread。

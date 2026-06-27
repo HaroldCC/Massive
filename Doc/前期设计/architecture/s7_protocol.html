@@ -96,8 +96,8 @@ Client                              GateServer                     WorldServer
   │                                    │                                ├─ AES-GCM 解密 → accountId, SessionKey
   │                                    │                                ├─ expireTime 检查
   │                                    │                                ├─ 加载/创建 Entity → 绑定 sessionId
-  │                                    │                                │  _sessionToEntity[1001] = entity
-  │                                    │                                │  _sessionKeys[1001] = SessionKey
+  │                                    │                                │  _sessions[1001] = WorldSession{ entity, SessionKey, inbox }
+  │                                    │                                │  
   │                                    │                                │
   │                                    │◀───────────────────────────────│
   │                                    │ InternalHeader{sessionId=1001} │

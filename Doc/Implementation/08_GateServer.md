@@ -300,9 +300,13 @@ TCPSocket::ProcessLengthPrefixed() 拆出完整帧
      - 没找到 → 丢弃（客户端已断开）
 
 
-  3. 如果 sessionID == 0（控制消息，非客户端消息）
-     - 读后续字节确定控制消息类型（如 MSG_DISCONNECT_RSP）
+  3. 控制消息（sessionID == 0）：走 RPC Notify 协议
+     - 读 RPCHeader 解析 EInternalMsgID（如 MSG_DISCONNECT_NTF）
+     - 投递到 Gate 内部的 RPCServerDispatcher 处理
      - 由 Gate 内部处理，不转发 Client
+
+所有 World→Gate 控制消息统一走 RPC Notify 通道（而非特殊 InternalHeader 分支），
+与 Center↔World 内部通信使用同一套协议栈。减少 World 侧消息分发分支。
 ```
 
 ### 5.3 GateSession 写客户端
