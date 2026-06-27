@@ -41,6 +41,7 @@ message LoginEnterWorldReq
 {
     bytes  session_token = 1;  // 46B SessionToken（明文，Gate 读取路由）
     uint64 nonce = 2;          // 防重放随机数
+    bytes  reconnect_seed = 3;  // 重连种子（8B，首次登录填 0，参见 CryptoSession::RotateReconnectKey）
 }
 
 message LoginEnterWorldRsp
