@@ -1,0 +1,85 @@
+/**
+ * @file LogicThread.h
+ * @brief WorldServer 单线程逻辑循环
+ *
+ * 20ms 固定 Tick：
+ *   ProcessMessages → TimingWheel.Tick → ProcessDB → ProcessRPC
+ *   → Tick(elapsed) → FlushOutgoing
+ */
+#pragma once
+
+#include <atomic>
+#include <functional>
+#include <memory>
+#include <shared_mutex>
+#include <thread>
+#include <unordered_map>
+
+#include "Common/Timer/TimingWheel.h"
+
+#include "World/WorldSession.h"
+
+namespace MMO
+{
+
+    /**
+     * @brief 单线程逻辑循环
+     *
+     * 设计文档 §4.2 — 20ms Tick + 防死亡螺旋 Clamp。
+     */
+    class LogicThread
+    {
+    public:
+        using TickCallback      = std::function<void(std::chrono::milliseconds)>;
+        using DispatchCallback  = std::function<void(uint32 sessionID, WorldSession &ws, const LogicMessage &msg)>;
+
+        LogicThread();
+
+        /**
+         * @brief 启动逻辑线程
+         * @param sessions          WorldServer::_sessions 引用
+         * @param sessionsMtx       WorldServer::_sessionsMtx 引用
+         * @param onTick            游戏逻辑回调（DasLang 脚本入口）
+         * @param onMessage         消息分发回调（按 msgID 查表 → handler）
+         * @param preProcess        可选：ProcessMessages 前回调（RPCClient::ProcessTimeouts 等）
+         * @param postFlush         可选：Flush 后回调（CenterClient::SendHeartbeat 等）
+         */
+        void Start(
+            std::unordered_map<uint32, WorldSession> *sessions,
+            std::shared_mutex                        *sessionsMtx,
+            TickCallback                              onTick,
+            DispatchCallback                          onMessage,
+            std::function<void()>                     preProcess  = nullptr,
+            std::function<void()>                     postFlush   = nullptr);
+
+        void Stop();
+
+        bool IsRunning() const { return _running.load(std::memory_order_acquire); }
+
+        // 供外部调用的统计
+        size_t LastTickProcessed() const { return _lastProcessed.load(std::memory_order_relaxed); }
+
+    private:
+        void RunLoop(
+            std::unordered_map<uint32, WorldSession> *sessions,
+            std::shared_mutex                        *sessionsMtx,
+            TickCallback                              onTick,
+            DispatchCallback                          onMessage,
+            std::function<void()>                     preProcess,
+            std::function<void()>                     postFlush);
+
+        void ProcessMessages(
+            std::unordered_map<uint32, WorldSession> *sessions,
+            DispatchCallback                          onMessage);
+
+        TimingWheel       _timingWheel;
+        std::thread       _thread;
+        std::atomic<bool> _running {false};
+        std::atomic<bool> _stopped {false};
+
+        std::atomic<size_t> _lastProcessed {0};
+
+        static constexpr size_t kMaxMessagesPerTick = 1000;
+    };
+
+} // namespace MMO
