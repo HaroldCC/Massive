@@ -227,9 +227,42 @@ namespace MMO
                 _config.security.loginServerSecret,
                 1, // gateID（MVP：固定 1）
                 *scene,
-                [this](uint32 targetSessionID, ByteBuffer data) {
-                    // 出站：通过 GateConnectionMgr 发回客户端
-                    _gateConnMgr->SendToGate(1, targetSessionID, std::move(data));
+                [this](uint32 sessionID, uint32 msgID, ByteBuffer rawBody) {
+                    // 出站：完成加密 + PacketHeader 包装后通过 GateConnectionMgr 发回客户端
+                    auto it = _sessions.find(sessionID);
+                    if (it != _sessions.end())
+                    {
+                        // 已创建 WorldSession → AES-GCM 加密
+                        auto encrypted = it->second.crypto.Encrypt(
+                            rawBody.Data(), rawBody.Size());
+                        if (encrypted.Size() == 0)
+                        {
+                            Log::Warn("WorldServer: encrypt failed for EnterWorldRsp session={}", sessionID);
+                            return;
+                        }
+
+                        // 构建 PacketHeader: [length:4B][msgID:4B][sessionID:4B]
+                        uint32 totalLen = static_cast<uint32>(sizeof(PacketHeader) + encrypted.Size());
+                        ByteBuffer frame = ByteBuffer::Own(totalLen);
+                        frame.WriteUint32(totalLen);   // PacketHeader.length
+                        frame.WriteUint32(msgID);      // PacketHeader.msgID
+                        frame.WriteUint32(sessionID);  // PacketHeader.sessionID
+                        frame.WriteBytes(encrypted.Data(), encrypted.Size());
+
+                        _gateConnMgr->SendToGate(it->second.gateServerID, sessionID, std::move(frame));
+                    }
+                    else
+                    {
+                        // 尚未创建 WorldSession（错误响应）→ 明文 PacketHeader
+                        uint32 totalLen = static_cast<uint32>(sizeof(PacketHeader) + rawBody.Size());
+                        ByteBuffer frame = ByteBuffer::Own(totalLen);
+                        frame.WriteUint32(totalLen);
+                        frame.WriteUint32(msgID);
+                        frame.WriteUint32(sessionID);
+                        frame.WriteBytes(rawBody.Data(), rawBody.Size());
+
+                        _gateConnMgr->SendToGate(1, sessionID, std::move(frame));
+                    }
                 });
 
             // 如果 Handle 执行后创建了新 session，通知 Center

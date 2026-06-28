@@ -107,9 +107,10 @@ namespace MMO
             }
 
             // 构建完整包: [PacketHeader:12B][encrypted]
+            // PacketHeader = {length, msgID, sessionID}，全大端
             uint32 totalLen = static_cast<uint32>(sizeof(PacketHeader) + encrypted.Size());
-            auto   frame    = ByteBuffer::Own(totalLen + sizeof(uint32)); // +4 for LengthPrefix
-            frame.WriteUint32(totalLen);
+            auto   frame    = ByteBuffer::Own(totalLen);
+            frame.WriteUint32(totalLen);   // PacketHeader.length
             frame.WriteUint32(msgID);
             frame.WriteUint32(sessionID);
             frame.WriteBytes(encrypted.Data(), encrypted.Size());

@@ -33,6 +33,12 @@ namespace MMO
          * @param defaultScene 默认场景
          * @param gateSendFn   WorldSession → Gate 出站回调
          */
+        /**
+         * @brief 出站回调类型: (sessionID, msgID, rawBody) → 发送到客户端
+         * WorldServer 侧会在回调内完成加密 + PacketHeader 包装
+         */
+        using GateSendFn = std::function<void(uint32, uint32, ByteBuffer)>;
+
         static void Handle(
             uint32                                    sessionID,
             const uint8                              *body,
@@ -41,7 +47,7 @@ namespace MMO
             const uint8                              *lss,
             uint16                                    gateServerID,
             ECS::Scene                               &defaultScene,
-            std::function<void(uint32, ByteBuffer)>   gateSendFn);
+            GateSendFn                                gateSendFn);
 
     private:
         static void HandleFirstLogin(
@@ -52,7 +58,7 @@ namespace MMO
             const uint8                              *sessionKey,
             uint64                                    clientRandom,
             ECS::Scene                               &defaultScene,
-            std::function<void(uint32, ByteBuffer)>   gateSendFn);
+            GateSendFn                                gateSendFn);
 
         static void HandleReconnect(
             uint32                                    sessionID,
@@ -62,13 +68,13 @@ namespace MMO
             const uint8                              *reconnectSeed,
             size_t                                    seedLen,
             uint64                                    clientRandom,
-            std::function<void(uint32, ByteBuffer)>   gateSendFn);
+            GateSendFn                                gateSendFn);
 
-        static void SendError(uint32 errorCode, const char *msg,
-                              std::function<void(uint32, ByteBuffer)> gateSendFn);
+        static void SendError(uint32 sessionID, uint32 errorCode, const char *msg,
+                              GateSendFn gateSendFn);
 
-        static void SendRsp(uint32 playerID, uint32 sceneID, float x, float y, float z,
-                            std::function<void(uint32, ByteBuffer)> gateSendFn);
+        static void SendRsp(uint32 sessionID, uint32 playerID, uint32 sceneID, float x, float y, float z,
+                            GateSendFn gateSendFn);
     };
 
 } // namespace MMO

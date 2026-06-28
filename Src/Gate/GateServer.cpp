@@ -133,7 +133,7 @@ namespace MMO
         // 注册消息回调
         auto weakSession = std::weak_ptr<GateSession>(session);
 
-        session->LowestLayer()->SetMessageHandler(
+        session->Socket()->SetMessageHandler(
             [this, weakSession](uint32 msgID, uint32 /*packetSessionID*/, const uint8 *body, size_t len) {
                 auto s = weakSession.lock();
                 if (s)
@@ -143,7 +143,7 @@ namespace MMO
             });
 
         // 注册断线回调
-        session->LowestLayer()->SetCloseHandler([this, sessionID, clientIP]() {
+        session->Socket()->SetCloseHandler([this, sessionID, clientIP]() {
             OnSessionDisconnect(sessionID);
             OnConnectionClosed(clientIP);
         });
@@ -234,7 +234,7 @@ namespace MMO
 
         // 从 SessionToken[0..1] 读取 worldServerId（大端）
         const auto *tokenRaw = reinterpret_cast<const uint8 *>(tokenBytes.data());
-        uint16 worldId =
+        uint16      worldId =
             static_cast<uint16>((static_cast<uint16>(tokenRaw[0]) << 8) | static_cast<uint16>(tokenRaw[1]));
 
         // 找对应 WorldServer 地址（MVP：第一个可用的）
@@ -317,11 +317,11 @@ namespace MMO
      * @param session  客户端会话
      * @param req      心跳请求
      */
-    void GateServer::OnHeartbeatReq(std::shared_ptr<GateSession> session, [[maybe_unused]] const Proto::HeartbeatReq &req)
+    void GateServer::OnHeartbeatReq(std::shared_ptr<GateSession>                session,
+                                    [[maybe_unused]] const Proto::HeartbeatReq &req)
     {
-
         Proto::HeartbeatRsp rsp;
-        auto nowMs = static_cast<uint64>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        auto                nowMs = static_cast<uint64>(std::chrono::duration_cast<std::chrono::milliseconds>(
                                              std::chrono::system_clock::now().time_since_epoch())
                                              .count());
         rsp.set_server_time(nowMs);
@@ -497,15 +497,17 @@ namespace MMO
             return;
         }
 
-        socket->LowestLayer().async_connect(*endpoints.begin(), [this, addr, socket](const asio::error_code &ec) {
-            if (ec)
-            {
-                Log::Error("GateServer: connect to '{}' failed: {}", addr, ec.message());
-                ScheduleReconnect(addr);
-                return;
-            }
-            OnWorldConnected(addr, socket);
-        });
+        socket->LowestLayer().async_connect(
+            *endpoints.begin(),
+            [this, addr, socket](const asio::error_code &ec) {
+                if (ec)
+                {
+                    Log::Error("GateServer: connect to '{}' failed: {}", addr, ec.message());
+                    ScheduleReconnect(addr);
+                    return;
+                }
+                OnWorldConnected(addr, socket);
+            });
     }
 
     /**

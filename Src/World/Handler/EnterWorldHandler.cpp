@@ -26,13 +26,13 @@ namespace MMO
         const uint8                              *lss,
         uint16                                    gateServerID,
         ECS::Scene                               &defaultScene,
-        std::function<void(uint32, ByteBuffer)>   gateSendFn)
+        GateSendFn                                gateSendFn)
     {
         Proto::LoginEnterWorldReq req;
         if (!req.ParseFromArray(body, static_cast<int>(len)))
         {
             Log::Warn("EnterWorld: protobuf parse failed ({} bytes)", len);
-            SendError(2001, "Invalid request", gateSendFn);
+            SendError(sessionID, 2001, "Invalid request", gateSendFn);
             return;
         }
 
@@ -40,7 +40,7 @@ namespace MMO
         if (static_cast<size_t>(req.session_token().size()) != Crypto::SessionToken::kTotalSize)
         {
             Log::Warn("EnterWorld: invalid session token size={}", req.session_token().size());
-            SendError(2002, "Invalid session token", gateSendFn);
+            SendError(sessionID, 2002, "Invalid session token", gateSendFn);
             return;
         }
 
@@ -49,7 +49,7 @@ namespace MMO
             static_cast<size_t>(req.session_token().size()));
         if (!tokenOpt)
         {
-            SendError(2002, "Invalid session token", gateSendFn);
+            SendError(sessionID, 2002, "Invalid session token", gateSendFn);
             return;
         }
 
@@ -57,7 +57,7 @@ namespace MMO
         if (!payloadOpt)
         {
             Log::Debug("EnterWorld: token verify failed (expired or tampered)");
-            SendError(2003, "Token expired or invalid", gateSendFn);
+            SendError(sessionID, 2003, "Token expired or invalid", gateSendFn);
             return;
         }
 
@@ -92,7 +92,7 @@ namespace MMO
         const uint8                              *sessionKey,
         uint64                                    clientRandom,
         ECS::Scene                               &defaultScene,
-        std::function<void(uint32, ByteBuffer)>   gateSendFn)
+        GateSendFn                                gateSendFn)
     {
         auto entity = defaultScene.CreateEntity();
 
@@ -113,7 +113,7 @@ namespace MMO
         Log::Info("EnterWorld: accountID={} → entity=({},{}) sessionID={}",
                   accountID, entity.sceneId, entity.entityId, sessionID);
 
-        SendRsp(entity.entityId, entity.sceneId, 0.0f, 0.0f, 0.0f, gateSendFn);
+        SendRsp(sessionID, entity.entityId, entity.sceneId, 0.0f, 0.0f, 0.0f, gateSendFn);
     }
 
     void EnterWorldHandler::HandleReconnect(
@@ -124,7 +124,7 @@ namespace MMO
         const uint8                              *reconnectSeed,
         size_t                                    seedLen,
         uint64                                    clientRandom,
-        std::function<void(uint32, ByteBuffer)>   gateSendFn)
+        GateSendFn                                gateSendFn)
     {
         // 找到旧 Session
         uint32 oldSessionID = 0;
@@ -162,11 +162,11 @@ namespace MMO
         Log::Info("EnterWorld: RECONNECT accountID={} sessionID {}→{}",
                   accountID, oldSessionID, sessionID);
 
-        SendRsp(ws.entity.entityId, ws.entity.sceneId, 0.0f, 0.0f, 0.0f, gateSendFn);
+        SendRsp(sessionID, ws.entity.entityId, ws.entity.sceneId, 0.0f, 0.0f, 0.0f, gateSendFn);
     }
 
-    void EnterWorldHandler::SendError(uint32 errorCode, const char *msg,
-                                      std::function<void(uint32, ByteBuffer)> gateSendFn)
+    void EnterWorldHandler::SendError(uint32 sessionID, uint32 errorCode, const char *msg,
+                                      GateSendFn gateSendFn)
     {
         Proto::LoginEnterWorldRsp rsp;
         rsp.mutable_error()->set_code(errorCode);
@@ -174,11 +174,12 @@ namespace MMO
         auto data = rsp.SerializeAsString();
         auto buf  = ByteBuffer::Copy(
             reinterpret_cast<const uint8 *>(data.data()), data.size());
-        gateSendFn(0, std::move(buf));
+        // 错误响应不加密（World 侧可能尚未完成 CryptoSession 初始化）
+        gateSendFn(sessionID, Proto::MSG_LOGIN_ENTER_WORLD_RSP, std::move(buf));
     }
 
-    void EnterWorldHandler::SendRsp(uint32 playerID, uint32 sceneID, float x, float y, float z,
-                                    std::function<void(uint32, ByteBuffer)> gateSendFn)
+    void EnterWorldHandler::SendRsp(uint32 sessionID, uint32 playerID, uint32 sceneID, float x, float y, float z,
+                                    GateSendFn gateSendFn)
     {
         Proto::LoginEnterWorldRsp rsp;
         rsp.mutable_error()->set_code(0);
@@ -191,7 +192,7 @@ namespace MMO
         auto data = rsp.SerializeAsString();
         auto buf  = ByteBuffer::Copy(
             reinterpret_cast<const uint8 *>(data.data()), data.size());
-        gateSendFn(0, std::move(buf));
+        gateSendFn(sessionID, Proto::MSG_LOGIN_ENTER_WORLD_RSP, std::move(buf));
     }
 
 } // namespace MMO

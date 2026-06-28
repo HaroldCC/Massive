@@ -50,7 +50,9 @@ namespace MMO
             return;
         }
 
+        // data = [PacketHeader:12B][Body]，PacketHeader = {length, msgID, sessionID}
         // 控制消息（sessionID == 0）：DisconnectNtf 等
+        // 控制消息不经过 PacketHeader 包装——body 直接以 [ctrlMsgID:4B][ctrlBody] 格式传输
         if (sessionID == 0 && len >= sizeof(uint32))
         {
             uint32 ctrlMsgID = ByteBuffer::Wrap(data, sizeof(uint32)).ReadUint32();
@@ -58,8 +60,13 @@ namespace MMO
             return;
         }
 
-        // 业务消息：读锁查找 session
-        uint32 msgID = ByteBuffer::Wrap(data, sizeof(uint32)).ReadUint32();
+        // 业务消息：从 PacketHeader.msgID（偏移 4）读取
+        if (len < sizeof(PacketHeader))
+        {
+            Log::Warn("GateConnection: undersized frame ({} bytes)", len);
+            return;
+        }
+        uint32 msgID = ByteBuffer::Wrap(data + sizeof(uint32), sizeof(uint32)).ReadUint32();
 
         {
             std::shared_lock lock(*_sessionsMtx);
@@ -102,11 +109,12 @@ namespace MMO
         // session 未找到——可能是首条 EnterWorldReq，走 Fallback 队列
         if (msgID == Proto::MSG_LOGIN_ENTER_WORLD_REQ)
         {
-            // 直接 Enqueue 到一个特殊队列，LogicThread 在 ProcessMessages 额外处理
+            // data = [PacketHeader:12B][Body]，只拷贝 Body（protobuf）
+            size_t bodyLen = len - sizeof(PacketHeader);
             LogicMessage logicMsg;
             logicMsg.sessionID = sessionID;
             logicMsg.msgID     = msgID;
-            logicMsg.body      = ByteBuffer::Copy(data, len);
+            logicMsg.body      = ByteBuffer::Copy(data + sizeof(PacketHeader), bodyLen);
             logicMsg.recvTime  = std::chrono::steady_clock::now();
             _unroutedQueue.Enqueue(std::move(logicMsg));
         }
@@ -129,10 +137,14 @@ namespace MMO
 
     void GateConnectionMgr::SendToGate(uint16 gateID, uint32 sessionID, ByteBuffer payload)
     {
-        // 构建 Gate 帧：[InternalHeader:4B(sessionID)][payload]
-        size_t  totalSize = sizeof(uint32) + payload.Size();
-        ByteBuffer frame = ByteBuffer::Own(totalSize);
-        frame.WriteUint32(sessionID);
+        // 构建 Gate 帧：[LengthPrefix:4B][InternalHeader:4B=sessionID][payload]
+        // Gate↔World 连接使用 Framing::LengthPrefix，Gate 侧 ProcessLengthPrefixed
+        // 先读 4B totalLen，再收齐 totalLen 字节。totalLen 包含后续 InternalHeader + payload。
+        uint32     internalLen = static_cast<uint32>(sizeof(uint32) + payload.Size());
+        uint32     totalLen    = sizeof(uint32) + internalLen;
+        ByteBuffer frame       = ByteBuffer::Own(totalLen);
+        frame.WriteUint32(totalLen);     // LengthPrefix（不含自身）
+        frame.WriteUint32(sessionID);    // InternalHeader.sessionID
         frame.WriteBytes(payload.Data(), payload.Size());
 
         {
