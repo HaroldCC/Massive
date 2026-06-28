@@ -1,0 +1,22 @@
+# TestClient 配置
+[server]
+host = "127.0.0.1"
+port = 8001
+
+[clients]
+count = 1
+spawn_rate_per_sec = 1.0
+duration_sec = 0   # 0 = 无限运行
+
+[behavior]
+heartbeat_interval_sec = 5
+move_interval_ms = 200
+move_speed = 5.0
+move_radius = 50.0
+
+[account]
+username_prefix = "testuser"
+password = "test123"
+
+[debug]
+verbose = false

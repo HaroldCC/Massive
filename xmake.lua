@@ -53,6 +53,7 @@ includes("Src/Gate/xmake.lua")
 includes("Src/World/xmake.lua")
 includes("Src/Center/xmake.lua")
 includes("Src/Social/xmake.lua")
+includes("Src/TestClient/xmake.lua")
 
 --- 聚合 Proto
 includes("Src/Proto/xmake.lua")
