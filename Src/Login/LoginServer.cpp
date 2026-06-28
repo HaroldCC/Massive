@@ -198,7 +198,7 @@ namespace MMO
             }
         }
 
-        int32_t accountId = row->account_id;
+        int32 accountID = row->account_id;
 
         // --- ECDH 密钥协商 ---
         auto keyPairOpt = Crypto::EcdhX25519::GenerateKeyPair();
@@ -247,7 +247,7 @@ namespace MMO
         auto tokenOpt = Crypto::SessionTokenBuilder::Issue(_lss,
                                                            sessionKeyBuf.Data(),
                                                            _worldServerID,
-                                                           static_cast<uint32>(accountId),
+                                                           static_cast<uint32>(accountID),
                                                            now + kTokenExpireSec);
         if (!tokenOpt)
         {
@@ -260,7 +260,7 @@ namespace MMO
         }
 
         // --- asio::post 回到 IO 线程，发送成功响应 ---
-        Log::Info("LoginServer: auth success for '{}' (accountId={})", username, accountId);
+        Log::Info("LoginServer: auth success for '{}' (accountID={})", username, accountID);
 
         asio::post(socket->LowestLayer().get_executor(),
                    [this, socket, keyPair = std::move(keyPair), token = std::move(*tokenOpt)]() mutable {
@@ -290,9 +290,18 @@ namespace MMO
         // SessionToken (46B)
         rsp.set_session_token(token.data, Crypto::SessionToken::kTotalSize);
 
-        auto data = rsp.SerializeAsString();
-        auto buf  = ByteBuffer::Copy(reinterpret_cast<const uint8 *>(data.data()), data.size());
-        socket->Send(std::move(buf));
+        auto rawData = rsp.SerializeAsString();
+        auto rawBody = reinterpret_cast<const uint8 *>(rawData.data());
+
+        // 构建 PacketHeader: [length:4B][msgID:4B][sessionID:4B][body]
+        uint32     totalLen = static_cast<uint32>(sizeof(PacketHeader) + rawData.size());
+        ByteBuffer frame    = ByteBuffer::Own(totalLen);
+        frame.WriteUint32(totalLen);
+        frame.WriteUint32(Proto::MSG_LOGIN_AUTH_RSP);
+        frame.WriteUint32(0); // sessionID=0 (短连接)
+        frame.WriteBytes(rawBody, rawData.size());
+
+        socket->Send(std::move(frame));
         socket->Close();
     }
 
@@ -320,9 +329,18 @@ namespace MMO
                 break;
         }
 
-        auto data = rsp.SerializeAsString();
-        auto buf  = ByteBuffer::Copy(reinterpret_cast<const uint8 *>(data.data()), data.size());
-        socket->Send(std::move(buf));
+        auto rawData = rsp.SerializeAsString();
+        auto rawBody = reinterpret_cast<const uint8 *>(rawData.data());
+
+        // 构建 PacketHeader: [length:4B][msgID:4B][sessionID:4B][body]
+        uint32     totalLen = static_cast<uint32>(sizeof(PacketHeader) + rawData.size());
+        ByteBuffer frame    = ByteBuffer::Own(totalLen);
+        frame.WriteUint32(totalLen);
+        frame.WriteUint32(Proto::MSG_LOGIN_AUTH_RSP);
+        frame.WriteUint32(0); // sessionID=0 (短连接)
+        frame.WriteBytes(rawBody, rawData.size());
+
+        socket->Send(std::move(frame));
         socket->Close();
     }
 

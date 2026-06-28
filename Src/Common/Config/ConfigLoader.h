@@ -43,7 +43,7 @@ namespace MMO
 
         // ── 类型安全取值（path 用点分，如 "network.port"；缺失返回 default）──
 
-        int         GetInt(const std::string &path, int defaultVal) const;
+        int32       GetInt(const std::string &path, int32 defaultVal) const;
         uint16      GetUInt16(const std::string &path, uint16 defaultVal) const;
         uint32      GetUInt32(const std::string &path, uint32 defaultVal) const;
         std::string GetString(const std::string &path, const std::string &defaultVal) const;

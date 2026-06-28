@@ -49,7 +49,7 @@ namespace MMO
         }
     }
 
-    int ConfigLoader::GetInt(const std::string &path, int defaultVal) const
+    int32 ConfigLoader::GetInt(const std::string &path, int32 defaultVal) const
     {
         auto &tbl = *static_cast<toml::table *>(_table);
         return tbl.at_path(path).value_or(defaultVal);
@@ -112,6 +112,10 @@ namespace MMO
             if (auto val = elem.value<std::string>())
             {
                 result.push_back(*val);
+            }
+            else if (auto val = elem.value<int64_t>())
+            {
+                result.push_back(std::to_string(*val));
             }
         }
         return result;

@@ -209,8 +209,12 @@ namespace MMO
                                   return;
                               }
 
-                              std::lock_guard lk(self->_writeMutex);
-                              self->_writeQueue.pop_front();
+                              // 在持锁状态下 pop_front，然后释放锁再递归 DoWrite
+                              // std::mutex 不可重入，不能在持锁时调用 DoWrite
+                              {
+                                  std::lock_guard lk(self->_writeMutex);
+                                  self->_writeQueue.pop_front();
+                              }
                               self->DoWrite(); // 链式写下一个
                           });
     }

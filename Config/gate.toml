@@ -8,7 +8,7 @@ max_connections = 20000
 
 [world]
 # WorldServer 内网地址列表（MVP 阶段静态配置）
-servers = ["127.0.0.1:8001", "127.0.0.1:8002"]
+servers = ["127.0.0.1:8002"]
 
 [heartbeat]
 client_timeout_sec = 60

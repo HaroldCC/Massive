@@ -5,17 +5,17 @@ io_threads = 4
 
 [center]
 host = "127.0.0.1"
-port = 7001
+port = 9000
 
 [database]
-conn_string = "host=127.0.0.1 port=6432 dbname=massive"
+conn_string = "host=127.0.0.1 port=5432 dbname=massive user=postgres password=cr11234"
 worker_count = 3
 
 [world]
 id = 1
 max_players = 10000
 # gate_addresses = ["127.0.0.1:9001"]
-persistent_scenes = [1]
+persistent_scenes = ["1"]
 
 [log]
 level = 0

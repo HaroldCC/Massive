@@ -73,6 +73,12 @@ namespace MMO
     {
         _running = true;
         _ioPool->Start();
+
+        Log::Info("CenterServer: running");
+        while (_running)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
     }
 
     void CenterServer::Stop()
