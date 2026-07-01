@@ -14,6 +14,7 @@
 #include <cctype>
 #include <cstdio>
 #include <fstream>
+#include <random>
 #include <sstream>
 
 namespace MMO
@@ -127,9 +128,28 @@ namespace MMO
             std::string fileContent = ReadFile(keyPath);
             if (fileContent.empty())
             {
-                Log::Error("LoginConfig: LSS not found (toml empty, key file '{}' missing or empty)",
-                           keyPath);
-                return std::nullopt;
+                // 自动生成 32B 随机密钥并写入文件
+                Log::Warn("LoginConfig: key file '{}' not found, generating random key", keyPath);
+                std::string newHex;
+                newHex.reserve(LoginConfig::kLSSSize * 2);
+                std::random_device rd;
+                for (size_t i = 0; i < LoginConfig::kLSSSize; ++i)
+                {
+                    uint8_t byte = static_cast<uint8_t>(rd());
+                    const char *hexDigits = "0123456789abcdef";
+                    newHex += hexDigits[byte >> 4];
+                    newHex += hexDigits[byte & 0x0f];
+                }
+                std::ofstream keyOut(keyPath);
+                if (!keyOut)
+                {
+                    Log::Error("LoginConfig: failed to write generated key to '{}'", keyPath);
+                    return std::nullopt;
+                }
+                keyOut << newHex;
+                keyOut.close();
+                fileContent = newHex;
+                Log::Info("LoginConfig: generated new LSS key -> '{}'", keyPath);
             }
             std::string hex = StripWhitespace(fileContent);
             if (!DecodeLSS(hex, cfg.security.loginServerSecret))

@@ -65,45 +65,49 @@ namespace MMO
 
         // LSS 密钥文件（与 LoginConfig 相同的 hex decode 逻辑）
         std::ifstream keyFile(keyPath);
-        if (keyFile)
+        if (!keyFile)
         {
-            std::string hexStr;
-            std::getline(keyFile, hexStr);
-            keyFile.close();
+            Log::Error("WorldConfig: key file '{}' not found. "
+                       "Start LoginServer first to auto-generate it.", keyPath);
+            return std::nullopt;
+        }
 
-            // strip whitespace
-            std::string hex;
-            for (char c : hexStr)
-            {
-                if (!std::isspace(static_cast<unsigned char>(c)))
-                    hex += c;
-            }
+        std::string hexStr;
+        std::getline(keyFile, hexStr);
+        keyFile.close();
 
-            if (hex.size() != WorldConfig::kLSSSize * 2)
+        // strip whitespace
+        std::string hex;
+        for (char c : hexStr)
+        {
+            if (!std::isspace(static_cast<unsigned char>(c)))
+                hex += c;
+        }
+
+        if (hex.size() != WorldConfig::kLSSSize * 2)
+        {
+            Log::Error("WorldConfig: key file '{}' hex size mismatch (expected {}, got {})",
+                       keyPath, WorldConfig::kLSSSize * 2, hex.size());
+            return std::nullopt;
+        }
+
+        for (size_t i = 0; i < WorldConfig::kLSSSize; ++i)
+        {
+            auto hexVal = [](char c) -> int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                return -1;
+            };
+            int hi = hexVal(hex[i * 2]);
+            int lo = hexVal(hex[i * 2 + 1]);
+            if (hi < 0 || lo < 0)
             {
-                Log::Error("WorldConfig: key file '{}' hex size mismatch (expected {}, got {})",
-                           keyPath, WorldConfig::kLSSSize * 2, hex.size());
+                Log::Error("WorldConfig: key file '{}' contains non-hex chars", keyPath);
                 return std::nullopt;
             }
-
-            for (size_t i = 0; i < WorldConfig::kLSSSize; ++i)
-            {
-                auto hexVal = [](char c) -> int {
-                    if (c >= '0' && c <= '9') return c - '0';
-                    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-                    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-                    return -1;
-                };
-                int hi = hexVal(hex[i * 2]);
-                int lo = hexVal(hex[i * 2 + 1]);
-                if (hi < 0 || lo < 0)
-                {
-                    Log::Error("WorldConfig: key file '{}' contains non-hex chars", keyPath);
-                    return std::nullopt;
-                }
-                cfg.security.loginServerSecret[i] =
-                    static_cast<uint8>((static_cast<unsigned>(hi) << 4) | static_cast<unsigned>(lo));
-            }
+            cfg.security.loginServerSecret[i] =
+                static_cast<uint8>((static_cast<unsigned>(hi) << 4) | static_cast<unsigned>(lo));
         }
 
         return cfg;
