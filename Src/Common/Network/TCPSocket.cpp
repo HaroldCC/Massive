@@ -7,11 +7,12 @@
 #include "Common/Log/Log.h"
 
 #include <asio/read.hpp>
+#include <asio/write.hpp>
 
 namespace MMO
 {
 
-    TCPSocket::TCPSocket(asio::ip::tcp::socket socket, Framing framing)
+    TCPSocket::TCPSocket(asio::ip::tcp::socket socket, EFraming framing)
         : _socket(std::move(socket))
         , _framing(framing)
     {
@@ -28,7 +29,6 @@ namespace MMO
         {
             return;
         }
-        _readBuffer.reserve(kMaxPacketSize);
         DoRead();
     }
 
@@ -61,16 +61,36 @@ namespace MMO
         DoClose();
     }
 
+    /**
+     * @brief 延迟关闭：写队列排空后再关闭
+     * @note 用于短连接场景（如 LoginServer 认证），Send 后调用此方法，
+     *       等所有异步写都完成后才真正关闭连接。参考 TrinityCore DelayedClose 模式。
+     */
+    void TCPSocket::DelayedClose()
+    {
+        std::unique_lock lock(_writeMutex);
+        if (_writeQueue.empty())
+        {
+            lock.unlock();
+            DoClose();
+        }
+        else
+        {
+            _pendingClose = true;
+        }
+    }
+
+    void TCPSocket::SendThenClose(ByteBuffer data)
+    {
+        Send(std::move(data));
+        DelayedClose();
+    }
+
     void TCPSocket::DoRead()
     {
         auto self = shared_from_this();
 
-        // 确保读缓冲有空间
         constexpr size_t kMaxReadBuffer = kMaxPacketSize * 4;
-        if (_readBuffer.capacity() < kMaxPacketSize)
-        {
-            _readBuffer.reserve(kMaxPacketSize);
-        }
         if (_readBuffer.size() >= kMaxReadBuffer)
         {
             Log::Error("TCPSocket: Read buffer exhausted ({} bytes), closing", _readBuffer.size());
@@ -78,25 +98,28 @@ namespace MMO
             return;
         }
 
-        // 至少有 4 KiB 空间可读
-        if (_readBuffer.capacity() - _readBuffer.size() < 4096)
-        {
-            size_t newCap = std::min(_readBuffer.capacity() + kMaxPacketSize, kMaxReadBuffer);
-            _readBuffer.reserve(newCap);
-        }
+        // reserve() 仅分配不构造 → async_read_some 写入未初始化内存
+        // resize() 先构造 → async_read_some 写入已初始化 → resize() 裁到实际大小
+        static constexpr size_t kReadChunk = 4096;
+        size_t oldSize = _readBuffer.size();
 
-        _socket.async_read_some(asio::buffer(_readBuffer.data() + _readBuffer.size(),
-                                             _readBuffer.capacity() - _readBuffer.size()),
-                                [self](const asio::error_code &ec, size_t bytesTransferred) {
+        if (_readBuffer.capacity() < oldSize + kReadChunk)
+        {
+            _readBuffer.reserve(oldSize + kReadChunk);
+        }
+        _readBuffer.resize(oldSize + kReadChunk);
+
+        _socket.async_read_some(asio::buffer(_readBuffer.data() + oldSize, kReadChunk),
+                                [self, oldSize](const asio::error_code &ec, size_t bytesTransferred) {
                                     if (ec)
                                     {
                                         self->HandleError(ec);
                                         return;
                                     }
 
-                                    self->_readBuffer.resize(self->_readBuffer.size() + bytesTransferred);
+                                    self->_readBuffer.resize(oldSize + bytesTransferred);
 
-                                    if (self->_framing == Framing::LengthPrefix)
+                                    if (self->_framing == EFraming::LengthPrefix)
                                     {
                                         self->ProcessLengthPrefixed();
                                     }
@@ -192,10 +215,17 @@ namespace MMO
     {
         auto self = shared_from_this();
 
-        std::lock_guard lock(_writeMutex);
+        std::unique_lock lock(_writeMutex);
         if (_writeQueue.empty())
         {
             _writing = false;
+            // 队列排空 + 标记延迟关闭 → 关闭连接
+            if (_pendingClose)
+            {
+                _pendingClose = false;
+                lock.unlock();
+                DoClose();
+            }
             return;
         }
 
@@ -212,7 +242,7 @@ namespace MMO
                               // 在持锁状态下 pop_front，然后释放锁再递归 DoWrite
                               // std::mutex 不可重入，不能在持锁时调用 DoWrite
                               {
-                                  std::lock_guard lk(self->_writeMutex);
+                                  std::unique_lock lk(self->_writeMutex);
                                   self->_writeQueue.pop_front();
                               }
                               self->DoWrite(); // 链式写下一个
