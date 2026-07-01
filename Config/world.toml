@@ -1,11 +1,11 @@
 # WorldServer 配置
 [network]
-internal_port = 8002
+internal_port = 9770
 io_threads = 4
 
 [center]
 host = "127.0.0.1"
-port = 9000
+port = 9660
 
 [database]
 conn_string = "host=127.0.0.1 port=5432 dbname=massive user=postgres password=cr11234"

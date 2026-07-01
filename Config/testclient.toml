@@ -1,7 +1,7 @@
 # TestClient 配置
 [server]
 host = "127.0.0.1"
-port = 8001
+port = 9551
 
 [clients]
 count = 1

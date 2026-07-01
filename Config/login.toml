@@ -1,7 +1,7 @@
 # LoginServer 配置
 
 [network]
-port = 8001
+port = 9551
 io_threads = 4
 
 [database]
@@ -20,5 +20,5 @@ level = 0
 dir = "logs"
 
 [world]
-gate_ips = ["127.0.0.1:9001"]
+gate_ips = ["127.0.0.1:9550"]
 world_server_id = 1
