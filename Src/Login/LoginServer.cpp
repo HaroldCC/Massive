@@ -301,8 +301,8 @@ namespace MMO
         frame.WriteUint32(0); // sessionID=0 (短连接)
         frame.WriteBytes(rawBody, rawData.size());
 
-        socket->Send(std::move(frame));
-        socket->Close();
+        // SendThenClose：写队列排空后自动关闭，避免 Send→立刻 Close 的时序 Bug
+        socket->SendThenClose(std::move(frame));
     }
 
     // ── Step 4: IO 线程 — 认证失败 → 错误 LoginAuthRsp + Send + Close ──
@@ -340,8 +340,7 @@ namespace MMO
         frame.WriteUint32(0); // sessionID=0 (短连接)
         frame.WriteBytes(rawBody, rawData.size());
 
-        socket->Send(std::move(frame));
-        socket->Close();
+        socket->SendThenClose(std::move(frame));
     }
 
 } // namespace MMO
