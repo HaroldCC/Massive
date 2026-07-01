@@ -35,6 +35,9 @@ namespace MMO
                 OnGateMessage(packetSessionID, data + sizeof(uint32), len - sizeof(uint32));
             });
 
+        // 必须在 move<unique_ptr> 之前 Start，否则 conn 为空指针
+        conn->socket->Start();
+
         {
             std::lock_guard lock(_gateMutex);
             _gateConns[gateID] = std::move(conn);

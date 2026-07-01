@@ -89,7 +89,7 @@ namespace MMO
         _gateConnMgr = std::make_unique<GateConnectionMgr>();
 
         // 监听 Gate 内部连接（LengthPrefix 帧协议）
-        _gateAcceptor = std::make_unique<TCPAcceptor>(*_ioPool, cfg.network.internalPort, Framing::LengthPrefix);
+        _gateAcceptor = std::make_unique<TCPAcceptor>(*_ioPool, cfg.network.internalPort, EFraming::LengthPrefix);
 
         // 使用一个简单的 gateID 自增计数器（MVP：单个 Gate 连接）
         static std::atomic<uint16> nextGateID {1};
@@ -230,37 +230,48 @@ namespace MMO
                 [this](uint32 sessionID, uint32 msgID, ByteBuffer rawBody) {
                     // 出站：完成加密 + PacketHeader 包装后通过 GateConnectionMgr 发回客户端
                     auto it = _sessions.find(sessionID);
-                    if (it != _sessions.end())
-                    {
-                        // 已创建 WorldSession → AES-GCM 加密
-                        auto encrypted = it->second.crypto.Encrypt(
-                            rawBody.Data(), rawBody.Size());
-                        if (encrypted.Size() == 0)
-                        {
-                            Log::Warn("WorldServer: encrypt failed for EnterWorldRsp session={}", sessionID);
-                            return;
-                        }
+                    bool hasSession = (it != _sessions.end());
 
-                        // 构建 PacketHeader: [length:4B][msgID:4B][sessionID:4B]
-                        uint32 totalLen = static_cast<uint32>(sizeof(PacketHeader) + encrypted.Size());
-                        ByteBuffer frame = ByteBuffer::Own(totalLen);
-                        frame.WriteUint32(totalLen);   // PacketHeader.length
-                        frame.WriteUint32(msgID);      // PacketHeader.msgID
-                        frame.WriteUint32(sessionID);  // PacketHeader.sessionID
-                        frame.WriteBytes(encrypted.Data(), encrypted.Size());
-
-                        _gateConnMgr->SendToGate(it->second.gateServerID, sessionID, std::move(frame));
-                    }
-                    else
+                    // EnterWorldRsp 不走加密（客户端尚未初始化 CryptoSession）
+                    if (msgID == Proto::MSG_LOGIN_ENTER_WORLD_RSP)
                     {
-                        // 尚未创建 WorldSession（错误响应）→ 明文 PacketHeader
                         uint32 totalLen = static_cast<uint32>(sizeof(PacketHeader) + rawBody.Size());
                         ByteBuffer frame = ByteBuffer::Own(totalLen);
                         frame.WriteUint32(totalLen);
                         frame.WriteUint32(msgID);
                         frame.WriteUint32(sessionID);
                         frame.WriteBytes(rawBody.Data(), rawBody.Size());
+                        _gateConnMgr->SendToGate(1, sessionID, std::move(frame));
+                        return;
+                    }
 
+                    if (hasSession)
+                    {
+                        auto encrypted = it->second.crypto.Encrypt(
+                            rawBody.Data(), rawBody.Size());
+                        if (encrypted.Size() == 0)
+                        {
+                            Log::Warn("WorldServer: encrypt failed for session={}", sessionID);
+                            return;
+                        }
+
+                        uint32 totalLen = static_cast<uint32>(sizeof(PacketHeader) + encrypted.Size());
+                        ByteBuffer frame = ByteBuffer::Own(totalLen);
+                        frame.WriteUint32(totalLen);
+                        frame.WriteUint32(msgID);
+                        frame.WriteUint32(sessionID);
+                        frame.WriteBytes(encrypted.Data(), encrypted.Size());
+
+                        _gateConnMgr->SendToGate(it->second.gateServerID, sessionID, std::move(frame));
+                    }
+                    else
+                    {
+                        uint32 totalLen = static_cast<uint32>(sizeof(PacketHeader) + rawBody.Size());
+                        ByteBuffer frame = ByteBuffer::Own(totalLen);
+                        frame.WriteUint32(totalLen);
+                        frame.WriteUint32(msgID);
+                        frame.WriteUint32(sessionID);
+                        frame.WriteBytes(rawBody.Data(), rawBody.Size());
                         _gateConnMgr->SendToGate(1, sessionID, std::move(frame));
                     }
                 });
