@@ -66,7 +66,7 @@ namespace MMO::TestClient
         _state = ClientState::ConnectingLogin;
 
         auto &ctx    = _pool.GetNextContext();
-        auto socket  = std::make_shared<TCPSocket>(asio::ip::tcp::socket(ctx), Framing::PacketHeader);
+        auto socket  = std::make_shared<TCPSocket>(asio::ip::tcp::socket(ctx), EFraming::PacketHeader);
 
         // 消息回调
         socket->SetMessageHandler([self = shared_from_this()](uint32 msgID, uint32 sessionID,
@@ -87,10 +87,14 @@ namespace MMO::TestClient
             }
         });
 
-        // 断线回调
+        // 断线回调（Login 短连接预期认证完毕连接会断开，不视为失败）
         socket->SetCloseHandler([self = shared_from_this()]() {
             self->_stats.RecordDisconnect();
-            if (self->_state != ClientState::Disconnecting && self->_state != ClientState::Failed)
+            // SendingAuth = 认证完毕 LoginServer 主动断开，是正常流程
+            // ConncetingGate/SendingEnterWorld/InWorld = 登录 socket 已替换
+            if (self->_state != ClientState::Disconnecting
+                && self->_state != ClientState::Failed
+                && self->_state != ClientState::SendingAuth)
             {
                 self->EnterFailedState("connection closed");
             }
@@ -243,7 +247,7 @@ namespace MMO::TestClient
         _state = ClientState::ConnectingGate;
 
         auto &ctx    = _pool.GetNextContext();
-        auto socket = std::make_shared<TCPSocket>(asio::ip::tcp::socket(ctx), Framing::PacketHeader);
+        auto socket = std::make_shared<TCPSocket>(asio::ip::tcp::socket(ctx), EFraming::PacketHeader);
 
         socket->SetMessageHandler([self = shared_from_this()](uint32 msgID, uint32 sessionID,
                                                               const uint8 *body, size_t len) {

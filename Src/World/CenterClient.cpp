@@ -39,7 +39,7 @@ namespace MMO
             return false;
         }
 
-        _socket = std::make_shared<TCPSocket>(asio::ip::tcp::socket(ctx), Framing::LengthPrefix);
+        _socket = std::make_shared<TCPSocket>(asio::ip::tcp::socket(ctx), EFraming::LengthPrefix);
         bool connected = false;
         asio::error_code connectEc;
 

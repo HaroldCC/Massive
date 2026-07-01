@@ -48,7 +48,7 @@ namespace MMO
         _ioPool = std::make_unique<IOContextPool>(static_cast<size_t>(cfg.network.ioThreads));
 
         // 监听客户端连接（PacketHeader 帧协议）
-        _acceptor = std::make_unique<TCPAcceptor>(*_ioPool, cfg.network.port, Framing::PacketHeader);
+        _acceptor = std::make_unique<TCPAcceptor>(*_ioPool, cfg.network.port, EFraming::PacketHeader);
 
         _acceptor->Start([this](std::shared_ptr<TCPSocket> socket) {
             OnNewClientConnection(std::move(socket));
@@ -485,7 +485,7 @@ namespace MMO
 
         auto &ctx = _ioPool->GetNextContext();
 
-        auto socket = std::make_shared<TCPSocket>(asio::ip::tcp::socket(ctx), Framing::LengthPrefix);
+        auto socket = std::make_shared<TCPSocket>(asio::ip::tcp::socket(ctx), EFraming::LengthPrefix);
 
         asio::ip::tcp::resolver resolver(ctx);
         asio::error_code        resolveEc;

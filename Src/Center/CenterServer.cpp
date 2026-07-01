@@ -19,7 +19,7 @@ namespace MMO
     {
         _ioPool = std::make_unique<IOContextPool>(static_cast<size_t>(cfg.network.ioThreads));
         // 内部 RPC 连接使用 LengthPrefix 帧协议
-        _acceptor = std::make_unique<TCPAcceptor>(*_ioPool, cfg.network.port, Framing::LengthPrefix);
+        _acceptor = std::make_unique<TCPAcceptor>(*_ioPool, cfg.network.port, EFraming::LengthPrefix);
         // 注册 RPC handler
         // ── 服务注册 ──
         _rpcHandlers.Register<Proto::Internal::RegisterWorldReq>(

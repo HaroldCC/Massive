@@ -11,7 +11,7 @@
 namespace MMO
 {
 
-    TCPAcceptor::TCPAcceptor(IOContextPool &pool, uint16 port, Framing framing)
+    TCPAcceptor::TCPAcceptor(IOContextPool &pool, uint16 port, EFraming framing)
         : _pool(pool)
         , _acceptor(pool.GetNextContext(), asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port))
         , _framing(framing)

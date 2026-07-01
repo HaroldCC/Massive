@@ -5,7 +5,7 @@
  * 监听端口，accept 新连接 → 交给 IOContextPool Round-Robin 分配的 io_context 线程
  * → 构造 TCPSocket 并回调上层。
  *
- * 帧协议模式：由构造参数指定 Framing，传递给每个 accept 的 TCPSocket。
+ * 帧协议模式：由构造参数指定 EFraming，传递给每个 accept 的 TCPSocket。
  */
 #pragma once
 
@@ -32,9 +32,9 @@ namespace MMO
          * @brief 构造接受器
          * @param pool    IOContextPool 引用（分配新连接的 io_context）
          * @param port    监听端口
-         * @param framing 帧协议模式（默认 PacketHeader）
+         * @param framing 帧协议模式（默认 EFraming::PacketHeader）
          */
-        TCPAcceptor(IOContextPool &pool, uint16 port, Framing framing = Framing::PacketHeader);
+        TCPAcceptor(IOContextPool &pool, uint16 port, EFraming framing = EFraming::PacketHeader);
 
         TCPAcceptor(const TCPAcceptor &)            = delete;
         TCPAcceptor &operator=(const TCPAcceptor &) = delete;
@@ -56,7 +56,7 @@ namespace MMO
         IOContextPool          &_pool;
         asio::ip::tcp::acceptor _acceptor;
         AcceptHandler           _onAccept;
-        Framing                 _framing;
+        EFraming                 _framing;
         bool                    _started = false;
     };
 
