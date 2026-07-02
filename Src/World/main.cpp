@@ -8,26 +8,26 @@
  *   3. DBWorkerPool::Init
  *   4. WorldServer::Init（CenterClient + GateAcceptor + LogicThread）
  *   5. WorldServer::Run（ioPool.Start + 等待 LogicThread）
+ *
+ * 用法：
+ *   WorldServer.exe
+ *   WorldServer.exe --config-path "F:/Dev/Massive/Config/world.toml"
+ *   WorldServer.exe --config-path "..." --key-path "..."
  */
 #include "World/WorldConfig.h"
 #include "World/WorldServer.h"
 
+#include "Common/Core/Args.h"
 #include "Common/Core/Stacktrace.h"
 #include "Common/DB/DBWorkerPool.h"
 #include "Common/Log/Log.h"
 
 int main(int argc, char **argv)
 {
-    std::string configPath = "Config/world.toml";
-    std::string keyPath    = "Config/login.key";
-    if (argc >= 2)
-    {
-        configPath = argv[1];
-    }
-    if (argc >= 3)
-    {
-        keyPath = argv[2];
-    }
+    MMO::Args args(argc, argv);
+
+    auto configPath = args.Get("--config-path", "Config/world.toml");
+    auto keyPath    = args.Get("--key-path", "Config/login.key");
 
     auto cfg = MMO::WorldConfig::Load(configPath, keyPath);
     if (!cfg)

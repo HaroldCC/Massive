@@ -7,21 +7,23 @@
  *   2. Log::Init
  *   3. GateServer::Init（IOContextPool + TCPAcceptor + 连 World）
  *   4. GateServer::Run（ioPool.Start + 定时超时检查）
+ *
+ * 用法：
+ *   GateServer.exe
+ *   GateServer.exe --config-path "F:/Dev/Massive/Config/gate.toml"
  */
 #include "Gate/GateConfig.h"
 #include "Gate/GateServer.h"
 
+#include "Common/Core/Args.h"
 #include "Common/Core/Stacktrace.h"
 #include "Common/Log/Log.h"
 
 int main(int argc, char **argv)
 {
-    // 默认配置路径
-    std::string configPath = "Config/gate.toml";
-    if (argc >= 2)
-    {
-        configPath = argv[1];
-    }
+    MMO::Args args(argc, argv);
+
+    auto configPath = args.Get("--config-path", "Config/gate.toml");
 
     auto cfg = MMO::GateConfig::Load(configPath);
     if (!cfg)
