@@ -20,7 +20,7 @@ add_rules("plugin.compile_commands.autoupdate", {outputdir = "$(projectdir)/buil
 
 set_targetdir(path.join("Bin", "$(plat)-$(arch)-$(mode)"))
 
-set_rundir(os.projectdir())
+-- set_rundir(os.projectdir())  -- 去掉 rundir，各 exe 通过 --config-path 参数接收绝对路径
 
 --- 全局编译器标志
 if is_mode("debug") then
@@ -163,154 +163,119 @@ task("format")
 
 --
 -- 自定义 up/down/logs task：本地开发环境一键起服/停服/看日志
--- xmake run <target> 通过 set_targetdir 路径找二进制并阻塞执行（Ctrl+C 退出）。
--- 这里用 cmd /c start /B (Win) / & (Unix) 做后台启动 + 端口轮询做健康检查。
+--
+-- 设计原则：
+--   xmake.lua 保有服务器拓扑表 _servers（唯一数据源），通过 stdin JSON 传给 Python。
+--   Python (Tools/ServerCtl.py) 负责所有进程管理、端口探测、日志跟踪等具体操作。
+--   xmake task 壳只做：找 Python + 拼 JSON payload + os.execv。
+--
+-- 注意：import/find_tool/config.load 等沙箱函数只在 on_run 内可用，
+--       所以辅助函数也定义在各 on_run 内部。文件级只放纯数据 + 纯字符串函数。
 --
 local _servers = {
-    { name = "CenterServer", bin = "CenterServer.exe", port = 9660, delay_ms = 1000 },
-    { name = "WorldServer",  bin = "WorldServer.exe",  port = 9770, delay_ms = 2000 },
-    { name = "LoginServer",  bin = "LoginServer.exe",  port = 9551, delay_ms = 1000 },
-    { name = "GateServer",   bin = "GateServer.exe",   port = 9550, delay_ms = 2000 },
+    { name = "CenterServer", bin = "CenterServer.exe", port = 9660, start_order = 1,
+      config = "Config/center.toml" },
+    { name = "WorldServer",  bin = "WorldServer.exe",  port = 9770, start_order = 2,
+      config = "Config/world.toml",  key_config = "Config/login.key" },
+    { name = "LoginServer",  bin = "LoginServer.exe",  port = 9551, start_order = 3,
+      config = "Config/login.toml",  key_config = "Config/login.key" },
+    { name = "GateServer",   bin = "GateServer.exe",   port = 9550, start_order = 4,
+      config = "Config/gate.toml" },
 }
+table.sort(_servers, function(a, b) return a.start_order < b.start_order end)
 
-local function _is_win() return os.host() == "windows" end
-
-local function _pids_dir()
-    return path.join(os.projectdir(), ".pids")
+--- 文件级纯函数：计算二进制目录
+--- @param  mode  string  "debug"|"release"|"releasedbg"
+--- @return       string  absolute path
+local function _bindir(mode)
+    return path.join(os.projectdir(), "Bin", os.host() .. "-" .. os.arch() .. "-" .. (mode or "debug"))
 end
 
+
+-- =========================================================================
+-- task: up
+-- =========================================================================
 task("up")
     set_category("run")
     on_run(function ()
+        import("core.base.json")
         import("core.project.config")
         config.load()
         local mode = config.get("mode") or "debug"
-        local bdir = path.join(os.projectdir(), "Bin", os.host() .. "-" .. os.arch() .. "-" .. mode)
-        local projectdir = os.projectdir()
-        os.mkdir(_pids_dir())
-
-        cprint("${bright green}═════════════════════════════════")
-        cprint("   Massive — 一键起服")
-        cprint("═════════════════════════════════${clear}")
-
-        for _, srv in ipairs(_servers) do
-            local bin = path.join(bdir, srv.bin)
-            if not os.isfile(bin) then
-                cprint("${red}✗ %s: 找不到二进制 → %s${clear}", srv.name, bin)
-                cprint("${yellow}  请先执行 xmake build${clear}")
-                return
-            end
-            cprint("${yellow}▶${clear} %-12s starting...", srv.name)
-            if _is_win() then
-                -- start /B 后台 + 日志重定向到 logs/ 避免终端泄漏
-                os.mkdir(path.join(bdir, "logs"))
-                local logfile = path.join(bdir, "logs", srv.name:lower() .. ".log")
-                os.exec("cmd /c start /B \"\" \"" .. bin .. "\" > \"" .. logfile .. "\" 2>&1", {curdir = projectdir})
-            else
-                os.exec("\"" .. bin .. "\" >/dev/null 2>&1 & echo $! > "
-                    .. _pids_dir() .. "/" .. srv.name:lower() .. ".pid", {curdir = projectdir})
-            end
-            os.sleep(srv.delay_ms)
-        end
-
-        os.sleep(1000)
-        cprint("${bright green}──── 端口健康检查 ────${clear}")
-        local all_ok = true
-        for _, srv in ipairs(_servers) do
-            local ok = false
-            if _is_win() then
-                ok = os.exec("cmd /c \"netstat -ano | findstr \\\"LISTENING\\\" | findstr \\\":" .. srv.port .. "\\\" >nul 2>nul\"")
-            else
-                ok = os.exec("ss -tlnp 2>/dev/null | grep " .. srv.port
-                    .. " || netstat -tlnp 2>/dev/null | grep " .. srv.port)
-            end
-            if ok then
-                cprint("${green}✓ %-12s :%d (LISTEN)${clear}", srv.name, srv.port)
-            else
-                cprint("${red}✗ %-12s :%d (NOT LISTENING)${clear}", srv.name, srv.port)
-                all_ok = false
-            end
-        end
-
-        if all_ok then
-            cprint("${bright green}═════════════════════════════════")
-            cprint("   全部就绪 ✓")
-            cprint("   xmake logs   — 查看日志")
-            cprint("   xmake down   — 停服")
-            cprint("═════════════════════════════════${clear}")
-        else
-            cprint("${yellow}部分服务未就绪，请检查日志: xmake logs${clear}")
-        end
+        local payload = json.encode({
+            action = "up",
+            project_dir = os.projectdir(),
+            bin_dir = _bindir(mode),
+            pids_dir = path.join(os.projectdir(), ".pids"),
+            servers = _servers,
+        })
+        local payload_file = path.join(os.projectdir(), ".pids", "payload.json")
+        os.mkdir(path.join(os.projectdir(), ".pids"))
+        io.writefile(payload_file, payload)
+        -- cmd /c 强制走 Windows cmd.com / cmd.exe，绕过 Scoop shim 的 CreateProcess 问题
+        os.exec("cmd /c python Tools/ServerCtl.py \"" .. payload_file .. "\"",
+            {curdir = os.projectdir()})
     end)
-
     set_menu {
         usage = "xmake up",
         description = "一键起服：Center → World → Login → Gate + 端口健康检查。"
     }
 
+
+-- =========================================================================
+-- task: down
+-- =========================================================================
 task("down")
     set_category("run")
     on_run(function ()
-        cprint("${bright yellow}═════════════════════════════════")
-        cprint("   Massive — 停服")
-        cprint("═════════════════════════════════${clear}")
-
-        for i = #_servers, 1, -1 do
-            local srv = _servers[i]
-            local ok = os.execv("taskkill", {"/F", "/IM", srv.bin}, {curdir = os.projectdir()})
-            if ok then
-                cprint("${yellow}✗${clear} %s", srv.name)
-            else
-                cprint("${yellow}?${clear} %s (未启动)", srv.name)
-            end
-            os.sleep(300)
-        end
-
-        os.tryrm(_pids_dir())
-        cprint("${green}全部服务已停止.${clear}")
-    end)
-
-    set_menu {
-        usage = "xmake down",
-        description = "停服：Gate → Login → World → Center。"
-    }
-
-task("logs")
-    set_category("run")
-    on_run(function ()
+        import("core.base.json")
         import("core.project.config")
         config.load()
         local mode = config.get("mode") or "debug"
-        local logdir = path.join(os.projectdir(), "Bin", os.host() .. "-" .. os.arch() .. "-" .. mode, "logs")
-        if not os.isdir(logdir) then
-            cprint("${red}日志目录不存在: %s${clear}", logdir)
-            cprint("${yellow}请先执行 xmake up 启动服务${clear}")
-            return
-        end
-
-        local logfiles = {}
-        for _, srv in ipairs(_servers) do
-            local log = path.join(logdir, srv.name:lower() .. ".log")
-            if os.isfile(log) then
-                table.insert(logfiles, "\"" .. log .. "\"")
-            end
-        end
-
-        if #logfiles == 0 then
-            cprint("${red}没有找到日志文件${clear}")
-            return
-        end
-
-        cprint("${cyan}=== Tailing %d logs (Ctrl+C 退出) ===${clear}", #logfiles)
-        if _is_win() then
-            os.exec("powershell -Command \"Get-Content -Wait -Tail 20 "
-                .. table.concat(logfiles, ",") .. "\"", {curdir = os.projectdir()})
-        else
-            os.exec("tail -f " .. table.concat(logfiles, " "), {curdir = os.projectdir()})
-        end
+        local payload = json.encode({
+            action = "down",
+            project_dir = os.projectdir(),
+            bin_dir = _bindir(mode),
+            pids_dir = path.join(os.projectdir(), ".pids"),
+            servers = _servers,
+        })
+        local payload_file = path.join(os.projectdir(), ".pids", "payload.json")
+        os.mkdir(path.join(os.projectdir(), ".pids"))
+        io.writefile(payload_file, payload)
+        os.exec("cmd /c python Tools/ServerCtl.py \"" .. payload_file .. "\"",
+            {curdir = os.projectdir()})
     end)
+    set_menu {
+        usage = "xmake down",
+        description = "停服：Gate → Login → World → Center（读 pidfile 精准终止）。"
+    }
 
+
+-- =========================================================================
+-- task: logs
+-- =========================================================================
+task("logs")
+    set_category("run")
+    on_run(function ()
+        import("core.base.json")
+        import("core.project.config")
+        config.load()
+        local mode = config.get("mode") or "debug"
+        local payload = json.encode({
+            action = "logs",
+            project_dir = os.projectdir(),
+            bin_dir = _bindir(mode),
+            pids_dir = path.join(os.projectdir(), ".pids"),
+            servers = _servers,
+        })
+        local payload_file = path.join(os.projectdir(), ".pids", "payload.json")
+        os.mkdir(path.join(os.projectdir(), ".pids"))
+        io.writefile(payload_file, payload)
+        os.exec("cmd /c python Tools/ServerCtl.py \"" .. payload_file .. "\"",
+            {curdir = os.projectdir()})
+    end)
     set_menu {
         usage = "xmake logs",
-        description = "tail -f 模式查看所有服务日志。"
+        description = "跟踪所有服务日志（Win：独立窗口 / Linux：tail -f）。"
     }
+
