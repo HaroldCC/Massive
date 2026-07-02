@@ -4,7 +4,7 @@
  */
 #pragma once
 
-#include "World/SceneManager.h"  // SceneConfig
+#include "World/SceneManager.h" // SceneConfig
 
 namespace MMO
 {
@@ -15,7 +15,7 @@ namespace MMO
 
         struct Network
         {
-            uint16 internalPort = 8002;  // 内网监听端口（Gate 连接用）
+            uint16 internalPort = 8002; // 内网监听端口（Gate 连接用）
             int    ioThreads    = 4;
         } network;
 
@@ -38,9 +38,9 @@ namespace MMO
 
         struct WorldInfo
         {
-            uint16              worldServerID   = 1;
-            uint16              maxPlayers      = 10000;
-            std::vector<std::string> gateAddresses; // Gate 内网地址列表
+            uint16                   worldServerID = 1;
+            uint16                   maxPlayers    = 10000;
+            std::vector<std::string> gateAddresses;    // Gate 内网地址列表
             std::vector<SceneConfig> persistentScenes; // 常驻场景配置
         } world;
 

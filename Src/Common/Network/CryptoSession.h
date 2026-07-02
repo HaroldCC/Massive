@@ -52,8 +52,15 @@ namespace MMO
          */
         void RotateReconnectKey(const uint8 *reconnectSeed, size_t seedLen);
 
-        const uint8 *SessionKey() const { return _sessionKey; }
-        uint64       ClientRandom() const { return _clientRandom; }
+        const uint8 *SessionKey() const
+        {
+            return _sessionKey;
+        }
+
+        uint64 ClientRandom() const
+        {
+            return _clientRandom;
+        }
 
         /**
          * @brief 出站加密

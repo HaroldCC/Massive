@@ -40,7 +40,7 @@ namespace MMO
         }
 
         _socket = std::make_shared<TCPSocket>(asio::ip::tcp::socket(ctx), EFraming::LengthPrefix);
-        bool connected = false;
+        bool             connected = false;
         asio::error_code connectEc;
 
         // 同步连接（Init 阶段，阻塞可接受）
@@ -53,37 +53,37 @@ namespace MMO
         }
 
         // 注册回调
-        _socket->SetMessageHandler([this](uint32 /*msgID*/, uint32 /*sessionID*/,
-                                          const uint8 *body, size_t len) {
-            // LengthPrefix 模式下收到的是 RPC 帧 → 解析 RPCHeader 路由
-            if (len < sizeof(RPCHeader))
-            {
-                return;
-            }
-            auto   headerBuf = ByteBuffer::Wrap(body, sizeof(RPCHeader));
-            uint32 rpcMsgID  = headerBuf.ReadUint32();
-            uint64 requestID = headerBuf.ReadUint64();
-            /*traceID=*/headerBuf.ReadUint64();
-            /*type=*/  headerBuf.ReadUint8();
-
-            size_t       protoLen  = len - sizeof(RPCHeader);
-            const uint8 *protoData = body + sizeof(RPCHeader);
-
-            if (rpcMsgID == Proto::Internal::MSG_REGISTER_WORLD_RSP)
-            {
-                Proto::Internal::RegisterWorldRsp rsp;
-                if (rsp.ParseFromArray(protoData, static_cast<int>(protoLen)) && rsp.ok())
+        _socket->SetMessageHandler(
+            [this](uint32 /*msgID*/, uint32 /*sessionID*/, const uint8 *body, size_t len) {
+                // LengthPrefix 模式下收到的是 RPC 帧 → 解析 RPCHeader 路由
+                if (len < sizeof(RPCHeader))
                 {
-                    _connected.store(true, std::memory_order_release);
-                    Log::Info("CenterClient: registered as worldServerID={}", _worldServerID);
+                    return;
                 }
-            }
-            else
-            {
-                // 其他 RPC 响应 → 交给 RPCClient 按 requestID 匹配回调
-                _rpcClient.OnResponse(requestID, protoData, protoLen);
-            }
-        });
+                auto   headerBuf = ByteBuffer::Wrap(body, sizeof(RPCHeader));
+                uint32 rpcMsgID  = headerBuf.ReadUint32();
+                uint64 requestID = headerBuf.ReadUint64();
+                /*traceID=*/headerBuf.ReadUint64();
+                /*type=*/headerBuf.ReadUint8();
+
+                size_t       protoLen  = len - sizeof(RPCHeader);
+                const uint8 *protoData = body + sizeof(RPCHeader);
+
+                if (rpcMsgID == Proto::Internal::MSG_REGISTER_WORLD_RSP)
+                {
+                    Proto::Internal::RegisterWorldRsp rsp;
+                    if (rsp.ParseFromArray(protoData, static_cast<int>(protoLen)) && rsp.ok())
+                    {
+                        _connected.store(true, std::memory_order_release);
+                        Log::Info("CenterClient: registered as worldServerID={}", _worldServerID);
+                    }
+                }
+                else
+                {
+                    // 其他 RPC 响应 → 交给 RPCClient 按 requestID 匹配回调
+                    _rpcClient.OnResponse(requestID, protoData, protoLen);
+                }
+            });
 
         _socket->Start();
 
@@ -93,8 +93,7 @@ namespace MMO
         req.set_address(address);
         req.set_max_players(maxPlayers);
 
-        auto frame = BuildRPCFrame(
-            Proto::Internal::MSG_REGISTER_WORLD_REQ, 0, ERPCType::Request, 0, req);
+        auto frame = BuildRPCFrame(Proto::Internal::MSG_REGISTER_WORLD_REQ, 0, ERPCType::Request, 0, req);
         if (frame.Size() > 0)
         {
             _socket->Send(std::move(frame));

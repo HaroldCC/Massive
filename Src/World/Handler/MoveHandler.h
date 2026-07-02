@@ -24,12 +24,11 @@ namespace MMO
          * @param len        数据长度
          * @param gateSendFn 出站回调
          */
-        static void Handle(
-            uint32                                  sessionID,
-            WorldSession                           &ws,
-            const uint8                            *body,
-            size_t                                  len,
-            std::function<void(uint32, ByteBuffer)> gateSendFn);
+        static void Handle(uint32                                  sessionID,
+                           WorldSession                           &ws,
+                           const uint8                            *body,
+                           size_t                                  len,
+                           std::function<void(uint32, ByteBuffer)> gateSendFn);
     };
 
 } // namespace MMO

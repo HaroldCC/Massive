@@ -31,7 +31,7 @@ namespace MMO
         constexpr char kKeyDomain[]  = "massive-reconnect-key-v1";
         constexpr char kRandDomain[] = "massive-reconnect-rand-v1";
         uint8          combined[64 + sizeof(kKeyDomain)];
-        size_t copyLen = seedLen;
+        size_t         copyLen = seedLen;
         if (seedLen > 64)
         {
             Log::Warn("CryptoSession: reconnect seed too large ({} > 64), truncating", seedLen);

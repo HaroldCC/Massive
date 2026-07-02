@@ -14,12 +14,11 @@
 namespace MMO
 {
 
-    void MoveHandler::Handle(
-        uint32                                  sessionID,
-        WorldSession                           &ws,
-        const uint8                            *body,
-        size_t                                  len,
-        std::function<void(uint32, ByteBuffer)> gateSendFn)
+    void MoveHandler::Handle(uint32                                  sessionID,
+                             WorldSession                           &ws,
+                             const uint8                            *body,
+                             size_t                                  len,
+                             std::function<void(uint32, ByteBuffer)> gateSendFn)
     {
         Proto::MoveReq req;
         if (!req.ParseFromArray(body, static_cast<int>(len)))
@@ -39,7 +38,11 @@ namespace MMO
         auto &pos = req.position();
 
         Log::Debug("MoveHandler: session={} pos=({:.1f}, {:.1f}, {:.1f}) spd={}",
-                   sessionID, pos.x(), pos.y(), pos.z(), req.speed());
+                   sessionID,
+                   pos.x(),
+                   pos.y(),
+                   pos.z(),
+                   req.speed());
 
         // 响应：服务器位置（MVP 直接回传，不做纠正）
         Proto::MoveRsp rsp;
@@ -47,13 +50,12 @@ namespace MMO
         rsp.mutable_position()->set_x(pos.x());
         rsp.mutable_position()->set_y(pos.y());
         rsp.mutable_position()->set_z(pos.z());
-        rsp.set_server_time(static_cast<uint32>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count()));
+        rsp.set_server_time(static_cast<uint32>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                    std::chrono::system_clock::now().time_since_epoch())
+                                                    .count()));
 
         auto data = rsp.SerializeAsString();
-        auto buf = ByteBuffer::Copy(
-            reinterpret_cast<const uint8 *>(data.data()), data.size());
+        auto buf  = ByteBuffer::Copy(reinterpret_cast<const uint8 *>(data.data()), data.size());
         gateSendFn(sessionID, std::move(buf));
     }
 

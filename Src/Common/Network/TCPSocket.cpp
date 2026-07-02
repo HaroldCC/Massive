@@ -101,7 +101,7 @@ namespace MMO
         // reserve() 仅分配不构造 → async_read_some 写入未初始化内存
         // resize() 先构造 → async_read_some 写入已初始化 → resize() 裁到实际大小
         static constexpr size_t kReadChunk = 4096;
-        size_t oldSize = _readBuffer.size();
+        size_t                  oldSize    = _readBuffer.size();
 
         if (_readBuffer.capacity() < oldSize + kReadChunk)
         {

@@ -56,7 +56,7 @@ namespace MMO
         IOContextPool          &_pool;
         asio::ip::tcp::acceptor _acceptor;
         AcceptHandler           _onAccept;
-        EFraming                 _framing;
+        EFraming                _framing;
         bool                    _started = false;
     };
 

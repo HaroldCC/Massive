@@ -174,7 +174,7 @@ namespace MMO
         void HandleError(const asio::error_code &ec);
 
         asio::ip::tcp::socket _socket;
-        EFraming               _framing;
+        EFraming              _framing;
 
         // 读缓冲
         std::vector<uint8>      _readBuffer;                  // 累积缓冲
@@ -182,7 +182,7 @@ namespace MMO
         // 写缓冲
         std::mutex             _writeMutex;
         std::deque<ByteBuffer> _writeQueue;
-        bool                   _writing = false;
+        bool                   _writing      = false;
         bool                   _pendingClose = false; // DelayedClose 标记：队列排空后关闭
 
         // 状态

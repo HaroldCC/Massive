@@ -26,8 +26,8 @@ namespace MMO
 {
 
     /**
- * @brief RPC handler 分发器（Center/Social 侧）
- */
+     * @brief RPC handler 分发器（Center/Social 侧）
+     */
     using RPCServerDispatcher = MessageDispatcher<RPCContext>;
 
 } // namespace MMO

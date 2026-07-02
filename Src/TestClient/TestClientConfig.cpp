@@ -23,29 +23,25 @@ namespace MMO::TestClient
             if (auto server = tbl["server"].as_table())
             {
                 cfg.loginHost = server->get("host")->value_or("127.0.0.1");
-                cfg.loginPort = static_cast<uint16>(
-                    server->get("port")->value_or(9000));
+                cfg.loginPort = static_cast<uint16>(server->get("port")->value_or(9000));
             }
 
             // [clients]
             if (auto clients = tbl["clients"].as_table())
             {
-                cfg.clientCount      = static_cast<uint32>(clients->get("count")->value_or(1));
-                cfg.spawnRatePerSec  = clients->get("spawn_rate_per_sec")->value_or(1.0);
-                cfg.durationSec      = static_cast<uint32>(clients->get("duration_sec")->value_or(60));
+                cfg.clientCount     = static_cast<uint32>(clients->get("count")->value_or(1));
+                cfg.spawnRatePerSec = clients->get("spawn_rate_per_sec")->value_or(1.0);
+                cfg.durationSec     = static_cast<uint32>(clients->get("duration_sec")->value_or(60));
             }
 
             // [behavior]
             if (auto behavior = tbl["behavior"].as_table())
             {
-                cfg.heartbeatIntervalSec = static_cast<uint32>(
-                    behavior->get("heartbeat_interval_sec")->value_or(5));
-                cfg.moveIntervalMs = static_cast<uint32>(
-                    behavior->get("move_interval_ms")->value_or(200));
-                cfg.moveSpeed = static_cast<float>(
-                    behavior->get("move_speed")->value_or(5.0));
-                cfg.moveRadius = static_cast<float>(
-                    behavior->get("move_radius")->value_or(50.0f));
+                cfg.heartbeatIntervalSec =
+                    static_cast<uint32>(behavior->get("heartbeat_interval_sec")->value_or(5));
+                cfg.moveIntervalMs = static_cast<uint32>(behavior->get("move_interval_ms")->value_or(200));
+                cfg.moveSpeed      = static_cast<float>(behavior->get("move_speed")->value_or(5.0));
+                cfg.moveRadius     = static_cast<float>(behavior->get("move_radius")->value_or(50.0f));
             }
 
             // [account]
@@ -59,7 +55,9 @@ namespace MMO::TestClient
             cfg.verbose = tbl["debug"]["verbose"].value_or(false);
 
             Log::Info("TestClientConfig: loaded from {} ({} clients, {}s)",
-                      path, cfg.clientCount, cfg.durationSec);
+                      path,
+                      cfg.clientCount,
+                      cfg.durationSec);
             return cfg;
         }
         catch (const toml::parse_error &e)

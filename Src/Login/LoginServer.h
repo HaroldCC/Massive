@@ -58,11 +58,11 @@ namespace MMO
         /**
          * @brief 主线程（DB 回调）：验证密码 + ECDH + SessionToken + 回包
          */
-        void OnAuthDBCallback(std::shared_ptr<TCPSocket>    socket,
-                              std::string                   clientIP,
-                              const std::string            &username,
-                              const std::string            &password,
-                              const std::string            &clientDHKey,
+        void OnAuthDBCallback(std::shared_ptr<TCPSocket>               socket,
+                              std::string                              clientIP,
+                              const std::string                       &username,
+                              const std::string                       &password,
+                              const std::string                       &clientDHKey,
                               std::optional<DB::AutoGen::accounts_row> row);
 
         /**

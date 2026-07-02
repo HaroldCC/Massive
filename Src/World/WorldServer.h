@@ -67,9 +67,14 @@ namespace MMO
         void NotifyCenterPlayerOffline(uint32 accountID);
 
         // ── 过载保护 ──
-        enum class ELoadLevel : uint8 { NORMAL, WARNING, DEGRADED };
-        void UpdateLoadLevel(size_t sessionCount, size_t pendingMessages);
-        void ApplyLoadLevel(ELoadLevel oldLevel, ELoadLevel newLevel);
+        enum class ELoadLevel : uint8
+        {
+            NORMAL,
+            WARNING,
+            DEGRADED
+        };
+        void       UpdateLoadLevel(size_t sessionCount, size_t pendingMessages);
+        void       ApplyLoadLevel(ELoadLevel oldLevel, ELoadLevel newLevel);
         ELoadLevel _loadLevel = ELoadLevel::NORMAL;
 
         // ── 未路由消息处理（EnterWorldReq Fallback）──
@@ -89,8 +94,7 @@ namespace MMO
         void SendToClient(uint32 sessionID, uint32 msgID, const TMsg &msg)
         {
             auto data = msg.SerializeAsString();
-            auto buf  = ByteBuffer::Copy(
-                reinterpret_cast<const uint8 *>(data.data()), data.size());
+            auto buf  = ByteBuffer::Copy(reinterpret_cast<const uint8 *>(data.data()), data.size());
 
             auto it = _sessions.find(sessionID);
             if (it == _sessions.end())
@@ -110,7 +114,7 @@ namespace MMO
             // PacketHeader = {length, msgID, sessionID}，全大端
             uint32 totalLen = static_cast<uint32>(sizeof(PacketHeader) + encrypted.Size());
             auto   frame    = ByteBuffer::Own(totalLen);
-            frame.WriteUint32(totalLen);   // PacketHeader.length
+            frame.WriteUint32(totalLen); // PacketHeader.length
             frame.WriteUint32(msgID);
             frame.WriteUint32(sessionID);
             frame.WriteBytes(encrypted.Data(), encrypted.Size());
@@ -119,14 +123,14 @@ namespace MMO
         }
 
         // ── 消息分发（按 msgID 查表）──
-        MessageDispatcher<uint32> _dispatcher;  // context = sessionID
+        MessageDispatcher<uint32> _dispatcher; // context = sessionID
 
         // ── 组件 ──
-        std::unique_ptr<IOContextPool>   _ioPool;
-        std::unique_ptr<TCPAcceptor>     _gateAcceptor;
-        std::unique_ptr<CenterClient>    _centerClient;
+        std::unique_ptr<IOContextPool>     _ioPool;
+        std::unique_ptr<TCPAcceptor>       _gateAcceptor;
+        std::unique_ptr<CenterClient>      _centerClient;
         std::unique_ptr<GateConnectionMgr> _gateConnMgr;
-        LogicThread                      _logicThread;
+        LogicThread                        _logicThread;
 
         // ── Session 存储（IO 线程读锁 + LogicThread 独占写）──
         std::shared_mutex                        _sessionsMtx;
@@ -139,7 +143,7 @@ namespace MMO
         size_t _prevQueueDepth = 0;
 
         // ── 配置 ──
-        WorldConfig _config;
+        WorldConfig       _config;
         std::atomic<bool> _running {false};
     };
 

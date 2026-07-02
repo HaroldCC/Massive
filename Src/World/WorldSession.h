@@ -28,18 +28,18 @@ namespace MMO
      */
     struct WorldSession
     {
-        uint32              sessionID     = 0;  // Gate 分配的 sessionId
-        uint32              accountID     = 0;  // 玩家账号 ID
-        Entity              entity;             // World 侧的玩家 Entity
-        CryptoSession       crypto;             // AES-256-GCM 加解密上下文
-        uint16              gateServerID  = 0;  // 当前连接的 Gate 实例 ID
-        uint32              gateConnIdx   = 0;  // 对应 Gate 连接在 GateConnectionMgr 中的索引
+        uint32        sessionID = 0;    // Gate 分配的 sessionId
+        uint32        accountID = 0;    // 玩家账号 ID
+        Entity        entity;           // World 侧的玩家 Entity
+        CryptoSession crypto;           // AES-256-GCM 加解密上下文
+        uint16        gateServerID = 0; // 当前连接的 Gate 实例 ID
+        uint32        gateConnIdx  = 0; // 对应 Gate 连接在 GateConnectionMgr 中的索引
 
         // IO 线程 → LogicThread Per-Session 独立队列（无锁）
         MPSCQueue<LogicMessage> inbox;
 
         std::chrono::steady_clock::time_point lastRecvTime;
-        bool disconnected = false;  // Gate 断线等待重连中
+        bool                                  disconnected = false; // Gate 断线等待重连中
     };
 
 } // namespace MMO

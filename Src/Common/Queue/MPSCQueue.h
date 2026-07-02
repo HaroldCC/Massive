@@ -24,16 +24,16 @@ namespace MMO
     {
     public:
         /**
- * @brief 生产者端入队（多线程安全）
- */
+         * @brief 生产者端入队（多线程安全）
+         */
         void Enqueue(T item)
         {
             _queue.enqueue(std::move(item));
         }
 
         /**
- * @brief 消费者端批量 drain（单线程调用）
- */
+         * @brief 消费者端批量 drain（单线程调用）
+         */
         void DrainAll(std::vector<T> &out)
         {
             size_t count = _queue.size_approx();
@@ -43,8 +43,8 @@ namespace MMO
         }
 
         /**
- * @brief 近似队列深度
- */
+         * @brief 近似队列深度
+         */
         size_t SizeApprox() const
         {
             return _queue.size_approx();

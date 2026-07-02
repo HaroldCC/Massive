@@ -58,14 +58,24 @@ namespace MMO
         _gateConnMgr->SetSessionsPtr(&_sessionsMtx, &_sessions);
 
         _logicThread.Start(
-            &_sessions, &_sessionsMtx,
-            [this](auto elapsed) { OnTick(elapsed); },
-            [this](auto sessionID, auto &ws, const auto &msg) { OnMessage(sessionID, ws, msg); },
-            [this]() { OnPreProcess(); },
-            [this]() { OnPostFlush(); });
+            &_sessions,
+            &_sessionsMtx,
+            [this](auto elapsed) {
+                OnTick(elapsed);
+            },
+            [this](auto sessionID, auto &ws, const auto &msg) {
+                OnMessage(sessionID, ws, msg);
+            },
+            [this]() {
+                OnPreProcess();
+            },
+            [this]() {
+                OnPostFlush();
+            });
 
         Log::Info("WorldServer: initialized (worldID={}, port={})",
-                  cfg.world.worldServerID, cfg.network.internalPort);
+                  cfg.world.worldServerID,
+                  cfg.network.internalPort);
         return true;
     }
 
@@ -75,13 +85,12 @@ namespace MMO
 
         std::string address = cfg.center.host + ":" + std::to_string(cfg.center.port);
 
-        return _centerClient->Connect(
-            cfg.center.host,
-            cfg.center.port,
-            cfg.world.worldServerID,
-            cfg.world.maxPlayers,
-            address,
-            _ioPool.get());
+        return _centerClient->Connect(cfg.center.host,
+                                      cfg.center.port,
+                                      cfg.world.worldServerID,
+                                      cfg.world.maxPlayers,
+                                      address,
+                                      _ioPool.get());
     }
 
     bool WorldServer::InitGateAcceptor(const WorldConfig &cfg)
@@ -89,7 +98,8 @@ namespace MMO
         _gateConnMgr = std::make_unique<GateConnectionMgr>();
 
         // 监听 Gate 内部连接（LengthPrefix 帧协议）
-        _gateAcceptor = std::make_unique<TCPAcceptor>(*_ioPool, cfg.network.internalPort, EFraming::LengthPrefix);
+        _gateAcceptor =
+            std::make_unique<TCPAcceptor>(*_ioPool, cfg.network.internalPort, EFraming::LengthPrefix);
 
         // 使用一个简单的 gateID 自增计数器（MVP：单个 Gate 连接）
         static std::atomic<uint16> nextGateID {1};
@@ -160,12 +170,15 @@ namespace MMO
                 }
 
                 Log::Debug("MoveHandler: session={} pos=({:.1f},{:.1f},{:.1f})",
-                           sessionID, req.position().x(), req.position().y(), req.position().z());
+                           sessionID,
+                           req.position().x(),
+                           req.position().y(),
+                           req.position().z());
 
                 // 回包
-                auto nowMs = static_cast<uint32>(
-                    std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch()).count());
+                auto nowMs = static_cast<uint32>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                     std::chrono::system_clock::now().time_since_epoch())
+                                                     .count());
 
                 Proto::MoveRsp rsp;
                 rsp.set_sequence(req.sequence());
@@ -222,21 +235,22 @@ namespace MMO
 
             EnterWorldHandler::Handle(
                 msg.sessionID,
-                msg.body.Data(), msg.body.Size(),
+                msg.body.Data(),
+                msg.body.Size(),
                 _sessions,
                 _config.security.loginServerSecret,
                 1, // gateID（MVP：固定 1）
                 *scene,
                 [this](uint32 sessionID, uint32 msgID, ByteBuffer rawBody) {
                     // 出站：完成加密 + PacketHeader 包装后通过 GateConnectionMgr 发回客户端
-                    auto it = _sessions.find(sessionID);
+                    auto it         = _sessions.find(sessionID);
                     bool hasSession = (it != _sessions.end());
 
                     // EnterWorldRsp 不走加密（客户端尚未初始化 CryptoSession）
                     if (msgID == Proto::MSG_LOGIN_ENTER_WORLD_RSP)
                     {
-                        uint32 totalLen = static_cast<uint32>(sizeof(PacketHeader) + rawBody.Size());
-                        ByteBuffer frame = ByteBuffer::Own(totalLen);
+                        uint32     totalLen = static_cast<uint32>(sizeof(PacketHeader) + rawBody.Size());
+                        ByteBuffer frame    = ByteBuffer::Own(totalLen);
                         frame.WriteUint32(totalLen);
                         frame.WriteUint32(msgID);
                         frame.WriteUint32(sessionID);
@@ -247,16 +261,15 @@ namespace MMO
 
                     if (hasSession)
                     {
-                        auto encrypted = it->second.crypto.Encrypt(
-                            rawBody.Data(), rawBody.Size());
+                        auto encrypted = it->second.crypto.Encrypt(rawBody.Data(), rawBody.Size());
                         if (encrypted.Size() == 0)
                         {
                             Log::Warn("WorldServer: encrypt failed for session={}", sessionID);
                             return;
                         }
 
-                        uint32 totalLen = static_cast<uint32>(sizeof(PacketHeader) + encrypted.Size());
-                        ByteBuffer frame = ByteBuffer::Own(totalLen);
+                        uint32     totalLen = static_cast<uint32>(sizeof(PacketHeader) + encrypted.Size());
+                        ByteBuffer frame    = ByteBuffer::Own(totalLen);
                         frame.WriteUint32(totalLen);
                         frame.WriteUint32(msgID);
                         frame.WriteUint32(sessionID);
@@ -266,8 +279,8 @@ namespace MMO
                     }
                     else
                     {
-                        uint32 totalLen = static_cast<uint32>(sizeof(PacketHeader) + rawBody.Size());
-                        ByteBuffer frame = ByteBuffer::Own(totalLen);
+                        uint32     totalLen = static_cast<uint32>(sizeof(PacketHeader) + rawBody.Size());
+                        ByteBuffer frame    = ByteBuffer::Own(totalLen);
                         frame.WriteUint32(totalLen);
                         frame.WriteUint32(msgID);
                         frame.WriteUint32(sessionID);
@@ -362,14 +375,14 @@ namespace MMO
         }
 
         it->second.disconnected = true;
-        uint32 accountID = it->second.accountID;
+        uint32 accountID        = it->second.accountID;
 
         Log::Info("WorldServer: client disconnected session={} account={}", sessionID, accountID);
 
         // 注册 30s 超时定时器（LogicThread 独占，TimingWheel 由 RunLoop 驱动 Tick）
-        _logicThread.GetTimingWheel().Schedule(
-            std::chrono::seconds(30),
-            [this, accountID]() { OnDisconnectTimeout(accountID); });
+        _logicThread.GetTimingWheel().Schedule(std::chrono::seconds(30), [this, accountID]() {
+            OnDisconnectTimeout(accountID);
+        });
     }
 
     void WorldServer::OnDisconnectTimeout(uint32 accountID)
@@ -407,7 +420,7 @@ namespace MMO
         for (int i = 0; i < req.session_ids_size(); ++i)
         {
             uint32 sid = req.session_ids(i);
-            auto it = _sessions.find(sid);
+            auto   it  = _sessions.find(sid);
             if (it != _sessions.end())
             {
                 it->second.disconnected = false;
@@ -429,10 +442,9 @@ namespace MMO
         ntf.set_account_id(accountID);
         ntf.set_world_server_id(std::to_string(_config.world.worldServerID));
 
-        _centerClient->GetRPCClient().Notify(
-            _centerClient->GetSocket(),
-            Proto::Internal::MSG_PLAYER_ONLINE_NTF,
-            ntf);
+        _centerClient->GetRPCClient().Notify(_centerClient->GetSocket(),
+                                             Proto::Internal::MSG_PLAYER_ONLINE_NTF,
+                                             ntf);
     }
 
     void WorldServer::NotifyCenterPlayerOffline(uint32 accountID)
@@ -445,20 +457,19 @@ namespace MMO
         Proto::Internal::PlayerOfflineNtf ntf;
         ntf.set_account_id(accountID);
 
-        _centerClient->GetRPCClient().Notify(
-            _centerClient->GetSocket(),
-            Proto::Internal::MSG_PLAYER_OFFLINE_NTF,
-            ntf);
+        _centerClient->GetRPCClient().Notify(_centerClient->GetSocket(),
+                                             Proto::Internal::MSG_PLAYER_OFFLINE_NTF,
+                                             ntf);
     }
 
     // ── 过载保护 ──
 
     void WorldServer::UpdateLoadLevel(size_t sessionCount, size_t pendingMessages)
     {
-        static constexpr size_t kWarnSessionCount   = 5000;
+        static constexpr size_t kWarnSessionCount    = 5000;
         static constexpr size_t kWarnPendingMessages = 10000;
-        static constexpr size_t kDegradeSessionCount  = 8000;
-        static constexpr size_t kDegradePendingMsgs   = 20000;
+        static constexpr size_t kDegradeSessionCount = 8000;
+        static constexpr size_t kDegradePendingMsgs  = 20000;
 
         ELoadLevel oldLevel = _loadLevel;
 

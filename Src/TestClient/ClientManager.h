@@ -31,9 +31,7 @@ namespace MMO::TestClient
     class ClientManager
     {
     public:
-        ClientManager(const TestClientConfig &cfg,
-                     IOContextPool           &pool,
-                     StatsCollector          &stats);
+        ClientManager(const TestClientConfig &cfg, IOContextPool &pool, StatsCollector &stats);
 
         ClientManager(const ClientManager &)            = delete;
         ClientManager &operator=(const ClientManager &) = delete;
@@ -58,12 +56,12 @@ namespace MMO::TestClient
         void PrintReport();
 
         const TestClientConfig &_cfg;
-        IOContextPool           &_pool;
-        StatsCollector          &_stats;
+        IOContextPool          &_pool;
+        StatsCollector         &_stats;
 
         std::vector<std::shared_ptr<VirtualClient>> _clients;
-        uint32 _spawnedCount  = 0;
-        bool   _running       = false;
+        uint32                                      _spawnedCount = 0;
+        bool                                        _running      = false;
 
         std::chrono::steady_clock::time_point _startTime;
         std::chrono::steady_clock::time_point _lastReportTime;

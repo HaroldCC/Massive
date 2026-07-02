@@ -146,11 +146,11 @@ namespace MMO
 
     // ── Step 2: 主线程 — DB 回调: 验密码 + ECDH + SessionToken 签发 ──
 
-    void LoginServer::OnAuthDBCallback(std::shared_ptr<TCPSocket>              socket,
-                                       std::string                             clientIP,
-                                       const std::string                      &username,
-                                       const std::string                      &password,
-                                       const std::string                      &clientDHKey,
+    void LoginServer::OnAuthDBCallback(std::shared_ptr<TCPSocket>               socket,
+                                       std::string                              clientIP,
+                                       const std::string                       &username,
+                                       const std::string                       &password,
+                                       const std::string                       &clientDHKey,
                                        std::optional<DB::AutoGen::accounts_row> row)
     {
         // --- 用户不存在 ---

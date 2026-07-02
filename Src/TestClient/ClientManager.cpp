@@ -13,9 +13,7 @@
 namespace MMO::TestClient
 {
 
-    ClientManager::ClientManager(const TestClientConfig &cfg,
-                                IOContextPool           &pool,
-                                StatsCollector          &stats)
+    ClientManager::ClientManager(const TestClientConfig &cfg, IOContextPool &pool, StatsCollector &stats)
         : _cfg(cfg)
         , _pool(pool)
         , _stats(stats)
@@ -24,13 +22,12 @@ namespace MMO::TestClient
 
     void ClientManager::Start()
     {
-        _running    = true;
+        _running        = true;
         _startTime      = std::chrono::steady_clock::now();
         _lastReportTime = _startTime;
         _lastSpawnTime  = _startTime;
 
-        Log::Info("ClientManager: starting {} clients ({} spawn/s)",
-                 _cfg.clientCount, _cfg.spawnRatePerSec);
+        Log::Info("ClientManager: starting {} clients ({} spawn/s)", _cfg.clientCount, _cfg.spawnRatePerSec);
 
         SpawnBatch();
     }
@@ -55,32 +52,29 @@ namespace MMO::TestClient
             return;
         }
 
-        uint32 toSpawn = std::min(
-            _cfg.clientCount - _spawnedCount,
-            static_cast<uint32>(_cfg.spawnRatePerSec > 0 ? _cfg.spawnRatePerSec : 1));
+        uint32 toSpawn = std::min(_cfg.clientCount - _spawnedCount,
+                                  static_cast<uint32>(_cfg.spawnRatePerSec > 0 ? _cfg.spawnRatePerSec : 1));
 
         for (uint32 i = 0; i < toSpawn; ++i)
         {
-            uint32 id   = _spawnedCount;
+            uint32      id       = _spawnedCount;
             std::string username = _cfg.usernamePrefix + std::to_string(id);
 
             // 创建 Scenario
-            auto scenario = std::make_unique<LoginFlowScenario>(
-                _cfg.heartbeatIntervalSec,
-                _cfg.moveIntervalMs,
-                static_cast<float>(_cfg.moveSpeed),
-                _cfg.moveRadius,
-                _cfg.durationSec);
+            auto scenario = std::make_unique<LoginFlowScenario>(_cfg.heartbeatIntervalSec,
+                                                                _cfg.moveIntervalMs,
+                                                                static_cast<float>(_cfg.moveSpeed),
+                                                                _cfg.moveRadius,
+                                                                _cfg.durationSec);
 
-            auto client = std::make_shared<VirtualClient>(
-                id,
-                username,
-                _cfg.password,
-                _cfg.loginHost,
-                _cfg.loginPort,
-                _stats,
-                _pool,
-                std::move(scenario));
+            auto client = std::make_shared<VirtualClient>(id,
+                                                          username,
+                                                          _cfg.password,
+                                                          _cfg.loginHost,
+                                                          _cfg.loginPort,
+                                                          _stats,
+                                                          _pool,
+                                                          std::move(scenario));
 
             _clients.push_back(client);
 
@@ -128,16 +122,11 @@ namespace MMO::TestClient
         auto snap = _stats.GetSnapshot();
 
         Log::Info("═══ TestClient Report (t={:.1f}s) ═══", snap.elapsedSec);
-        Log::Info("  Active:     {} / {}",
-                 snap.activeClients, _cfg.clientCount);
-        Log::Info("  Login:      {} OK / {} FAIL",
-                 snap.loginSuccess, snap.loginFail);
-        Log::Info("  EnterWorld: {} OK / {} FAIL",
-                 snap.enterWorldSuccess, snap.enterWorldFail);
-        Log::Info("  Heartbeat:  {} sent / {} rcvd",
-                 snap.heartbeatSent, snap.heartbeatRcvd);
-        Log::Info("  Move:       {} sent / {} rcvd",
-                 snap.moveSent, snap.moveRcvd);
+        Log::Info("  Active:     {} / {}", snap.activeClients, _cfg.clientCount);
+        Log::Info("  Login:      {} OK / {} FAIL", snap.loginSuccess, snap.loginFail);
+        Log::Info("  EnterWorld: {} OK / {} FAIL", snap.enterWorldSuccess, snap.enterWorldFail);
+        Log::Info("  Heartbeat:  {} sent / {} rcvd", snap.heartbeatSent, snap.heartbeatRcvd);
+        Log::Info("  Move:       {} sent / {} rcvd", snap.moveSent, snap.moveRcvd);
         Log::Info("  Disconnects: {}", snap.disconnects);
 
         // 延迟统计
@@ -155,7 +144,9 @@ namespace MMO::TestClient
             for (auto &[op, tc] : latencyMap)
             {
                 Log::Info("  Latency {}: avg={:.2f}ms ({} samples)",
-                         op, tc.first / 1000.0 / tc.second, tc.second);
+                          op,
+                          tc.first / 1000.0 / tc.second,
+                          tc.second);
             }
         }
     }

@@ -21,10 +21,10 @@ namespace MMO::TestClient
      */
     struct LatencyRecord
     {
-        std::string          operation; // "LoginAuth", "EnterWorld", "MoveReq"
+        std::string               operation; // "LoginAuth", "EnterWorld", "MoveReq"
         std::chrono::microseconds latency;
-        bool                 success = true;
-        uint32               errorCode = 0;
+        bool                      success   = true;
+        uint32                    errorCode = 0;
     };
 
     /**
@@ -93,9 +93,8 @@ namespace MMO::TestClient
 
         // ── 延迟记录 ──
 
-        void RecordLatency(const std::string &operation,
-                           std::chrono::microseconds latency,
-                           bool success = true)
+        void
+        RecordLatency(const std::string &operation, std::chrono::microseconds latency, bool success = true)
         {
             std::lock_guard lock(_latencyMutex);
             _latencyRecords.push_back({operation, latency, success});
@@ -105,34 +104,34 @@ namespace MMO::TestClient
 
         struct Snapshot
         {
-            uint32 loginSuccess    = 0;
-            uint32 loginFail       = 0;
+            uint32 loginSuccess      = 0;
+            uint32 loginFail         = 0;
             uint32 enterWorldSuccess = 0;
-            uint32 enterWorldFail   = 0;
-            uint32 heartbeatSent   = 0;
-            uint32 heartbeatRcvd   = 0;
-            uint32 moveSent        = 0;
-            uint32 moveRcvd        = 0;
-            uint32 disconnects     = 0;
-            uint32 activeClients   = 0;
-            double elapsedSec      = 0;
+            uint32 enterWorldFail    = 0;
+            uint32 heartbeatSent     = 0;
+            uint32 heartbeatRcvd     = 0;
+            uint32 moveSent          = 0;
+            uint32 moveRcvd          = 0;
+            uint32 disconnects       = 0;
+            uint32 activeClients     = 0;
+            double elapsedSec        = 0;
         };
 
         Snapshot GetSnapshot() const
         {
             Snapshot s;
-            s.loginSuccess       = _loginSuccess.load(std::memory_order_relaxed);
-            s.loginFail          = _loginFail.load(std::memory_order_relaxed);
-            s.enterWorldSuccess  = _enterWorldSuccess.load(std::memory_order_relaxed);
-            s.enterWorldFail     = _enterWorldFail.load(std::memory_order_relaxed);
-            s.heartbeatSent      = _heartbeatSent.load(std::memory_order_relaxed);
-            s.heartbeatRcvd      = _heartbeatRcvd.load(std::memory_order_relaxed);
-            s.moveSent           = _moveSent.load(std::memory_order_relaxed);
-            s.moveRcvd           = _moveRcvd.load(std::memory_order_relaxed);
-            s.disconnects        = _disconnects.load(std::memory_order_relaxed);
-            s.activeClients      = _activeClients.load(std::memory_order_relaxed);
+            s.loginSuccess      = _loginSuccess.load(std::memory_order_relaxed);
+            s.loginFail         = _loginFail.load(std::memory_order_relaxed);
+            s.enterWorldSuccess = _enterWorldSuccess.load(std::memory_order_relaxed);
+            s.enterWorldFail    = _enterWorldFail.load(std::memory_order_relaxed);
+            s.heartbeatSent     = _heartbeatSent.load(std::memory_order_relaxed);
+            s.heartbeatRcvd     = _heartbeatRcvd.load(std::memory_order_relaxed);
+            s.moveSent          = _moveSent.load(std::memory_order_relaxed);
+            s.moveRcvd          = _moveRcvd.load(std::memory_order_relaxed);
+            s.disconnects       = _disconnects.load(std::memory_order_relaxed);
+            s.activeClients     = _activeClients.load(std::memory_order_relaxed);
 
-            auto now = std::chrono::steady_clock::now();
+            auto now     = std::chrono::steady_clock::now();
             s.elapsedSec = std::chrono::duration<double>(now - _startTime).count();
             return s;
         }
@@ -153,19 +152,19 @@ namespace MMO::TestClient
     private:
         std::chrono::steady_clock::time_point _startTime;
 
-        std::atomic<uint32> _loginSuccess      {0};
-        std::atomic<uint32> _loginFail         {0};
-        std::atomic<uint32> _enterWorldSuccess  {0};
-        std::atomic<uint32> _enterWorldFail    {0};
-        std::atomic<uint32> _heartbeatSent     {0};
-        std::atomic<uint32> _heartbeatRcvd     {0};
-        std::atomic<uint32> _moveSent          {0};
-        std::atomic<uint32> _moveRcvd          {0};
-        std::atomic<uint32> _disconnects       {0};
-        std::atomic<uint32> _activeClients     {0};
+        std::atomic<uint32> _loginSuccess {0};
+        std::atomic<uint32> _loginFail {0};
+        std::atomic<uint32> _enterWorldSuccess {0};
+        std::atomic<uint32> _enterWorldFail {0};
+        std::atomic<uint32> _heartbeatSent {0};
+        std::atomic<uint32> _heartbeatRcvd {0};
+        std::atomic<uint32> _moveSent {0};
+        std::atomic<uint32> _moveRcvd {0};
+        std::atomic<uint32> _disconnects {0};
+        std::atomic<uint32> _activeClients {0};
 
-        std::mutex                   _latencyMutex;
-        std::vector<LatencyRecord>   _latencyRecords;
+        std::mutex                 _latencyMutex;
+        std::vector<LatencyRecord> _latencyRecords;
     };
 
 } // namespace MMO::TestClient

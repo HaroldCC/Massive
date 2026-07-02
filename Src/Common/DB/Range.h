@@ -40,8 +40,8 @@ namespace MMO::DB
         }
 
         /**
- * @brief 显式指定 DBWorkerPool
- */
+         * @brief 显式指定 DBWorkerPool
+         */
         explicit Range(DBWorkerPool *pool) : _tableName(Table::kTableName), _pool(pool)
         {
         }
@@ -160,7 +160,7 @@ namespace MMO::DB
         void UpdateByPK(const RowType &row)
         {
             auto [sql, params] = Table::SerializeUpdateByPK(row);
-            auto pool = _pool ? _pool : &DBWorkerPool::Instance();
+            auto pool          = _pool ? _pool : &DBWorkerPool::Instance();
             pool->AsyncQuery(std::move(sql), std::move(params), nullptr);
         }
 
@@ -316,7 +316,7 @@ namespace MMO::DB
         void InsertOne(const RowType &row)
         {
             auto [sql, params] = Table::SerializeInsert(row);
-            auto pool = _pool ? _pool : &DBWorkerPool::Instance();
+            auto pool          = _pool ? _pool : &DBWorkerPool::Instance();
             pool->AsyncQuery(std::move(sql), std::move(params), nullptr);
         }
 

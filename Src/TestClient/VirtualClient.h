@@ -73,14 +73,14 @@ namespace MMO::TestClient
          * @param pool        IO 线程池
          * @param scenario    进入世界后的行为
          */
-        VirtualClient(uint32                 clientID,
-                     std::string            username,
-                     std::string            password,
-                     std::string            loginHost,
-                     uint16                 loginPort,
-                     StatsCollector        &stats,
-                     IOContextPool         &pool,
-                     std::unique_ptr<Scenario> scenario);
+        VirtualClient(uint32                    clientID,
+                      std::string               username,
+                      std::string               password,
+                      std::string               loginHost,
+                      uint16                    loginPort,
+                      StatsCollector           &stats,
+                      IOContextPool            &pool,
+                      std::unique_ptr<Scenario> scenario);
 
         ~VirtualClient();
 
@@ -100,6 +100,7 @@ namespace MMO::TestClient
         {
             return _clientID;
         }
+
         const std::string &Name() const
         {
             return _name;
@@ -119,6 +120,7 @@ namespace MMO::TestClient
         {
             return _state;
         }
+
         bool IsConnected() const
         {
             return _state == ClientState::InWorld;
@@ -145,37 +147,37 @@ namespace MMO::TestClient
         void EnterFailedState(const std::string &reason);
         void DoDisconnect();
 
-        uint32        _clientID;
-        std::string   _name;
-        std::string   _username;
-        std::string   _password;
-        std::string   _loginHost;
-        uint16        _loginPort;
-        StatsCollector      &_stats;
-        IOContextPool       &_pool;
+        uint32          _clientID;
+        std::string     _name;
+        std::string     _username;
+        std::string     _password;
+        std::string     _loginHost;
+        uint16          _loginPort;
+        StatsCollector &_stats;
+        IOContextPool  &_pool;
 
         // 状态
-        ClientState  _state = ClientState::Idle;
+        ClientState _state = ClientState::Idle;
 
         // 安全材料
-        uint64       _clientRandom = 0;  // 客户端生成的随机数（nonce 下半部分）
-        ByteBuffer   _sessionKey;        // 32B 共享密钥（ECDH → SHA-256）
+        uint64        _clientRandom = 0; // 客户端生成的随机数（nonce 下半部分）
+        ByteBuffer    _sessionKey;       // 32B 共享密钥（ECDH → SHA-256）
         CryptoSession _crypto;
 
         // SessionToken（从 LoginAuthRsp）
-        ByteBuffer   _sessionToken;      // 46B
+        ByteBuffer _sessionToken; // 46B
 
         // Gate 地址（从 LoginAuthRsp 解析）
-        std::string  _gateHost;
-        uint16       _gatePort = 0;
+        std::string _gateHost;
+        uint16      _gatePort = 0;
 
         // 连接
-        std::shared_ptr<TCPSocket>  _socket;
-        uint32                      _sessionID = 0;
+        std::shared_ptr<TCPSocket> _socket;
+        uint32                     _sessionID = 0;
 
         // 行为
-        std::unique_ptr<Scenario>   _scenario;
-        asio::steady_timer          _tickTimer;
+        std::unique_ptr<Scenario> _scenario;
+        asio::steady_timer        _tickTimer;
 
         void StartTick();
         void OnTick(const asio::error_code &ec);

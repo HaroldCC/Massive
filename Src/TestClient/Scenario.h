@@ -30,7 +30,7 @@ namespace MMO::TestClient
     class Scenario
     {
     public:
-        Scenario() = default;
+        Scenario()          = default;
         virtual ~Scenario() = default;
 
         Scenario(const Scenario &)            = delete;

@@ -34,8 +34,8 @@ namespace MMO
 {
 
     /**
- * @brief thread_local 默认 = kInvalidID（0xFFFFFFFF），忘记 SetTraceID 则输出 [FFFFFFFF]
- */
+     * @brief thread_local 默认 = kInvalidID（0xFFFFFFFF），忘记 SetTraceID 则输出 [FFFFFFFF]
+     */
     thread_local uint64 Log::_traceID = kInvalidID;
 
     namespace
@@ -82,24 +82,24 @@ namespace MMO
     void Log::Init(const std::string &name, ELogLevel level, const std::string_view logDir)
     {
         /**
- * @brief 初始化全局线程池（异步日志用），队列 16384，1 个工作线程
- */
+         * @brief 初始化全局线程池（异步日志用），队列 16384，1 个工作线程
+         */
         spdlog::init_thread_pool(16384, 1U);
 
         /**
- * @brief 收集 sink
- */
+         * @brief 收集 sink
+         */
         std::vector<spdlog::sink_ptr> sinks;
 
         /**
- * @brief 控制台 sink（彩色输出）
- */
+         * @brief 控制台 sink（彩色输出）
+         */
         auto consoleSink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
         sinks.push_back(consoleSink);
 
         /**
- * @brief 文件 sink（仅在指定 logDir 时添加）
- */
+         * @brief 文件 sink（仅在指定 logDir 时添加）
+         */
         if (!logDir.empty())
         {
             namespace fs = std::filesystem;
@@ -132,8 +132,8 @@ namespace MMO
                                                              spdlog::async_overflow_policy::block);
 
         /**
- * @brief 设置级别
- */
+         * @brief 设置级别
+         */
         logger->set_level(static_cast<spdlog::level::level_enum>(level));
 
         /**
@@ -145,8 +145,8 @@ namespace MMO
         logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] %v");
 
         /**
- * @brief 即时 flush：Error 及以上级别立即写磁盘
- */
+         * @brief 即时 flush：Error 及以上级别立即写磁盘
+         */
         logger->flush_on(spdlog::level::err);
 
         spdlog::set_default_logger(logger);

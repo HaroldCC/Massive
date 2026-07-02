@@ -52,28 +52,28 @@ namespace MMO
         void Cancel(TimerID timerID);
 
         /**
- * @brief 每逻辑帧调用一次（20ms），推进时间轮并触发到期回调
- */
+         * @brief 每逻辑帧调用一次（20ms），推进时间轮并触发到期回调
+         */
         void Tick();
 
         /**
- * @brief 当前活跃定时器数量
- */
+         * @brief 当前活跃定时器数量
+         */
         size_t ActiveCount() const;
 
         static constexpr std::chrono::milliseconds kMaxDelay {3 * 24 * 60 * 60 * 1000}; // 最大延迟 72h
-        static constexpr int                       kSlots  = 60;                   // 每层槽位数
-        static constexpr int                       kLevels = 4;                    // 层级数
+        static constexpr int                       kSlots  = 60;                        // 每层槽位数
+        static constexpr int                       kLevels = 4;                         // 层级数
 
         /**
- * @brief 活跃定时器告警阈值（可能泄漏）
- */
+         * @brief 活跃定时器告警阈值（可能泄漏）
+         */
         static constexpr size_t kWarnThreshold = 10000;
 
     private:
         /**
- * @brief 槽位链表节点
- */
+         * @brief 槽位链表节点
+         */
         struct Node
         {
             TimerID  id              = 0;

@@ -17,8 +17,7 @@
 namespace MMO
 {
 
-    std::optional<WorldConfig> WorldConfig::Load(const std::string &path,
-                                                 const std::string &keyPath)
+    std::optional<WorldConfig> WorldConfig::Load(const std::string &path, const std::string &keyPath)
     {
         ConfigLoader loader;
         if (!loader.LoadFile(path))
@@ -34,7 +33,8 @@ namespace MMO
         cfg.center.host = loader.GetString("center.host", "127.0.0.1");
         cfg.center.port = loader.GetUInt16("center.port", 7001);
 
-        cfg.database.connString  = loader.GetString("database.conn_string", "host=127.0.0.1 port=6432 dbname=massive");
+        cfg.database.connString =
+            loader.GetString("database.conn_string", "host=127.0.0.1 port=6432 dbname=massive");
         cfg.database.workerCount = loader.GetInt("database.worker_count", 3);
 
         cfg.world.worldServerID = loader.GetUInt16("world.id", 1);
@@ -45,11 +45,11 @@ namespace MMO
         auto sceneIDs = loader.GetStringArray("world.persistent_scenes");
         for (const auto &sidStr : sceneIDs)
         {
-            uint32 sceneId = static_cast<uint32>(std::stoul(sidStr));
+            uint32      sceneId = static_cast<uint32>(std::stoul(sidStr));
             SceneConfig sc;
-            sc.id        = sceneId;
-            sc.name      = "scene_" + std::to_string(sceneId);
-            sc.gridSize  = 50.0f;
+            sc.id           = sceneId;
+            sc.name         = "scene_" + std::to_string(sceneId);
+            sc.gridSize     = 50.0f;
             sc.viewRadiusXZ = 100.0f;
             sc.viewRadiusY  = 15.0f;
             cfg.world.persistentScenes.push_back(std::move(sc));
@@ -68,7 +68,8 @@ namespace MMO
         if (!keyFile)
         {
             Log::Error("WorldConfig: key file '{}' not found. "
-                       "Start LoginServer first to auto-generate it.", keyPath);
+                       "Start LoginServer first to auto-generate it.",
+                       keyPath);
             return std::nullopt;
         }
 
@@ -81,22 +82,35 @@ namespace MMO
         for (char c : hexStr)
         {
             if (!std::isspace(static_cast<unsigned char>(c)))
+            {
                 hex += c;
+            }
         }
 
         if (hex.size() != WorldConfig::kLSSSize * 2)
         {
             Log::Error("WorldConfig: key file '{}' hex size mismatch (expected {}, got {})",
-                       keyPath, WorldConfig::kLSSSize * 2, hex.size());
+                       keyPath,
+                       WorldConfig::kLSSSize * 2,
+                       hex.size());
             return std::nullopt;
         }
 
         for (size_t i = 0; i < WorldConfig::kLSSSize; ++i)
         {
             auto hexVal = [](char c) -> int {
-                if (c >= '0' && c <= '9') return c - '0';
-                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                if (c >= '0' && c <= '9')
+                {
+                    return c - '0';
+                }
+                if (c >= 'a' && c <= 'f')
+                {
+                    return c - 'a' + 10;
+                }
+                if (c >= 'A' && c <= 'F')
+                {
+                    return c - 'A' + 10;
+                }
                 return -1;
             };
             int hi = hexVal(hex[i * 2]);

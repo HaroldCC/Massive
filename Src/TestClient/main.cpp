@@ -129,12 +129,12 @@ int main(int argc, char *argv[])
     Log::Init("testclient", logCfg.level, logCfg.logDir);
 
     Log::Info("TestClient: {} clients, {}s duration, {} spawn/s",
-             static_cast<int32>(cfg.clientCount),
-             static_cast<int32>(cfg.durationSec),
-             static_cast<int32>(cfg.spawnRatePerSec));
+              static_cast<int32>(cfg.clientCount),
+              static_cast<int32>(cfg.durationSec),
+              static_cast<int32>(cfg.spawnRatePerSec));
 
     // IO 线程池（模拟客户端的 N）
-    int32 ioThreads = std::max(static_cast<int32>(2), static_cast<int32>(cfg.clientCount / 500 + 1));
+    int32         ioThreads = std::max(static_cast<int32>(2), static_cast<int32>(cfg.clientCount / 500 + 1));
     IOContextPool ioPool(static_cast<size_t>(ioThreads));
     ioPool.Start();
 
@@ -156,8 +156,9 @@ int main(int argc, char *argv[])
         // 检查超时
         if (cfg.durationSec > 0)
         {
-            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::steady_clock::now() - startTime).count();
+            auto elapsed =
+                std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - startTime)
+                    .count();
             if (static_cast<uint32>(elapsed) >= cfg.durationSec)
             {
                 Log::Info("TestClient: duration reached, stopping...");
@@ -172,14 +173,10 @@ int main(int argc, char *argv[])
     // 最终报告
     auto snap = stats.GetSnapshot();
     Log::Info("═══ Final Report ═══");
-    Log::Info("  Login:      {} success / {} failed",
-             snap.loginSuccess, snap.loginFail);
-    Log::Info("  EnterWorld: {} success / {} failed",
-             snap.enterWorldSuccess, snap.enterWorldFail);
-    Log::Info("  Heartbeat:  {} sent / {} rcvd",
-             snap.heartbeatSent, snap.heartbeatRcvd);
-    Log::Info("  Move:       {} sent / {} rcvd",
-             snap.moveSent, snap.moveRcvd);
+    Log::Info("  Login:      {} success / {} failed", snap.loginSuccess, snap.loginFail);
+    Log::Info("  EnterWorld: {} success / {} failed", snap.enterWorldSuccess, snap.enterWorldFail);
+    Log::Info("  Heartbeat:  {} sent / {} rcvd", snap.heartbeatSent, snap.heartbeatRcvd);
+    Log::Info("  Move:       {} sent / {} rcvd", snap.moveSent, snap.moveRcvd);
     Log::Info("  Disconnects: {}", snap.disconnects);
 
     return 0;

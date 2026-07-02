@@ -26,13 +26,13 @@ namespace MMO
      */
     struct SceneConfig
     {
-        uint32       id   = 0;
-        std::string  name;
-        std::string  navmeshPath;          // 空字符串表示无 NavMesh
-        float        gridSize     = 50.0f;
-        float        viewRadiusXZ = 100.0f;
-        float        viewRadiusY  = 15.0f;
-        float        layerHeight  = 0.0f;  // 0 = 单层
+        uint32      id = 0;
+        std::string name;
+        std::string navmeshPath; // 空字符串表示无 NavMesh
+        float       gridSize     = 50.0f;
+        float       viewRadiusXZ = 100.0f;
+        float       viewRadiusY  = 15.0f;
+        float       layerHeight  = 0.0f; // 0 = 单层
     };
 
     /**

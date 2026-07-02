@@ -9,8 +9,8 @@ namespace MMO::Crypto
 {
 
     /**
- * @brief 构造，初始化空的 Bloom filter
- */
+     * @brief 构造，初始化空的 Bloom filter
+     */
     NonceVerifier::NonceVerifier() : _filter()
     {
     }
@@ -56,8 +56,8 @@ namespace MMO::Crypto
     }
 
     /**
- * @brief Bloom filter 碰撞检测
- */
+     * @brief Bloom filter 碰撞检测
+     */
     bool NonceVerifier::ProbablySeen(uint64 nonce) const
     {
         return _filter.test(Hash1(nonce) % kFilterBits) && _filter.test(Hash2(nonce) % kFilterBits)
@@ -65,8 +65,8 @@ namespace MMO::Crypto
     }
 
     /**
- * @brief 设置 Bloom filter 位
- */
+     * @brief 设置 Bloom filter 位
+     */
     void NonceVerifier::Insert(uint64 nonce)
     {
         _filter.set(Hash1(nonce) % kFilterBits);
@@ -75,8 +75,8 @@ namespace MMO::Crypto
     }
 
     /**
- * @brief 基于 splitmix64 的哈希函数 1
- */
+     * @brief 基于 splitmix64 的哈希函数 1
+     */
     uint32 NonceVerifier::Hash1(uint64 v) const
     {
         v = v + 0x9e3779b97f4a7c15ULL;
@@ -85,8 +85,8 @@ namespace MMO::Crypto
     }
 
     /**
- * @brief 基于 splitmix64 的哈希函数 2
- */
+     * @brief 基于 splitmix64 的哈希函数 2
+     */
     uint32 NonceVerifier::Hash2(uint64 v) const
     {
         v = v + 0x3c6ef372fe94f82aULL;
@@ -95,8 +95,8 @@ namespace MMO::Crypto
     }
 
     /**
- * @brief 基于 splitmix64 的哈希函数 3
- */
+     * @brief 基于 splitmix64 的哈希函数 3
+     */
     uint32 NonceVerifier::Hash3(uint64 v) const
     {
         v = (v ^ (v >> 33)) * 0xff51afd7ed558ccdULL;

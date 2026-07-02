@@ -12,7 +12,7 @@ namespace MMO
     {
         for (const auto &cfg : configs)
         {
-            auto scene = std::make_unique<ECS::Scene>(cfg.id);
+            auto scene      = std::make_unique<ECS::Scene>(cfg.id);
             _scenes[cfg.id] = std::move(scene);
 
             Log::Info("SceneManager: scene {} ({}) loaded", cfg.id, cfg.name);
@@ -46,8 +46,8 @@ namespace MMO
             return nullptr;
         }
 
-        auto scene = std::make_unique<ECS::Scene>(config.id);
-        auto *ptr  = scene.get();
+        auto  scene        = std::make_unique<ECS::Scene>(config.id);
+        auto *ptr          = scene.get();
         _scenes[config.id] = std::move(scene);
 
         Log::Info("SceneManager: scene {} ({}) created dynamically", config.id, config.name);

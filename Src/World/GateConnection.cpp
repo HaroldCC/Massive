@@ -14,7 +14,7 @@ namespace MMO
 
     void GateConnectionMgr::AcceptConnection(uint16 gateID, std::shared_ptr<TCPSocket> socket)
     {
-        auto conn = std::make_unique<GateConnection>();
+        auto conn    = std::make_unique<GateConnection>();
         conn->gateID = gateID;
         conn->socket = std::move(socket);
 
@@ -29,7 +29,7 @@ namespace MMO
                     return;
                 }
 
-                ByteBuffer headerBuf = ByteBuffer::Wrap(data, sizeof(uint32));
+                ByteBuffer headerBuf       = ByteBuffer::Wrap(data, sizeof(uint32));
                 uint32     packetSessionID = headerBuf.ReadUint32();
 
                 OnGateMessage(packetSessionID, data + sizeof(uint32), len - sizeof(uint32));
@@ -73,7 +73,7 @@ namespace MMO
 
         {
             std::shared_lock lock(*_sessionsMtx);
-            auto it = _sessions->find(sessionID);
+            auto             it = _sessions->find(sessionID);
             if (it != _sessions->end())
             {
                 auto &ws = it->second;
@@ -81,13 +81,15 @@ namespace MMO
                 // 入站帧: [PacketHeader:12B][Seq:4B][Ciphertext+Tag]
                 if (len <= sizeof(PacketHeader) + sizeof(uint32))
                 {
-                    Log::Warn("GateConnection: undersized business msg session={} msgID={}", sessionID, msgID);
+                    Log::Warn("GateConnection: undersized business msg session={} msgID={}",
+                              sessionID,
+                              msgID);
                     return;
                 }
 
                 // 提取 Seq
-                uint32     seq     = ByteBuffer::Wrap(data + sizeof(PacketHeader), sizeof(uint32)).ReadUint32();
-                size_t     encLen  = len - sizeof(PacketHeader) - sizeof(uint32);
+                uint32       seq = ByteBuffer::Wrap(data + sizeof(PacketHeader), sizeof(uint32)).ReadUint32();
+                size_t       encLen  = len - sizeof(PacketHeader) - sizeof(uint32);
                 const uint8 *encBody = data + sizeof(PacketHeader) + sizeof(uint32);
 
                 // AES-GCM 解密
@@ -113,7 +115,7 @@ namespace MMO
         if (msgID == Proto::MSG_LOGIN_ENTER_WORLD_REQ)
         {
             // data = [PacketHeader:12B][Body]，只拷贝 Body（protobuf）
-            size_t bodyLen = len - sizeof(PacketHeader);
+            size_t       bodyLen = len - sizeof(PacketHeader);
             LogicMessage logicMsg;
             logicMsg.sessionID = sessionID;
             logicMsg.msgID     = msgID;
@@ -146,13 +148,13 @@ namespace MMO
         uint32     internalLen = static_cast<uint32>(sizeof(uint32) + payload.Size());
         uint32     totalLen    = sizeof(uint32) + internalLen;
         ByteBuffer frame       = ByteBuffer::Own(totalLen);
-        frame.WriteUint32(totalLen);     // LengthPrefix（不含自身）
-        frame.WriteUint32(sessionID);    // InternalHeader.sessionID
+        frame.WriteUint32(totalLen);  // LengthPrefix（不含自身）
+        frame.WriteUint32(sessionID); // InternalHeader.sessionID
         frame.WriteBytes(payload.Data(), payload.Size());
 
         {
             std::lock_guard lock(_gateMutex);
-            auto it = _gateConns.find(gateID);
+            auto            it = _gateConns.find(gateID);
             if (it == _gateConns.end())
             {
                 Log::Warn("GateConnection: gateID={} not connected", gateID);

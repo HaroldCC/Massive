@@ -30,8 +30,9 @@ namespace MMO
     class LogicThread
     {
     public:
-        using TickCallback      = std::function<void(std::chrono::milliseconds)>;
-        using DispatchCallback  = std::function<void(uint32 sessionID, WorldSession &ws, const LogicMessage &msg)>;
+        using TickCallback = std::function<void(std::chrono::milliseconds)>;
+        using DispatchCallback =
+            std::function<void(uint32 sessionID, WorldSession &ws, const LogicMessage &msg)>;
 
         LogicThread();
 
@@ -44,36 +45,41 @@ namespace MMO
          * @param preProcess        可选：ProcessMessages 前回调（RPCClient::ProcessTimeouts 等）
          * @param postFlush         可选：Flush 后回调（CenterClient::SendHeartbeat 等）
          */
-        void Start(
-            std::unordered_map<uint32, WorldSession> *sessions,
-            std::shared_mutex                        *sessionsMtx,
-            TickCallback                              onTick,
-            DispatchCallback                          onMessage,
-            std::function<void()>                     preProcess  = nullptr,
-            std::function<void()>                     postFlush   = nullptr);
+        void Start(std::unordered_map<uint32, WorldSession> *sessions,
+                   std::shared_mutex                        *sessionsMtx,
+                   TickCallback                              onTick,
+                   DispatchCallback                          onMessage,
+                   std::function<void()>                     preProcess = nullptr,
+                   std::function<void()>                     postFlush  = nullptr);
 
         void Stop();
 
-        bool IsRunning() const { return _running.load(std::memory_order_acquire); }
+        bool IsRunning() const
+        {
+            return _running.load(std::memory_order_acquire);
+        }
 
         // 供外部调用的统计
-        size_t LastTickProcessed() const { return _lastProcessed.load(std::memory_order_relaxed); }
+        size_t LastTickProcessed() const
+        {
+            return _lastProcessed.load(std::memory_order_relaxed);
+        }
 
         // 供 WorldServer 注册定时器（LogicThread 独占，非线程安全）
-        TimingWheel &GetTimingWheel() { return _timingWheel; }
+        TimingWheel &GetTimingWheel()
+        {
+            return _timingWheel;
+        }
 
     private:
-        void RunLoop(
-            std::unordered_map<uint32, WorldSession> *sessions,
-            std::shared_mutex                        *sessionsMtx,
-            TickCallback                              onTick,
-            DispatchCallback                          onMessage,
-            std::function<void()>                     preProcess,
-            std::function<void()>                     postFlush);
+        void RunLoop(std::unordered_map<uint32, WorldSession> *sessions,
+                     std::shared_mutex                        *sessionsMtx,
+                     TickCallback                              onTick,
+                     DispatchCallback                          onMessage,
+                     std::function<void()>                     preProcess,
+                     std::function<void()>                     postFlush);
 
-        void ProcessMessages(
-            std::unordered_map<uint32, WorldSession> *sessions,
-            DispatchCallback                          onMessage);
+        void ProcessMessages(std::unordered_map<uint32, WorldSession> *sessions, DispatchCallback onMessage);
 
         TimingWheel       _timingWheel;
         std::thread       _thread;

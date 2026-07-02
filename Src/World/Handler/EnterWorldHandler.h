@@ -39,41 +39,42 @@ namespace MMO
          */
         using GateSendFn = std::function<void(uint32, uint32, ByteBuffer)>;
 
-        static void Handle(
-            uint32                                    sessionID,
-            const uint8                              *body,
-            size_t                                    len,
-            std::unordered_map<uint32, WorldSession> &sessions,
-            const uint8                              *lss,
-            uint16                                    gateServerID,
-            ECS::Scene                               &defaultScene,
-            GateSendFn                                gateSendFn);
+        static void Handle(uint32                                    sessionID,
+                           const uint8                              *body,
+                           size_t                                    len,
+                           std::unordered_map<uint32, WorldSession> &sessions,
+                           const uint8                              *lss,
+                           uint16                                    gateServerID,
+                           ECS::Scene                               &defaultScene,
+                           GateSendFn                                gateSendFn);
 
     private:
-        static void HandleFirstLogin(
-            uint32                                    sessionID,
-            uint16                                    gateServerID,
-            std::unordered_map<uint32, WorldSession> &sessions,
-            uint32                                    accountID,
-            const uint8                              *sessionKey,
-            uint64                                    clientRandom,
-            ECS::Scene                               &defaultScene,
-            GateSendFn                                gateSendFn);
+        static void HandleFirstLogin(uint32                                    sessionID,
+                                     uint16                                    gateServerID,
+                                     std::unordered_map<uint32, WorldSession> &sessions,
+                                     uint32                                    accountID,
+                                     const uint8                              *sessionKey,
+                                     uint64                                    clientRandom,
+                                     ECS::Scene                               &defaultScene,
+                                     GateSendFn                                gateSendFn);
 
-        static void HandleReconnect(
-            uint32                                    sessionID,
-            uint16                                    gateServerID,
-            std::unordered_map<uint32, WorldSession> &sessions,
-            uint32                                    accountID,
-            const uint8                              *reconnectSeed,
-            size_t                                    seedLen,
-            uint64                                    clientRandom,
-            GateSendFn                                gateSendFn);
+        static void HandleReconnect(uint32                                    sessionID,
+                                    uint16                                    gateServerID,
+                                    std::unordered_map<uint32, WorldSession> &sessions,
+                                    uint32                                    accountID,
+                                    const uint8                              *reconnectSeed,
+                                    size_t                                    seedLen,
+                                    uint64                                    clientRandom,
+                                    GateSendFn                                gateSendFn);
 
-        static void SendError(uint32 sessionID, uint32 errorCode, const char *msg,
-                              GateSendFn gateSendFn);
+        static void SendError(uint32 sessionID, uint32 errorCode, const char *msg, GateSendFn gateSendFn);
 
-        static void SendRsp(uint32 sessionID, uint32 playerID, uint32 sceneID, float x, float y, float z,
+        static void SendRsp(uint32     sessionID,
+                            uint32     playerID,
+                            uint32     sceneID,
+                            float      x,
+                            float      y,
+                            float      z,
                             GateSendFn gateSendFn);
     };
 

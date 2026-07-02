@@ -61,11 +61,14 @@ namespace MMO
         }
 
         // 获取 Center TCPSocket（用于 Notify）
-        std::shared_ptr<TCPSocket> GetSocket() const { return _socket; }
+        std::shared_ptr<TCPSocket> GetSocket() const
+        {
+            return _socket;
+        }
 
     private:
         std::shared_ptr<TCPSocket> _socket;
-        RPCClient                  _rpcClient;  // LogicThread 模式
+        RPCClient                  _rpcClient; // LogicThread 模式
         std::atomic<bool>          _connected {false};
         uint16                     _worldServerID = 0;
         uint16                     _maxPlayers    = 0;

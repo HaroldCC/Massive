@@ -9,8 +9,8 @@
 #include <sstream>
 
 #ifdef _WIN32
-#pragma warning(push)
-#pragma warning(disable : 4996) // sscanf 在 MSVC 标记为不安全，我们用的时候已确保缓冲区安全
+    #pragma warning(push)
+    #pragma warning(disable : 4996) // sscanf 在 MSVC 标记为不安全，我们用的时候已确保缓冲区安全
 #endif
 
 namespace MMO::DB
@@ -41,13 +41,13 @@ namespace MMO::DB
         // 解析 "YYYY-MM-DD HH:MM:SS"
         const char *p = pgText.c_str();
         auto        n = std::sscanf(p,
-                           "%d-%d-%d %d:%d:%d",
-                           &tmBuf.tm_year,
-                           &tmBuf.tm_mon,
-                           &tmBuf.tm_mday,
-                           &tmBuf.tm_hour,
-                           &tmBuf.tm_min,
-                           &tmBuf.tm_sec);
+                                    "%d-%d-%d %d:%d:%d",
+                                    &tmBuf.tm_year,
+                                    &tmBuf.tm_mon,
+                                    &tmBuf.tm_mday,
+                                    &tmBuf.tm_hour,
+                                    &tmBuf.tm_min,
+                                    &tmBuf.tm_sec);
         if (n < 6)
         {
             return {};
@@ -58,44 +58,56 @@ namespace MMO::DB
 
         // 跳过已解析的 "YYYY-MM-DD HH:MM:SS"
         while (*p && *p >= '0' && *p <= '9')
-            ++p;
-        if (*p == '-')
         {
             ++p;
-            while (*p && *p >= '0' && *p <= '9')
-                ++p;
         }
         if (*p == '-')
         {
             ++p;
             while (*p && *p >= '0' && *p <= '9')
+            {
                 ++p;
+            }
+        }
+        if (*p == '-')
+        {
+            ++p;
+            while (*p && *p >= '0' && *p <= '9')
+            {
+                ++p;
+            }
         }
         if (*p == ' ')
         {
             ++p;
             while (*p && *p >= '0' && *p <= '9')
+            {
                 ++p;
+            }
         }
         if (*p == ':')
         {
             ++p;
             while (*p && *p >= '0' && *p <= '9')
+            {
                 ++p;
+            }
         }
         if (*p == ':')
         {
             ++p;
             while (*p && *p >= '0' && *p <= '9')
+            {
                 ++p;
+            }
         }
 
         // 可选小数秒 ".123456"
         if (*p == '.')
         {
             ++p;
-            int  frac    = 0;
-            int  digits  = 0;
+            int frac   = 0;
+            int digits = 0;
             while (*p && *p >= '0' && *p <= '9' && digits < 3)
             {
                 frac = frac * 10 + (*p - '0');
@@ -111,7 +123,9 @@ namespace MMO::DB
             fractionalMs = frac;
             // 跳过剩余小数位
             while (*p && *p >= '0' && *p <= '9')
+            {
                 ++p;
+            }
         }
 
         // 可选时区偏移 "+08:00" 或 "+08"
@@ -173,15 +187,15 @@ namespace MMO::DB
     std::string Timestamp::ToPGText() const
     {
         // 格式: "2025-06-20 12:00:00.123+00"
-        auto sec     = unix_ms / 1000;
-        auto ms      = unix_ms % 1000;
+        auto sec = unix_ms / 1000;
+        auto ms  = unix_ms % 1000;
         if (ms < 0)
         {
             ms += 1000;
             sec -= 1;
         }
 
-        auto tt   = static_cast<time_t>(sec);
+        auto      tt = static_cast<time_t>(sec);
         struct tm tmBuf;
 #ifdef _WIN32
         gmtime_s(&tmBuf, &tt);
@@ -191,19 +205,13 @@ namespace MMO::DB
 
         std::ostringstream oss;
         oss.fill('0');
-        oss << (tmBuf.tm_year + 1900) << '-'
-            << (tmBuf.tm_mon + 1) << '-'
-            << tmBuf.tm_mday << ' '
-            << tmBuf.tm_hour << ':'
-            << tmBuf.tm_min << ':'
-            << tmBuf.tm_sec << '.'
-            << ms
-            << "+00";
+        oss << (tmBuf.tm_year + 1900) << '-' << (tmBuf.tm_mon + 1) << '-' << tmBuf.tm_mday << ' '
+            << tmBuf.tm_hour << ':' << tmBuf.tm_min << ':' << tmBuf.tm_sec << '.' << ms << "+00";
         return oss.str();
     }
 
 } // namespace MMO::DB
 
 #ifdef _WIN32
-#pragma warning(pop)
+    #pragma warning(pop)
 #endif // _WIN32

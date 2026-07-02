@@ -42,7 +42,11 @@ namespace MMO::DB
         std::string ToPGText() const;
 
         bool operator==(const Timestamp &) const = default;
-        bool operator<(const Timestamp &other) const { return unix_ms < other.unix_ms; }
+
+        bool operator<(const Timestamp &other) const
+        {
+            return unix_ms < other.unix_ms;
+        }
     };
 
 } // namespace MMO::DB

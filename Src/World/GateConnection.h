@@ -59,21 +59,27 @@ namespace MMO
         void HandleControlMessage(uint32 ctrlMsgID, const uint8 *data, size_t len);
 
         // 注册/注销 IO 线程可访问的 _sessions 指针
-        void SetSessionsPtr(std::shared_mutex *mtx,
-                            std::unordered_map<uint32, WorldSession> *sessions)
+        void SetSessionsPtr(std::shared_mutex *mtx, std::unordered_map<uint32, WorldSession> *sessions)
         {
-            _sessionsMtx  = mtx;
-            _sessions     = sessions;
+            _sessionsMtx = mtx;
+            _sessions    = sessions;
         }
 
         // Fallback / 控制消息队列（IO 线程写，LogicThread 在 OnTick 中 DrainAll）
-        MPSCQueue<LogicMessage> &GetUnroutedQueue() { return _unroutedQueue; }
-        MPSCQueue<LogicMessage> &GetCtrlQueue() { return _ctrlQueue; }
+        MPSCQueue<LogicMessage> &GetUnroutedQueue()
+        {
+            return _unroutedQueue;
+        }
+
+        MPSCQueue<LogicMessage> &GetCtrlQueue()
+        {
+            return _ctrlQueue;
+        }
 
     private:
         struct GateConnection
         {
-            uint16                    gateID = 0;
+            uint16                     gateID = 0;
             std::shared_ptr<TCPSocket> socket;
         };
 
@@ -81,8 +87,8 @@ namespace MMO
         std::mutex                                                  _gateMutex;
 
         // 指向 WorldServer::_sessions 的指针（IO 线程读锁访问）
-        std::shared_mutex                              *_sessionsMtx  = nullptr;
-        std::unordered_map<uint32, WorldSession>        *_sessions     = nullptr;
+        std::shared_mutex                        *_sessionsMtx = nullptr;
+        std::unordered_map<uint32, WorldSession> *_sessions    = nullptr;
 
         // Fallback / 控制消息队列（IO 线程写，LogicThread 读）
         MPSCQueue<LogicMessage> _unroutedQueue;

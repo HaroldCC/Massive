@@ -18,10 +18,10 @@ namespace MMO::TestClient
     /** @brief LoginFlowScenario */
 
     LoginFlowScenario::LoginFlowScenario(uint32 heartbeatIntervalSec,
-                                        uint32 moveIntervalMs,
-                                        float  moveSpeed,
-                                        float  moveRadius,
-                                        uint32 durationSec)
+                                         uint32 moveIntervalMs,
+                                         float  moveSpeed,
+                                         float  moveRadius,
+                                         uint32 durationSec)
         : _heartbeatIntervalSec(heartbeatIntervalSec)
         , _heartbeatIntervalMs(heartbeatIntervalSec * 1000)
         , _moveIntervalMs(moveIntervalMs)
@@ -34,13 +34,16 @@ namespace MMO::TestClient
 
     void LoginFlowScenario::OnEnter()
     {
-        _enterTime         = std::chrono::steady_clock::now();
+        _enterTime          = std::chrono::steady_clock::now();
         _elapsedHeartbeatMs = 0;
         _elapsedMoveMs      = 0;
 
         Log::Info("[{}] LoginFlow started (hb={}s, move={}ms, speed={}, radius={})",
                   _owner ? _owner->Name() : "?",
-                  _heartbeatIntervalSec, _moveIntervalMs, _moveSpeed, _moveRadius);
+                  _heartbeatIntervalSec,
+                  _moveIntervalMs,
+                  _moveSpeed,
+                  _moveRadius);
     }
 
     void LoginFlowScenario::OnTick(uint32 elapsedMs)
@@ -53,8 +56,8 @@ namespace MMO::TestClient
         // 检查总时长
         if (_durationSec > 0)
         {
-            auto now  = std::chrono::steady_clock::now();
-            auto dur  = std::chrono::duration_cast<std::chrono::seconds>(now - _enterTime).count();
+            auto now = std::chrono::steady_clock::now();
+            auto dur = std::chrono::duration_cast<std::chrono::seconds>(now - _enterTime).count();
             if (static_cast<uint32>(dur) >= _durationSec)
             {
                 Log::Info("[{}] LoginFlow complete (duration={}s)", _owner->Name(), _durationSec);
@@ -83,8 +86,8 @@ namespace MMO::TestClient
                 std::uniform_real_distribution<float> dirDist(-1.0f, 1.0f);
                 std::uniform_real_distribution<float> stepDist(0.0f, 1.0f);
 
-                float dx = dirDist(_rng);
-                float dz = dirDist(_rng);
+                float dx  = dirDist(_rng);
+                float dz  = dirDist(_rng);
                 float len = std::sqrt(dx * dx + dz * dz);
                 if (len > 0.001f)
                 {
@@ -123,8 +126,8 @@ namespace MMO::TestClient
 
     void IdleScenario::OnEnter()
     {
-        _enterTime  = std::chrono::steady_clock::now();
-        _elapsedMs  = 0;
+        _enterTime = std::chrono::steady_clock::now();
+        _elapsedMs = 0;
     }
 
     void IdleScenario::OnTick(uint32 elapsedMs)
@@ -145,9 +148,9 @@ namespace MMO::TestClient
     /** @brief MoveStressScenario -- 密集 MoveReq */
 
     MoveStressScenario::MoveStressScenario(uint32 heartbeatIntervalSec,
-                                          uint32 moveIntervalMs,
-                                          float  moveSpeed,
-                                          float  moveRadius)
+                                           uint32 moveIntervalMs,
+                                           float  moveSpeed,
+                                           float  moveRadius)
         : _heartbeatIntervalMs(heartbeatIntervalSec * 1000)
         , _moveIntervalMs(moveIntervalMs)
         , _moveSpeed(moveSpeed)
@@ -182,9 +185,9 @@ namespace MMO::TestClient
             _elapsedMoveMs -= _moveIntervalMs;
 
             std::uniform_real_distribution<float> dirDist(-1.0f, 1.0f);
-            float dx = dirDist(_rng);
-            float dz = dirDist(_rng);
-            float len = std::sqrt(dx * dx + dz * dz);
+            float                                 dx  = dirDist(_rng);
+            float                                 dz  = dirDist(_rng);
+            float                                 len = std::sqrt(dx * dx + dz * dz);
             if (len > 0.001f)
             {
                 dx /= len;

@@ -36,8 +36,8 @@ namespace MMO
 {
 
     /**
- * @brief 日志级别
- */
+     * @brief 日志级别
+     */
     enum class ELogLevel : uint8
     {
         Trace    = 0, /**< 追踪 */
@@ -91,8 +91,8 @@ namespace MMO
         consteval std::string_view ShortenFunctionName(std::string_view name) noexcept
         {
             /**
- * @brief 找第一个 '('，去掉参数列表
- */
+             * @brief 找第一个 '('，去掉参数列表
+             */
             auto parenPos = std::string_view::npos;
             for (size_t i = 0; i < name.size(); ++i)
             {
@@ -110,8 +110,8 @@ namespace MMO
             auto prefix = name.substr(0, parenPos);
 
             /**
- * @brief 去掉末尾空白
- */
+             * @brief 去掉末尾空白
+             */
             size_t end = prefix.size();
             while (end > 0 && (prefix[end - 1] == ' ' || prefix[end - 1] == '\t'))
             {
@@ -120,8 +120,8 @@ namespace MMO
             prefix = prefix.substr(0, end);
 
             /**
- * @brief 找最后一个空格，去掉返回类型和调用约定
- */
+             * @brief 找最后一个空格，去掉返回类型和调用约定
+             */
             auto spacePos = std::string_view::npos;
             for (size_t i = 0; i < prefix.size(); ++i)
             {
@@ -167,8 +167,8 @@ namespace MMO
         };
 
         /**
- * @brief 外部调用方传入的 source location（供 Log::At 使用）
- */
+         * @brief 外部调用方传入的 source location（供 Log::At 使用）
+         */
         struct SourceLoc
         {
             std::string_view file;
@@ -187,8 +187,8 @@ namespace MMO
         }
 
         /**
- * @brief 日志内部实现（定义在 Log.cpp，隐藏 spdlog）
- */
+         * @brief 日志内部实现（定义在 Log.cpp，隐藏 spdlog）
+         */
         void LogImpl(ELogLevel        level,
                      std::string_view file,
                      int              line,
@@ -204,8 +204,8 @@ namespace MMO
         bool ShouldLog(ELogLevel level);
 
         /**
- * @brief spdlog::logger 裸指针缓存（非拥有），Init() 赋值，Shutdown() 清空
- */
+         * @brief spdlog::logger 裸指针缓存（非拥有），Init() 赋值，Shutdown() 清空
+         */
         inline std::atomic<spdlog::logger *> g_rawLogger = nullptr;
 
         /**
@@ -287,8 +287,8 @@ namespace MMO
     struct Log
     {
         /**
- * @brief 日志初始化参数（从 toml 配置加载）
- */
+         * @brief 日志初始化参数（从 toml 配置加载）
+         */
         struct Config
         {
             ELogLevel   level = ELogLevel::Trace; /**< 日志级别 */
@@ -315,18 +315,18 @@ namespace MMO
                          const std::string_view logDir = "");
 
         /**
- * @brief 关闭 spdlog
- */
+         * @brief 关闭 spdlog
+         */
         static void Shutdown();
 
         /**
- * @brief 刷新所有 sink
- */
+         * @brief 刷新所有 sink
+         */
         static void Flush();
 
         /**
- * @brief 运行时修改日志级别
- */
+         * @brief 运行时修改日志级别
+         */
         static void SetLevel(ELogLevel level);
 
         /**
@@ -343,12 +343,12 @@ namespace MMO
         /** @name traceID 上下文 */
 
         /**
- * @brief 设置当前线程的 traceID
- */
+         * @brief 设置当前线程的 traceID
+         */
         static void SetTraceID(uint64 traceID);
         /**
- * @brief 获取当前线程的 traceID
- */
+         * @brief 获取当前线程的 traceID
+         */
         static uint64 GetTraceID();
 
         /** @name 日志 API（FormatWithLocation 自动捕获 source_location） */

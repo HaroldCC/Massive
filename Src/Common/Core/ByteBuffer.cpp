@@ -92,8 +92,8 @@ namespace MMO
     }
 
     /**
- * @brief 仅释放拥有的内存
- */
+     * @brief 仅释放拥有的内存
+     */
     void ByteBuffer::Release()
     {
         if (_ownsMemory && _data)

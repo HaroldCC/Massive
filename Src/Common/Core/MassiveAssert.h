@@ -46,8 +46,8 @@ inline void SetMassiveAssertFlushHook(MassiveAssertFlushHook hook)
 #ifdef NDEBUG
 
     /**
- * @brief Release: stderr → 栈回溯 → 钩子 → 继续执行
- */
+     * @brief Release: stderr → 栈回溯 → 钩子 → 继续执行
+     */
     #define MASSIVE_ASSERT(cond, msg)                                                      \
         do                                                                                 \
         {                                                                                  \
@@ -63,8 +63,8 @@ inline void SetMassiveAssertFlushHook(MassiveAssertFlushHook hook)
         } while (0)
 
     /**
- * @brief Release: 带格式，stderr → 栈回溯 → 钩子 → 继续执行
- */
+     * @brief Release: 带格式，stderr → 栈回溯 → 钩子 → 继续执行
+     */
     #define MASSIVE_ASSERT_FMT(cond, msg, ...)                                                          \
         do                                                                                              \
         {                                                                                               \
@@ -110,8 +110,8 @@ inline void SetMassiveAssertFlushHook(MassiveAssertFlushHook hook)
         } while (0)
 
     /**
- * @brief Debug: 带格式，fprintf → 钩子 → flush → 栈回溯 → debugbreak → abort
- */
+     * @brief Debug: 带格式，fprintf → 钩子 → flush → 栈回溯 → debugbreak → abort
+     */
     #define MASSIVE_ASSERT_FMT(cond, msg, ...)                                                          \
         do                                                                                              \
         {                                                                                               \

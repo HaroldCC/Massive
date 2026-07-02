@@ -10,21 +10,21 @@ namespace MMO
 {
 
     /**
- * @brief 全局 TimerID 生成器（永不回绕）
- */
+     * @brief 全局 TimerID 生成器（永不回绕）
+     */
     std::atomic<TimingWheel::TimerID> TimingWheel::_nextTimerID {1};
 
     /**
- * @brief 生成唯一 TimerID
- */
+     * @brief 生成唯一 TimerID
+     */
     TimingWheel::TimerID TimingWheel::GenTimerID()
     {
         return _nextTimerID.fetch_add(1, std::memory_order_relaxed);
     }
 
     /**
- * @brief 构造时间轮，初始化所有槽位为空
- */
+     * @brief 构造时间轮，初始化所有槽位为空
+     */
     TimingWheel::TimingWheel()
     {
         for (int i = 0; i < kLevels; ++i)
@@ -38,8 +38,8 @@ namespace MMO
     }
 
     /**
- * @brief 析构时间轮，清理所有剩余节点和空闲池
- */
+     * @brief 析构时间轮，清理所有剩余节点和空闲池
+     */
     TimingWheel::~TimingWheel()
     {
         for (int i = 0; i < kLevels; ++i)
@@ -89,8 +89,8 @@ namespace MMO
     }
 
     /**
- * @brief 将节点归还到对象池
- */
+     * @brief 将节点归还到对象池
+     */
     void TimingWheel::FreeNode(Node *node)
     {
         node->callback = {};
@@ -99,8 +99,8 @@ namespace MMO
     }
 
     /**
- * @brief 释放对象池中所有节点
- */
+     * @brief 释放对象池中所有节点
+     */
     void TimingWheel::ClearFreeList()
     {
         while (_freeList)
@@ -155,8 +155,8 @@ namespace MMO
     }
 
     /**
- * @brief 节点插入槽位链表头部
- */
+     * @brief 节点插入槽位链表头部
+     */
     void TimingWheel::InsertToWheel(int level, int slot, Node *node)
     {
         node->next           = _wheels[level][slot];
@@ -180,8 +180,8 @@ namespace MMO
     }
 
     /**
- * @brief 推进轮0 + 级联，每逻辑帧调用一次（20ms）
- */
+     * @brief 推进轮0 + 级联，每逻辑帧调用一次（20ms）
+     */
     void TimingWheel::Tick()
     {
         // 推进轮0
@@ -196,7 +196,9 @@ namespace MMO
                 _currentSlot[level] = (_currentSlot[level] + 1) % kSlots;
                 CascadeToLower(level - 1);
                 if (_currentSlot[level] != 0)
+                {
                     break;
+                }
             }
         }
 
@@ -307,8 +309,8 @@ namespace MMO
     }
 
     /**
- * @brief 当前活跃定时器数量
- */
+     * @brief 当前活跃定时器数量
+     */
     size_t TimingWheel::ActiveCount() const
     {
         return _idMap.size();

@@ -22,8 +22,8 @@ namespace MMO
         cfg.network.ioThreads = loader.GetInt("network.io_threads", 2);
 
         /**
- * @brief 日志配置
- */
+         * @brief 日志配置
+         */
         cfg.log.logDir   = loader.GetString("log.dir", "");
         auto logLevelInt = loader.GetInt("log.level", 0);
         if (logLevelInt >= 0 && logLevelInt <= 5)

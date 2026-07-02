@@ -27,32 +27,35 @@ namespace MMO::TestClient
     {
     public:
         LoginFlowScenario(uint32 heartbeatIntervalSec,
-                         uint32 moveIntervalMs,
-                         float  moveSpeed,
-                         float  moveRadius,
-                         uint32 durationSec);
+                          uint32 moveIntervalMs,
+                          float  moveSpeed,
+                          float  moveRadius,
+                          uint32 durationSec);
 
-        const char *Name() const override { return "LoginFlow"; }
+        const char *Name() const override
+        {
+            return "LoginFlow";
+        }
 
         void OnEnter() override;
         void OnTick(uint32 elapsedMs) override;
         void OnMoveRsp([[maybe_unused]] uint32 sequence) override;
 
     private:
-        uint32 _heartbeatIntervalSec;          // 心跳间隔（秒）
-        uint32 _heartbeatIntervalMs;           // 同上（毫秒）
-        uint32 _moveIntervalMs;                // 移动间隔（毫秒）
+        uint32 _heartbeatIntervalSec; // 心跳间隔（秒）
+        uint32 _heartbeatIntervalMs;  // 同上（毫秒）
+        uint32 _moveIntervalMs;       // 移动间隔（毫秒）
         float  _moveSpeed;
         float  _moveRadius;
         uint32 _durationSec;
 
         // 运行时状态
         std::chrono::steady_clock::time_point _enterTime;
-        uint64 _elapsedHeartbeatMs  = 0;
-        uint64 _elapsedMoveMs       = 0;
-        uint32 _moveSequence        = 0;
-        uint32 _moveRspCount        = 0;
-        float  _x = 0.0f, _y = 0.0f, _z = 0.0f;
+        uint64                                _elapsedHeartbeatMs = 0;
+        uint64                                _elapsedMoveMs      = 0;
+        uint32                                _moveSequence       = 0;
+        uint32                                _moveRspCount       = 0;
+        float                                 _x = 0.0f, _y = 0.0f, _z = 0.0f;
 
         std::mt19937 _rng;
     };
@@ -65,14 +68,17 @@ namespace MMO::TestClient
     public:
         explicit IdleScenario(uint32 heartbeatIntervalSec);
 
-        const char *Name() const override { return "Idle"; }
+        const char *Name() const override
+        {
+            return "Idle";
+        }
 
         void OnEnter() override;
         void OnTick(uint32 elapsedMs) override;
 
     private:
-        uint32       _heartbeatIntervalMs;
-        uint64       _elapsedMs = 0;
+        uint32                                _heartbeatIntervalMs;
+        uint64                                _elapsedMs = 0;
         std::chrono::steady_clock::time_point _enterTime;
     };
 
@@ -83,11 +89,14 @@ namespace MMO::TestClient
     {
     public:
         MoveStressScenario(uint32 heartbeatIntervalSec,
-                          uint32 moveIntervalMs,
-                          float  moveSpeed,
-                          float  moveRadius);
+                           uint32 moveIntervalMs,
+                           float  moveSpeed,
+                           float  moveRadius);
 
-        const char *Name() const override { return "MoveStress"; }
+        const char *Name() const override
+        {
+            return "MoveStress";
+        }
 
         void OnEnter() override;
         void OnTick(uint32 elapsedMs) override;

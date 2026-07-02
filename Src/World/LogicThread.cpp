@@ -17,20 +17,23 @@ namespace MMO
 
     LogicThread::LogicThread() = default;
 
-    void LogicThread::Start(
-        std::unordered_map<uint32, WorldSession> *sessions,
-        std::shared_mutex                        *sessionsMtx,
-        TickCallback                              onTick,
-        DispatchCallback                          onMessage,
-        std::function<void()>                     preProcess,
-        std::function<void()>                     postFlush)
+    void LogicThread::Start(std::unordered_map<uint32, WorldSession> *sessions,
+                            std::shared_mutex                        *sessionsMtx,
+                            TickCallback                              onTick,
+                            DispatchCallback                          onMessage,
+                            std::function<void()>                     preProcess,
+                            std::function<void()>                     postFlush)
     {
         _stopped.store(false, std::memory_order_release);
 
-        _thread = std::thread(&LogicThread::RunLoop, this,
-                              sessions, sessionsMtx,
-                              std::move(onTick), std::move(onMessage),
-                              std::move(preProcess), std::move(postFlush));
+        _thread = std::thread(&LogicThread::RunLoop,
+                              this,
+                              sessions,
+                              sessionsMtx,
+                              std::move(onTick),
+                              std::move(onMessage),
+                              std::move(preProcess),
+                              std::move(postFlush));
     }
 
     void LogicThread::Stop()
@@ -43,22 +46,22 @@ namespace MMO
         _running.store(false, std::memory_order_release);
     }
 
-    void LogicThread::RunLoop(
-        std::unordered_map<uint32, WorldSession> *sessions,
-        std::shared_mutex                        *sessionsMtx,
-        TickCallback                              onTick,
-        DispatchCallback                          onMessage,
-        std::function<void()>                     preProcess,
-        std::function<void()>                     postFlush)
+    void LogicThread::RunLoop(std::unordered_map<uint32, WorldSession> *sessions,
+                              std::shared_mutex                        *sessionsMtx,
+                              TickCallback                              onTick,
+                              DispatchCallback                          onMessage,
+                              std::function<void()>                     preProcess,
+                              std::function<void()>                     postFlush)
     {
         _running.store(true, std::memory_order_release);
 
-        auto lastTime = std::chrono::steady_clock::now();
+        auto           lastTime     = std::chrono::steady_clock::now();
         constexpr auto tickInterval = 20ms;
         constexpr auto maxElapsed   = 50ms;
 
         Log::Info("LogicThread: started (tickInterval={}ms, clamp={}ms)",
-                  tickInterval.count(), maxElapsed.count());
+                  tickInterval.count(),
+                  maxElapsed.count());
 
         while (!_stopped.load(std::memory_order_acquire))
         {
@@ -102,8 +105,9 @@ namespace MMO
             }
             else
             {
-                Log::Warn("LogicThread: tick overran by {}ms",
-                          std::chrono::duration_cast<std::chrono::milliseconds>(workDur - tickInterval).count());
+                Log::Warn(
+                    "LogicThread: tick overran by {}ms",
+                    std::chrono::duration_cast<std::chrono::milliseconds>(workDur - tickInterval).count());
             }
         }
 
@@ -111,9 +115,8 @@ namespace MMO
         Log::Info("LogicThread: stopped");
     }
 
-    void LogicThread::ProcessMessages(
-        std::unordered_map<uint32, WorldSession> *sessions,
-        DispatchCallback                          onMessage)
+    void LogicThread::ProcessMessages(std::unordered_map<uint32, WorldSession> *sessions,
+                                      DispatchCallback                          onMessage)
     {
         if (!sessions)
         {
@@ -141,7 +144,8 @@ namespace MMO
                 if (processed >= kMaxMessagesPerTick)
                 {
                     Log::Warn("LogicThread: kMaxMessagesPerTick reached ({}), remaining={}",
-                              kMaxMessagesPerTick, totalMsgs - processed);
+                              kMaxMessagesPerTick,
+                              totalMsgs - processed);
                     _lastProcessed.store(processed, std::memory_order_relaxed);
                     return;
                 }

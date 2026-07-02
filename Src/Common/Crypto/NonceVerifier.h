@@ -44,17 +44,17 @@ namespace MMO::Crypto
 
     private:
         /**
- * @brief Bloom filter 碰撞检测
- */
+         * @brief Bloom filter 碰撞检测
+         */
         bool ProbablySeen(uint64 nonce) const;
         /**
- * @brief 插入 Bloom filter
- */
+         * @brief 插入 Bloom filter
+         */
         void Insert(uint64 nonce);
 
         /**
- * @brief 基于 splitmix64 的 3 个哈希函数
- */
+         * @brief 基于 splitmix64 的 3 个哈希函数
+         */
         uint32 Hash1(uint64 v) const;
         uint32 Hash2(uint64 v) const;
         uint32 Hash3(uint64 v) const;

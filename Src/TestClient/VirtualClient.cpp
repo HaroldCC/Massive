@@ -22,14 +22,14 @@
 namespace MMO::TestClient
 {
 
-    VirtualClient::VirtualClient(uint32                 clientID,
-                                std::string            username,
-                                std::string            password,
-                                std::string            loginHost,
-                                uint16                 loginPort,
-                                StatsCollector        &stats,
-                                IOContextPool         &pool,
-                                std::unique_ptr<Scenario> scenario)
+    VirtualClient::VirtualClient(uint32                    clientID,
+                                 std::string               username,
+                                 std::string               password,
+                                 std::string               loginHost,
+                                 uint16                    loginPort,
+                                 StatsCollector           &stats,
+                                 IOContextPool            &pool,
+                                 std::unique_ptr<Scenario> scenario)
         : _clientID(clientID)
         , _name(std::to_string(clientID))
         , _username(std::move(username))
@@ -66,34 +66,33 @@ namespace MMO::TestClient
         _state = ClientState::ConnectingLogin;
 
         auto &ctx    = _pool.GetNextContext();
-        auto socket  = std::make_shared<TCPSocket>(asio::ip::tcp::socket(ctx), EFraming::PacketHeader);
+        auto  socket = std::make_shared<TCPSocket>(asio::ip::tcp::socket(ctx), EFraming::PacketHeader);
 
         // 消息回调
-        socket->SetMessageHandler([self = shared_from_this()](uint32 msgID, uint32 sessionID,
-                                                              const uint8 *body, size_t len) {
-            switch (self->_state)
-            {
-                case ClientState::SendingAuth:
-                    self->OnAuthRsp(msgID, sessionID, body, len);
-                    break;
-                case ClientState::SendingEnterWorld:
-                    self->OnEnterWorldRsp(msgID, sessionID, body, len);
-                    break;
-                case ClientState::InWorld:
-                    self->OnGateMessage(msgID, sessionID, body, len);
-                    break;
-                default:
-                    break;
-            }
-        });
+        socket->SetMessageHandler(
+            [self = shared_from_this()](uint32 msgID, uint32 sessionID, const uint8 *body, size_t len) {
+                switch (self->_state)
+                {
+                    case ClientState::SendingAuth:
+                        self->OnAuthRsp(msgID, sessionID, body, len);
+                        break;
+                    case ClientState::SendingEnterWorld:
+                        self->OnEnterWorldRsp(msgID, sessionID, body, len);
+                        break;
+                    case ClientState::InWorld:
+                        self->OnGateMessage(msgID, sessionID, body, len);
+                        break;
+                    default:
+                        break;
+                }
+            });
 
         // 断线回调（Login 短连接预期认证完毕连接会断开，不视为失败）
         socket->SetCloseHandler([self = shared_from_this()]() {
             self->_stats.RecordDisconnect();
             // SendingAuth = 认证完毕 LoginServer 主动断开，是正常流程
             // ConncetingGate/SendingEnterWorld/InWorld = 登录 socket 已替换
-            if (self->_state != ClientState::Disconnecting
-                && self->_state != ClientState::Failed
+            if (self->_state != ClientState::Disconnecting && self->_state != ClientState::Failed
                 && self->_state != ClientState::SendingAuth)
             {
                 self->EnterFailedState("connection closed");
@@ -113,9 +112,9 @@ namespace MMO::TestClient
         }
 
         _socket->LowestLayer().async_connect(*endpoints.begin(),
-            [self = shared_from_this()](const asio::error_code &ec) {
-                self->OnLoginConnected(ec);
-            });
+                                             [self = shared_from_this()](const asio::error_code &ec) {
+                                                 self->OnLoginConnected(ec);
+                                             });
     }
 
     void VirtualClient::OnLoginConnected(const asio::error_code &ec)
@@ -155,8 +154,8 @@ namespace MMO::TestClient
 
         auto data = req.SerializeAsString();
         BuildAndSendPacket(Proto::MSG_LOGIN_AUTH_REQ,
-                          reinterpret_cast<const uint8 *>(data.data()),
-                          data.size());
+                           reinterpret_cast<const uint8 *>(data.data()),
+                           data.size());
 
         // 暂存私钥到成员变量（用 sessionKey 临时存，后续 ECDH 后覆盖）
         _sessionKey = std::move(privateKey);
@@ -190,7 +189,7 @@ namespace MMO::TestClient
 
         // ECDH: 计算 shared secret → SessionKey
         auto sharedSecretOpt = Crypto::EcdhX25519::DeriveSharedSecret(
-            _sessionKey.Data(),  // 之前存的私钥
+            _sessionKey.Data(), // 之前存的私钥
             reinterpret_cast<const uint8 *>(rsp.server_dh_key().data()));
         if (!sharedSecretOpt)
         {
@@ -203,8 +202,7 @@ namespace MMO::TestClient
 
         // 存储 SessionToken
         auto &tokenStr = rsp.session_token();
-        _sessionToken  = ByteBuffer::Copy(
-            reinterpret_cast<const uint8 *>(tokenStr.data()), tokenStr.size());
+        _sessionToken  = ByteBuffer::Copy(reinterpret_cast<const uint8 *>(tokenStr.data()), tokenStr.size());
 
         // 解析 Gate IP 列表
         if (rsp.gate_ips_size() > 0)
@@ -247,19 +245,19 @@ namespace MMO::TestClient
         _state = ClientState::ConnectingGate;
 
         auto &ctx    = _pool.GetNextContext();
-        auto socket = std::make_shared<TCPSocket>(asio::ip::tcp::socket(ctx), EFraming::PacketHeader);
+        auto  socket = std::make_shared<TCPSocket>(asio::ip::tcp::socket(ctx), EFraming::PacketHeader);
 
-        socket->SetMessageHandler([self = shared_from_this()](uint32 msgID, uint32 sessionID,
-                                                              const uint8 *body, size_t len) {
-            if (self->_state == ClientState::SendingEnterWorld)
-            {
-                self->OnEnterWorldRsp(msgID, sessionID, body, len);
-            }
-            else if (self->_state == ClientState::InWorld)
-            {
-                self->OnGateMessage(msgID, sessionID, body, len);
-            }
-        });
+        socket->SetMessageHandler(
+            [self = shared_from_this()](uint32 msgID, uint32 sessionID, const uint8 *body, size_t len) {
+                if (self->_state == ClientState::SendingEnterWorld)
+                {
+                    self->OnEnterWorldRsp(msgID, sessionID, body, len);
+                }
+                else if (self->_state == ClientState::InWorld)
+                {
+                    self->OnGateMessage(msgID, sessionID, body, len);
+                }
+            });
 
         socket->SetCloseHandler([self = shared_from_this()]() {
             self->_stats.RecordDisconnect();
@@ -273,7 +271,7 @@ namespace MMO::TestClient
 
         asio::ip::tcp::resolver resolver(ctx);
         asio::error_code        resolveEc;
-        auto endpoints = resolver.resolve(_gateHost, std::to_string(_gatePort), resolveEc);
+        auto                    endpoints = resolver.resolve(_gateHost, std::to_string(_gatePort), resolveEc);
         if (resolveEc || endpoints.empty())
         {
             EnterFailedState("gate resolve failed: " + _gateHost + ":" + std::to_string(_gatePort));
@@ -281,9 +279,9 @@ namespace MMO::TestClient
         }
 
         _socket->LowestLayer().async_connect(*endpoints.begin(),
-            [self = shared_from_this()](const asio::error_code &ec) {
-                self->OnGateConnected(ec);
-            });
+                                             [self = shared_from_this()](const asio::error_code &ec) {
+                                                 self->OnGateConnected(ec);
+                                             });
     }
 
     void VirtualClient::OnGateConnected(const asio::error_code &ec)
@@ -310,8 +308,8 @@ namespace MMO::TestClient
 
         auto data = req.SerializeAsString();
         BuildAndSendPacket(Proto::MSG_LOGIN_ENTER_WORLD_REQ,
-                          reinterpret_cast<const uint8 *>(data.data()),
-                          data.size());
+                           reinterpret_cast<const uint8 *>(data.data()),
+                           data.size());
     }
 
     void VirtualClient::OnEnterWorldRsp(uint32 msgID, uint32 /*sessionID*/, const uint8 *body, size_t len)
@@ -342,8 +340,7 @@ namespace MMO::TestClient
         _crypto.Init(_sessionKey.Data(), _clientRandom);
 
         _state = ClientState::InWorld;
-        Log::Info("[{}] Entered World (playerID={}, sceneID={})",
-                  _name, rsp.player_id(), rsp.scene_id());
+        Log::Info("[{}] Entered World (playerID={}, sceneID={})", _name, rsp.player_id(), rsp.scene_id());
 
         // 启动 Scenario
         if (_scenario)
@@ -378,8 +375,8 @@ namespace MMO::TestClient
                 {
                     return;
                 }
-                uint32     seq     = ByteBuffer::Wrap(body, sizeof(uint32)).ReadUint32();
-                size_t     encLen  = len - sizeof(uint32);
+                uint32       seq     = ByteBuffer::Wrap(body, sizeof(uint32)).ReadUint32();
+                size_t       encLen  = len - sizeof(uint32);
                 const uint8 *encBody = body + sizeof(uint32);
 
                 auto plaintext = _crypto.Decrypt(encBody, encLen, seq);
@@ -416,15 +413,15 @@ namespace MMO::TestClient
         }
 
         Proto::HeartbeatReq req;
-        auto nowMs = static_cast<uint64>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count());
+        auto nowMs = static_cast<uint64>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                             std::chrono::system_clock::now().time_since_epoch())
+                                             .count());
         req.set_client_time(nowMs);
 
         auto data = req.SerializeAsString();
         BuildAndSendPacket(Proto::MSG_HEARTBEAT_REQ,
-                          reinterpret_cast<const uint8 *>(data.data()),
-                          data.size());
+                           reinterpret_cast<const uint8 *>(data.data()),
+                           data.size());
 
         _stats.RecordHeartbeatSent();
     }
@@ -446,8 +443,7 @@ namespace MMO::TestClient
         auto rawBody = req.SerializeAsString();
 
         // AES-GCM 加密
-        auto encrypted = _crypto.Encrypt(
-            reinterpret_cast<const uint8 *>(rawBody.data()), rawBody.size());
+        auto encrypted = _crypto.Encrypt(reinterpret_cast<const uint8 *>(rawBody.data()), rawBody.size());
         if (encrypted.Size() == 0)
         {
             Log::Debug("[{}] MoveReq encrypt failed", _name);
@@ -488,9 +484,9 @@ namespace MMO::TestClient
             return;
         }
 
-        auto now = std::chrono::steady_clock::now();
+        auto now     = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - _lastTick);
-        _lastTick = now;
+        _lastTick    = now;
 
         if (_scenario && elapsed.count() > 0)
         {
