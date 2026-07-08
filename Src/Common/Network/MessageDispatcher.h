@@ -38,24 +38,23 @@ namespace MMO
 
         /**
          * @brief 注册消息处理器
+         * @tparam MsgID 消息 ID（编译期常量，static_assert 确保不越界）
          * @tparam TMsg  protobuf 消息类型
-         * @param msgID    消息 ID（数组下标）
          * @param handler  强类型处理回调 void(TContext, const TMsg&)
          */
-        template <typename TMsg>
-        void Register(uint32 msgID, std::function<void(TContext, const TMsg &)> handler)
+        template <uint32 MsgID, typename TMsg>
+        void Register(std::function<void(TContext, const TMsg &)> handler)
         {
-            if (msgID >= kMaxHandlers)
+            static_assert(
+                MsgID < kMaxHandlers,
+                "MsgID exceeds kMaxHandlers -- increase kMaxHandlers in Types.h or fix the MsgID enum");
+
+            if (_handlers[MsgID])
             {
-                Log::Error("MessageDispatcher: msgID {} exceeds kMaxHandlers {}", msgID, kMaxHandlers);
-                return;
-            }
-            if (_handlers[msgID])
-            {
-                Log::Warn("MessageDispatcher: msgID {} already registered, overwriting", msgID);
+                Log::Warn("MessageDispatcher: msgID {} already registered, overwriting", MsgID);
             }
 
-            _handlers[msgID] = [handler = std::move(handler)](TContext ctx, const uint8 *body, size_t len) {
+            _handlers[MsgID] = [handler = std::move(handler)](TContext ctx, const uint8 *body, size_t len) {
                 TMsg msg;
                 if (!msg.ParseFromArray(body, static_cast<int>(len)))
                 {

@@ -46,8 +46,7 @@ namespace MMO
         _acceptor = std::make_unique<TCPAcceptor>(*_ioPool, cfg.network.port);
 
         // 注册 MSG_LOGIN_AUTH_REQ handler（IO 线程）
-        _dispatcher.Register<Proto::LoginAuthReq>(
-            Proto::MSG_LOGIN_AUTH_REQ,
+        _dispatcher.Register<Proto::MSG_LOGIN_AUTH_REQ, Proto::LoginAuthReq>(
             [this](std::shared_ptr<TCPSocket> socket, const Proto::LoginAuthReq &req) {
                 std::string clientIP = "0.0.0.0";
                 try

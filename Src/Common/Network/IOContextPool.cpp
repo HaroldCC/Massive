@@ -39,6 +39,11 @@ namespace MMO
         }
     }
 
+    void IOContextPool::Wait()
+    {
+        _mainCtx.run(); // 主线程阻塞，直到 Stop() 调用 _mainCtx.stop()
+    }
+
     asio::io_context &IOContextPool::GetNextContext()
     {
         auto index = _nextIndex.fetch_add(1, std::memory_order_relaxed);
@@ -47,6 +52,9 @@ namespace MMO
 
     void IOContextPool::Stop()
     {
+        // 停主线程 io_context（让 Wait() 返回）
+        _mainCtx.stop();
+
         for (auto &ctx : _ioContexts)
         {
             ctx.stop();

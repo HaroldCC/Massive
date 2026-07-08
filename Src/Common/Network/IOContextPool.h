@@ -48,6 +48,12 @@ namespace MMO
         void Start();
 
         /**
+         * @brief 主线程阻塞等待（调用方线程阻塞于 _mainCtx.run()）
+         *        Stop() 被调用后返回
+         */
+        void Wait();
+
+        /**
          * @brief Round-Robin 获取下一个 io_context
          * @return asio::io_context&
          */
@@ -70,6 +76,10 @@ namespace MMO
         std::vector<std::thread>      _threads;
         std::atomic<std::size_t>      _nextIndex {0};
         bool                          _started = false;
+
+        // 主线程 io_context：Wait() 在其中 run()，Stop() 时 stop()
+        asio::io_context _mainCtx;
+        WorkGuard        _mainWork {_mainCtx.get_executor()};
     };
 
 } // namespace MMO
