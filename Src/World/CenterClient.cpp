@@ -40,11 +40,12 @@ namespace MMO
         }
 
         _socket = std::make_shared<TCPSocket>(asio::ip::tcp::socket(ctx), EFraming::LengthPrefix);
-        bool             connected = false;
+        // Center 内网连接：写队列满时丢弃最老包而非断连
+        _socket->SetBackPressure(EBackPressure::DropOldest);
         asio::error_code connectEc;
 
         // 同步连接（Init 阶段，阻塞可接受）
-        _socket->LowestLayer().connect(*endpoints.begin(), connectEc);
+        [[maybe_unused]] auto r = _socket->LowestLayer().connect(*endpoints.begin(), connectEc);
         if (connectEc)
         {
             Log::Error("CenterClient: connect to {}:{} failed: {}", host, port, connectEc.message());
@@ -76,6 +77,8 @@ namespace MMO
                     {
                         _connected.store(true, std::memory_order_release);
                         Log::Info("CenterClient: registered as worldServerID={}", _worldServerID);
+                        // 注册成功后批量 dump 在线玩家，重建 Center 索引
+                        SendBatchOnlinePlayers();
                     }
                 }
                 else
@@ -87,19 +90,50 @@ namespace MMO
 
         _socket->Start();
 
+        // 在 IO 线程启动 RPC 超时检查定时器
+        _rpcClient.StartTimeoutChecker(ctx);
+
         // 发送 RegisterWorldReq
+        SendRegisterWorld();
+
+        return true;
+    }
+
+    void CenterClient::SendRegisterWorld()
+    {
         Proto::Internal::RegisterWorldReq req;
-        req.set_service_id(std::to_string(worldServerID));
-        req.set_address(address);
-        req.set_max_players(maxPlayers);
+        req.set_service_id(std::to_string(_worldServerID));
+        req.set_address(_address);
+        req.set_max_players(_maxPlayers);
 
         auto frame = BuildRPCFrame(Proto::Internal::MSG_REGISTER_WORLD_REQ, 0, ERPCType::Request, 0, req);
         if (frame.Size() > 0)
         {
             _socket->Send(std::move(frame));
         }
+    }
 
-        return true;
+    void CenterClient::SendBatchOnlinePlayers()
+    {
+        if (!_collector)
+        {
+            return; // 未设置收集器（WorldServer 尚未初始化完）
+        }
+
+        auto ids = _collector();
+        if (ids.empty())
+        {
+            return;
+        }
+
+        Proto::Internal::BatchOnlinePlayersNtf ntf;
+        ntf.set_world_server_id(_worldServerID);
+        for (uint32 accountID : ids)
+        {
+            ntf.add_account_ids(accountID);
+        }
+        _rpcClient.Notify(_socket, Proto::Internal::MSG_BATCH_PLAYERS_ONLINE_NTF, ntf);
+        Log::Info("CenterClient: replayed {} online players to Center", ids.size());
     }
 
     void CenterClient::SendHeartbeat(uint32 currentPlayers)

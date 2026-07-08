@@ -7,6 +7,12 @@ package MMO.Proto.Internal;
 
 // ── 服务注册与发现 ──
 
+message BatchOnlinePlayersNtf
+{
+    uint32          world_server_id = 1;
+    repeated uint32 account_ids     = 2;  // 该 World 当前在线所有玩家 accountID
+}
+
 message RegisterWorldReq
 {
     string service_id = 1;   // WorldServer 唯一标识

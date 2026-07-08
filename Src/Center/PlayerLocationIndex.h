@@ -28,6 +28,9 @@ namespace MMO
         // 查询玩家所在 World
         std::optional<std::string> GetServiceID(uint32 accountID) const;
 
+        // 清空某 World 的所有记录（World 重连重建用）
+        void ClearWorld(const std::string &serviceID);
+
         // 总在线玩家数
         uint32 GetTotalOnline() const;
 

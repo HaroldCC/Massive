@@ -37,4 +37,12 @@ namespace MMO
         return static_cast<uint32>(_accountToService.size());
     }
 
+    void PlayerLocationIndex::ClearWorld(const std::string &serviceID)
+    {
+        std::unique_lock lock(_mutex);
+        std::erase_if(_accountToService, [&](const auto &pair) {
+            return pair.second == serviceID;
+        });
+    }
+
 } // namespace MMO

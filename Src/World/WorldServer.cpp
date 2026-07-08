@@ -85,6 +85,18 @@ namespace MMO
 
         std::string address = cfg.center.host + ":" + std::to_string(cfg.center.port);
 
+        // 注册在线玩家收集器：Center 重连后自动 dump 全量在线列表重建索引
+        _centerClient->SetOnlinePlayersCollector([this]() -> std::vector<uint32> {
+            std::shared_lock    lock(_sessionsMtx);
+            std::vector<uint32> ids;
+            ids.reserve(_sessions.size());
+            for (const auto &[sessionID, ws] : _sessions)
+            {
+                ids.push_back(ws.accountID);
+            }
+            return ids;
+        });
+
         return _centerClient->Connect(cfg.center.host,
                                       cfg.center.port,
                                       cfg.world.worldServerID,
@@ -153,8 +165,7 @@ namespace MMO
         // EnterWorldReq 由 OnTick 中消费 _unroutedQueue 直接处理
 
         // MoveReq
-        _dispatcher.Register<Proto::MoveReq>(
-            Proto::MSG_MOVE_REQ,
+        _dispatcher.Register<Proto::MSG_MOVE_REQ, Proto::MoveReq>(
             [this](uint32 sessionID, const Proto::MoveReq &req) {
                 auto it = _sessions.find(sessionID);
                 if (it == _sessions.end())
@@ -314,11 +325,7 @@ namespace MMO
 
     void WorldServer::OnPreProcess()
     {
-        if (_centerClient)
-        {
-            // RPC 超时检查
-            _centerClient->GetRPCClient().ProcessTimeouts();
-        }
+        // RPC 超时检查已移至 RPCClient IO 线程定时器，这里不再需要
     }
 
     void WorldServer::OnPostFlush()

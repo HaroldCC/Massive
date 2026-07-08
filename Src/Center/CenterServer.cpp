@@ -22,40 +22,42 @@ namespace MMO
         _acceptor = std::make_unique<TCPAcceptor>(*_ioPool, cfg.network.port, EFraming::LengthPrefix);
         // 注册 RPC handler
         // ── 服务注册 ──
-        _rpcHandlers.Register<Proto::Internal::RegisterWorldReq>(
-            Proto::Internal::MSG_REGISTER_WORLD_REQ,
+        _rpcHandlers.Register<Proto::Internal::MSG_REGISTER_WORLD_REQ, Proto::Internal::RegisterWorldReq>(
             [this](RPCContext ctx, const Proto::Internal::RegisterWorldReq &req) {
                 OnRegisterWorld(std::move(ctx), req);
             });
 
-        _rpcHandlers.Register<Proto::Internal::HeartbeatReq>(
-            Proto::Internal::MSG_HEARTBEAT_REQ,
+        _rpcHandlers.Register<Proto::Internal::MSG_HEARTBEAT_REQ, Proto::Internal::HeartbeatReq>(
             [this](RPCContext ctx, const Proto::Internal::HeartbeatReq &req) {
                 OnHeartbeat(std::move(ctx), req);
             });
 
         // ── 玩家位置 ──
-        _rpcHandlers.Register<Proto::Internal::QueryPlayerLocationReq>(
-            Proto::Internal::MSG_QUERY_PLAYER_LOCATION_REQ,
+        _rpcHandlers.Register<Proto::Internal::MSG_QUERY_PLAYER_LOCATION_REQ,
+                              Proto::Internal::QueryPlayerLocationReq>(
             [this](RPCContext ctx, const Proto::Internal::QueryPlayerLocationReq &req) {
                 OnQueryPlayerLocation(std::move(ctx), req);
             });
 
-        _rpcHandlers.Register<Proto::Internal::PlayerOnlineNtf>(
-            Proto::Internal::MSG_PLAYER_ONLINE_NTF,
+        _rpcHandlers.Register<Proto::Internal::MSG_PLAYER_ONLINE_NTF, Proto::Internal::PlayerOnlineNtf>(
             [this](RPCContext ctx, const Proto::Internal::PlayerOnlineNtf &req) {
                 OnPlayerOnline(std::move(ctx), req);
             });
 
-        _rpcHandlers.Register<Proto::Internal::PlayerOfflineNtf>(
-            Proto::Internal::MSG_PLAYER_OFFLINE_NTF,
+        _rpcHandlers.Register<Proto::Internal::MSG_PLAYER_OFFLINE_NTF, Proto::Internal::PlayerOfflineNtf>(
             [this](RPCContext ctx, const Proto::Internal::PlayerOfflineNtf &req) {
                 OnPlayerOffline(std::move(ctx), req);
             });
 
+        // ── World 重连重建 ──
+        _rpcHandlers
+            .Register<Proto::Internal::MSG_BATCH_PLAYERS_ONLINE_NTF, Proto::Internal::BatchOnlinePlayersNtf>(
+                [this](RPCContext ctx, const Proto::Internal::BatchOnlinePlayersNtf &req) {
+                    OnBatchOnlinePlayers(std::move(ctx), req);
+                });
+
         // ── 负载均衡 ──
-        _rpcHandlers.Register<Proto::Internal::PickWorldReq>(
-            Proto::Internal::MSG_PICK_WORLD_REQ,
+        _rpcHandlers.Register<Proto::Internal::MSG_PICK_WORLD_REQ, Proto::Internal::PickWorldReq>(
             [this](RPCContext ctx, const Proto::Internal::PickWorldReq &req) {
                 OnPickWorld(std::move(ctx), req);
             });
@@ -75,10 +77,7 @@ namespace MMO
         _ioPool->Start();
 
         Log::Info("CenterServer: running");
-        while (_running)
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
+        _ioPool->Wait(); // 主线程阻塞，直到 Stop() 被调用
     }
 
     void CenterServer::Stop()
@@ -241,6 +240,19 @@ namespace MMO
     {
         _playerIndex.UnregisterPlayer(req.account_id());
         Log::Debug("CenterServer: player {} offline", req.account_id());
+    }
+
+    void CenterServer::OnBatchOnlinePlayers(RPCContext ctx, const Proto::Internal::BatchOnlinePlayersNtf &req)
+    {
+        auto worldID = std::to_string(req.world_server_id());
+        _playerIndex.ClearWorld(worldID);
+        for (uint32 accountID : req.account_ids())
+        {
+            _playerIndex.RegisterPlayer(accountID, worldID);
+        }
+        Log::Info("CenterServer: World {} replayed {} online players",
+                  req.world_server_id(),
+                  req.account_ids_size());
     }
 
 } // namespace MMO

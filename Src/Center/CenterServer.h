@@ -30,6 +30,7 @@ namespace MMO::Proto::Internal
     class QueryPlayerLocationReq;
     class PlayerOnlineNtf;
     class PlayerOfflineNtf;
+    class BatchOnlinePlayersNtf;
 
 } // namespace MMO::Proto::Internal
 
@@ -56,6 +57,7 @@ namespace MMO
         void OnQueryPlayerLocation(RPCContext ctx, const Proto::Internal::QueryPlayerLocationReq &req);
         void OnPlayerOnline(RPCContext ctx, const Proto::Internal::PlayerOnlineNtf &req);
         void OnPlayerOffline(RPCContext ctx, const Proto::Internal::PlayerOfflineNtf &req);
+        void OnBatchOnlinePlayers(RPCContext ctx, const Proto::Internal::BatchOnlinePlayersNtf &req);
 
         /**
          * @brief 将 socket remote endpoint 映射到 serviceID

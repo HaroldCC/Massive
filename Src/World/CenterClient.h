@@ -48,6 +48,15 @@ namespace MMO
         // 发送心跳（LogicThread 每 Tick 调用）
         void SendHeartbeat(uint32 currentPlayers);
 
+        // 注册在线玩家收集回调（WorldServer Init 时设置）
+        // 重连成功后自动调用，发送 BatchOnlinePlayersNtf 重建 Center 索引
+        using OnlinePlayersCollector = std::function<std::vector<uint32>()>;
+
+        void SetOnlinePlayersCollector(OnlinePlayersCollector collector)
+        {
+            _collector = std::move(collector);
+        }
+
         // 获取 RPCClient 引用
         RPCClient &GetRPCClient()
         {
@@ -67,12 +76,16 @@ namespace MMO
         }
 
     private:
+        void SendRegisterWorld();
+        void SendBatchOnlinePlayers();
+
         std::shared_ptr<TCPSocket> _socket;
         RPCClient                  _rpcClient; // LogicThread 模式
         std::atomic<bool>          _connected {false};
         uint16                     _worldServerID = 0;
         uint16                     _maxPlayers    = 0;
         std::string                _address;
+        OnlinePlayersCollector     _collector; // 收集在线玩家回调
     };
 
 } // namespace MMO
