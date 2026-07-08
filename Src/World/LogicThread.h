@@ -79,7 +79,9 @@ namespace MMO
                      std::function<void()>                     preProcess,
                      std::function<void()>                     postFlush);
 
-        void ProcessMessages(std::unordered_map<uint32, WorldSession> *sessions, DispatchCallback onMessage);
+        void ProcessMessages(std::unordered_map<uint32, WorldSession> *sessions,
+                             DispatchCallback                          onMessage,
+                             size_t                                    limit);
 
         TimingWheel       _timingWheel;
         std::thread       _thread;
@@ -88,7 +90,12 @@ namespace MMO
 
         std::atomic<size_t> _lastProcessed {0};
 
+        // 动态入口门控——根据 Tick 负载自动调整每 Tick 处理的消息数
+        uint32 _currentMsgLimit = kMaxMessagesPerTick;
+
         static constexpr size_t kMaxMessagesPerTick = 1000;
+        static constexpr auto   kTickInterval       = std::chrono::milliseconds(20);
+        static constexpr auto   kMaxElapsed         = std::chrono::milliseconds(50);
     };
 
 } // namespace MMO
