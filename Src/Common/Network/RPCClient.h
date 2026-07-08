@@ -10,7 +10,10 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <unordered_map>
+
+#include <asio/steady_timer.hpp>
 
 #include "Common/Core/ByteBuffer.h"
 #include "Common/Core/Types.h"
@@ -75,6 +78,13 @@ namespace MMO
         // 每 Tick 检查超时（LogicThread 调用）
         void ProcessTimeouts();
 
+        /**
+         * @brief 在 IO 线程启动独立定时器做超时兜底
+         *        首次由 CenterClient 连接建立后调用
+         * @param ioCtx  IOContextPool 的某个 io_context
+         */
+        void StartTimeoutChecker(asio::io_context &ioCtx);
+
         // 当前在途请求数
         size_t PendingCount() const
         {
@@ -90,11 +100,17 @@ namespace MMO
         };
 
         void EnqueueCallback(std::function<void()> fn);
+        void ScheduleTimeoutCheck();
 
         std::unordered_map<uint64, PendingCall> _pending;
+        std::mutex                              _pendingMtx; // LogicThread 写 / IO 线程读
         std::atomic<uint64>                     _nextRequestID {1};
         bool                                    _useLogicThread;
         MPSCQueue<Completed>                    _completedQueue;
+
+        // IO 线程独立超时检查定时器
+        std::unique_ptr<asio::steady_timer> _timeoutTimer;
+        bool                                _timerStarted = false;
     };
 
     // ── 模板实现 ──

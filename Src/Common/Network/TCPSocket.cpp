@@ -29,7 +29,32 @@ namespace MMO
         {
             return;
         }
-        DoRead();
+
+        if (_tlsEnabled)
+        {
+            // TLS 模式：创建 ssl::stream 包装底层 socket，先做 handshake
+            _sslCtx.set_options(asio::ssl::context::default_workarounds | asio::ssl::context::no_sslv2
+                                | asio::ssl::context::no_sslv3 | asio::ssl::context::single_dh_use);
+            _sslCtx.use_certificate_chain_file(_certPath);
+            _sslCtx.use_private_key_file(_keyPath, asio::ssl::context::pem);
+
+            _sslStream.reset(new asio::ssl::stream<asio::ip::tcp::socket &>(_socket, _sslCtx));
+
+            auto self = shared_from_this();
+            _sslStream->async_handshake(asio::ssl::stream_base::server, [self](const asio::error_code &ec) {
+                if (ec)
+                {
+                    Log::Error("TCPSocket: TLS handshake failed: {}", ec.message());
+                    self->DoClose();
+                    return;
+                }
+                self->DoRead();
+            });
+        }
+        else
+        {
+            DoRead();
+        }
     }
 
     void TCPSocket::Send(ByteBuffer data)
@@ -43,6 +68,27 @@ namespace MMO
         bool needWrite = false;
         {
             std::lock_guard lock(_writeMutex);
+
+            // 写队列水位保护：达到上限时按背压策略处理
+            static constexpr size_t kMaxWriteQueue = 4096;
+            if (_writeQueue.size() >= kMaxWriteQueue)
+            {
+                Log::Warn("TCPSocket: write queue full ({}), applying backpressure ({})",
+                          _writeQueue.size(),
+                          _backPressure == EBackPressure::DropOldest ? "DropOldest" : "DropConnection");
+
+                switch (_backPressure)
+                {
+                    case EBackPressure::DropOldest:
+                        _writeQueue.pop_front(); // 丢弃最老的包，保持队列水位
+                        break;
+                    case EBackPressure::DropConnection:
+                        _pendingClose = true; // 排空后关闭（不丢已有数据）
+                        // 不 push_back，直接返回
+                        return;
+                }
+            }
+
             _writeQueue.push_back(std::move(data));
             if (!_writing)
             {
@@ -109,27 +155,37 @@ namespace MMO
         }
         _readBuffer.resize(oldSize + kReadChunk);
 
-        _socket.async_read_some(asio::buffer(_readBuffer.data() + oldSize, kReadChunk),
-                                [self, oldSize](const asio::error_code &ec, size_t bytesTransferred) {
-                                    if (ec)
-                                    {
-                                        self->HandleError(ec);
-                                        return;
-                                    }
+        auto readHandler = [self, oldSize](const asio::error_code &ec, size_t bytesTransferred) {
+            if (ec)
+            {
+                self->HandleError(ec);
+                return;
+            }
 
-                                    self->_readBuffer.resize(oldSize + bytesTransferred);
+            self->_readBuffer.resize(oldSize + bytesTransferred);
 
-                                    if (self->_framing == EFraming::LengthPrefix)
-                                    {
-                                        self->ProcessLengthPrefixed();
-                                    }
-                                    else
-                                    {
-                                        self->ProcessReadBuffer();
-                                    }
+            if (self->_framing == EFraming::LengthPrefix)
+            {
+                self->ProcessLengthPrefixed();
+            }
+            else
+            {
+                self->ProcessReadBuffer();
+            }
 
-                                    self->DoRead();
-                                });
+            self->DoRead();
+        };
+
+        if (_sslStream)
+        {
+            _sslStream->async_read_some(asio::buffer(_readBuffer.data() + oldSize, kReadChunk),
+                                        std::move(readHandler));
+        }
+        else
+        {
+            _socket.async_read_some(asio::buffer(_readBuffer.data() + oldSize, kReadChunk),
+                                    std::move(readHandler));
+        }
     }
 
     void TCPSocket::ProcessReadBuffer()
@@ -230,23 +286,29 @@ namespace MMO
         }
 
         auto &buf = _writeQueue.front();
-        asio::async_write(_socket,
-                          asio::buffer(buf.Data(), buf.Size()),
-                          [self](const asio::error_code &ec, size_t) {
-                              if (ec)
-                              {
-                                  self->HandleError(ec);
-                                  return;
-                              }
 
-                              // 在持锁状态下 pop_front，然后释放锁再递归 DoWrite
-                              // std::mutex 不可重入，不能在持锁时调用 DoWrite
-                              {
-                                  std::unique_lock lk(self->_writeMutex);
-                                  self->_writeQueue.pop_front();
-                              }
-                              self->DoWrite(); // 链式写下一个
-                          });
+        auto writeHandler = [self](const asio::error_code &ec, size_t) {
+            if (ec)
+            {
+                self->HandleError(ec);
+                return;
+            }
+
+            {
+                std::unique_lock lk(self->_writeMutex);
+                self->_writeQueue.pop_front();
+            }
+            self->DoWrite();
+        };
+
+        if (_sslStream)
+        {
+            asio::async_write(*_sslStream, asio::buffer(buf.Data(), buf.Size()), std::move(writeHandler));
+        }
+        else
+        {
+            asio::async_write(_socket, asio::buffer(buf.Data(), buf.Size()), std::move(writeHandler));
+        }
     }
 
     void TCPSocket::DoClose()
@@ -256,9 +318,17 @@ namespace MMO
             return; // 幂等
         }
 
+        if (_sslStream)
+        {
+            // SSL 关闭：先发 shutdown 通知对端
+            asio::error_code      ec;
+            [[maybe_unused]] auto r = _sslStream->shutdown(ec);
+            // shutdown 可能返回非致命错误（对端已关闭），忽略
+        }
+
         asio::error_code ec;
-        _socket.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
-        _socket.close(ec);
+        [[maybe_unused]]auto r = _socket.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
+        r = _socket.close(ec);
 
         if (_onClose)
         {
@@ -268,7 +338,7 @@ namespace MMO
 
     void TCPSocket::HandleError(const asio::error_code &ec)
     {
-        if (ec == asio::error::eof)
+        if (ec == asio::error::eof || ec == asio::error::connection_reset)
         {
             DoClose();
         }
@@ -278,7 +348,7 @@ namespace MMO
         }
         else
         {
-            Log::Error("TCPSocket: asio error: {}", ec.message());
+            Log::Warn("TCPSocket: connection closed: {}", ec.message());
             DoClose();
         }
     }

@@ -13,7 +13,8 @@ namespace MMO
 {
 
     void GateConnectionMgr::AcceptConnection(uint16 gateID, std::shared_ptr<TCPSocket> socket)
-    {
+    { // Gate 内网连接：写队列满时丢弃最老包而非断连
+        socket->SetBackPressure(EBackPressure::DropOldest);
         auto conn    = std::make_unique<GateConnection>();
         conn->gateID = gateID;
         conn->socket = std::move(socket);

@@ -7,6 +7,8 @@
 #include "Common/Network/TCPSocket.h"
 #include "Common/Log/Log.h"
 
+#include <asio/post.hpp>
+
 namespace MMO
 {
 
@@ -18,57 +20,105 @@ namespace MMO
 
     void RPCClient::OnResponse(uint64 requestID, const uint8 *body, size_t len)
     {
-        auto it = _pending.find(requestID);
-        if (it == _pending.end())
+        PendingCall call;
         {
-            return; // 已超时/断线清理，丢弃
+            std::lock_guard lock(_pendingMtx);
+            auto            it = _pending.find(requestID);
+            if (it == _pending.end())
+            {
+                return; // 已超时/断线清理，丢弃
+            }
+            call = std::move(it->second);
+            _pending.erase(it);
         }
 
-        if (it->second.deserializeAndCallback)
+        if (call.deserializeAndCallback)
         {
-            auto cb = std::move(it->second.deserializeAndCallback);
-            // 无论哪种线程模型，反序列化 + 回调都投递到目标线程
-            EnqueueCallback([cb = std::move(cb), body = std::vector<uint8>(body, body + len)]() {
-                cb(body.data(), body.size());
-            });
+            EnqueueCallback(
+                [cb = std::move(call.deserializeAndCallback), body = std::vector<uint8>(body, body + len)]() {
+                    cb(body.data(), body.size());
+                });
         }
-        _pending.erase(it);
     }
 
     void RPCClient::OnConnectionLost()
     {
-        for (auto &[id, call] : _pending)
+        std::vector<std::function<void()>> errorCbs;
         {
-            if (call.onError)
+            std::lock_guard lock(_pendingMtx);
+            for (auto &[id, call] : _pending)
             {
-                EnqueueCallback([cb = std::move(call.onError)]() {
-                    cb();
-                });
+                if (call.onError)
+                {
+                    errorCbs.push_back(std::move(call.onError));
+                }
             }
+            _pending.clear();
         }
-        _pending.clear();
+        for (auto &cb : errorCbs)
+        {
+            EnqueueCallback(std::move(cb));
+        }
     }
 
     void RPCClient::ProcessTimeouts()
     {
-        auto now = std::chrono::steady_clock::now();
-        for (auto it = _pending.begin(); it != _pending.end();)
+        auto                               now = std::chrono::steady_clock::now();
+        std::vector<std::function<void()>> timedOut;
+
         {
-            if (now > it->second.deadline)
+            std::lock_guard lock(_pendingMtx);
+            for (auto it = _pending.begin(); it != _pending.end();)
             {
-                if (it->second.onError)
+                if (now > it->second.deadline)
                 {
-                    EnqueueCallback([cb = std::move(it->second.onError)]() {
-                        cb();
-                    });
+                    if (it->second.onError)
+                    {
+                        timedOut.push_back(std::move(it->second.onError));
+                    }
+                    it = _pending.erase(it);
                 }
-                it = _pending.erase(it);
-            }
-            else
-            {
-                ++it;
+                else
+                {
+                    ++it;
+                }
             }
         }
+
+        for (auto &cb : timedOut)
+        {
+            EnqueueCallback(std::move(cb));
+        }
+    }
+
+    void RPCClient::StartTimeoutChecker(asio::io_context &ioCtx)
+    {
+        if (_timerStarted)
+        {
+            return;
+        }
+        _timerStarted = true;
+
+        _timeoutTimer = std::make_unique<asio::steady_timer>(ioCtx);
+
+        ScheduleTimeoutCheck();
+    }
+
+    void RPCClient::ScheduleTimeoutCheck()
+    {
+        if (!_timeoutTimer)
+        {
+            return;
+        }
+        _timeoutTimer->expires_after(std::chrono::milliseconds(100));
+        _timeoutTimer->async_wait([this](const asio::error_code &ec) {
+            if (ec)
+            {
+                return; // io_context 停止或定时器取消
+            }
+            ProcessTimeouts();
+            ScheduleTimeoutCheck(); // 递归重设
+        });
     }
 
     void RPCClient::EnqueueCallback(std::function<void()> fn)

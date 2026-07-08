@@ -23,6 +23,7 @@
 #include <asio/error.hpp>
 #include <asio/ip/tcp.hpp>
 #include <asio/read_until.hpp>
+#include <asio/ssl.hpp>
 
 #include "Common/Core/ByteBuffer.h"
 #include "Common/Core/Types.h"
@@ -43,6 +44,15 @@ namespace MMO
     {
         PacketHeader, // 12B PacketHeader + body（Client<->Gate）
         LengthPrefix, // 4B 总长度 + 裸数据（内部 RPC）
+    };
+
+    /**
+     * @brief 写队列满时的背压策略
+     */
+    enum class EBackPressure : uint8
+    {
+        DropOldest,     // 丢弃最老包，保最新（内网长连接）
+        DropConnection, // 直接关闭连接（客户端连接）
     };
 
     class TCPSocket : public std::enable_shared_from_this<TCPSocket>
@@ -123,11 +133,36 @@ namespace MMO
         }
 
         /**
+         * @brief 设置背压策略
+         * @param bp  DropOldest（内网长连接）或 DropConnection（客户端连接）
+         */
+        void SetBackPressure(EBackPressure bp)
+        {
+            _backPressure = bp;
+        }
+
+        /**
+         * @brief 启用 TLS（LoginServer 等公网进程在 Start 前调用）
+         * @param certFile  证书文件路径（PEM）
+         * @param keyFile   私钥文件路径（PEM）
+         */
+        void EnableTLS(const std::string &certFile, const std::string &keyFile)
+        {
+            _tlsEnabled = true;
+            _certPath   = certFile;
+            _keyPath    = keyFile;
+        }
+
+        /**
          * @brief 获取底层 socket 引用
-         * @note 预留 TLS：将来 LowestLayer() 返回 ssl::stream 的 lowest_layer
+         * @note TLS 模式下返回 ssl::stream::lowest_layer()
          */
         asio::ip::tcp::socket &LowestLayer()
         {
+            if (_sslStream)
+            {
+                return static_cast<asio::ip::tcp::socket &>(_sslStream->lowest_layer());
+            }
             return _socket;
         }
 
@@ -185,6 +220,9 @@ namespace MMO
         bool                   _writing      = false;
         bool                   _pendingClose = false; // DelayedClose 标记：队列排空后关闭
 
+        // 背压
+        EBackPressure _backPressure = EBackPressure::DropConnection;
+
         // 状态
         std::atomic<bool> _closed {false};
         std::atomic<bool> _started {false};
@@ -195,6 +233,13 @@ namespace MMO
 
         // 拆包中间状态
         static constexpr size_t kHeaderSize = sizeof(PacketHeader);
+
+        // TLS/SSL
+        bool                                                        _tlsEnabled = false;
+        std::string                                                 _certPath;
+        std::string                                                 _keyPath;
+        std::unique_ptr<asio::ssl::stream<asio::ip::tcp::socket &>> _sslStream;
+        asio::ssl::context                                          _sslCtx {asio::ssl::context::tlsv12};
     };
 
 } // namespace MMO
