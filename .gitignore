@@ -52,3 +52,6 @@ Config/login.key
 # ===== 运行时 =====
 *.log
 *.dmp
+*.stacktrace
+core.
+vgcore.*
