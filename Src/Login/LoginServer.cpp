@@ -53,8 +53,13 @@ namespace MMO
                 {
                     clientIP = socket->LowestLayer().remote_endpoint().address().to_string();
                 }
+                catch (const std::exception &e)
+                {
+                    Log::Error("LoginServer: remote_endpoint failed: {}", e.what());
+                }
                 catch (...)
                 {
+                    Log::Error("LoginServer: remote_endpoint failed (unknown)");
                 }
                 HandleLoginAuthReq(std::move(socket), req, clientIP);
             });
@@ -286,19 +291,23 @@ namespace MMO
         // server DH public key (32B)
         rsp.set_server_dh_key(keyPair.publicKey.Data(), keyPair.publicKey.Size());
 
-        // SessionToken (46B)
+        // SessionToken (50B)
         rsp.set_session_token(token.data, Crypto::SessionToken::kTotalSize);
 
-        auto rawData = rsp.SerializeAsString();
-        auto rawBody = reinterpret_cast<const uint8 *>(rawData.data());
+        // 零分配序列化
+        size_t                bodySize = static_cast<size_t>(rsp.ByteSizeLong());
+        ByteBuffer            bodyBuf  = ByteBuffer::Own(bodySize);
+        [[maybe_unused]] bool ok       = rsp.SerializeToArray(bodyBuf.WritePtr(), static_cast<int>(bodySize));
+        (void)ok;
+        bodyBuf.SetWritePos(bodySize);
 
         // 构建 PacketHeader: [length:4B][msgID:4B][sessionID:4B][body]
-        uint32     totalLen = static_cast<uint32>(sizeof(PacketHeader) + rawData.size());
+        uint32     totalLen = static_cast<uint32>(sizeof(PacketHeader) + bodySize);
         ByteBuffer frame    = ByteBuffer::Own(totalLen);
         frame.WriteUint32(totalLen);
         frame.WriteUint32(Proto::MSG_LOGIN_AUTH_RSP);
         frame.WriteUint32(0); // sessionID=0 (短连接)
-        frame.WriteBytes(rawBody, rawData.size());
+        frame.WriteBytes(bodyBuf.Data(), bodyBuf.Size());
 
         // SendThenClose：写队列排空后自动关闭，避免 Send→立刻 Close 的时序 Bug
         socket->SendThenClose(std::move(frame));
@@ -328,16 +337,20 @@ namespace MMO
                 break;
         }
 
-        auto rawData = rsp.SerializeAsString();
-        auto rawBody = reinterpret_cast<const uint8 *>(rawData.data());
+        // 零分配序列化
+        size_t                bodySize = static_cast<size_t>(rsp.ByteSizeLong());
+        ByteBuffer            bodyBuf  = ByteBuffer::Own(bodySize);
+        [[maybe_unused]] bool ok       = rsp.SerializeToArray(bodyBuf.WritePtr(), static_cast<int>(bodySize));
+        (void)ok;
+        bodyBuf.SetWritePos(bodySize);
 
         // 构建 PacketHeader: [length:4B][msgID:4B][sessionID:4B][body]
-        uint32     totalLen = static_cast<uint32>(sizeof(PacketHeader) + rawData.size());
+        uint32     totalLen = static_cast<uint32>(sizeof(PacketHeader) + bodySize);
         ByteBuffer frame    = ByteBuffer::Own(totalLen);
         frame.WriteUint32(totalLen);
         frame.WriteUint32(Proto::MSG_LOGIN_AUTH_RSP);
         frame.WriteUint32(0); // sessionID=0 (短连接)
-        frame.WriteBytes(rawBody, rawData.size());
+        frame.WriteBytes(bodyBuf.Data(), bodyBuf.Size());
 
         socket->SendThenClose(std::move(frame));
     }

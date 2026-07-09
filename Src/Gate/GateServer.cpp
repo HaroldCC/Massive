@@ -114,8 +114,13 @@ namespace MMO
         {
             clientIP = socket->LowestLayer().remote_endpoint().address().to_string();
         }
+        catch (const std::exception &e)
+        {
+            Log::Error("GateServer: remote_endpoint failed: {}", e.what());
+        }
         catch (...)
         {
+            Log::Error("GateServer: remote_endpoint failed (unknown)");
         }
 
         // 限流检查
@@ -150,7 +155,7 @@ namespace MMO
 
         // 记录 session
         {
-            std::lock_guard lock(_sessionsMutex);
+            std::lock_guard lock(_gateMutex);
             _sessions[sessionID] = session;
         }
 
@@ -252,14 +257,14 @@ namespace MMO
 
         // 记录路由表
         {
-            std::lock_guard lock(_routesMutex);
+            std::lock_guard lock(_gateMutex);
             _sessionRoutes[session->SessionID()] =
                 SessionRoute {worldAddr, std::weak_ptr<GateSession>(session)};
         }
 
         // 记录 world→sessions 映射
         {
-            std::lock_guard lock(_worldSessionMapMutex);
+            std::lock_guard lock(_gateMutex);
             _worldSessionMap[worldAddr].push_back(session->SessionID());
         }
 
@@ -295,16 +300,20 @@ namespace MMO
                 break;
         }
 
-        auto data = rsp.SerializeAsString();
+        // 零分配序列化
+        size_t bodySize = static_cast<size_t>(rsp.ByteSizeLong());
+        auto   bodyBuf  = ByteBuffer::Own(bodySize);
+        rsp.SerializeToArray(bodyBuf.WritePtr(), static_cast<int>(bodySize));
+        bodyBuf.SetWritePos(bodySize);
 
         // 构建 PacketHeader + Body
-        uint32 totalLen = static_cast<uint32>(sizeof(PacketHeader) + data.size());
+        uint32 totalLen = static_cast<uint32>(sizeof(PacketHeader) + bodySize);
         auto   buf      = ByteBuffer::Own(totalLen);
 
         buf.WriteUint32(totalLen);
         buf.WriteUint32(Proto::MSG_LOGIN_ENTER_WORLD_RSP);
         buf.WriteUint32(session->SessionID());
-        buf.WriteBytes(reinterpret_cast<const uint8 *>(data.data()), data.size());
+        buf.WriteBytes(bodyBuf.Data(), bodyBuf.Size());
 
         session->SendToClient(std::move(buf));
         session->Close();
@@ -326,16 +335,20 @@ namespace MMO
                                              .count());
         rsp.set_server_time(nowMs);
 
-        auto data = rsp.SerializeAsString();
+        // 零分配序列化
+        size_t bodySize = static_cast<size_t>(rsp.ByteSizeLong());
+        auto   bodyBuf  = ByteBuffer::Own(bodySize);
+        rsp.SerializeToArray(bodyBuf.WritePtr(), static_cast<int>(bodySize));
+        bodyBuf.SetWritePos(bodySize);
 
         // 构建 PacketHeader + Body
-        uint32 totalLen = static_cast<uint32>(sizeof(PacketHeader) + data.size());
+        uint32 totalLen = static_cast<uint32>(sizeof(PacketHeader) + bodySize);
         auto   buf      = ByteBuffer::Own(totalLen);
 
         buf.WriteUint32(totalLen);
         buf.WriteUint32(Proto::MSG_HEARTBEAT_RSP);
         buf.WriteUint32(session->SessionID());
-        buf.WriteBytes(reinterpret_cast<const uint8 *>(data.data()), data.size());
+        buf.WriteBytes(bodyBuf.Data(), bodyBuf.Size());
 
         session->SendToClient(std::move(buf));
     }
@@ -357,7 +370,7 @@ namespace MMO
         // 找目标 World 地址
         std::string worldAddr;
         {
-            std::lock_guard lock(_routesMutex);
+            std::lock_guard lock(_gateMutex);
             auto            routeIt = _sessionRoutes.find(session->SessionID());
             if (routeIt == _sessionRoutes.end())
             {
@@ -388,7 +401,7 @@ namespace MMO
 
         // 发送到 World
         {
-            std::lock_guard lock(_worldConnsMutex);
+            std::lock_guard lock(_gateMutex);
             auto            connIt = _worldConns.find(worldAddr);
             if (connIt == _worldConns.end() || !connIt->second->connected)
             {
@@ -430,7 +443,7 @@ namespace MMO
         // 查找目标客户端
         std::shared_ptr<GateSession> clientSession;
         {
-            std::lock_guard lock(_routesMutex);
+            std::lock_guard lock(_gateMutex);
             auto            routeIt = _sessionRoutes.find(sessionID);
             if (routeIt == _sessionRoutes.end())
             {
@@ -518,7 +531,7 @@ namespace MMO
     void GateServer::OnWorldConnected(const std::string &addr, std::shared_ptr<TCPSocket> socket)
     {
         {
-            std::lock_guard lock(_worldConnsMutex);
+            std::lock_guard lock(_gateMutex);
             auto            it = _worldConns.find(addr);
             if (it == _worldConns.end())
             {
@@ -555,7 +568,7 @@ namespace MMO
         Log::Warn("GateServer: world '{}' disconnected", addr);
 
         {
-            std::lock_guard lock(_worldConnsMutex);
+            std::lock_guard lock(_gateMutex);
             auto            it = _worldConns.find(addr);
             if (it != _worldConns.end())
             {
@@ -566,7 +579,7 @@ namespace MMO
 
         // 清理路由到该 World 的 session
         {
-            std::lock_guard lock(_routesMutex);
+            std::lock_guard lock(_gateMutex);
             for (auto it = _sessionRoutes.begin(); it != _sessionRoutes.end();)
             {
                 if (it->second.worldAddr == addr)
@@ -581,7 +594,7 @@ namespace MMO
         }
 
         {
-            std::lock_guard lock(_worldSessionMapMutex);
+            std::lock_guard lock(_gateMutex);
             _worldSessionMap.erase(addr);
         }
 
@@ -597,7 +610,7 @@ namespace MMO
     {
         uint32 delayMs;
         {
-            std::lock_guard lock(_worldConnsMutex);
+            std::lock_guard lock(_gateMutex);
             auto            it = _worldConns.find(addr);
             if (it == _worldConns.end())
             {
@@ -634,13 +647,13 @@ namespace MMO
 
         // 清理路由表
         {
-            std::lock_guard lock(_routesMutex);
+            std::lock_guard lock(_gateMutex);
             _sessionRoutes.erase(sessionID);
         }
 
         // 清理 world→sessions 映射
         {
-            std::lock_guard lock(_worldSessionMapMutex);
+            std::lock_guard lock(_gateMutex);
             for (auto &[addr, sessions] : _worldSessionMap)
             {
                 auto it = std::find(sessions.begin(), sessions.end(), sessionID);
@@ -654,7 +667,7 @@ namespace MMO
 
         // 清理 session 本身
         {
-            std::lock_guard lock(_sessionsMutex);
+            std::lock_guard lock(_gateMutex);
             _sessions.erase(sessionID);
         }
     }
@@ -675,7 +688,7 @@ namespace MMO
      */
     std::string GateServer::GetWorldRoute(uint32 sessionID) const
     {
-        std::lock_guard lock(_routesMutex);
+        std::lock_guard lock(_gateMutex);
         auto            it = _sessionRoutes.find(sessionID);
         if (it != _sessionRoutes.end())
         {
@@ -690,7 +703,7 @@ namespace MMO
      */
     std::string GateServer::PickWorldServer() const
     {
-        std::lock_guard lock(_worldConnsMutex);
+        std::lock_guard lock(_gateMutex);
         for (const auto &[addr, conn] : _worldConns)
         {
             if (conn->connected)
@@ -776,7 +789,7 @@ namespace MMO
         // 收集超时 session（不能在持锁时 Close，会导致死锁）
         std::vector<uint32> toRemove;
         {
-            std::lock_guard lock(_sessionsMutex);
+            std::lock_guard lock(_gateMutex);
             for (const auto &[sid, session] : _sessions)
             {
                 if (session->IdleSeconds() >= timeoutSec)
@@ -790,10 +803,10 @@ namespace MMO
         {
             Log::Debug("GateServer: timeout session {}", sid);
             // Close 会触发 close handler → OnSessionDisconnect
-            // 后者需要获取 _sessionsMutex，所以必须不能在这里持锁
+            // 后者需要获取 _gateMutex，所以必须不能在这里持锁
             std::shared_ptr<GateSession> session;
             {
-                std::lock_guard lock(_sessionsMutex);
+                std::lock_guard lock(_gateMutex);
                 auto            it = _sessions.find(sid);
                 if (it != _sessions.end())
                 {

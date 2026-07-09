@@ -152,7 +152,20 @@ namespace MMO
         ws.disconnected = false;
         ws.gateServerID = gateServerID;
         ws.lastRecvTime = std::chrono::steady_clock::now();
-        ws.sessionID    = sessionID;
+
+        // 如果新 sessionID 已在 sessions 中存在（极罕见但非不可能），
+        // extract + insert 会静默覆盖——暴露给日志比掩盖好
+        if (sessionID != oldSessionID && sessions.contains(sessionID))
+        {
+            Log::Error("EnterWorld: sessionID {} already in use during reconnect! "
+                       "accountID={} oldSessionID={}",
+                       sessionID,
+                       accountID,
+                       oldSessionID);
+            SendError(sessionID, 2004, "Internal error", gateSendFn);
+            return;
+        }
+        ws.sessionID = sessionID;
 
         // 旋转密钥
         if (seedLen > 0)
@@ -180,8 +193,15 @@ namespace MMO
         Proto::LoginEnterWorldRsp rsp;
         rsp.mutable_error()->set_code(errorCode);
         rsp.mutable_error()->set_message(msg);
-        auto data = rsp.SerializeAsString();
-        auto buf  = ByteBuffer::Copy(reinterpret_cast<const uint8 *>(data.data()), data.size());
+        // 零分配序列化
+        size_t bodySize = static_cast<size_t>(rsp.ByteSizeLong());
+        auto   buf      = ByteBuffer::Own(bodySize);
+        if (!rsp.SerializeToArray(buf.WritePtr(), static_cast<int>(bodySize)))
+        {
+            Log::Error("EnterWorldHandler::SendError: SerializeToArray failed");
+            return;
+        }
+        buf.SetWritePos(bodySize);
         // 错误响应不加密（World 侧可能尚未完成 CryptoSession 初始化）
         gateSendFn(sessionID, Proto::MSG_LOGIN_ENTER_WORLD_RSP, std::move(buf));
     }
@@ -202,8 +222,11 @@ namespace MMO
         rsp.mutable_position()->set_y(y);
         rsp.mutable_position()->set_z(z);
 
-        auto data = rsp.SerializeAsString();
-        auto buf  = ByteBuffer::Copy(reinterpret_cast<const uint8 *>(data.data()), data.size());
+        // 零分配序列化
+        size_t bodySize = static_cast<size_t>(rsp.ByteSizeLong());
+        auto   buf      = ByteBuffer::Own(bodySize);
+        rsp.SerializeToArray(buf.WritePtr(), static_cast<int>(bodySize));
+        buf.SetWritePos(bodySize);
         gateSendFn(sessionID, Proto::MSG_LOGIN_ENTER_WORLD_RSP, std::move(buf));
     }
 

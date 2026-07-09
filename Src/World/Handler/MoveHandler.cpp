@@ -54,8 +54,11 @@ namespace MMO
                                                     std::chrono::system_clock::now().time_since_epoch())
                                                     .count()));
 
-        auto data = rsp.SerializeAsString();
-        auto buf  = ByteBuffer::Copy(reinterpret_cast<const uint8 *>(data.data()), data.size());
+        // 零分配序列化
+        size_t bodySize = static_cast<size_t>(rsp.ByteSizeLong());
+        auto   buf      = ByteBuffer::Own(bodySize);
+        rsp.SerializeToArray(buf.WritePtr(), static_cast<int>(bodySize));
+        buf.SetWritePos(bodySize);
         gateSendFn(sessionID, std::move(buf));
     }
 

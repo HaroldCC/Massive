@@ -87,15 +87,14 @@ namespace MMO::TestClient
                 }
             });
 
-        // 断线回调（Login 短连接预期认证完毕连接会断开，不视为失败）
+        // 断线回调（Login 短连接：SendThenClose → 认证完毕断开 = 正常流程）
+        // Login socket 关闭可能在 _socket.reset() + Gate 连接建立后才触发，
+        // 所以只要不是连接前的初始状态就认为是正常关闭
         socket->SetCloseHandler([self = shared_from_this()]() {
             self->_stats.RecordDisconnect();
-            // SendingAuth = 认证完毕 LoginServer 主动断开，是正常流程
-            // ConncetingGate/SendingEnterWorld/InWorld = 登录 socket 已替换
-            if (self->_state != ClientState::Disconnecting && self->_state != ClientState::Failed
-                && self->_state != ClientState::SendingAuth)
+            if (self->_state == ClientState::ConnectingLogin)
             {
-                self->EnterFailedState("connection closed");
+                self->EnterFailedState("login connection lost");
             }
         });
 
