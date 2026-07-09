@@ -42,6 +42,26 @@ namespace MMO
     {
 
         /**
+         * @brief 检查 stdout 是否有效（Windows DETACHED_PROCESS 场景）
+         *
+         * Windows 上使用 DETACHED_PROCESS 创建的子进程没有控制台，
+         * GetStdHandle(STD_OUTPUT_HANDLE) 返回 INVALID_HANDLE_VALUE。
+         * 此时创建 stdout_color_sink_mt 会因 spdlog 访问空句柄而崩溃。
+         *
+         * Linux 上 stdout 始终有效。
+         */
+        bool IsStdoutAvailable()
+        {
+#ifdef _WIN32
+            HANDLE hOut = ::GetStdHandle(STD_OUTPUT_HANDLE);
+            return hOut != nullptr && hOut != INVALID_HANDLE_VALUE;
+#else
+            // Linux: stdout 始终有值，即使重定向到 /dev/null
+            return true;
+#endif
+        }
+
+        /**
          * @brief 获取可执行文件所在目录（跨平台）
          *
          * Win32:  GetModuleFileNameW -> 去掉 exe 文件名
@@ -93,9 +113,15 @@ namespace MMO
 
         /**
          * @brief 控制台 sink（彩色输出）
+         *
+         * 仅在 stdout 有效时添加（Windows DETACHED_PROCESS 场景无控制台句柄）。
+         * 无控制台时写 stdout_color_sink_mt 会导致 spdlog 内部访问空句柄而崩溃。
          */
-        auto consoleSink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
-        sinks.push_back(consoleSink);
+        if (IsStdoutAvailable())
+        {
+            auto consoleSink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
+            sinks.push_back(consoleSink);
+        }
 
         /**
          * @brief 文件 sink（仅在指定 logDir 时添加）
@@ -148,6 +174,20 @@ namespace MMO
          * @brief 即时 flush：Error 及以上级别立即写磁盘
          */
         logger->flush_on(spdlog::level::err);
+
+        /**
+         * @brief 定时 flush（1 秒），异步日志的最后一道防线。
+         *
+         * 三层防御体系：
+         *   1. ShutdownLog() 在 main 末尾显式调用 → 优雅关停时保证全部落盘
+         *   2. flush_every(1s) 周期性刷盘 → crash / force kill 最多丢 1 秒日志
+         *   3. flush_on(err) Error 级即时刷盘 → 异常信息零延迟落盘
+         *
+         * 原理：spdlog 内部起一个 dedicated 线程，每秒调一次所有 sink 的 flush，
+         * 将 async 后台线程写好的数据 fsync 到磁盘。
+         * 对性能的影响几乎为零（1 次 fsync/秒 vs 通常数千 TPS 的日志写入量）。
+         */
+        spdlog::flush_every(std::chrono::seconds(1));
 
         spdlog::set_default_logger(logger);
 

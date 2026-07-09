@@ -45,11 +45,25 @@ namespace MMO
      *
      * Signal handler 中仅做 signal-safe 操作:
      *   - absl::GetStackTrace(addr only, no Symbolize)
-     *   - write() to STDERR_FILENO
+     *   - raw write() to crash dump file + STDERR_FILENO
      *   - _exit(1)
+     *
+     * crash dump 文件默认写入当前目录 ({name}_crash_{pid}.dmp),
+     * 可通过 SetCrashDumpDirectory(logDir) 指定目录.
      *
      * @param argv0 程序路径 (传递给 absl::InitializeSymbolizer)
      */
     void InstallStackTrace(const char *argv0);
+
+    /**
+     * @brief 设置 crash dump 文件目录
+     *
+     * 必须在 InstallStackTrace 之后、但是在可能 crash 之前调用.
+     * 通常在 Log::Init 之后调用: SetCrashDumpDirectory(cfg.log.logDir.c_str())
+     * 如果没有显式调用，crash dump 文件会写入当前工作目录.
+     *
+     * @param logDir 日志目录（绝对路径或相对路径）
+     */
+    void SetCrashDumpDirectory(const char *logDir);
 
 } // namespace MMO
