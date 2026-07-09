@@ -6,7 +6,7 @@ port = 9551
 [clients]
 count = 1
 spawn_rate_per_sec = 1.0
-duration_sec = 0   # 0 = 无限运行
+duration_sec = 60  # 默认 60 秒，CLI --duration 可覆盖
 
 [behavior]
 heartbeat_interval_sec = 5

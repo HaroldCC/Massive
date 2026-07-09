@@ -303,7 +303,7 @@ namespace MMO
         // 零分配序列化
         size_t bodySize = static_cast<size_t>(rsp.ByteSizeLong());
         auto   bodyBuf  = ByteBuffer::Own(bodySize);
-        rsp.SerializeToArray(bodyBuf.WritePtr(), static_cast<int>(bodySize));
+        std::ignore = rsp.SerializeToArray(bodyBuf.WritePtr(), static_cast<int>(bodySize));
         bodyBuf.SetWritePos(bodySize);
 
         // 构建 PacketHeader + Body
@@ -338,7 +338,7 @@ namespace MMO
         // 零分配序列化
         size_t bodySize = static_cast<size_t>(rsp.ByteSizeLong());
         auto   bodyBuf  = ByteBuffer::Own(bodySize);
-        rsp.SerializeToArray(bodyBuf.WritePtr(), static_cast<int>(bodySize));
+        std::ignore = rsp.SerializeToArray(bodyBuf.WritePtr(), static_cast<int>(bodySize));
         bodyBuf.SetWritePos(bodySize);
 
         // 构建 PacketHeader + Body

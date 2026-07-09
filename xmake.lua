@@ -279,3 +279,60 @@ task("logs")
         description = "跟踪所有服务日志（Win：独立窗口 / Linux：tail -f）。"
     }
 
+
+-- =========================================================================
+-- task: testclient — 多客户端压测工具入口
+--
+-- 用法:
+--   xmake testclient                         # 默认配置
+--   xmake testclient -- --config Config/xxx.toml          # 指定配置
+--   xmake testclient -- --count 50 --duration 120           # 覆盖参数
+--   xmake testclient -- --verbose                           # verbose 模式
+--
+-- 注意：-- 后的参数原样透传给 TestClient 二进制。
+-- =========================================================================
+task("testclient")
+    set_category("run")
+    on_run(function ()
+        import("core.base.option")
+        import("core.project.config")
+        import("core.project.project")
+        config.load()
+        local mode = config.get("mode") or "debug"
+
+        -- 确保 target 存在
+        local target = project.target("TestClient")
+        if not target then
+            cprint("${color.error}testclient: target TestClient not found")
+            return
+        end
+
+        -- 检查二进制，兜底自动编译
+        local bin = path.join(_bindir(mode), "TestClient.exe")
+        if not os.isfile(bin) then
+            cprint("${color.warning}testclient: building TestClient...")
+            local ok = os.exec("xmake build TestClient", {curdir = os.projectdir()})
+            if ok ~= 0 then
+                cprint("${color.error}testclient: build failed!")
+                return
+            end
+        end
+
+        -- 取透传参数（xmake 的 "--" 分隔符后的全部参数）
+        local raw = option.get("arguments") or ""
+        if raw == "" then
+            raw = "--config Config/testclient.toml"
+        end
+
+        cprint("${color.success}testclient: running...")
+        -- cmd /c 强制走 Windows cmd.exe，绕过 Scoop shim CreateProcess 问题
+        os.exec("cmd /c \"" .. bin .. "\" " .. raw, {curdir = os.projectdir()})
+    end)
+    set_menu {
+        usage = "xmake testclient [-- args...]",
+        description = "启动多客户端压测工具 TestClient。\n" ..
+                      "在 -- 后传递所有 TestClient 参数。无参数时默认用 Config/testclient.toml。\n" ..
+                      "  xmake testclient                                     # 默认配置\n" ..
+                      "  xmake testclient -- --config Config/my.toml          # 指定配置\n" ..
+                      "  xmake testclient -- --count 100 --duration 300       # 覆盖参数"
+    }
