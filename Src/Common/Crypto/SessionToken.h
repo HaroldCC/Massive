@@ -1,15 +1,17 @@
 /**
  * @file SessionToken.h
- * @brief 46 字节自包含凭证
+ * @brief 50 字节自包含凭证（全部明文段按大端序存储）
  *
- * [worldServerId: 2B] [accountId: 4B] [expireTime: 4B] [encryptedSessionKey: 32B] [HMAC: 4B]
+ * [worldServerId: 2B] [accountId: 4B] [expireTime: 4B] [encryptedSessionKey: 32B] [HMAC: 8B]
  * ↑─── 明文段 10B ───↑   ↑─── 加密段 32B ───↑  ↑─HMAC─↑
  *
- * GateServer 只读 [0..1] → worldServerId 路由，无需解密。
- * WorldServer 验证 HMAC + 解密 SessionKey。
+ * 所有数值字段在存储时固定为大端序（网络序），
+ * WorldServerId()/AccountId()/ExpireTime() 在读取时自动转换为主机序。
+ * GateServer 读 token[0..1] 用大端解析即可获得 worldServerId，无需解密。
  */
 #pragma once
 
+#include <bit>
 #include <cstring>
 
 #include "Common/Core/ByteBuffer.h"
@@ -23,68 +25,92 @@ namespace MMO::Crypto
      */
     struct SessionToken
     {
-        static constexpr size_t kTotalSize  = 46; // 总大小
+        static constexpr size_t kTotalSize  = 50; // 总大小
         static constexpr size_t kPlainSize  = 10; // worldServerId(2B) + accountId(4B) + expireTime(4B)
         static constexpr size_t kKeyEncSize = 32; // AES-256-ECB 加密的 SessionKey
-        static constexpr size_t kHmacSize   = 4;  // HMAC-SHA256 截断
+        static constexpr size_t kHmacSize   = 8;  // HMAC-SHA256 截断（64 位，碰撞概率 2^-64）
 
         uint8 data[kTotalSize] = {};
 
         // ── 明文段读取 ──
 
         /**
-         * @brief 读取 WorldServerId
+         * @brief 读取 WorldServerId（大端→主机序）
          */
         uint16 WorldServerId() const
         {
             uint16 id;
             std::memcpy(&id, data, 2);
+            if constexpr (std::endian::native == std::endian::little)
+            {
+                id = std::byteswap(id);
+            }
             return id;
         }
 
         /**
-         * @brief 读取 AccountId
+         * @brief 读取 AccountId（大端→主机序）
          */
         uint32 AccountId() const
         {
             uint32 id;
             std::memcpy(&id, data + 2, 4);
+            if constexpr (std::endian::native == std::endian::little)
+            {
+                id = std::byteswap(id);
+            }
             return id;
         }
 
         /**
-         * @brief 读取过期时间
+         * @brief 读取过期时间（大端→主机序）
          */
         uint32 ExpireTime() const
         {
             uint32 t;
             std::memcpy(&t, data + 6, 4);
+            if constexpr (std::endian::native == std::endian::little)
+            {
+                t = std::byteswap(t);
+            }
             return t;
         }
 
-        // ── 明文段写入（LoginServer 签发时内部使用）──
+        // ── 明文段写入（LoginServer 签发时内部使用，全部按大端存储）──
 
         /**
-         * @brief 设置 WorldServerId
+         * @brief 设置 WorldServerId（主机序→大端存储）
          */
         void SetWorldServerId(uint16 id)
         {
+            if constexpr (std::endian::native == std::endian::little)
+            {
+                id = std::byteswap(id);
+            }
             std::memcpy(data, &id, 2);
         }
 
         /**
-         * @brief 设置 AccountId
+         * @brief 设置 AccountId（主机序→大端存储）
          */
         void SetAccountId(uint32 id)
         {
+            if constexpr (std::endian::native == std::endian::little)
+            {
+                id = std::byteswap(id);
+            }
             std::memcpy(data + 2, &id, 4);
         }
 
         /**
-         * @brief 设置过期时间
+         * @brief 设置过期时间（主机序→大端存储）
          */
         void SetExpireTime(uint32 t)
         {
+            if constexpr (std::endian::native == std::endian::little)
+            {
+                t = std::byteswap(t);
+            }
             std::memcpy(data + 6, &t, 4);
         }
 

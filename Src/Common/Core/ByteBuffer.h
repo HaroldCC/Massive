@@ -8,6 +8,7 @@
  */
 #pragma once
 
+#include <bit>
 #include <cstring>
 
 #include "Common/Core/Types.h"
@@ -110,8 +111,12 @@ namespace MMO
         uint16 ReadUint16()
         {
             CheckRead(2);
-            uint16 result = static_cast<uint16>((static_cast<uint16>(_data[_readPos]) << 8)
-                                                | static_cast<uint16>(_data[_readPos + 1]));
+            uint16 result;
+            std::memcpy(&result, _data + _readPos, 2);
+            if constexpr (std::endian::native == std::endian::little)
+            {
+                result = std::byteswap(result);
+            }
             _readPos += 2;
             return result;
         }
@@ -122,10 +127,12 @@ namespace MMO
         uint32 ReadUint32()
         {
             CheckRead(4);
-            uint32 result = (static_cast<uint32>(_data[_readPos]) << 24)
-                            | (static_cast<uint32>(_data[_readPos + 1]) << 16)
-                            | (static_cast<uint32>(_data[_readPos + 2]) << 8)
-                            | static_cast<uint32>(_data[_readPos + 3]);
+            uint32 result;
+            std::memcpy(&result, _data + _readPos, 4);
+            if constexpr (std::endian::native == std::endian::little)
+            {
+                result = std::byteswap(result);
+            }
             _readPos += 4;
             return result;
         }
@@ -136,14 +143,12 @@ namespace MMO
         uint64 ReadUint64()
         {
             CheckRead(8);
-            uint64 result = (static_cast<uint64>(_data[_readPos]) << 56)
-                            | (static_cast<uint64>(_data[_readPos + 1]) << 48)
-                            | (static_cast<uint64>(_data[_readPos + 2]) << 40)
-                            | (static_cast<uint64>(_data[_readPos + 3]) << 32)
-                            | (static_cast<uint64>(_data[_readPos + 4]) << 24)
-                            | (static_cast<uint64>(_data[_readPos + 5]) << 16)
-                            | (static_cast<uint64>(_data[_readPos + 6]) << 8)
-                            | static_cast<uint64>(_data[_readPos + 7]);
+            uint64 result;
+            std::memcpy(&result, _data + _readPos, 8);
+            if constexpr (std::endian::native == std::endian::little)
+            {
+                result = std::byteswap(result);
+            }
             _readPos += 8;
             return result;
         }
@@ -197,8 +202,11 @@ namespace MMO
         void WriteUint16(uint16 v)
         {
             EnsureWrite(2);
-            _data[_writePos]     = static_cast<uint8>(v >> 8);
-            _data[_writePos + 1] = static_cast<uint8>(v);
+            if constexpr (std::endian::native == std::endian::little)
+            {
+                v = std::byteswap(v);
+            }
+            std::memcpy(_data + _writePos, &v, 2);
             _writePos += 2;
         }
 
@@ -208,10 +216,11 @@ namespace MMO
         void WriteUint32(uint32 v)
         {
             EnsureWrite(4);
-            _data[_writePos]     = static_cast<uint8>(v >> 24);
-            _data[_writePos + 1] = static_cast<uint8>(v >> 16);
-            _data[_writePos + 2] = static_cast<uint8>(v >> 8);
-            _data[_writePos + 3] = static_cast<uint8>(v);
+            if constexpr (std::endian::native == std::endian::little)
+            {
+                v = std::byteswap(v);
+            }
+            std::memcpy(_data + _writePos, &v, 4);
             _writePos += 4;
         }
 
@@ -221,14 +230,11 @@ namespace MMO
         void WriteUint64(uint64 v)
         {
             EnsureWrite(8);
-            _data[_writePos]     = static_cast<uint8>(v >> 56);
-            _data[_writePos + 1] = static_cast<uint8>(v >> 48);
-            _data[_writePos + 2] = static_cast<uint8>(v >> 40);
-            _data[_writePos + 3] = static_cast<uint8>(v >> 32);
-            _data[_writePos + 4] = static_cast<uint8>(v >> 24);
-            _data[_writePos + 5] = static_cast<uint8>(v >> 16);
-            _data[_writePos + 6] = static_cast<uint8>(v >> 8);
-            _data[_writePos + 7] = static_cast<uint8>(v);
+            if constexpr (std::endian::native == std::endian::little)
+            {
+                v = std::byteswap(v);
+            }
+            std::memcpy(_data + _writePos, &v, 8);
             _writePos += 8;
         }
 

@@ -18,7 +18,11 @@ namespace MMO
 {
 
     /**
-     * @brief 构造完整 RPC 帧（RPCHeader + protobuf body），零中间 string 分配
+     * @brief 构造完整 RPC 帧（LengthPrefix + RPCHeader + protobuf body），零中间 string 分配
+     *
+     * 输出格式（LengthPrefix 帧协议）：
+     *   [totalLen:4B] [RPCHeader:17B] [protobuf body]
+     * totalLen 包含自身 4B + RPCHeader + body，与 TCPSocket::ProcessLengthPrefixed 兼容。
      *
      * @tparam TMsg  protobuf message 类型（Req/Rsp/Ntf）
      * @param msgID     EInternalMsgID
@@ -26,20 +30,26 @@ namespace MMO
      * @param type      Request / Response / Notify
      * @param traceID   链路追踪 ID
      * @param msg       protobuf message 引用
-     * @return Own 模式的 ByteBuffer（RPCHeader + protobuf body）
+     * @return Own 模式的 ByteBuffer（LengthPrefix + RPCHeader + protobuf body）
      */
     template <typename TMsg>
     ByteBuffer BuildRPCFrame(uint32 msgID, uint64 requestID, ERPCType type, uint64 traceID, const TMsg &msg)
     {
-        size_t bodySize = static_cast<size_t>(msg.ByteSizeLong());
-        size_t total    = sizeof(RPCHeader) + bodySize;
-        auto   buf      = ByteBuffer::Own(total);
+        size_t bodySize  = static_cast<size_t>(msg.ByteSizeLong());
+        size_t headerLen = sizeof(RPCHeader);
+        size_t total     = sizeof(uint32) + headerLen + bodySize;
+        auto   buf       = ByteBuffer::Own(total);
 
+        // 写 LengthPrefix（大端总长度，含自身 4B）
+        buf.WriteUint32(static_cast<uint32>(total));
+
+        // 写 RPCHeader
         buf.WriteUint32(msgID);
         buf.WriteUint64(requestID);
         buf.WriteUint64(traceID);
         buf.WriteUint8(static_cast<uint8>(type));
 
+        // 写 protobuf body（零 copy 写入）
         bool ok = msg.SerializeToArray(buf.WritePtr(), static_cast<int>(bodySize));
         MASSIVE_ASSERT(ok, "SerializeToArray failed -- message may be incomplete");
         if (!ok)
