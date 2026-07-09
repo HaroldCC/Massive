@@ -80,6 +80,7 @@ namespace MMO
                      std::function<void()>                     postFlush);
 
         void ProcessMessages(std::unordered_map<uint32, WorldSession> *sessions,
+                             std::shared_mutex                        *sessionsMtx,
                              DispatchCallback                          onMessage,
                              size_t                                    limit);
 

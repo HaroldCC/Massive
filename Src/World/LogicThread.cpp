@@ -76,7 +76,7 @@ namespace MMO
                 preProcess();
             }
 
-            ProcessMessages(sessions, onMessage, msgLimit);
+            ProcessMessages(sessions, sessionsMtx, onMessage, msgLimit);
 
             // ── Phase 2: 定时器 ──
             _timingWheel.Tick();
@@ -146,10 +146,11 @@ namespace MMO
     }
 
     void LogicThread::ProcessMessages(std::unordered_map<uint32, WorldSession> *sessions,
+                                      std::shared_mutex                        *sessionsMtx,
                                       DispatchCallback                          onMessage,
                                       size_t                                    limit)
     {
-        if (!sessions)
+        if (!sessions || !sessionsMtx)
         {
             return;
         }
@@ -158,7 +159,8 @@ namespace MMO
         size_t totalMsgs = 0;
 
         // 遍历所有活跃 Session，Drain 其 Per-Session inbox
-        // LogicThread 是唯一消费者，sessions 不会被并发修改
+        // LogicThread 读遍历，IO 线程通过 shared_lock 并发读，需要加共享锁避免 data race
+        std::shared_lock lock(*sessionsMtx);
         for (auto &[sessionID, ws] : *sessions)
         {
             if (ws.disconnected)

@@ -85,6 +85,7 @@ namespace MMO
 
         /**
          * @brief 加密 protobuf 消息并发送到客户端
+         * @warning 必须在 LogicThread 中调用（独占 _sessions 读写权限）
          * @tparam TMsg protobuf 消息类型
          * @param sessionID  目标 Session
          * @param msgID      消息 ID（EMsgID）
@@ -93,8 +94,16 @@ namespace MMO
         template <typename TMsg>
         void SendToClient(uint32 sessionID, uint32 msgID, const TMsg &msg)
         {
-            auto data = msg.SerializeAsString();
-            auto buf  = ByteBuffer::Copy(reinterpret_cast<const uint8 *>(data.data()), data.size());
+            // 零分配序列化：ByteSizeLong → ByteBuffer::Own → SerializeToArray
+            size_t bodySize = static_cast<size_t>(msg.ByteSizeLong());
+            auto   buf      = ByteBuffer::Own(bodySize);
+            bool   ok       = msg.SerializeToArray(buf.WritePtr(), static_cast<int>(bodySize));
+            if (!ok)
+            {
+                Log::Error("SendToClient: SerializeToArray failed session={} msgID={}", sessionID, msgID);
+                return;
+            }
+            buf.SetWritePos(bodySize);
 
             auto it = _sessions.find(sessionID);
             if (it == _sessions.end())

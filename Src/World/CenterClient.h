@@ -45,6 +45,10 @@ namespace MMO
                      const std::string &address,
                      IOContextPool     *ioPool);
 
+        // 异步重连
+        void DoConnect();
+        void ScheduleConnectRetry();
+
         // 发送心跳（LogicThread 每 Tick 调用）
         void SendHeartbeat(uint32 currentPlayers);
 
@@ -79,6 +83,9 @@ namespace MMO
         void SendRegisterWorld();
         void SendBatchOnlinePlayers();
 
+        std::string                _host;
+        uint16                     _port   = 0;
+        IOContextPool             *_ioPool = nullptr;
         std::shared_ptr<TCPSocket> _socket;
         RPCClient                  _rpcClient; // LogicThread 模式
         std::atomic<bool>          _connected {false};
@@ -86,6 +93,7 @@ namespace MMO
         uint16                     _maxPlayers    = 0;
         std::string                _address;
         OnlinePlayersCollector     _collector; // 收集在线玩家回调
+        static constexpr uint32    kRetryIntervalMs = 1000;
     };
 
 } // namespace MMO

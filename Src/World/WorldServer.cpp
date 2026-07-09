@@ -205,17 +205,22 @@ namespace MMO
 
     void WorldServer::OnTick([[maybe_unused]] std::chrono::milliseconds elapsed)
     {
-        // 1. 处理未路由的 EnterWorldReq
+        // 1. 处理未路由的 EnterWorldReq（内部持 unique_lock 写 _sessions）
         ProcessUnroutedMessages();
 
         // 2. 控制消息（DisconnectNtf / SessionRebindReq）
         ProcessControlMessages();
 
-        // 3. 过载保护
+        // 3. 过载保护（读遍历 _sessions，与 IO 线程 shared_lock 并发读不冲突）
+        //    但此处 LogicThread 刚写完 _sessions（ProcessUnroutedMessages），
+        //    后续无写，读锁只是为了与 IO 线程互斥
         size_t queueDepth = 0;
-        for (auto &[sid, ws] : _sessions)
         {
-            queueDepth += ws.inbox.SizeApprox();
+            std::shared_lock lock(_sessionsMtx);
+            for (auto &[sid, ws] : _sessions)
+            {
+                queueDepth += ws.inbox.SizeApprox();
+            }
         }
         UpdateLoadLevel(_sessions.size(), queueDepth);
 
@@ -244,6 +249,9 @@ namespace MMO
                 continue;
             }
 
+            // ProcessUnroutedMessages 会写 _sessions（insert），
+            // 与 IO 线程的 shared_lock 读互斥，需持 unique_lock
+            std::unique_lock lock(_sessionsMtx);
             EnterWorldHandler::Handle(
                 msg.sessionID,
                 msg.body.Data(),
@@ -330,12 +338,22 @@ namespace MMO
 
     void WorldServer::OnPostFlush()
     {
+        // 排干 RPCClient 已完成回调队列（超时/响应回调）
+        if (_centerClient)
+        {
+            _centerClient->GetRPCClient().DrainCompleted();
+        }
+
         if (_centerClient && _centerClient->IsConnected())
         {
             static int tickCounter = 0;
             if (++tickCounter % (1000 / 20) == 0) // 每 ~1s
             {
-                uint32 online = static_cast<uint32>(_sessions.size());
+                uint32 online;
+                {
+                    std::shared_lock lock(_sessionsMtx);
+                    online = static_cast<uint32>(_sessions.size());
+                }
                 _centerClient->SendHeartbeat(online);
             }
         }
@@ -375,7 +393,8 @@ namespace MMO
 
     void WorldServer::OnDisconnectNtf(uint32 sessionID)
     {
-        auto it = _sessions.find(sessionID);
+        std::shared_lock lock(_sessionsMtx);
+        auto             it = _sessions.find(sessionID);
         if (it == _sessions.end())
         {
             return;
@@ -394,6 +413,9 @@ namespace MMO
 
     void WorldServer::OnDisconnectTimeout(uint32 accountID)
     {
+        // 超时回调在 LogicThread 中执行（TimingWheel.Tick 触发），
+        // 与 IO 线程 shared_lock 读互斥，需持 unique_lock（可能 erase）
+        std::unique_lock lock(_sessionsMtx);
         for (auto it = _sessions.begin(); it != _sessions.end(); ++it)
         {
             if (it->second.accountID == accountID && it->second.disconnected)

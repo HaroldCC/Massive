@@ -91,6 +91,12 @@ namespace MMO
             return _pending.size();
         }
 
+        /**
+         * @brief 排干已完成回调队列（LogicThread 每 Tick 调用）
+         *        配合 _useLogicThread=true 模式，确保 RPC 响应/超时被消费
+         */
+        void DrainCompleted();
+
     private:
         struct PendingCall
         {

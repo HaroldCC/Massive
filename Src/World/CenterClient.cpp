@@ -26,34 +26,44 @@ namespace MMO
         _worldServerID = worldServerID;
         _maxPlayers    = maxPlayers;
         _address       = address;
+        _host          = host;
+        _port          = port;
+        _ioPool        = ioPool;
 
-        // 建立 TCP 连接到 CenterServer（LengthPrefix 帧协议）
-        auto &ctx = ioPool->GetNextContext();
+        // 在 IO 线程启动 RPC 超时检查定时器
+        _rpcClient.StartTimeoutChecker(ioPool->GetNextContext());
+
+        DoConnect();
+
+        return true;
+    }
+
+    void CenterClient::DoConnect()
+    {
+        if (!_ioPool)
+        {
+            return;
+        }
+
+        auto &ctx = _ioPool->GetNextContext();
 
         asio::ip::tcp::resolver resolver(ctx);
         asio::error_code        resolveEc;
-        auto                    endpoints = resolver.resolve(host, std::to_string(port), resolveEc);
+        auto                    endpoints = resolver.resolve(_host, std::to_string(_port), resolveEc);
         if (resolveEc || endpoints.empty())
         {
-            Log::Error("CenterClient: resolve {}:{} failed: {}", host, port, resolveEc.message());
-            return false;
+            Log::Error("CenterClient: resolve {}:{} failed: {}, retrying in {}ms",
+                       _host,
+                       _port,
+                       resolveEc.message(),
+                       kRetryIntervalMs);
+            ScheduleConnectRetry();
+            return;
         }
 
         _socket = std::make_shared<TCPSocket>(asio::ip::tcp::socket(ctx), EFraming::LengthPrefix);
-        // Center 内网连接：写队列满时丢弃最老包而非断连
         _socket->SetBackPressure(EBackPressure::DropOldest);
-        asio::error_code connectEc;
 
-        // 同步连接（Init 阶段，阻塞可接受）
-        [[maybe_unused]] auto r = _socket->LowestLayer().connect(*endpoints.begin(), connectEc);
-        if (connectEc)
-        {
-            Log::Error("CenterClient: connect to {}:{} failed: {}", host, port, connectEc.message());
-            _socket.reset();
-            return false;
-        }
-
-        // 注册回调
         _socket->SetMessageHandler(
             [this](uint32 /*msgID*/, uint32 /*sessionID*/, const uint8 *body, size_t len) {
                 // LengthPrefix 模式下收到的是 RPC 帧 → 解析 RPCHeader 路由
@@ -88,15 +98,44 @@ namespace MMO
                 }
             });
 
-        _socket->Start();
+        _socket->LowestLayer().async_connect(*endpoints.begin(), [this](const asio::error_code &ec) {
+            if (ec)
+            {
+                Log::Error("CenterClient: connect to {}:{} failed: {}, retrying in {}ms",
+                           _host,
+                           _port,
+                           ec.message(),
+                           kRetryIntervalMs);
+                _socket.reset();
+                _connected.store(false, std::memory_order_release);
+                ScheduleConnectRetry();
+                return;
+            }
 
-        // 在 IO 线程启动 RPC 超时检查定时器
-        _rpcClient.StartTimeoutChecker(ctx);
+            Log::Info("CenterClient: connected to {}:{}", _host, _port);
 
-        // 发送 RegisterWorldReq
-        SendRegisterWorld();
+            // 连接成功后启动异步读循环 + 发送 RegisterWorldReq
+            _socket->Start();
+            SendRegisterWorld();
+        });
+    }
 
-        return true;
+    void CenterClient::ScheduleConnectRetry()
+    {
+        if (!_ioPool)
+        {
+            return;
+        }
+
+        auto &ctx   = _ioPool->GetNextContext();
+        auto  timer = std::make_shared<asio::steady_timer>(ctx, std::chrono::milliseconds(kRetryIntervalMs));
+        timer->async_wait([this, timer](const asio::error_code &ec) {
+            if (ec)
+            {
+                return;
+            }
+            DoConnect();
+        });
     }
 
     void CenterClient::SendRegisterWorld()

@@ -121,11 +121,21 @@ namespace MMO
         });
     }
 
+    void RPCClient::DrainCompleted()
+    {
+        std::vector<Completed> batch;
+        _completedQueue.DrainAll(batch);
+        for (auto &item : batch)
+        {
+            item.fn();
+        }
+    }
+
     void RPCClient::EnqueueCallback(std::function<void()> fn)
     {
         if (_useLogicThread)
         {
-            // 投递到 MPSCQueue，等 LogicThread::ProcessRPCResponses() 消费
+            // 投递到 MPSCQueue，由 DrainCompleted() 在 LogicThread 中消费
             _completedQueue.Enqueue(Completed {std::move(fn)});
         }
         else
