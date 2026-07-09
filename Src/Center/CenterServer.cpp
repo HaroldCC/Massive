@@ -76,6 +76,8 @@ namespace MMO
         _running = true;
         _ioPool->Start();
 
+        StartHealthCheck();
+
         Log::Info("CenterServer: running");
         _ioPool->Wait(); // 主线程阻塞，直到 Stop() 被调用
     }
@@ -83,6 +85,10 @@ namespace MMO
     void CenterServer::Stop()
     {
         _running = false;
+        if (_healthTimer)
+        {
+            _healthTimer->cancel();
+        }
         if (_acceptor)
         {
             _acceptor->Stop();
@@ -253,6 +259,41 @@ namespace MMO
         Log::Info("CenterServer: World {} replayed {} online players",
                   req.world_server_id(),
                   req.account_ids_size());
+    }
+
+    // ── 心跳超时检查 ──
+
+    void CenterServer::StartHealthCheck()
+    {
+        if (_healthTimer)
+        {
+            return;
+        }
+
+        _healthTimer = std::make_unique<asio::steady_timer>(_ioPool->GetNextContext());
+        _healthTimer->expires_after(std::chrono::seconds(10));
+        _healthTimer->async_wait([this](const asio::error_code &ec) {
+            if (ec || !_running.load(std::memory_order_acquire))
+            {
+                return;
+            }
+            CheckServiceHealth();
+            // 重新调度（非递归，MSVC lambda 友好）
+            _healthTimer->expires_after(std::chrono::seconds(10));
+            _healthTimer->async_wait([this](const asio::error_code &ec2) {
+                if (ec2 || !_running.load(std::memory_order_acquire))
+                {
+                    return;
+                }
+                CheckServiceHealth();
+                StartHealthCheck();
+            });
+        });
+    }
+
+    void CenterServer::CheckServiceHealth()
+    {
+        _services.CheckTimeouts();
     }
 
 } // namespace MMO

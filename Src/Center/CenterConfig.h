@@ -26,6 +26,11 @@ namespace MMO
          */
         Log::Config log;
 
+        /**
+         * @brief 从 toml 文件加载配置
+         * @param path 配置路径
+         * @return CenterConfig，失败返回 nullopt
+         */
         static std::optional<CenterConfig> Load(const std::string &path);
     };
 

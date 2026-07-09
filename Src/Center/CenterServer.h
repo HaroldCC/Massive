@@ -7,9 +7,12 @@
  */
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <unordered_map>
+
+#include <asio/steady_timer.hpp>
 
 #include "Common/Core/Types.h"
 #include "Common/Network/IOContextPool.h"
@@ -64,18 +67,24 @@ namespace MMO
          */
         std::string ServiceIDForSocket(const TCPSocket &socket) const;
 
-        std::unique_ptr<IOContextPool> _ioPool;
-        std::unique_ptr<TCPAcceptor>   _acceptor;
-        RPCServerDispatcher            _rpcHandlers;
-        ServiceRegistry                _services;
-        PlayerLocationIndex            _playerIndex;
+        // ── 心跳超时检查 ──
+
+        void StartHealthCheck();
+        void CheckServiceHealth();
+
+        std::unique_ptr<IOContextPool>      _ioPool;
+        std::unique_ptr<TCPAcceptor>        _acceptor;
+        std::unique_ptr<asio::steady_timer> _healthTimer;
+        RPCServerDispatcher                 _rpcHandlers;
+        ServiceRegistry                     _services;
+        PlayerLocationIndex                 _playerIndex;
 
         /**
          * @brief socket 指针 → serviceID（用于断线感知）
          */
         std::unordered_map<const TCPSocket *, std::string> _socketToService;
 
-        bool _running = false;
+        std::atomic<bool> _running {false};
     };
 
 } // namespace MMO
