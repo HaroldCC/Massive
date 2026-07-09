@@ -117,13 +117,23 @@ def _start(srv: ServerDef, payload: Payload) -> bool:
 
     if _is_win():
         try:
+            # DETACHED_PROCESS：进程脱离控制台，独立运行。
+            # 缺点是无法通过 taskkill /PID 发送 CTRL_CLOSE_EVENT 走优雅关停，
+            # 但 Log 模块的定时 flush（1s 周期）能确保即使被 taskkill /F 强制杀，
+            # 丢失的日志不超过约 1 秒的日志量。
+            #
+            # CREATE_BREAKAWAY_FROM_JOB：脱离 xmake 的 Job Object。
+            # xmake task 通过 os.exec / subprocess 启动本脚本时，进程会落入
+            # xmake 的 Job Object 管理；如果没有该标志，xmake task 退出时
+            # Windows 会 TerminateProcess 所有 Job 内进程——即使 DETACHED_PROCESS
+            # 也无法逃脱。加上该标志后子进程完全独立，xmake 退出不影响服务器。
+            CREATE_BREAKAWAY_FROM_JOB = 0x01000000
             proc = subprocess.Popen(
                 args,
-                creationflags=subprocess.DETACHED_PROCESS,
+                creationflags=subprocess.DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            # DETACHED_PROCESS 会使进程完全脱离本进程组
             pf.write_text(str(proc.pid), encoding="ascii")
         except OSError as e:
             print(f"  XX {srv.name}: start failed -> {e}", file=sys.stderr)
@@ -212,26 +222,30 @@ def _stop(srv: ServerDef, payload: Payload) -> dict[str, Any]:
             pf.unlink(missing_ok=True)
             return ret
 
+        # 尝试优雅关停（前台启动的进程可通过 CTRL_CLOSE_EVENT 接收）
+        # DETACHED_PROCESS 进程对此无响应，2 秒后 force kill 兜底。
         r = subprocess.run(
             ["taskkill", "/PID", str(pid)],
             capture_output=True, timeout=10,
         )
         if r.returncode == 0:
-            time.sleep(2.0)
-            r2 = subprocess.run(
-                ["tasklist", "/FI", f'"PID eq {pid}"', "/NH"],
-                capture_output=True, text=True, timeout=10,
-            )
-            st = r2.stdout or ""
-            if r2.returncode == 0 and st and "No " not in st:
+            # 阶梯等待：快进程秒退，慢进程给满 5 秒
+            for wait_s in [1, 1, 3]:
+                time.sleep(wait_s)
+                alive = subprocess.run(
+                    ["tasklist", "/FI", f'"PID eq {pid}"', "/NH"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                st = alive.stdout or ""
+                if alive.returncode != 0 or not st or "No " in st:
+                    ret["action"] = "graceful"
+                    break
+            else:
                 subprocess.run(
                     ["taskkill", "/F", "/PID", str(pid)],
                     capture_output=True, timeout=10,
                 )
                 ret["action"] = "force"
-            else:
-                ret["action"] = "graceful"
-        else:
             ret["action"] = "pid-not-found"
             subprocess.run(
                 ["taskkill", "/F", "/IM", srv.bin],
