@@ -28,7 +28,7 @@ namespace MMO
      */
     struct WorldSession
     {
-        uint32        sessionID = 0;    // Gate 分配的 sessionId
+        uint32        sessionID = 0;    // Gate 分配的 sessionID
         uint32        accountID = 0;    // 玩家账号 ID
         Entity        entity;           // World 侧的玩家 Entity
         CryptoSession crypto;           // AES-256-GCM 加解密上下文
