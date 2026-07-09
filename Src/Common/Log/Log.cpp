@@ -16,6 +16,7 @@
 #include "Common/Log/Log.h"
 
 #include "Common/Core/MassiveAssert.h"
+#include "Common/Core/Platform.h"
 
 #include <spdlog/async.h>
 #include <spdlog/async_logger.h>
@@ -26,10 +27,6 @@
 #include <array>
 #include <filesystem>
 
-#ifdef _WIN32
-    #include <windows.h>
-#endif
-
 namespace MMO
 {
 
@@ -37,62 +34,6 @@ namespace MMO
      * @brief thread_local 默认 = kInvalidID（0xFFFFFFFF），忘记 SetTraceID 则输出 [FFFFFFFF]
      */
     thread_local uint64 Log::_traceID = kInvalidID;
-
-    namespace
-    {
-
-        /**
-         * @brief 检查 stdout 是否有效（Windows DETACHED_PROCESS 场景）
-         *
-         * Windows 上使用 DETACHED_PROCESS 创建的子进程没有控制台，
-         * GetStdHandle(STD_OUTPUT_HANDLE) 返回 INVALID_HANDLE_VALUE。
-         * 此时创建 stdout_color_sink_mt 会因 spdlog 访问空句柄而崩溃。
-         *
-         * Linux 上 stdout 始终有效。
-         */
-        bool IsStdoutAvailable()
-        {
-#ifdef _WIN32
-            HANDLE hOut = ::GetStdHandle(STD_OUTPUT_HANDLE);
-            return hOut != nullptr && hOut != INVALID_HANDLE_VALUE;
-#else
-            // Linux: stdout 始终有值，即使重定向到 /dev/null
-            return true;
-#endif
-        }
-
-        /**
-         * @brief 获取可执行文件所在目录（跨平台）
-         *
-         * Win32:  GetModuleFileNameW -> 去掉 exe 文件名
-         * Linux:  readlink("/proc/self/exe") -> 去掉 exe 文件名
-         * fallback: current_path()
-         */
-        std::filesystem::path GetExeDir()
-        {
-            std::error_code ec;
-
-#ifdef _WIN32
-            wchar_t buf[MAX_PATH];
-            DWORD   len = GetModuleFileNameW(nullptr, buf, MAX_PATH);
-            if (len > 0 && len < MAX_PATH)
-            {
-                return std::filesystem::path(buf).parent_path();
-            }
-#else
-            char    buf[PATH_MAX];
-            ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-            if (len > 0)
-            {
-                buf[len] = '\0';
-                return std::filesystem::path(std::string(buf)).parent_path();
-            }
-#endif
-
-            return std::filesystem::current_path(ec);
-        }
-
-    } // anonymous namespace
 
     void Log::Init(const std::string &name, const Config &cfg)
     {
@@ -117,7 +58,7 @@ namespace MMO
          * 仅在 stdout 有效时添加（Windows DETACHED_PROCESS 场景无控制台句柄）。
          * 无控制台时写 stdout_color_sink_mt 会导致 spdlog 内部访问空句柄而崩溃。
          */
-        if (IsStdoutAvailable())
+        if (Platform::IsStdoutAvailable())
         {
             auto consoleSink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
             sinks.push_back(consoleSink);
@@ -132,7 +73,7 @@ namespace MMO
             fs::path dir = fs::path(logDir);
             if (!dir.is_absolute())
             {
-                dir = GetExeDir() / dir;
+                dir = Platform::GetExeDir() / dir;
             }
             fs::create_directories(dir);
             auto logPath = dir / std::format("{}.log", name);
@@ -187,7 +128,7 @@ namespace MMO
          * 将 async 后台线程写好的数据 fsync 到磁盘。
          * 对性能的影响几乎为零（1 次 fsync/秒 vs 通常数千 TPS 的日志写入量）。
          */
-        spdlog::flush_every(std::chrono::seconds(1));
+        spdlog::flush_every(std::chrono::seconds(3));
 
         spdlog::set_default_logger(logger);
 

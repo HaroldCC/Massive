@@ -1,22 +1,24 @@
 /**
  * @file Stacktrace.h
- * @brief 栈回溯与 Crash Handler (基于 Abseil debugging)
+ * @brief 栈回溯与 Crash Handler 高层接口
  *
- * 使用方式 (每个进程 main 中调用一次):
+ * 使用方式（每个进程 main 中调用一次）:
  * @code
  *   #include "Common/Core/Stacktrace.h"
+ *   #include "Common/Core/Dump.h"  // SetCrashDumpDirectory
  *   int main(int argc, char **argv) {
  *       MMO::InstallStackTrace(argv[0]);  // 必须在 Log::Init 之后
- *       // ... 业务代码 ...
+ *       MMO::SetCrashDumpDirectory(cfg->log.logDir.c_str());
+ *       // ...
  *   }
  * @endcode
  *
- * 两层防御:
- *   1. FailureSignalHandler - SIGSEGV/SIGABRT/SIGILL/... -> stderr 打印完整栈 -> abort
- *   2. MASSIVE_ASSERT 宏内 - Release 下输出栈到 stderr + 日志文件 (Abseil backend)
- *
- * 依赖: absl/debugging/stacktrace.h + symbolize.h + failure_signal_handler.h
- *   - 随 abseil 目标打包
+ * 架构：
+ *   Stacktrace.h    → 高层接口（InstallStackTrace, DumpStackTrace）
+ *   Dump.h          → crash 编排（文本栈 + 平台 dump + _exit）
+ *   Platform.h      → 平台抽象声明
+ *   Platform_Win.cpp → Windows 实现（MiniDumpWriteDump, SEH）
+ *   Platform_Linux.cpp → Linux 实现（fork+abort, sigaction）
  */
 #pragma once
 
@@ -26,44 +28,28 @@ namespace MMO
 {
 
     /**
-     * @brief 打印当前线程栈回溯到 FILE (最多 maxFrames 帧)
+     * @brief 打印当前线程栈回溯到 FILE（符号化版本，非 signal-safe）
      *
-     * 线程安全、非 signal-safe (调用 absl::Symbolize, 可能 heap 分配),
-     * 用于 MASSIVE_ASSERT Release 路径 (进程不终止、可安全使用).
+     * 线程安全（调用 absl::Symbolize，可能 heap 分配），
+     * 用于 MASSIVE_ASSERT Release 路径（进程不终止）。
      *
-     * @param out       输出 FILE (stderr / 日志文件)
+     * @param out       输出 FILE (默认 stderr)
      * @param maxFrames 最大帧数 (默认 32)
-     * @param skip      跳过的栈帧数 (默认 2: 跳过自身 + 宏包装层)
+     * @param skip      跳过的栈帧数 (默认 2)
      */
     void DumpStackTrace(FILE *out = stderr, int maxFrames = 32, int skip = 2);
 
     /**
-     * @brief 安装 Crash 信号处理器 + 初始化符号解析
+     * @brief 安装 Crash dump 处理器 + 初始化符号解析
      *
-     * 必须在 Log::Init() 之后调用 (信号处理器可能输出到日志文件).
-     * 覆盖信号: SIGSEGV, SIGILL, SIGFPE, SIGABRT, SIGBUS, SIGTRAP
+     * 必须在 Log::Init() 之后调用。
      *
-     * Signal handler 中仅做 signal-safe 操作:
-     *   - absl::GetStackTrace(addr only, no Symbolize)
-     *   - raw write() to crash dump file + STDERR_FILENO
-     *   - _exit(1)
+     * 安装内容:
+     *   - absl InitializeSymbolizer（供 DumpStackTrace 符号化）
+     *   - 平台原生 crash dump handler（Dump.h + Platform.h）
      *
-     * crash dump 文件默认写入当前目录 ({name}_crash_{pid}.dmp),
-     * 可通过 SetCrashDumpDirectory(logDir) 指定目录.
-     *
-     * @param argv0 程序路径 (传递给 absl::InitializeSymbolizer)
+     * @param argv0 程序路径（传递给 absl::InitializeSymbolizer）
      */
     void InstallStackTrace(const char *argv0);
-
-    /**
-     * @brief 设置 crash dump 文件目录
-     *
-     * 必须在 InstallStackTrace 之后、但是在可能 crash 之前调用.
-     * 通常在 Log::Init 之后调用: SetCrashDumpDirectory(cfg.log.logDir.c_str())
-     * 如果没有显式调用，crash dump 文件会写入当前工作目录.
-     *
-     * @param logDir 日志目录（绝对路径或相对路径）
-     */
-    void SetCrashDumpDirectory(const char *logDir);
 
 } // namespace MMO

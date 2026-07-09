@@ -22,6 +22,7 @@
 #include "Common/Core/Args.h"
 #include "Common/Log/GracefulShutdown.h"
 #include "Common/Core/Stacktrace.h"
+#include "Common/Core/Dump.h" // SetCrashDumpDirectory
 #include "Common/DB/DBWorkerPool.h"
 #include "Common/Log/Log.h"
 

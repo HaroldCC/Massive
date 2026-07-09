@@ -7,6 +7,8 @@
  */
 #pragma once
 
+#include "Common/Core/Platform.h" // 平台检测 + _WIN32_WINNT 定义
+
 #include <atomic>
 #include <cstddef>
 #include <thread>
@@ -14,13 +16,6 @@
 
 #include <asio/io_context.hpp>
 #include <asio/executor_work_guard.hpp>
-
-// Asio 需要 Windows 平台宏
-#ifdef _WIN32
-    #ifndef _WIN32_WINNT
-        #define _WIN32_WINNT 0x0601
-    #endif
-#endif
 
 namespace MMO
 {
