@@ -42,7 +42,7 @@ namespace MMO
             uint16                   worldServerID = 1;
         } world;
 
-        /// @brief 日志配置（Log::Init 入参）
+        /** @brief 日志配置（Log::Init 入参） */
         Log::Config log;
 
         /**

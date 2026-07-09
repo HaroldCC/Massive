@@ -5,14 +5,13 @@
 
 #include "World/WorldConfig.h"
 #include "Common/Config/ConfigLoader.h"
+#include "Common/Crypto/Hex.h"
+#include "Common/Log/Log.h"
 
-#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <string>
-
-#include "Common/Log/Log.h"
 
 namespace MMO
 {
@@ -96,32 +95,10 @@ namespace MMO
             return std::nullopt;
         }
 
-        for (size_t i = 0; i < WorldConfig::kLSSSize; ++i)
+        if (!Crypto::HexDecode(hex, cfg.security.loginServerSecret, WorldConfig::kLSSSize))
         {
-            auto hexVal = [](char c) -> int {
-                if (c >= '0' && c <= '9')
-                {
-                    return c - '0';
-                }
-                if (c >= 'a' && c <= 'f')
-                {
-                    return c - 'a' + 10;
-                }
-                if (c >= 'A' && c <= 'F')
-                {
-                    return c - 'A' + 10;
-                }
-                return -1;
-            };
-            int hi = hexVal(hex[i * 2]);
-            int lo = hexVal(hex[i * 2 + 1]);
-            if (hi < 0 || lo < 0)
-            {
-                Log::Error("WorldConfig: key file '{}' contains non-hex chars", keyPath);
-                return std::nullopt;
-            }
-            cfg.security.loginServerSecret[i] =
-                static_cast<uint8>((static_cast<unsigned>(hi) << 4) | static_cast<unsigned>(lo));
+            Log::Error("WorldConfig: key file '{}' contains non-hex chars", keyPath);
+            return std::nullopt;
         }
 
         return cfg;

@@ -20,7 +20,6 @@ namespace MMO
         conn->socket = std::move(socket);
 
         // 注册消息回调（IO 线程回调，拆 InternalHeader 后写入对应 Session inbox）
-        auto weakSock = std::weak_ptr<TCPSocket>(conn->socket);
         conn->socket->SetMessageHandler(
             [this, gateID](uint32 /*msgID*/, uint32 /*sessionID*/, const uint8 *data, size_t len) {
                 // data = [InternalHeader:4B][payload]

@@ -75,7 +75,7 @@ namespace MMO
         std::vector<WorkGuard>        _works;
         std::vector<std::thread>      _threads;
         std::atomic<std::size_t>      _nextIndex {0};
-        bool                          _started = false;
+        std::atomic<bool>             _started {false};
 
         // 主线程 io_context：Wait() 在其中 run()，Stop() 时 stop()
         asio::io_context _mainCtx;

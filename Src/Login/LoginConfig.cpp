@@ -9,9 +9,9 @@
  */
 #include "Login/LoginConfig.h"
 #include "Common/Config/ConfigLoader.h"
+#include "Common/Crypto/Hex.h"
 #include "Common/Log/Log.h"
 
-#include <cctype>
 #include <cstdio>
 #include <fstream>
 #include <random>
@@ -19,44 +19,6 @@
 
 namespace MMO
 {
-
-    // hex 字符 → 4-bit 值，非法字符返回 -1
-    static int HexValue(char c)
-    {
-        if (c >= '0' && c <= '9')
-        {
-            return c - '0';
-        }
-        if (c >= 'a' && c <= 'f')
-        {
-            return c - 'a' + 10;
-        }
-        if (c >= 'A' && c <= 'F')
-        {
-            return c - 'A' + 10;
-        }
-        return -1;
-    }
-
-    // hex 字符串 → 32B LSS，失败返回 false
-    static bool DecodeLSS(const std::string &hex, uint8 (&lss)[LoginConfig::kLSSSize])
-    {
-        if (hex.size() != LoginConfig::kLSSSize * 2)
-        {
-            return false;
-        }
-        for (size_t i = 0; i < LoginConfig::kLSSSize; ++i)
-        {
-            int hi = HexValue(hex[i * 2]);
-            int lo = HexValue(hex[i * 2 + 1]);
-            if (hi < 0 || lo < 0)
-            {
-                return false;
-            }
-            lss[i] = static_cast<uint8>((static_cast<unsigned>(hi) << 4) | static_cast<unsigned>(lo));
-        }
-        return true;
-    }
 
     // 读取文件全部内容为 string
     static std::string ReadFile(const std::string &path)
@@ -69,21 +31,6 @@ namespace MMO
         std::ostringstream ss;
         ss << f.rdbuf();
         return ss.str();
-    }
-
-    // 移除字符串中的空白字符（空格/tab/换行/回车）
-    static std::string StripWhitespace(const std::string &s)
-    {
-        std::string result;
-        result.reserve(s.size());
-        for (char c : s)
-        {
-            if (!std::isspace(static_cast<unsigned char>(c)))
-            {
-                result += c;
-            }
-        }
-        return result;
     }
 
     std::optional<LoginConfig> LoginConfig::Load(const std::string &path, const std::string &keyPath)
@@ -115,7 +62,7 @@ namespace MMO
         std::string lssHex = loader.GetString("security.login_server_secret", "");
         if (!lssHex.empty())
         {
-            if (!DecodeLSS(lssHex, cfg.security.loginServerSecret))
+            if (!Crypto::HexDecode(lssHex, cfg.security.loginServerSecret, LoginConfig::kLSSSize))
             {
                 Log::Error("LoginConfig: security.login_server_secret hex decode failed "
                            "(expected {} hex chars)",
@@ -151,8 +98,8 @@ namespace MMO
                 fileContent = newHex;
                 Log::Info("LoginConfig: generated new LSS key -> '{}'", keyPath);
             }
-            std::string hex = StripWhitespace(fileContent);
-            if (!DecodeLSS(hex, cfg.security.loginServerSecret))
+            std::string hex = Crypto::StripWhitespace(fileContent);
+            if (!Crypto::HexDecode(hex, cfg.security.loginServerSecret, LoginConfig::kLSSSize))
             {
                 Log::Error("LoginConfig: key file '{}' hex decode failed "
                            "(expected {} hex chars, got {})",

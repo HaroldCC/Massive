@@ -33,10 +33,19 @@ namespace MMO
         if (_tlsEnabled)
         {
             // TLS 模式：创建 ssl::stream 包装底层 socket，先做 handshake
-            _sslCtx.set_options(asio::ssl::context::default_workarounds | asio::ssl::context::no_sslv2
-                                | asio::ssl::context::no_sslv3 | asio::ssl::context::single_dh_use);
-            _sslCtx.use_certificate_chain_file(_certPath);
-            _sslCtx.use_private_key_file(_keyPath, asio::ssl::context::pem);
+            try
+            {
+                _sslCtx.set_options(asio::ssl::context::default_workarounds | asio::ssl::context::no_sslv2
+                                    | asio::ssl::context::no_sslv3 | asio::ssl::context::single_dh_use);
+                _sslCtx.use_certificate_chain_file(_certPath);
+                _sslCtx.use_private_key_file(_keyPath, asio::ssl::context::pem);
+            }
+            catch (const std::exception &e)
+            {
+                Log::Error("TCPSocket: TLS cert/key load failed: {}", e.what());
+                DoClose();
+                return;
+            }
 
             _sslStream.reset(new asio::ssl::stream<asio::ip::tcp::socket &>(_socket, _sslCtx));
 
@@ -326,9 +335,9 @@ namespace MMO
             // shutdown 可能返回非致命错误（对端已关闭），忽略
         }
 
-        asio::error_code ec;
-        [[maybe_unused]]auto r = _socket.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
-        r = _socket.close(ec);
+        asio::error_code      ec;
+        [[maybe_unused]] auto r = _socket.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
+        r                       = _socket.close(ec);
 
         if (_onClose)
         {

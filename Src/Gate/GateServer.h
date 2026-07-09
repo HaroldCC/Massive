@@ -230,7 +230,6 @@ namespace MMO
 
         // 连接管理
         std::unordered_map<uint32, std::shared_ptr<GateSession>> _sessions;
-        std::mutex                                               _sessionsMutex;
 
         // session 路由表：sessionID → (worldAddr, clientSession)
         struct SessionRoute
@@ -240,7 +239,6 @@ namespace MMO
         };
 
         std::unordered_map<uint32, SessionRoute> _sessionRoutes;
-        mutable std::mutex                       _routesMutex;
 
         // Gate↔World 连接
         struct WorldConnection
@@ -251,11 +249,12 @@ namespace MMO
         };
 
         std::unordered_map<std::string, std::unique_ptr<WorldConnection>> _worldConns;
-        mutable std::mutex                                                _worldConnsMutex;
 
         // World 连接上的 session 列表（用于断线时清理）
         std::unordered_map<std::string, std::vector<uint32>> _worldSessionMap;
-        mutable std::mutex                                   _worldSessionMapMutex;
+
+        /// 保护 _sessions, _sessionRoutes, _worldConns, _worldSessionMap 的粗粒度锁
+        mutable std::mutex _gateMutex;
 
         // 限流
         struct IPEntry
