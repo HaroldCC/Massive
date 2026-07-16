@@ -1,6 +1,4 @@
 options gen2
-options no_unused_block_arguments = false
-options no_unused_function_arguments = false
 options no_global_variables = false
 options indenting = 4
 options strict_smart_pointers = true
@@ -55,10 +53,7 @@ def package_tag(tag : string) {
 }
 
 def package_tags(tags : array<string>) {
-    _pkg_meta.tags |> reserve(length(_pkg_meta.tags) + length(tags))
-    for (t in tags) {
-        _pkg_meta.tags |> push_clone(t)
-    }
+    _pkg_meta.tags |> push_clone_from(tags)
 }
 
 def package_min_sdk(version : string) {

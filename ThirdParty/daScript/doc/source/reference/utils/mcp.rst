@@ -1,0 +1,656 @@
+.. _utils_mcp:
+
+.. index::
+   single: Utils; MCP Server
+   single: Utils; AI Tool Integration
+   single: Utils; Model Context Protocol
+
+===========================================
+ MCP Server --- AI Tool Integration
+===========================================
+
+The daslang MCP server exposes compiler-backed tools to AI coding
+assistants via the `Model Context Protocol <https://modelcontextprotocol.io/>`_.
+It provides compilation diagnostics, type inspection, go-to-definition,
+find-references, AST dump, AOT generation, expression evaluation,
+parse-aware grep, and more.
+
+Uses stdio transport -- no extra build dependencies.
+
+.. contents::
+   :local:
+   :depth: 2
+
+
+Quick start
+===========
+
+Test the server manually::
+
+   # Windows
+   bin/Release/daslang.exe utils/mcp/main.das
+
+   # Linux
+   ./bin/daslang utils/mcp/main.das
+
+Configure in ``.mcp.json`` (project root):
+
+.. code-block:: json
+
+   {
+     "mcpServers": {
+       "daslang": {
+         "command": "bin/Release/daslang.exe",
+         "args": ["utils/mcp/main.das"],
+         "defer_loading": false
+       }
+     }
+   }
+
+Or add via CLI::
+
+   claude mcp add daslang -- bin/Release/daslang.exe utils/mcp/main.das
+
+Claude Code starts and stops the server automatically with each
+session.
+
+The ``"defer_loading": false`` field requests that tool schemas load
+at session start instead of being deferred (deferred = the assistant
+must ``ToolSearch`` each tool by name before it can be called).  When
+the harness honors the flag the per-call friction is removed; when it
+doesn't (currently the upstream behavior --- see
+`Issue #26844 <https://github.com/anthropics/claude-code/issues/26844>`_),
+the flag is harmless and the tools fall back to the deferred path.
+
+
+Tools
+=====
+
+Each tool is invoked via MCP's ``tools/call`` method.
+
+Common parameters
+-----------------
+
+Several tools share the same module-resolution arguments. Tools that
+take them are marked below; the meaning is identical everywhere.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 20 80
+
+   * - Parameter
+     - Description
+   * - ``project``
+     - Path to a ``.das_project`` file. Equivalent to daslang's
+       ``-project <file>`` CLI flag. Use when the target source belongs
+       to a project that pins module roots / source-resolver options.
+   * - ``project_root``
+     - Project root directory --- the parent of ``modules/`` for
+       daspkg-style module resolution. Equivalent to daslang's
+       ``-project_root <path>`` CLI flag. Use when working on an
+       external module via a ``<DummyRoot>/modules/<your-module>``
+       junction.
+   * - ``load_modules``
+     - JSON array of paths to individual module folders (each
+       containing ``.das_module``) to load directly. Equivalent to
+       daslang's ``-load_module <path>`` CLI flag (repeatable).
+       Bypasses the ``<project_root>/modules/<name>`` scan and shadows
+       same-basename entries in dasroot and project_root. Use to work
+       on an external module without setting up the junction trick.
+
+All three default to empty (no project / cwd-based resolution). Most
+compilation, navigation, introspection, execution, code-generation,
+and tree-sitter tools accept all three arguments.
+
+Compilation and diagnostics
+---------------------------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 75
+
+   * - Tool
+     - Description
+   * - ``compile_check``
+     - Compile a ``.das`` file and return errors/warnings plus a
+       categorized function listing on success.  Optional ``json``
+       for structured output.
+   * - ``list_functions``
+     - Compile a ``.das`` file and list all user functions, class
+       methods, and generic instances (after macro expansion).
+   * - ``list_types``
+     - Compile a ``.das`` file and list all structs, classes (with
+       fields), enums (with values), and type aliases.
+   * - ``list_requires``
+     - Compile a ``.das`` file and list all ``require`` dependencies
+       (direct and transitive), with source file paths.  Optional
+       ``json`` for structured output.
+   * - ``list_modules``
+     - List all available daslang modules (builtin C++ modules and
+       daslib).  Optional ``json`` for structured output.
+   * - ``list_module_api``
+     - List all functions, types, enums, and globals exported by a
+       builtin or daslib module.  Optional ``compact`` mode for large
+       modules, ``filter`` for substring matching, ``section`` to
+       limit output (e.g. ``functions``, ``structs``).
+
+Code navigation
+---------------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 75
+
+   * - Tool
+     - Description
+   * - ``goto_definition``
+     - Given a cursor position (file, line, column), resolve the
+       definition of the symbol under the cursor.  Returns location,
+       kind, and source snippet.
+   * - ``type_of``
+     - Given a cursor position, return the resolved type of the
+       expression under the cursor (innermost to outermost).
+   * - ``find_references``
+     - Find all references to the symbol under the cursor.  Scope:
+       ``file`` (default) or ``all`` (all loaded modules).
+   * - ``find_symbol``
+     - Cross-module symbol search (functions, generics, structs,
+       handled types, enums, globals, typedefs, fields).
+       Case-insensitive substring by default; ``=query`` for exact
+       match.  Optional ``with_cpp_source`` to redirect builtins /
+       handled types to their C++ source location (see below).
+
+Cursor-based tools (``goto_definition``, ``type_of``,
+``find_references``) support a ``no_opt`` parameter that disables
+compiler optimizations to preserve the full AST -- useful when globals,
+enum values, or bitfield constants get constant-folded away.
+
+``with_cpp_source`` redirect
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``find_symbol`` and ``goto_definition`` accept an optional
+``with_cpp_source`` boolean.  When ``true``, results that have a C++
+implementation (builtin functions, handled types via ``addExtern`` /
+``MAKE_TYPE_FACTORY``) get a resolved C++ source location appended via
+the lazily-built C++ index.  First call costs ~2 s (one full
+``src/include/modules`` scan); subsequent calls cost ~150 ms (a
+git-state staleness signature: ``git rev-parse HEAD`` + filtered
+``git status`` + per-file mtimes + the search-config file's mtime).
+The index rebuilds automatically when relevant ``.cpp/.cc/.h/.hpp``
+files in the search scope change, when ``HEAD`` moves, or when the
+search config is edited.  Default off -- opt in when the question is "where
+is X *actually* implemented", not when just enumerating symbols.
+
+Program introspection
+---------------------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 75
+
+   * - Tool
+     - Description
+   * - ``ast_dump``
+     - Dump AST of an expression or compiled function.
+       ``mode=ast`` returns S-expression, ``mode=source`` returns
+       post-macro daslang code.  Optional ``lineinfo``.
+   * - ``program_log``
+     - Produce full post-compilation program text (like
+       ``options log``).  Shows all types, globals, and functions after
+       macro expansion.  Optional ``function`` filter.
+   * - ``describe_type``
+     - Describe a type's fields, methods, values, and base type.
+       Supports structs, classes, handled types, enums, bitfields,
+       variants, tuples, typedefs.
+
+Execution
+---------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 75
+
+   * - Tool
+     - Description
+   * - ``run_script``
+     - Run a ``.das`` file or inline code snippet and return
+       stdout/stderr.  Optional ``project`` for ``.das_project``-bound
+       module resolution.
+   * - ``run_test``
+     - Run dastest on a ``.das`` test file and return pass/fail
+       results.  Optional ``json`` for structured output.
+   * - ``eval_expression``
+     - Evaluate a daslang expression and return its printed result.
+       Supports module imports via ``require`` parameter.  Optional
+       ``project`` for ``.das_project``-bound module resolution.
+
+Code generation and transformation
+-----------------------------------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 75
+
+   * - Tool
+     - Description
+   * - ``format_file``
+     - Format a ``.das`` file using the built-in formatter.
+   * - ``convert_to_gen2``
+     - Convert a ``.das`` file from gen1 syntax to gen2 using
+       ``das-fmt``.  Optional ``inplace`` flag.
+   * - ``aot``
+     - Generate AOT (ahead-of-time) C++ code for a ``.das`` file or a
+       single function.  Overloaded names return a disambiguation list.
+
+Parse-aware search (tree-sitter)
+---------------------------------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 75
+
+   * - Tool
+     - Description
+   * - ``grep_usage``
+     - Parse-aware symbol search across ``.das`` files using ast-grep +
+       tree-sitter.  Finds identifier occurrences excluding comments
+       and strings.  Conditional on ``sg`` CLI.
+   * - ``outline``
+     - List all declarations in a file or set of files using
+       tree-sitter.  Works on broken/incomplete code -- no compilation
+       needed.  Conditional on ``sg`` CLI.
+
+C++ source search (tree-sitter-cpp)
+------------------------------------
+
+Parallel parse-aware tools for the C++ side of the codebase, backed by
+ast-grep with tree-sitter-cpp.  Search scope and exclusions are
+configured in :ref:`utils_mcp_cpp_search_config` (defaults: ``src/``,
+``include/``, ``modules/`` --- locked to
+``.cpp``/``.cc``/``.h``/``.hpp`` ---
+with ``build*/``, ``cmake-build-*/``, ``CMakeFiles/``, ``_deps/``,
+``3rdparty/``, ``.git/`` always excluded plus an auto-exclude for any
+folder that contains a ``.git`` file or directory).  All tools are
+conditional on the ``sg`` CLI.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 75
+
+   * - Tool
+     - Description
+   * - ``cpp_grep_usage``
+     - Parse-aware identifier search across ``.cpp``/``.cc``/``.h``/``.hpp``
+       files.  Driven by a generated multi-kind ast-grep rule file
+       (``identifier`` / ``type_identifier`` / ``namespace_identifier`` /
+       ``field_identifier``) so usages in type position
+       (``Foo writer;``), qualified calls (``Foo::method()``) and
+       base-class clauses (``class Bar : public Foo``) are all caught.
+       Skips comments and strings.  Hits deduped by ``(file, line)``.
+   * - ``cpp_find_symbol``
+     - Search C++ symbol *declarations* by name + kind.  ``kind`` accepts
+       ``function``, ``class``, ``struct``, ``enum``, ``union``,
+       ``typedef``, ``namespace``, ``macro``.  Covers function
+       definitions *and* header-only function declarations
+       (e.g. ``void foo();``); ``typedef`` matches both legacy
+       ``typedef X Y;`` and modern ``using X = Y;``.  Best-effort name
+       extraction; complex templates and function-pointer typedefs may
+       report partial names.  Specializations are not separately listed
+       (primary template only).  Macro-expanded declarations like
+       ``DAS_BIND_FN(foo)`` are invisible to ast-grep.
+   * - ``cpp_outline``
+     - Top-level declarations in a C++ file or glob via tree-sitter-cpp.
+       Works on broken/incomplete code -- no compile DB needed.
+   * - ``cpp_goto_definition``
+     - Given a cursor position in a C++ file, return up to five
+       plausible definition locations.  **Approximate** -- no scope
+       resolution, no overload disambiguation, no template-specialization
+       tracking.  For substring/usage searches prefer ``cpp_grep_usage``.
+       A clangd-backed precise mode is on the v2 roadmap.
+
+.. _utils_mcp_cpp_search_config:
+
+Search-scope configuration
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Edit ``utils/mcp/cpp_search_config.das`` to change which folders the
+C++ tools (and the ``with_cpp_source`` redirect) scan.  The file
+declares four constants:
+
+- ``CPP_SEARCH_DIRS`` --- root folders to scan, recursively.
+  Defaults to ``["src", "include", "modules"]``.
+- ``CPP_SEARCH_ALWAYS_EXCLUDE`` --- ``--globs`` exclusion patterns
+  always applied (``build*/``, ``cmake-build-*/``, ``CMakeFiles/``,
+  ``_deps/``, ``3rdparty/``, ``.git/``).
+- ``CPP_SEARCH_INCLUDE_GLOBS`` --- file-extension lock; defaults to
+  ``["*.cpp", "*.cc", "*.h", "*.hpp"]``.  ``.cc`` is included so
+  consumers who embed the MCP server in a Google/Chromium-style
+  codebase get coverage out of the box; the daslang repo itself only
+  uses ``.cpp``/``.h``/``.hpp``.
+- ``CPP_SEARCH_INCLUDE_OVERRIDES`` --- repo-relative paths to
+  re-include even when the auto-``.git``-folder rule would have
+  excluded them.  Empty by default.
+
+Folders containing a ``.git`` file or directory at any depth are
+auto-excluded.  This covers daspkg-installed packages (in
+``modules/.daspkg_cache/``), git submodules, ``FetchContent``
+destinations, and ad-hoc clones.  To force-include such a folder, add
+its repo-relative path to ``CPP_SEARCH_INCLUDE_OVERRIDES``.
+
+Edits to ``cpp_search_config.das`` trigger an index rebuild on the
+next lookup automatically (the file's mtime is part of the staleness
+signature; see the ``with_cpp_source`` redirect section above).
+
+C++ build tools (compile database)
+-----------------------------------
+
+Compiler-backed C++ tools driven by the CMake compile database
+(``build/compile_commands.json``).  The top-level ``CMakeLists.txt`` sets
+``CMAKE_EXPORT_COMPILE_COMMANDS ON``; the **Ninja** and **Makefile**
+generators honor it, but the **Visual Studio generator does not** emit the
+database --- on Windows, configure a side Ninja build directory.  The tools
+probe ``build/``, ``build-ninja/``, then ``build*/`` under the repo root;
+pass ``build_dir`` to point elsewhere.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 75
+
+   * - Tool
+     - Description
+   * - ``cpp_compile_check``
+     - Syntax-check a C++ translation unit with the real compiler.  Takes
+       the TU's exact flags from the compile database, strips the codegen
+       tail (``/Fo`` ``/Fd`` ``-c`` ``-o`` + PCH) and appends ``/Zs``
+       (MSVC) or ``-fsyntax-only`` (clang/gcc).  Inherits the build's
+       flags including ``/WX``.  Optional ``json`` -> structured
+       ``CppCompileResult`` (``file``, ``success``, ``errors``,
+       ``warnings``); optional ``build_dir``.  Headers are not translation
+       units (not in the database) --- pass a ``.cpp``/``.cc`` that
+       includes them.
+   * - ``cpp_build_info``
+     - Return the compiler, build directory, and both the full and
+       derived syntax-only command lines for a TU.  Answers "what command
+       line compiles this file".
+   * - ``cpp_format_file``
+     - Format a C++ file in place with clang-format, but only when a
+       ``.clang-format`` is discoverable by walking up from the file.
+       No-op-with-message otherwise (the daslang tree ships none); for
+       external C++ consumers that carry a style.
+
+.. _utils_mcp_msvc_env:
+
+Windows + MSVC: developer environment
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+On MSVC the compile database omits the system include paths --- the
+compiler reads them from the ``INCLUDE`` environment variable set by
+``vcvars64.bat``.  The MCP server (and the ``cl.exe`` it spawns) therefore
+needs a Visual Studio developer environment, or ``cpp_compile_check`` fails
+on ``<vcruntime.h>``.  Two options:
+
+#. **Wrapper launcher (recommended).**  Point ``.mcp.json`` at
+   ``utils/mcp/daslang-mcp-msvc.cmd`` instead of the bare binary.  The
+   wrapper locates Visual Studio via ``vswhere``, loads the x64 developer
+   environment, then starts the server --- so it works no matter how Claude
+   Code is launched:
+
+   .. code-block:: json
+
+      {
+        "mcpServers": {
+          "daslang": {
+            "command": "cmd",
+            "args": ["/c", "utils\\mcp\\daslang-mcp-msvc.cmd"],
+            "defer_loading": false
+          }
+        }
+      }
+
+#. **Launch from a developer shell.**  Start Claude Code from an *x64
+   Native Tools Command Prompt for VS* (or any shell where ``vcvars64`` has
+   run); the server inherits the environment and needs no wrapper.
+
+clang/gcc find their system headers automatically, so this is
+Windows/MSVC-only --- on Linux/macOS point ``.mcp.json`` straight at the
+daslang binary.
+
+
+Two servers: full and C++-only
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Two entry points share the dispatch core (``protocol_core.das``):
+``main.das`` registers the full tool set; ``cpp_main.das`` registers only
+the cpp/agnostic subset (``grep_usage``, ``outline``, the seven ``cpp_*``
+tools, and ``shutdown``) --- none of the daslang compiler-backed tools, so a
+C++-only project gets a focused tool list. Register either or both. On
+Windows the same launcher serves both, with the server script as its first
+argument:
+
+.. code-block:: json
+
+   {
+     "mcpServers": {
+       "daslang": {
+         "command": "cmd",
+         "args": ["/c", "utils\\mcp\\daslang-mcp-msvc.cmd"],
+         "defer_loading": false
+       },
+       "daslang-cpp": {
+         "command": "cmd",
+         "args": ["/c", "utils\\mcp\\daslang-mcp-msvc.cmd", "cpp_main.das"],
+         "defer_loading": false
+       }
+     }
+   }
+
+On Linux/macOS point each entry straight at the binary
+(``"args": ["utils/mcp/cpp_main.das"]`` for the cpp server). Tools are
+namespaced by server, so the cpp server's tools appear as
+``mcp__daslang-cpp__cpp_compile_check`` etc. A future ``cpp-mcp`` AOT binary
+will ship ``cpp_main.das`` as a standalone executable for C++-only consumers.
+
+Duplicate detection
+-------------------
+
+All four tools shell out to the underlying CLIs --- daslang's
+``require`` grammar can't take hyphenated path components, so the MCP
+wrappers invoke ``daslang utils/detect-dupe/main.das`` and
+``daslang utils/find-dupe/main.das`` as subprocesses.  ``export_corpus``
+builds the corpus once over a body of code; ``detect_duplicates``
+queries it; ``judge_duplicates`` and ``find_dupe`` invoke the
+:ref:`utils_find_dupe` AI judge.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 75
+
+   * - Tool
+     - Description
+   * - ``export_corpus``
+     - Scan one or more ``.das`` files / directories / globs and write
+       a corpus JSON to ``out``.  Subprocesses
+       ``detect-dupe --export-functions``.
+   * - ``detect_duplicates``
+     - Compare candidate file(s) against a pre-built corpus.  Returns
+       a per-candidate JSON envelope with corpus stats, pattern-skip
+       counts, and the top-N exact and fuzzy matches per candidate.
+       Supports ``keep`` to override the default pattern filter.
+   * - ``judge_duplicates``
+     - Take a ``detect-dupe`` JSON report and ask Claude to partition
+       each cluster into real / partial / false_positive verdicts.
+       Shells out to ``daslang utils/find-dupe/main.das`` --- requires
+       ``daspkg install --root utils/find-dupe`` first (the
+       ``anthropic/anthropic`` package).
+   * - ``find_dupe``
+     - Convenience wrapper: run ``detect-dupe`` against ``paths`` and
+       judge the resulting clusters in one call.  Same daspkg
+       requirement as ``judge_duplicates``.
+
+
+Live-reload control
+-------------------
+
+These tools interact with a running :ref:`daslang-live <utils_daslang_live>`
+instance via its REST API. All accept an optional ``port`` parameter
+(default ``"9090"``); to drive a daslang-live started with
+``--live-port N``, pass the same value here so polling matches the bind.
+``live_launch`` forwards a non-empty ``port`` to the spawned binary as
+``--live-port <port>``, and rejects values outside ``[1, 65535]``
+before composing the spawn argv.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 20 80
+
+   * - Tool
+     - Args + description
+   * - ``live_launch``
+     - ``file`` (required), optional ``project``, ``project_root``,
+       ``load_modules``, ``port``. Launches ``daslang-live.exe`` on a
+       script if not already running, then polls up to 10 s for the
+       HTTP server. The working directory is set to the script's folder
+       via the ``-cwd`` flag; ``project`` / ``project_root`` /
+       ``load_modules`` are forwarded as ``-project`` /
+       ``-project_root`` / ``-load_module`` (one per entry); ``port``
+       is forwarded as ``--live-port``.
+   * - ``live_status``
+     - Optional ``port``. Returns JSON with ``fps``, ``uptime``,
+       ``paused``, ``dt``, ``has_error``. Returns 503 JSON if the script
+       failed to compile.
+   * - ``live_error``
+     - Optional ``port``. Returns the last compilation error as plain
+       text (or JSON ``null`` if none).
+   * - ``live_reload``
+     - ``full`` (``"true"`` for full recompile, anything else for
+       incremental), optional ``port``. Works even when there is a
+       compile error.
+   * - ``live_pause``
+     - ``paused`` (``"true"`` to pause, ``"false"`` to resume) (required),
+       optional ``port``. Returns 503 if a compile error is active.
+   * - ``live_command``
+     - ``name`` (required), optional ``args`` (JSON object string,
+       e.g. ``'{"x":1}'``), optional ``port``. Dispatches a
+       ``[live_command]`` by name. Use ``name="help"`` to list all
+       registered commands. Returns 503 on compile error.
+   * - ``live_commands``
+     - ``commands`` (required, JSON array of ``{name, args}`` objects),
+       optional ``port``. Dispatches the batch in one round-trip with
+       continue-on-error semantics --- the response is a JSON array
+       preserving input order, with malformed entries surfacing
+       ``{"error":...}`` in their slot.
+   * - ``live_shutdown``
+     - Optional ``port``. Gracefully shuts the instance down.
+
+
+ast-grep / tree-sitter setup
+=============================
+
+The ``grep_usage``, ``outline``, and ``cpp_*`` tools use
+`ast-grep <https://ast-grep.github.io/>`_ (``sg`` CLI) with a custom
+tree-sitter grammar for daslang plus the built-in tree-sitter-cpp
+grammar.  The ``sgconfig.yml`` config file is platform-specific (shared
+library extension differs), so it is gitignored.
+
+Copy the appropriate template to ``sgconfig.yml`` in the project root:
+
+.. code-block:: bash
+
+   # Windows
+   cp sgconfig.yml.windows sgconfig.yml
+
+   # Linux
+   cp sgconfig.yml.linux sgconfig.yml
+
+   # macOS
+   cp sgconfig.yml.osx sgconfig.yml
+
+All three templates include a ``languageGlobs: { cpp: ["*.h", "*.hpp"] }``
+block.  Without this, ast-grep classifies ``.h`` files as C (not C++)
+and the ``cpp_*`` tools silently produce zero matches on headers.
+
+
+Architecture
+============
+
+- Each tool invocation runs in a **separate thread** with its own
+  context/heap -- when the thread ends, its memory is freed without GC.
+- Dispatch + JSON-RPC framing live in ``protocol_core.das``. Tools are
+  described by a data-driven registry (``array<ToolDef>``):
+  ``registry_das.das`` registers the daslang compiler-backed tools,
+  ``registry_cpp.das`` the cpp/agnostic subset. Adding a tool = one
+  ``ToolDef`` entry.
+- Two entry points share that dispatch: ``main.das`` registers the full
+  set; ``cpp_main.das`` registers only the cpp/agnostic subset (ast-grep
+  search/outline + the C++ build tools + ``shutdown``), for C++-focused
+  consumers.
+- Heap is collected after each request when over threshold (1 MB).
+- Tool handlers are modular: each tool lives in ``tools/*.das``,
+  shared utilities in ``tools/common.das``.
+
+
+Protocol
+========
+
+The server implements `MCP <https://modelcontextprotocol.io/>`_ via
+JSON-RPC 2.0 over stdio:
+
+- Reads newline-delimited JSON (NDJSON) from stdin.
+- Writes JSON-RPC responses to stdout (one line per message).
+- Handles: ``initialize``, ``tools/list``, ``tools/call``, ``ping``.
+- Logs to stderr and to ``utils/mcp/mcp_server.log``.
+- File paths passed to tools are resolved relative to the server's
+  working directory.
+
+
+Configuring Claude Code permissions
+=====================================
+
+Optionally, allow all MCP tools without prompting by adding to
+``.claude/settings.json``:
+
+.. code-block:: json
+
+   {
+     "permissions": {
+       "allow": [
+         "mcp__daslang__compile_check",
+         "mcp__daslang__list_functions",
+         "mcp__daslang__list_types",
+         "mcp__daslang__run_test",
+         "mcp__daslang__format_file",
+         "mcp__daslang__run_script",
+         "mcp__daslang__ast_dump",
+         "mcp__daslang__list_modules",
+         "mcp__daslang__find_symbol",
+         "mcp__daslang__list_requires",
+         "mcp__daslang__list_module_api",
+         "mcp__daslang__convert_to_gen2",
+         "mcp__daslang__goto_definition",
+         "mcp__daslang__type_of",
+         "mcp__daslang__find_references",
+         "mcp__daslang__program_log",
+         "mcp__daslang__eval_expression",
+         "mcp__daslang__describe_type",
+         "mcp__daslang__grep_usage",
+         "mcp__daslang__outline",
+         "mcp__daslang__cpp_grep_usage",
+         "mcp__daslang__cpp_find_symbol",
+         "mcp__daslang__cpp_outline",
+         "mcp__daslang__cpp_goto_definition",
+         "mcp__daslang__cpp_compile_check",
+         "mcp__daslang__cpp_build_info",
+         "mcp__daslang__cpp_format_file",
+         "mcp__daslang__aot"
+       ]
+     }
+   }
+
+
+.. seealso::
+
+   ``utils/mcp/README.md`` -- setup and configuration details
+
+   `Model Context Protocol specification <https://modelcontextprotocol.io/>`_
+
+   :ref:`utils_daslang_live` -- the live-reload application host controlled by ``live_*`` tools

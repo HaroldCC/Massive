@@ -1,3 +1,4 @@
+#include "daScript/misc/das_common.h"
 #include "daScript/misc/platform.h"
 #include "daScript/misc/performance_time.h"
 
@@ -230,7 +231,8 @@ namespace das {
         // 64-bit user-space pointers fit in 48 bits (canonical form on x86-64
         // and AArch64 Linux/macOS — top 16 bits are sign-extended copies of
         // bit 47, and we only ever see user-space addresses here, so they are
-        // zero). Pack a small epoch into those unused top 16 bits so the
+        // zero — but we mask them on write regardless, since ptr is an identity
+        // key only). Pack a small epoch into those unused top 16 bits so the
         // common case is a single 8-byte word. Reserve sentinel 0xFFFF for
         // "epoch overflow" — fall back to a separate adaptive-size write.
         // 32-bit hosts have no headroom; always emit ptr + adaptive epoch.
@@ -238,10 +240,7 @@ namespace das {
             constexpr uint64_t kPtrMask  = (uint64_t(1) << 48) - 1;
             constexpr uint64_t kEpochOverflowTag = 0xFFFFull << 48;
             if ( writing ) {
-                uintptr_t pbits = reinterpret_cast<uintptr_t>(value.ptr);
-                DAS_ASSERTF((uint64_t(pbits) & ~kPtrMask) == 0,
-                    "SerializeNodeId: pointer %p has non-zero top 16 bits — "
-                    "non-canonical address violates packing assumption", value.ptr);
+                uintptr_t pbits = reinterpret_cast<uintptr_t>(value.ptr) & kPtrMask;
                 if ( value.epoch < 0xFFFFull ) {
                     uint64_t packed = (uint64_t(value.epoch) << 48) | uint64_t(pbits);
                     *this << packed;
@@ -367,6 +366,36 @@ namespace das {
         serialize_hash_map<K, V, H, E>(value);
         return *this;
     }
+
+    // Guarded: see ast_serializer.h note. Under DAS_CUSTOM_HASH=0 these would
+    // duplicate the das_hash_map definitions above (identical aliases).
+#if DAS_CUSTOM_HASH
+    template <typename K, typename V, typename H, typename E>
+    void AstSerializer::serialize_hash_map ( das_insert_only_hash_map<K, V, H, E> & value ) {
+        dtag(HASH_TAG("DasHashmap"));
+        if ( writing ) {
+            uint64_t size = value.size(); *this << size;
+            for ( auto & item : value ) {
+                *this << item.first << item.second;
+            }
+            return;
+        }
+        uint64_t size = 0; *this << size;
+        das_insert_only_hash_map<K, V, H, E> deser;
+        deser.reserve(size);
+        for ( uint64_t i = 0; i < size; i++ ) {
+            K k; V v; *this << k << v;
+            deser.emplace(das::move(k),das::move(v));
+        }
+        value = das::move(deser);
+    }
+
+    template <typename K, typename V, typename H, typename E>
+    AstSerializer & AstSerializer::operator << ( das_insert_only_hash_map<K, V, H, E> & value ) {
+        serialize_hash_map<K, V, H, E>(value);
+        return *this;
+    }
+#endif
 
     template <typename V>
     AstSerializer & AstSerializer::operator << ( safebox_map<V> & box ) {
@@ -1104,22 +1133,27 @@ namespace das {
         switch ( baseType ) {
             case Type::typeMacro:
             case Type::typeDecl:
-                ser << alias << dimExpr;
+                ser << alias;
                 DAS_VERIFYF_MULTI(!annotation, !structType, !enumType, !firstType, !secondType,
                                 argTypes.empty(), argNames.empty());
                 break;
+            case Type::tFixedArray:
+                ser << alias << firstType << fixedDim << fixedDimExpr;
+                DAS_VERIFYF_MULTI(!annotation, !structType, !enumType, !secondType,
+                                argTypes.empty(), argNames.empty());
+                break;
             case Type::alias:
-                ser << alias << firstType << dim << dimExpr;
+                ser << alias << firstType;
                 DAS_VERIFYF_MULTI(!annotation, !structType, !enumType, !secondType,
                                 !alias.empty(), argTypes.empty(), argNames.empty());
                 break;
             case option:
-                ser << argTypes << dim << dimExpr;
+                ser << argTypes;
                 DAS_VERIFYF_MULTI(!annotation, !structType, !enumType, !firstType, !secondType,
                                 alias.empty(), !argTypes.empty(), argNames.empty());
                 break;
             case autoinfer:
-                ser << dim << dimExpr << alias;
+                ser << alias;
                 DAS_VERIFYF_MULTI(!annotation, !structType, !enumType, !firstType, !secondType,
                                 argTypes.empty(), argNames.empty());
                 break;
@@ -1149,7 +1183,7 @@ namespace das {
             case tFloat4:
             case tDouble:
             case tString:
-                ser << alias << dim << dimExpr;
+                ser << alias;
                 DAS_VERIFYF_MULTI(!annotation, !structType, !enumType, !firstType, !secondType,
                                 argTypes.empty(), argNames.empty());
                 break;
@@ -1157,17 +1191,17 @@ namespace das {
             case tURange:
             case tRange64:
             case tURange64: // blow up!
-                ser << alias << dim << dimExpr;
+                ser << alias;
                 DAS_VERIFYF_MULTI(!annotation, !structType, !enumType, !firstType, !secondType,
                                 argTypes.empty(), argNames.empty());
                 break;
             case tStructure:
-                ser << alias << structType << dim << dimExpr;
+                ser << alias << structType;
                 DAS_VERIFYF_MULTI(!annotation, !!structType, !enumType, !firstType, !secondType,
                                 argTypes.empty(), argNames.empty());
                 break;
             case tHandle:
-                ser << alias << annotation << dim << dimExpr;
+                ser << alias << annotation;
                 DAS_VERIFYF_MULTI(!!annotation, !structType, !enumType, !firstType, !secondType,
                                 argTypes.empty(), argNames.empty());
                 break;
@@ -1175,7 +1209,7 @@ namespace das {
             case tEnumeration8:
             case tEnumeration16:
             case tEnumeration64:
-                ser << alias << enumType << dim << dimExpr;
+                ser << alias << enumType;
                 DAS_VERIFYF_MULTI(!annotation, !structType, !!enumType, !firstType, !secondType,
                                 argTypes.empty(), argNames.empty());
                 break;
@@ -1183,31 +1217,31 @@ namespace das {
             case tBitfield8:
             case tBitfield16:
             case tBitfield64:
-                ser << alias << argNames << dim << dimExpr;
+                ser << alias << argNames;
                 DAS_VERIFYF_MULTI(!annotation, !structType, !enumType, !firstType, !secondType,
                                 argTypes.empty());
                 break;
             case tIterator:
             case tPointer:
             case tArray: // blow up!
-                ser << alias << firstType << dim << dimExpr;
+                ser << alias << firstType;
                 DAS_VERIFYF_MULTI(!annotation, !structType, !enumType, !secondType,
                                 argTypes.empty(), argNames.empty());
                 break;
             case tFunction:
             case tLambda:
             case tBlock:
-                ser << alias << firstType << argTypes << argNames << dim << dimExpr;
+                ser << alias << firstType << argTypes << argNames;
                 DAS_VERIFYF_MULTI(!annotation, !structType, !enumType, !secondType);
                 break;
             case tTable:
-                ser << alias << firstType << secondType << dim << dimExpr;
+                ser << alias << firstType << secondType;
                 DAS_VERIFYF_MULTI(!annotation, !structType, !enumType, !!firstType,
                                 argTypes.empty(), argNames.empty());
                 break;
             case tTuple:
             case tVariant:
-                ser << alias << argTypes << argNames << dim << dimExpr;
+                ser << alias << argTypes << argNames;
                 DAS_VERIFYF_MULTI(!annotation, !structType, !enumType, !firstType, !secondType,
                                 !argTypes.empty());
                 break;
@@ -1215,6 +1249,10 @@ namespace das {
                 SERIALIZER_VERIFYF(false,  "not expected to be here");
                 break;
         }
+
+        // unconditional: typeMacro/typeDecl payload, and the tag payload riding on an
+        // autoinfer firstType (FIXED_ARRAY_REWORK.md, 1b)
+        ser << typeMacroExpr;
 
         ser << flags << at << module;
     }
@@ -1301,7 +1339,7 @@ namespace das {
         ser.tag(HASH_TAG("Variable"));
         ser << name << aka << type << init << source << at << index << stackTop
             << extraLocalOffset << module
-            << initStackSize << flags << access_flags << annotation;
+            << initStackSize << flags << access_flags << access_info << annotation;
     }
 
     void Function::AliasInfo::serialize ( AstSerializer & ser ) {
@@ -1441,6 +1479,7 @@ namespace das {
         serializeBase(expr);
         ser << expr->name                   << expr->arguments;
         ser << expr->argumentsFailedToInfer << expr->aliasSubstitution << expr->atEnclosure;
+        ser << expr->pipedCallArgument;
     }
 
     void SerializeVisitor::serializeCallFunc ( ExprCallFunc * expr ) {
@@ -1462,7 +1501,7 @@ namespace das {
 
     void SerializeVisitor::serializeConst ( ExprConst * expr ) {
         serializeBase(expr);
-        ser << expr->baseType << expr->value << expr->foldedNonConst;
+        ser << expr->baseType << expr->value << expr->foldedNonConst << expr->promotedFromInt << expr->inexactFloatPromotion;
     }
 
     void SerializeVisitor::serializeMakeLocal ( ExprMakeLocal * expr ) {
@@ -1523,7 +1562,7 @@ namespace das {
 
     void SerializeVisitor::serializeMakeArray ( ExprMakeArray * expr ) {
         serializeMakeLocal(expr);
-        ser << expr->recordType << expr->values << expr->gen2;
+        ser << expr->recordType << expr->values << expr->gen2 << expr->makeArrayOnHeap;
     }
 
     void SerializeVisitor::preVisitExpression ( Expression * expr ) {
@@ -1781,7 +1820,7 @@ namespace das {
         serializeBase(expr);
         ser << expr->iterators << expr->iteratorsAka << expr->iteratorsAt << expr->iteratorsTupleExpansion << expr->iteratorsTags
             << expr->iteratorVariables << expr->sources << expr->body << expr->visibility
-            << expr->allowIteratorOptimization << expr->canShadow;
+            << expr->allowIteratorOptimization << expr->canShadow << expr->annotations;
     }
 
     void SerializeVisitor::preVisit ( ExprUnsafe * expr ) {
@@ -1791,7 +1830,7 @@ namespace das {
 
     void SerializeVisitor::preVisit ( ExprWhile * expr ) {
         serializeBase(expr);
-        ser << expr->cond << expr->body;
+        ser << expr->cond << expr->body << expr->annotations;
     }
 
     void SerializeVisitor::preVisit ( ExprWith * expr ) {
@@ -1855,7 +1894,7 @@ namespace das {
 
     void SerializeVisitor::preVisit ( ExprNew * expr ) {
         serializeCallFunc(expr);
-        ser << expr->typeexpr << expr->initializer;
+        ser << expr->typeexpr << expr->initializer << expr->allocate_on_stack;
     }
 
     void SerializeVisitor::preVisit ( ExprCall * expr ) {
@@ -1890,7 +1929,7 @@ namespace das {
 
     void SerializeVisitor::preVisit ( ExprMakeTuple * expr ) {
         serializeMakeArray(expr);
-        ser << expr->isKeyValue << expr->recordNames;
+        ser << expr->isKeyValue << expr->recordNames << expr->shorthandRecordNames;
     }
 
     void SerializeVisitor::preVisit ( ExprArrayComprehension * expr ) {
@@ -2524,7 +2563,6 @@ namespace das {
               << value.no_unsafe_uninitialized_structures
               << value.strict_properties
               << value.no_writing_to_nameless
-              << value.always_call_super
               << value.no_optimizations
               << value.no_infer_time_folding
               << value.fail_on_no_aot
@@ -2664,13 +2702,6 @@ namespace das {
         smartMakeStructMap.clear();
         smartTypeDeclMap.clear();
         exprBlockMap.clear();
-    }
-
-    uint32_t AstSerializer::getVersion () {
-        // bumped for ska::flat_hash_map → das::daslang_hash_map switch:
-        // iteration order differs, invalidating any cached serialized AST.
-        static constexpr uint32_t currentVersion = 81;
-        return currentVersion;
     }
 
     // Serializes the whole script as opposed to just one module
@@ -2879,14 +2910,9 @@ namespace das {
             AstSerializerState * state,
             const TBlock<void,TTemporary<TArray<uint8_t> const>> & block,
             Context * context, LineInfoArg * at ) {
-        auto dataSize = state->storage->buffer.size();
-        if ( dataSize > INT32_MAX ) {
-            context->throw_error_at(at, "data size exceeds 2GB limit");
-            return;
-        }
         Array arr;
         array_mark_locked(arr, state->storage->buffer.data(),
-            uint32_t(state->storage->buffer.size()), uint32_t(state->storage->buffer.size()));
+            uint64_t(state->storage->buffer.size()), uint64_t(state->storage->buffer.size()));
         vec4f args[1] = { cast<Array *>::from(&arr) };
         context->invoke(block, args, nullptr, at);
     }

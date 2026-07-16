@@ -15,6 +15,9 @@ struct Event {
         //! Sound/sample name (`"bd"`, `"sd"`, `"sawtooth"`, `"sine"`, ...).
     note    : float = 60.0      // MIDI note number (60 = middle C)
         //! MIDI note number (60 = middle C).
+    freq    : float = 0.0       // explicit frequency in Hz (0 = unset → derived from note)
+        //! Explicit oscillator frequency in Hz. `0` = unset (derive from `note`); any
+        //! positive value overrides `note`. Matches strudel.cc `.freq(440)`.
     n       : int = 0           // sample variation index (bd:0, bd:1, bd:2)
         //! Sample variation index within a bank (`bd:0`, `bd:1`, `bd:2`).
     gain    : float = 0.8       // amplitude 0.0–1.0 (applied after rendering)
@@ -47,6 +50,10 @@ struct Event {
         //! Reverb send amount 0.0–1.0.
     roomsize : float = 2.0      // reverb decay time in seconds (0.1–10.0)
         //! Reverb decay time in seconds (0.1–10.0).
+    reverb_quality : int = 0    // reverb quality tier: 0=high (default), 1=medium, 2=low
+        //! Reverb quality tier: 0 = high (dual-IR, default), 1 = medium (mono IR + allpass decorrelation, ~2x cheaper), 2 = low (Freeverb, cheapest).
+    reverb_stages : int = 0     // medium allpass cascade depth (0 = default 5, range 1–8)
+        //! Medium-tier allpass cascade depth (0 = default of 5; range 1–8). Ignored by high/low.
     delay_amount : float = 0.0  // delay send amount 0.0–1.0
         //! Delay send amount 0.0–1.0.
     delaytime    : float = -1.0 // delay time in seconds (-1 = unset → derived from delaysync and cps)
@@ -152,9 +159,7 @@ def resolve_adsr(attack, decay, sustain, release : float) : tuple<float; float; 
     let d_set = decay >= 0.0
     let s_set = sustain >= 0.0
     let r_set = release >= 0.0
-    if (!a_set && !d_set && !s_set && !r_set) {
-        return (envmin, envmin, envmax, release_min)
-    }
+    if (!a_set && !d_set && !s_set && !r_set) return (envmin, envmin, envmax, release_min)
     let sustain_resolved = s_set ? sustain : (d_set ? envmin : envmax)
     let a_final = max(a_set ? attack : 0.0, envmin)
     let d_final = max(d_set ? decay : 0.0, envmin)
@@ -171,9 +176,7 @@ def resolve_delaytime(delaytime, delaysync, cps : float) : float {
     //! Resolve delay time: use `delaytime` if set (>= 0), otherwise derive from
     //! `delaysync` (in cycles) and the current `cps` so the echo locks to tempo.
     //! The 3/16-cycle default yields a dotted-eighth feel that tracks tempo changes.
-    if (delaytime >= 0.0) {
-        return delaytime
-    }
+    if (delaytime >= 0.0) return delaytime
     let safe_cps = cps > 0.0001 ? cps : 0.5
     return delaysync / safe_cps
 }

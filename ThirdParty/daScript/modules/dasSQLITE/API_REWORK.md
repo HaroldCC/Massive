@@ -5430,6 +5430,186 @@ The `_sql` translator side stays unchanged — `text_match` on an
 query string to SQLite verbatim. The full-grammar in-memory matcher
 just removes the panic when those same chains run without `_sql`.
 
+## Shipped — chunk N: `_distinct_by` as chain operator + first-row aggregates (branch `bbatkin/sqlite-linq-distinct-by-aggregates`)
+
+### Surface in this PR
+
+`_distinct_by(_.K)` is now a first-class chain operator (previously
+recognized only inside `peel_count_terminal`'s `try_peel_distinct_by_field`
+helper). When followed by an aggregate terminator, lowers to a SQLite
+bare-aggregate subquery:
+
+- `_distinct_by(_.K) |> _count(P)` / `_long_count(P)`
+  → `SELECT COUNT(*) FROM (SELECT *, MIN("pk") FROM "table" GROUP BY "K") WHERE <P>`
+- `_distinct_by(_.K) |> _select(_.F) |> sum()` / `min()` / `max()` / `average()`
+  → `SELECT <AGG>("F") FROM (SELECT *, MIN("pk") FROM "table" GROUP BY "K")`
+
+Existing fast path preserved: `_distinct_by(_.K) |> count()` (no predicate)
+continues to emit `COUNT(DISTINCT "K")` — single SELECT, no subquery wrap.
+
+User idiom inside `_sql(...)` for the predicate form is the linq_boost
+`_count(_.field > X)` / `_long_count(_.field > X)` shorthand (parallel
+to `_where(_.field > X)`). The explicit `count($(c) => c.field > X)`
+lambda form fails type inference because `_sql`'s macro boundary blocks
+the typer from binding `c` through unexpanded chain operators.
+
+### Why the bare-aggregate trick
+
+SQLite documents that `SELECT *, MIN(<col>) FROM table GROUP BY K` returns
+non-aggregate columns from the row with the minimum `<col>` per group
+(the "bare aggregate" optimization). With `<col>` set to the table's
+`@sql_primary_key`, "row with min PK per K" = "first row by source order"
+when the PK is monotonic with insertion (the common case). This matches
+linq's `_distinct_by` "first row per key" semantics without window
+functions.
+
+### Constraints (v1)
+
+- Source must have exactly one `@sql_primary_key` field (composite PKs reject).
+- `_distinct_by` appears at most once in the chain.
+- `_distinct_by` must apply to a single source table (no `_join` upstream).
+- No other chain ops between `_distinct_by` and the terminator (other than
+  the optional `_select(_.F)` for column aggregates) — `_where` / `_order_by` /
+  `take` / `skip` etc. in between cleanly reject with macro_error.
+
+### Tests
+
+`tests/dasSQLITE/test_32_distinct.das` — 8 new tests (3 → 11 total)
+covering each new chain shape + emit-shape assertions + runtime correctness
+on a fixture with duplicate names and monotonic PKs.
+
+Rejection paths (no-pk / composite-pk / double `_distinct_by` / chain ops
+between distinct_by and terminator) wired via explicit macro_error calls in
+`sqlite_linq.das` but NOT added as `failed_*.das` probes — the linq
+generic-instantiation cascade after `_sql` returns null is brittle to
+maintain (couples to internal linq.das line numbers). Code-review covers
+the rejection sites.
+
+### Benches
+
+`benchmarks/sql/distinct_count_pred.das` — `m1` row now populated
+(uses the new `_count(_.year > THRESHOLD)` shorthand inside `_sql`).
+`benchmarks/sql/order_distinct_take.das` — `m1` row now populated via
+new 1-column `Brand` table fixture in `_common.das`.
+`benchmarks/sql/results.md` refreshed. `sqlite_linq_gaps.md` updated to
+note both gaps closed.
+
+### Deferred to chunk N+1
+
+- ~~MAX(pk) variant for `each |> reverse |> _distinct_by(K) |> ...`~~ — **shipped in chunk N+1**.
+- ~~`_distinct_by(K) |> _order_by` / `take` / `skip` composition~~ — **shipped in chunk N+1**.
+- `_where(P) |> _distinct_by(K) |> ...` — still deferred (where-then-distinct
+  vs. distinct-then-where semantic split; inner-WHERE placement needs design).
+- Composite-PK support (would need a tuple-key MIN like `MIN(pk1, pk2)` or
+  a synthetic row-id projection).
+
+## Shipped — chunk N+1: `_distinct_by` composition + `reverse()` + `_group_by |> first()` (branch `bbatkin/sqlite-linq-distinct-by-composition`)
+
+### Surface in this PR
+
+Closes 4 SQL gap cells from [`benchmarks/sql/sqlite_linq_gaps.md`](../../benchmarks/sql/sqlite_linq_gaps.md)'s
+"window-function lowerings" group — turns out 3 of them are bare-aggregate composition,
+not window functions (the gaps doc's ROW_NUMBER prescription was conservative). The
+4th (`groupby_first`) is a genuine new arm but reuses the bare-aggregate machinery.
+
+**Arm A — `_distinct_by(K)` row passthrough + composition:**
+- `_distinct_by(_.K) |> to_array` → `SELECT … FROM (SELECT *, MIN(pk) FROM t GROUP BY K) AS t0`
+  (closes a latent silent-drop bug from chunk N — `_distinct_by(K) |> to_array` emitted no GROUP BY)
+- `_distinct_by(_.K) |> _order_by(_.S) [|> take(N)] [|> skip(N)]` — outer ORDER BY / LIMIT / OFFSET
+  composes over the bare-aggregate subquery.
+
+**Arm B — `reverse() |> _distinct_by(K)` (MAX(pk) variant):**
+- `reverse() |> _distinct_by(_.K)` → `SELECT … FROM (SELECT *, MAX(pk) FROM t GROUP BY K) AS t0`
+  — picks LAST row per K by source/PK order; mirrors linq's
+  `each(arr).reverse()._distinct_by(K)` "last per group" splice.
+- Strict gating: `reverse()` only legal when wrapped by `_distinct_by` (SQL has no inherent
+  row ordering to reverse). Bare `reverse() |> to_array` rejects with a fixit pointing to
+  `_order_by_descending(...)`.
+
+**Arm C — `_group_by(K) |> _select((K=_._0, R=_._1 |> first()))` (tuple projection):**
+- Whole-row entry in a grouped projection lowers to `SELECT "key", "col1", "col2", …
+  FROM (SELECT *, MIN(pk) FROM t GROUP BY key) AS t0`. Row entry expands inline to all
+  source columns; `build_row_builder` reconstructs the struct via `ExprMakeStruct` with
+  per-field reads at the right column offset.
+
+### Why no window functions
+
+SQLite's bare-aggregate optimization (already used by chunk N for first-row aggregates)
+covers all 4 of these cells without `ROW_NUMBER() OVER (PARTITION BY K ORDER BY S)`.
+The bare-aggregate trick + outer ORDER BY / LIMIT is faster (no window-function
+overhead) and idiomatic SQLite. Window-function lowering (for "min-S per K", "rank",
+"lag" etc.) remains future work — none of today's benches need it.
+
+### Constraints (v1)
+
+- All chunk N constraints carry forward (single `@sql_primary_key`, single source table, no `_join`, no repeat `_distinct_by`).
+- Arm A passthrough rejects `_where` / `_join` / `_group_by` / `_having` / set ops / additional `distinct` between `_distinct_by` and the row terminator; permits `_order_by` / `take` / `skip`.
+- Arm B: `reverse()` must be immediately above `_distinct_by`; double-reverse rejects as a no-op.
+- Arm C: single-key groups only; no mixing `first()` with column aggregates (`length` / `sum` / `min` / `max` / `average`) in the same projection; no computed-expression group keys with `first()`.
+
+### Tests
+
+`tests/dasSQLITE/test_32_distinct.das` — 13 new tests (11 → 24 total) covering each new
+chain shape × (emit-shape + runtime correctness). 3 new `failed_*.das` rejection probes:
+- `failed_distinct_by_with_where.das` — Arm A `_where` composition rejected
+- `failed_reverse_without_distinct_by.das` — Arm B bare `reverse()` rejected
+- `failed_groupby_first_mixed_with_aggregate.das` — Arm C `first()` + `length` rejected
+
+### Benches
+
+All 4 m1 lanes backfilled in `benchmarks/sql/{distinct_by_order_take,distinct_by_order_to_array,reverse_distinct_by,groupby_first}.das`. `benchmarks/sql/results.md` refreshed. `sqlite_linq_gaps.md` "window-function lowerings" group fully drained.
+
+### Deferred to chunk N+2
+
+- `_where(P) |> _distinct_by(K) |> ...` — inner-WHERE composition (`SELECT … FROM (SELECT *, MIN(pk) FROM t WHERE P GROUP BY K)` — semantically distinct from outer-WHERE; needs design).
+- Composite-PK support (still pending from chunk N).
+- Mixed projection: `_group_by(K) |> _select((K=_._0, N=_._1|>length, R=_._1|>first()))` — would require inner subquery to add `COUNT(*) AS group_count` alongside `MIN(pk)`, and outer row builder to interleave scalar + offset row reads.
+- Multi-key groups with `_._1 |> first()` (single-key only today).
+- Computed-expression group keys with `first()` (only `_.<field>` keys today).
+- Real window functions (`ROW_NUMBER() OVER (PARTITION BY K ORDER BY S)`) — not blocked by today's benches but useful for `_distinct_by_min_by(K, S)` ("min-S row per K") shape if a future bench needs it.
+- **Pre-distinct phase-divert composition** (Copilot R1 #2909). Chains like `take(N) |> _distinct_by(K)` or `skip(N) |> _distinct_by(K)` trigger `divert_to_inner` BEFORE `_distinct_by` peels — `q.innerSql`/`q.innerBindExprs` get populated by the take's inner subquery, and chunk N+1's passthrough finalize would overwrite the inner SQL while orphaning the take's bind. Currently rejected with a clear macro_error pointing the user to restructure as `_distinct_by(K) |> take(N)` (cap-after-distinct semantics). A future composition would 2-level wrap: `SELECT … FROM (SELECT *, MIN(pk) FROM ({prior_innerSql}) GROUP BY K) AS t0` to preserve cap-before-distinct semantics — needs design + tests for arbitrary phase-divert combinations.
+- **Whole-row projection as inner subquery** (Copilot R1 #2909). `_group_by(K) |> _select((K=_._0, R=_._1 |> first())) |> _where(P) |> to_array` triggers `divert_to_inner` (PHASE_WHERE forces a SELECT divert), which would wrap the grouped+first projection as inner. The row entry expands to N source columns without `AS <alias>` under `force_aliases=true`, and `apply_passthrough_projection` expects 1 column per record name. Currently rejected with a clear macro_error pointing the user to restructure (run the wrap-triggering op before `_group_by`, or split into separate `_sql` calls). Resolution options: (a) emit deterministic per-field aliases (`"col1" AS "<RecordName>_col1"`) under `force_aliases` and teach `apply_passthrough_projection` to reconstruct the row entry from those, or (b) keep the rejection and document the constraint. Same PR could lift the v1 single-key-only constraint on `first()` projections.
+
+## Shipped — chunk N+2: `_group_by` / `_having` / `_order_by` after `_join` via projection-alias resolution (branch `bbatkin/sqlite-linq-join-groupby-alias`)
+
+### Surface in this PR
+
+Closes 2 SQL bench cells from [`benchmarks/sql/sqlite_linq_gaps.md`](../../benchmarks/sql/sqlite_linq_gaps.md)'s "`_group_by` after `_join`" section. After this PR, every chain operator that references a column reads the join's `into`-projection alias through a single registry — fields named in the `into` lambda's named tuple (`(Brand = c.brand, Price = c.price)`) become first-class names for subsequent `_group_by` / `_having` / `_order_by` / aggregate / computed-key operations:
+
+- `_join(...) |> _group_by(_.Brand) |> _select((Brand=_._0, N=_._1|>count()))` lowers to `SELECT ("t0"."brand"), COUNT(*) FROM "Cars" AS "t0" INNER JOIN ... GROUP BY ("t0"."brand")`.
+- `_join(...) |> _group_by(_.Brand) |> _select((Brand=_._0, Total=_._1|>_select(_.Price)|>sum()))` lowers to `... SUM("t0"."price") ... GROUP BY ("t0"."brand")`.
+- `_join(...) |> _having(_._1 |> _select(_.Price) |> sum() > 200) |> _select(...)` resolves the alias inside HAVING.
+- `_join(...) |> _order_by(_.Brand)` resolves the alias inside ORDER BY.
+- `_join(...) |> _group_by(_.Price / 100) |> _select(...)` resolves the alias inside a computed group key.
+
+### Architecture
+
+Single load-bearing change: `pred_to_sql`'s column-reference branch consults a new `joinProjRecordNames` snapshot of the join's `into` projection (captured at the end of `process_join_call`, preserved across `analyze_grouped_projection`'s clear-and-repopulate of `projRecordNames`). New helpers `find_projection_alias(q, name)` and `render_projection_alias_sql(q, idx)` resolve aliases to qualified SQL fragments. Bare-`_.Field` fast paths in `push_group_key`, `collect_order_keys`, and `try_translate_group_aggregate` mirror the same lookup so they don't bypass `pred_to_sql`. v1 supports `t0` / `t1` aliases (the 2-source `_join` shape); other aliases (multi-source / nested joins) reject loudly.
+
+### Constraints (v1)
+
+- 2-source `_join` only (carries forward from chunks N / N+1).
+- The join's `into` lambda's named-tuple aliases are the field namespace post-join — base-table column names ARE NOT available unqualified. Users referring to base-table fields by name post-join get a `not a projection alias` error listing the valid alias names.
+- HAVING with alias-resolved aggregate (`_._1 |> _select(_.X) |> sum() > N`) has a known typer-ordering quirk: in compilation units with multiple `_sql` calls referencing the same chain shape, the typer pre-folds the predicate's aggregate side and the runtime `_sql` form fails to bind `_` for the row builder. The SQL emit itself is correct (verified via `_sql_text`), so chains that don't need to materialize the predicate body at runtime work. Investigating in chunk N+3.
+
+### Tests
+
+`tests/dasSQLITE/test_33_join_groupby.das` — 12 new tests covering Arm B (4: emit + runtime × 2 chain shapes), Arm C (4: emit + runtime + min/max/avg + multi-aggregate), and transitive coverage via HAVING / ORDER BY / computed-key (4: emit-shape + runtime mix). 3 new `failed_*.das` rejection probes:
+- `failed_join_groupby_unknown_alias.das` — `_group_by(_.NotAnAlias)` after join rejects with alias list
+- `failed_join_groupby_aggregate_unknown_alias.das` — `_._1 |> _select(_.NotAField) |> sum()` rejects similarly
+- `failed_join_order_by_unknown_alias.das` — `_order_by(_.NotAnAlias)` after join rejects similarly
+
+### Benches
+
+Both `benchmarks/sql/join_groupby_count.das` and `benchmarks/sql/join_groupby_to_array.das` got `run_m1` lanes. INTERP m1 beats array-fold m3f baselines (158 vs 184 ns/op for count; 191 vs 216 for to_array). `benchmarks/sql/results.md` refreshed. `sqlite_linq_gaps.md` "`_group_by` after `_join`" section struck.
+
+### Deferred to chunk N+3
+
+- **HAVING with alias-resolved aggregate in `_sql(...)` runtime form** — typer-ordering quirk noted above. `_sql_text(...)` emit is correct; only the row-binder in `_sql(...)` is affected. Workaround for now: split the chain into a separate `_sql_text` probe for verification, or restructure to use bare `count()` predicates.
+- Nested / multi-way joins (`_join |> _join |> ...`) — chunks N / N+1 already constrain to 2-source; `render_projection_alias_sql` rejects aliases beyond `t0`/`t1`. A future extension would generalize `source_rootType_for_alias` over an N-source join chain.
+- HAVING / ORDER BY / computed-key composition with `_distinct_by` (orthogonal to this chunk's _join surface; deferred from N+1's "where-then-distinct" follow-up).
+- Real window functions — still no bench needs them.
+
 ## Plan (to be written after all tutorials are reviewed)
 
 _TBD — this section is filled in once we have notes from every tutorial._

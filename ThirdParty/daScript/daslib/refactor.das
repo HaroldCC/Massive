@@ -1,7 +1,5 @@
 options gen2
 options indenting = 4
-options no_unused_block_arguments = false
-options no_unused_function_arguments = false
 options strict_smart_pointers = true
 
 module refactor shared private
@@ -21,7 +19,7 @@ require strings
 
 let LOG_REFACTOR = 100500
 
-[tag_function(extract_method_tag), sideeffects]
+[tag_function(extract_method_tag), sideeffects, unused_argument(method_name)]
 def public extract_method(method_name : string; blk : block) {
     //! Marks a block of code for method extraction refactoring.
     invoke(blk)
@@ -68,7 +66,7 @@ class ExtractMethodMacro : AstFunctionAnnotation {
         let function_declaration = build_string() $(writer) {
             writer |> write("def ")
             writer |> write(call_name)
-            if (length(captured) != 0) {
+            if (!empty(captured)) {
                 writer |> write(" ( ")
                 var first = true
                 for (v in captured) {
@@ -77,13 +75,16 @@ class ExtractMethodMacro : AstFunctionAnnotation {
                     } else {
                         writer |> write("; ")
                     }
-                    if (!v.variable._type.flags.constant && v.variable.access_flags.access_ref) {
+                    // access_info_pass_mutable: a callee inside the extracted block demands a
+                    // mutable ref even if it never writes — a const param would not compile
+                    let needs_mutable = v.variable.access_flags.access_ref || v.variable.access_info.access_info_pass_mutable
+                    if (!v.variable._type.flags.constant && needs_mutable) {
                         writer |> write("var ")
                     }
                     writer |> write(v.variable.name)
                     writer |> write(":")
                     writer |> write(describe(v.variable._type))
-                    if (v.variable._type.isWorkhorseType && v.variable.access_flags.access_ref) {
+                    if (v.variable._type.isWorkhorseType && needs_mutable) {
                         writer |> write("&")
                     }
                 }
@@ -94,7 +95,7 @@ class ExtractMethodMacro : AstFunctionAnnotation {
         let call_expression = build_string() $(writer) {
             writer |> write(call_name)
             writer |> write("(")
-            if (length(captured) != 0) {
+            if (!empty(captured)) {
                 var first = true
                 for (v in captured) {
                     if (first) {

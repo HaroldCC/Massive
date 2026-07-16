@@ -1,0 +1,1 @@
+Type alias for ``AnnotationDeclaration?``, used when constructing or attaching annotation declarations to functions, blocks, or structures.

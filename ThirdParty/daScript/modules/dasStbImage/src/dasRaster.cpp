@@ -11,7 +11,7 @@ namespace das
 {
     void rast_hspan_u8 ( TArray<uint8_t> & Span, int32_t spanOffset, const TArray<uint8_t> & Tspan, int32_t tspanOffset, float uvY, float dUVY, int32_t _count, LineInfoArg * at, Context * context ) {
         if ( uint32_t(spanOffset+_count) > Span.size ) {
-            context->throw_error_at(at,"rast_hspan: span out of range %i+%i >= %i", spanOffset, _count, Span.size);
+            context->throw_error_at(at,"rast_hspan: span out of range %i+%i >= %llu", spanOffset, _count, (unsigned long long)Span.size);
         }
         if ( tspanOffset<0 ) {
             context->throw_error_at(at,"rast_hspan: tspan offset is negative");
@@ -66,7 +66,7 @@ namespace das
 
     void rast_hspan_masked_u8 ( TArray<uint8_t> & Span, int32_t spanOffset, const TArray<uint8_t> & Tspan, int32_t tspanOffset, float uvY, float dUVY, int32_t _count, LineInfoArg * at, Context * context ) {
         if ( uint32_t(spanOffset+_count) > Span.size ) {
-            context->throw_error_at(at,"rast_hspan: span out of range %i+%i >= %i", spanOffset, _count, Span.size);
+            context->throw_error_at(at,"rast_hspan: span out of range %i+%i >= %llu", spanOffset, _count, (unsigned long long)Span.size);
         }
         if ( tspanOffset<0 ) {
             context->throw_error_at(at,"rast_hspan: tspan offset is negative");
@@ -117,7 +117,7 @@ namespace das
 
     void rast_hspan_masked_solid_u8 ( uint8_t solid, TArray<uint8_t> & Span, int32_t spanOffset, const TArray<uint8_t> & Tspan, int32_t tspanOffset, float uvY, float dUVY, int32_t _count, LineInfoArg * at, Context * context ) {
         if ( uint32_t(spanOffset+_count) > Span.size ) {
-            context->throw_error_at(at,"rast_hspan: span out of range %i+%i >= %i", spanOffset, _count, Span.size);
+            context->throw_error_at(at,"rast_hspan: span out of range %i+%i >= %llu", spanOffset, _count, (unsigned long long)Span.size);
         }
         if ( tspanOffset<0 ) {
             context->throw_error_at(at,"rast_hspan: tspan offset is negative");
@@ -141,10 +141,10 @@ namespace das
             auto i1 = uint32_t(v_extract_yi(iuv4));
             auto i2 = uint32_t(v_extract_zi(iuv4));
             auto i3 = uint32_t(v_extract_wi(iuv4));
-            if ( auto b0 = tspan[i0] ) PSP[0] = solid;
-            if ( auto b1 = tspan[i1] ) PSP[1] = solid;
-            if ( auto b2 = tspan[i2] ) PSP[2] = solid;
-            if ( auto b3 = tspan[i3] ) PSP[3] = solid;
+            if ( tspan[i0] ) PSP[0] = solid;
+            if ( tspan[i1] ) PSP[1] = solid;
+            if ( tspan[i2] ) PSP[2] = solid;
+            if ( tspan[i3] ) PSP[3] = solid;
             PSP += 4;
             uv4 = v_add(uv4,duv4);
         }
@@ -154,13 +154,13 @@ namespace das
             mask &= ((1<<count)-1);
             if ( mask!=0 ) context->throw_error_at(at,"rast_hspan: tspan out of range");
             auto i0 = uint32_t(v_extract_xi(iuv4));
-            if ( auto b0 = tspan[i0] ) PSP[0] = solid;
+            if ( tspan[i0] ) PSP[0] = solid;
             if ( count > 1 ) {
                 auto i1 = uint32_t(v_extract_yi(iuv4));
-                if ( auto b1 = tspan[i1] ) PSP[1] = solid;
+                if ( tspan[i1] ) PSP[1] = solid;
                 if ( count > 2 ) {
                     auto i2 = uint32_t(v_extract_zi(iuv4));
-                    if ( auto b2 = tspan[i2] ) PSP[2] = solid;
+                    if ( tspan[i2] ) PSP[2] = solid;
                 }
             }
         }
@@ -233,6 +233,7 @@ namespace das
     // ---- channel conversion (loops inside each branch) ----
 
     void rast_convert_channels_u8 ( uint8_t * dst, const uint8_t * src, int32_t num_pixels, int32_t src_ch, int32_t dst_ch ) {
+        if ( num_pixels <= 0 || src_ch <= 0 ) return;   // the memcpy fast-path would turn a negative count into a huge size_t
         if ( src_ch == 1 && dst_ch == 2 ) {
             for ( int32_t i = 0; i < num_pixels; ++i ) { dst[i*2] = src[i]; dst[i*2+1] = 255; }
         } else if ( src_ch == 1 && dst_ch == 3 ) {
@@ -258,11 +259,12 @@ namespace das
         } else if ( src_ch == 4 && dst_ch == 3 ) {
             for ( int32_t i = 0; i < num_pixels; ++i ) { dst[i*3] = src[i*4]; dst[i*3+1] = src[i*4+1]; dst[i*3+2] = src[i*4+2]; }
         } else if ( src_ch == dst_ch ) {
-            memcpy(dst, src, num_pixels * src_ch);
+            memcpy(dst, src, size_t(num_pixels) * size_t(src_ch));
         }
     }
 
     void rast_convert_channels_u16 ( uint16_t * dst, const uint16_t * src, int32_t num_pixels, int32_t src_ch, int32_t dst_ch ) {
+        if ( num_pixels <= 0 || src_ch <= 0 ) return;   // the memcpy fast-path would turn a negative count into a huge size_t
         if ( src_ch == 1 && dst_ch == 2 ) {
             for ( int32_t i = 0; i < num_pixels; ++i ) { dst[i*2] = src[i]; dst[i*2+1] = 65535; }
         } else if ( src_ch == 1 && dst_ch == 3 ) {
@@ -288,11 +290,12 @@ namespace das
         } else if ( src_ch == 4 && dst_ch == 3 ) {
             for ( int32_t i = 0; i < num_pixels; ++i ) { dst[i*3] = src[i*4]; dst[i*3+1] = src[i*4+1]; dst[i*3+2] = src[i*4+2]; }
         } else if ( src_ch == dst_ch ) {
-            memcpy(dst, src, num_pixels * src_ch * sizeof(uint16_t));
+            memcpy(dst, src, size_t(num_pixels) * size_t(src_ch) * sizeof(uint16_t));
         }
     }
 
     void rast_convert_channels_f32 ( float * dst, const float * src, int32_t num_pixels, int32_t src_ch, int32_t dst_ch ) {
+        if ( num_pixels <= 0 || src_ch <= 0 ) return;   // the memcpy fast-path would turn a negative count into a huge size_t
         if ( src_ch == 1 && dst_ch == 2 ) {
             for ( int32_t i = 0; i < num_pixels; ++i ) { dst[i*2] = src[i]; dst[i*2+1] = 1.0f; }
         } else if ( src_ch == 1 && dst_ch == 3 ) {
@@ -318,7 +321,7 @@ namespace das
         } else if ( src_ch == 4 && dst_ch == 3 ) {
             for ( int32_t i = 0; i < num_pixels; ++i ) { dst[i*3] = src[i*4]; dst[i*3+1] = src[i*4+1]; dst[i*3+2] = src[i*4+2]; }
         } else if ( src_ch == dst_ch ) {
-            memcpy(dst, src, num_pixels * src_ch * sizeof(float));
+            memcpy(dst, src, size_t(num_pixels) * size_t(src_ch) * sizeof(float));
         }
     }
 

@@ -1,0 +1,1 @@
+Pointer to a `TypeInfoMacro` object. Used for registering and managing custom ``typeinfo`` trait macros.

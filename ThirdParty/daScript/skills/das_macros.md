@@ -40,6 +40,25 @@ If you find yourself reading older guidance about `var inscope`, `<-`,
 `move_new`, `add_ptr_ref` for AST types, the source is pre-migration.
 The post-migration rules above are correct as of daslang 0.6.x.
 
+### Pre-set `_type` on emitted `ExprVar` (and similar nodes) that flow into typed positions
+
+`Expression::clone` deep-copies `_type` faithfully ([ast.cpp:1094](src/ast/ast.cpp#L1094): `expr->type = type ? new TypeDecl(*type) : nullptr`). So whatever you put on the source propagates to every consumer. The trap is the **source**: `new ExprVar(at = at, name := wbName)` leaves `_type` null, every `clone_expression` of it inherits the null, and if any of those clones flows into a generic call (`push_clone`, `sum`, etc.) the typer fails with `30165: cannot infer ... return type with 'auto'`.
+
+Don't rely on the typer's later local-variable-resolution pass to fix this — its generic-instantiation pass runs **first** and commits to `auto`, cascading errors up through every downstream consumer.
+
+Fix at emission time:
+
+```das
+var pvar = new ExprVar(at = at, name := boundName)
+pvar._type = clone_type(boundElementType)
+pvar._type.flags.ref = true
+// now any clone_expression(pvar) downstream carries the type into push_clone et al.
+```
+
+Same family of trap as the [ExprRef2Value blocker](#peel-exprref2value-before-qmatch) — the typer doesn't repair what macro substitution introduces, when the substitution lands in an already-typed AST fragment.
+
+Canonical example: `try_make_inline_cmp` and the `_where`-arm projection-bind rewrite in `daslib/linq_fold.das` (PR #2714).
+
 ## The few residual smart_ptr types — `Program`, `Context`, `FileAccess`
 
 A small set of types are still `smart_ptr<T>` (refcounted with manual
@@ -57,6 +76,18 @@ For these:
 - **`move` function**: Bound via C++ `builtin_smart_ptr_move*` family in `module_builtin_runtime.cpp` — proper smart pointer move with reference counting. Use `move(dest, src)` for `smart_ptr<T>` transfers when the refcount needs to be tracked.
 - **`return <- expr`**: Moves value to return slot and zeroes `expr`. If `expr` is a `&` ref parameter, this zeroes the *caller's* variable since they share memory.
 - **Visitor adapters** (`make_visitor` returns `VisitorAdapterPtr`) need `var inscope adapter <- make_visitor(*v)` and an `unsafe` block at the call site — see `daslib/ast.das` for examples.
+
+## Macro modules each compile into their own context — cross-module registration is intra-context only
+
+Each macro-bearing module is `simulate`d into its **own context** at compile time; its macros run via `invoke_in_context`. Compile-time globals a macro mutates (a pattern/registry table, an adapter list, any `[_macro]`-populated state) live in **that module's** context. A macro in module B **cannot** push state into module A's compile-time registry by calling A's functions — the two run in **separate contexts**, so it would require marshalling the value across the context boundary through the `invoke_in_context` transport layer (copying data between heaps, no shared pointers). Registering a closure/adapter/AST builder that way is impractical: **there is no "self-registration" of macro state across modules.**
+
+The practical pattern: to contribute macro-time state into module A's registry, the contributing code must **compile into A's context** — i.e. **A `require`s the contributor**, pulling its definitions in. Direction is *consumer → contributor*, never contributor-self-registers-into-consumer. (Example: the linq_fold engine's `splice_patterns` table lives in linq_fold's macro context, so a source adapter for an external module is pulled in via `linq_fold` requiring the adapter file — not the module registering itself.)
+
+This forces a hard `require` even when the dependency is logically optional / inverted (core requiring an external module). Make it conditional with two pieces (both available):
+- an **optional require** — `require ?<guard> <target>` (gen2) requires `<target>` only when module `<guard>` is available, and skips silently otherwise (a plain top-level `require` resolves at module-resolution time, *before* `static_if`, so `static_if` alone can't gate it — this is what the `?guard` form solves). See `doc/source/reference/language/modules.rst` "Optional requires".
+- a **`static_if (typeinfo builtin_module_exists(<guard>))`** guard around the registration call and any dispatcher branch that names the contributor's symbols (the `static_if` drops its untaken branch before name resolution, so the symbols resolve only when the module is present).
+
+Note adapters can still *emit* code referencing the contributor's symbols by name (resolved at the user's splice site, like linq_fold_decs emitting `for_each_archetype` without requiring decs) — that's orthogonal to *registering* into the consumer's macro state, which is the part bound by the context model.
 
 ## Structure macros — generating types and functions
 
@@ -81,6 +112,106 @@ For these:
 - **`typeDecl.argTypes`** — array of `TypeDeclPtr` representing function-type arguments (indices: 0 = first parameter). For interface method fields, `argTypes[0]` is the `self` parameter — check `.isConst` to determine if the method is const.
 - **Interior mutability pattern** — when a const getter needs to lazily mutate a cache: declare param as `self : T ==const`, then `var pS = unsafe(reinterpret<T? -const>(addr(self)))` to strip const for cache mutation. Used in `daslib/interfaces.das` for const-only interface proxy caching.
 
+### Fixed arrays in the AST (tFixedArray, since 0.6.3)
+
+`int[3][4]` is a chain of `TypeDecl` nodes, NOT a `dim` vector on the element — the `dim`/`dimExpr` fields are **deleted**:
+
+- One node per dimension: `baseType == Type.tFixedArray`, element in `firstType`, size in `fixedDim`, **outermost first** (`int[3][4]` = FA(3, FA(4, int))). Operate on the head's `fixedDim`/`firstType` and recurse — never assume one node covers all dims (the one-peel rule).
+- `fixedDim` sentinels pre-inference: `TypeDecl.dimAuto` (-1) for `[]`, `TypeDecl.dimConst` (-2) while `fixedDimExpr` awaits constant folding. Post-inference both are resolved; `fixedDim <= 0` reaching final verify is an error.
+- ref/const/temporary qualifiers live on the **chain head only**. Build chains with `make_fixed_array_type(total, element)` from `daslib/ast_boost` — it hoists the element's qualifiers onto the new head for you.
+- **Typemacro payloads moved**: `$mytag(args...)` argument expressions are in `typeMacroExpr`, not `dimExpr`. Update any pre-0.6.3 macro that read `t.dimExpr` for tag payloads.
+- Walking to the element: `var leaf = t; while (leaf.baseType == Type.tFixedArray && leaf.firstType != null) { leaf = leaf.firstType; }` — collect `fixedDim` per level if you need the flattened dims (runtime `TypeInfo.dim[]` stays flattened; only the AST is structural).
+
+## Shared AST-match helpers
+
+`daslib/ast_match.das` exposes a small set of public helpers harvested from `linq_fold` + `sqlite_linq` during the 2026-05 refactor. Reach for these BEFORE writing a new `is X / as X` cascade — they capture the exact semantics each pattern was hand-rolling, with module-gating and generic-instantiation transparency baked in.
+
+| Helper | Signature | Purpose |
+|---|---|---|
+| `match_call_in_module` | `(expr, name, modName) → ExprCall?` | Match an `ExprCall` to `(name, modName)`, transparent to generic instantiation (consults `func.fromGeneric` as fallback). |
+| `match_call_in_linq` | `(expr, name) → ExprCall?` | Thin wrapper on `match_call_in_module` with `modName="linq"`. |
+| `peel_lambda_single_return` | `(lam) → Expression?` | For `@(x : T) => expr`, return `expr`. `null` if shape doesn't match. |
+| `peel_lambda_rename_var` | `(expr, argName) → Expression?` | Peel + rename the bound variable. Falls back to `invoke(expr, argName)` when non-peelable so callers can splice the result unconditionally. |
+| `peel_lambda_replace_var` | `(expr, replacement) → Expression?` | Variant of `peel_lambda_rename_var` that substitutes the bound variable with an arbitrary expression. Uses the unified peel-aware `replaceVariable` (single rule strips typer-inserted `ExprRef2Value` on already-typed AST). |
+| `peel_lambda_rename_2vars` | `(expr, a, b) → Expression?` | 2-arg form for `aggregate`-style `block<(acc, x) : AGG>` lambdas. Returns `null` on shape mismatch — caller decides fallback. |
+| `peel_tuple_field_read` | `(expr, bindName, fieldIndex) → bool` | `true` when `expr` matches `<bindName>._<fieldIndex>` — tuple-slot read on a named bind. Single-level `ExprRef2Value` peel on each side. |
+| `extract_const_string` | `(e) → tuple<bool; string>` | For `ExprConstString` returns `(true, value)`, else `(false, "")`. Use to consume compile-time string literals threaded through macro args. |
+| `qn` | `(prefix, at) → string` | Synthesizes ``` `<prefix>`<at.line>`<at.column> ``` — qualified-name helper for macro-emitted locals. Deterministic per `(prefix, at)`; synthesized `LineInfo()` (line=0, col=0) WILL collide across distinct synth sites with the same prefix — build a synth-specific name if it matters. |
+| `qm_peel_ref2value` | `(var e : Expression?&) → void` | Single source of truth for `ExprRef2Value` peeling. Always call this instead of hand-rolling `while (... is ExprRef2Value)` or `if`-peel — see ["Peel ExprRef2Value before qmatch"](#peel-exprref2value-before-qmatch). |
+| `push_block_list` | `(var stmts, var blockExpr)` in `daslib/templates_boost.das` | Splices every statement from a `qmacro_block(...)` result into `stmts`, cloning each. See ["Push cluster consolidation"](#push-cluster-consolidation). |
+
+**When the patterns apply (and when they don't).** These helpers earn their keep in files that **probe AST shape** to route macro emission — `linq_fold`, `sqlite_linq`, `ast_match` itself. Files that only **emit code** without introspecting it — `decs_boost`, the emitter half of `templates_boost` — won't find adoption sites. Audit before mechanically searching: if a file has zero hand-rolled `is X / as X` call-cascades and zero qname construction, the patterns don't apply there.
+
+## `qmatch` — predicate-style pattern matching
+
+Prefer `qmatch(expr, <pattern>).matched` over hand-rolled `is X / as X` cascades when matching structural AST shapes. `ExprRef2Value` wrappers are transparent on both sides (pattern + source) — see ast_match.das's header; `$e` captures bind the peeled node.
+
+```das
+// HAND-ROLLED (avoid)
+if (node is ExprOp2) {
+    let op = node as ExprOp2
+    if (op.op == "+" && op.left is ExprVar && op.right is ExprVar) {
+        // ...
+    }
+}
+
+// qmatch (prefer) — bind variables are declared BEFORE the call
+// and filled when the match succeeds
+var lhs, rhs : ExpressionPtr
+let r = qmatch(node, $e(lhs) + $e(rhs))
+if (r.matched) {
+    // lhs, rhs are now bound
+}
+```
+
+Pattern tags inside `qmatch(expr, <pattern>)`:
+
+- `$e(name)` — bind an arbitrary sub-expression to outer `var name : ExpressionPtr`
+- `$f(name)` — bind a field name to outer `var name : string`
+- `$v(name)` — bind a constant value to a typed outer var
+- `$i(name)` — bind an identifier name to outer `var name : string`
+- `_` — anonymous wildcard (no bind)
+- Concrete operators (`&&`, `||`, `+`, `==`, `<`, dot-field, function-call) and literals match literally
+
+Result is `QMatchResult` with `.matched : bool` and `.error : QMatchError` — captured bindings live in the pre-declared outer variables, NOT on the result struct. On match failure the bindings are left untouched.
+
+Canonical examples in `modules/dasSQLITE/daslib/sqlite_linq.das` — search for `qmatch(` for 37+ adoption sites. Tests in `tests/ast_match/test_qmatch_*.das` + `test_capture_*.das` exercise every tag and grammar form. Full pattern grammar lives in `daslib/ast_match.das`.
+
+**Not every probe fits qmatch.** Shapes with cross-statement constraints (e.g., "3 statements with specific types where push target equals res var and recordNames count matches sources count") exceed qmatch's grammar — fall back to hand-rolled `is X / as X` for those. Self-circular file dependencies are also out: `ast_match.das` itself can't use `qmatch` to define its own grammar.
+
+## `match` (daslib/match) — node-class destructuring; pairs with `qmatch`
+
+`daslib/match` is the OTHER pattern matcher, and for AST work the two divide cleanly. Pick by what the pattern looks like:
+
+- **`qmatch`** when the pattern is *daslang source syntax* — `qmatch(that, $e(fa) * $e(fb) + $e(other))`. Operator trees, call shapes, field chains spelled as code.
+- **`match`** when the pattern is *node classes and fields* — `match (e) { if (ExprSwizzle(mask = "xy", value = $v(v))) … }` — or plain value dispatch (`match (op) { if ("*") … }`, enum tables like flatten's `zero_const_of`).
+
+What `match` does that hand-rolled ladders and qmatch don't (all test-pinned in `tests/match/`):
+
+```das
+match (keySide) {
+    // nested class patterns, literal field values, capture; null guard + is/as + ExprRef2Value
+    // peel are all emitted for you
+    if (ExprField(name = "key", value = ExprVar(name = match_expr(bindName)))) {
+        return lane == TableLane.KV
+    }
+    if (ExprVar(name = match_expr(bindName))) {
+        return lane != TableLane.KV
+    }
+    if (_) {
+        return false
+    }
+}
+return false   // match is statement-shaped; flow analysis wants the trailing return
+```
+
+- **Alternation `||` works in field position** — `ExprOp2(op = "+" || "-")` — and at arm level; guards compose with `&&` referencing captures and locals.
+- **`match_expr(localVar)`** compares a field against a runtime expression (das_string fields compare against `string` locals directly).
+- **das-vector fields can NOT be destructured** — `ExprCall.arguments` / `ExprBlock.list` are `dasvector`-backed and the array-pattern arm rejects them ("is not an array"). Capture the node and index/length-check manually; this is why deep block-shape probes (`extract_decs_bridge`) stay hand-rolled.
+- **Statement-shaped, not expression-shaped** — a tuple-returning recognizer that mixes name dispatch with structural probes (`is_bucket_reducer_call`) usually reads better hand-rolled; convert only when the ladder is the function.
+
+Canonical conversions: `is_key_ref` / `join_keyb_is_bare_key` (daslib/linq_fold_table.das / linq_fold_common.das), flatten_opt's `component_read_of` + `zero_const_of`. flatten_opt and the linq_fold family require BOTH libraries and use each where it fits — do the same.
+
 ## `qmacro` vs `quote` (code generation)
 
 - **`qmacro(expr)`** — quasi-quote with reification splices (`$v()`, `$e()`, `$c()`, `$t()`, `$i()`, `$f()`, `$a()`, `$b()` etc.). Use when the generated code contains interpolated values.
@@ -100,6 +231,82 @@ For these:
 - **`$a(arrayOfExprPtr)`** — splice an `array<ExpressionPtr>` as function call **arguments**
 - **`$b(arrayOfExprPtr)`** — splice an `array<ExpressionPtr>` as a **block body** (sequence of statements). Build the array with `push <| qmacro_expr(...)`, then `$b(bodyExprs)` inlines all statements into the function body
 
+### Splice inputs are cloned for you — don't pre-clone with `clone_expression`
+
+`qmacro` / `qmacro_block` / `qmacro_expr` / `qmacro_block_to_array` all go through [`apply_template`](../daslib/templates_boost.das#L249), which calls `clone_expression` on every `$e(...)` substitution input. So this is wasted work:
+
+```das
+// WRONG — clones twice (once explicitly, once inside apply_template)
+var defaultExpr = clone_expression(terminatorCall.arguments[1])
+preludeStmts |> push <| qmacro_expr() {
+    let $i(defaultName) = $e(defaultExpr)
+}
+```
+
+```das
+// RIGHT — inline the source; apply_template clones during substitution
+preludeStmts |> push <| qmacro_expr() {
+    let $i(defaultName) = $e(terminatorCall.arguments[1])
+}
+```
+
+**Multi-splice cases.** Even when the same source feeds N `$e(...)` slots in one qmacro, you don't need to pre-clone. `apply_template` clones each substitution independently:
+
+```das
+// WRONG — three pre-clones for three splice slots
+var takeA = clone_expression(takeExpr)
+var takeB = clone_expression(takeExpr)
+var takeC = clone_expression(takeExpr)
+body = qmacro_block() {
+    let $i(takeNName) = $e(takeA) <= 0 ? 0 : ($e(takeB) < $i(lenName) ? $e(takeC) : $i(lenName))
+}
+```
+
+```das
+// RIGHT — inline takeExpr at each slot; apply_template gives you 3 independent clones
+body = qmacro_block() {
+    let $i(takeNName) = $e(takeExpr) <= 0 ? 0 : ($e(takeExpr) < $i(lenName) ? $e(takeExpr) : $i(lenName))
+}
+```
+
+If the source expression has side effects (rare in AST-building code — most sources are bare variable reads), bind once via plain `let baseE = E` (no clone) and splice the local:
+
+```das
+let baseE = make_side_effecty_expr()  // 1 eval, no clone
+body = qmacro_block() { let _x = $e(baseE) + $e(baseE) }
+```
+
+The lint rule `PERF023` (see `skills/perf_lint.md`) catches the wasted-pre-clone shape automatically.
+
+### `[clone(...)]`-annotated functions clone for you too
+
+The same wasted-pre-clone shape exists at **direct calls** to functions that promise to clone internally — e.g. `peel_lambda_rename_var`, `apply_qmacro_template_function`, `push_inline_id`. Each carries a `[clone(paramName, ...)]` annotation declaring which params it clones:
+
+```das
+// WRONG — peel_lambda_rename_var has [clone(expr)], clones internally
+var pred = peel_lambda_rename_var(clone_expression(terminatorCall.arguments[1]), valueName)
+
+// RIGHT
+var pred = peel_lambda_rename_var(terminatorCall.arguments[1], valueName)
+```
+
+Var-init-then-pass form is also flagged when every use is into an annotated arg position:
+
+```das
+// WRONG — topClone's only use is annotated arg of finalize_emission_stmts
+var topClone = clone_expression(adapter.arrayTop)
+return finalize_emission_stmts(topClone, ...)
+
+// RIGHT
+return finalize_emission_stmts(adapter.arrayTop, ...)
+```
+
+PERF024 catches both shapes. Canonical annotated set (grows over time): `peel_lambda_rename_var`/`_replace_var`/`_rename_2vars` + `qm_extract_stmts` in `ast_match`, `push_block_list` + `apply_qmacro_template_function` in `templates_boost`, the `emit_*`/`finalize_emission_stmts` family in `linq_fold`, `push_bind`/`push_inline_id`/`push_inline_lit` in `sqlite_linq`.
+
+**To mark your own function** — add `[clone(p1, p2)]` (one annotation per function, comma-separated param names). The annotation is registered C++-side, no `require` needed.
+
+**Before annotating, verify the function CONSUMES `p` cleanly — does not MUTATE `p` and does not retain shared aliases.** The correct contract is: every code path either ignores `p`, clones (or deep-iterates-and-clones) the pieces of `p` it needs into its output, OR forwards `p` to another `[clone(p)]`-annotated function — and never mutates `p` or stores raw aliases that outlive the call. `clone_expression(p)` directly is the common case; cloning sub-pieces is also fine (e.g. `push_block_list` clones each element of `blockExpr.list`, `qm_extract_stmts` clones each element of `blk_expr.list`). What MUST NOT happen: `apply_template(rules, at, p)` — that mutates `p` in place via `TemplateVisitor`. Same for every `apply_qmacro_*` / `apply_qblock_*` variant; pre-clones at their callsites are **load-bearing**, not redundant. Marking them `[clone(...)]` would make PERF024 flag callers who are doing the right thing.
+
 ### Default-initializing generated struct variables
 
 In macro-generated code, `var x : $t(st)` fails with "uninitialized variable" for structs without field defaults. Use `default<T>` instead:
@@ -111,6 +318,38 @@ blk |> push <| qmacro_block() { var entity : $t(st) }
 // CORRECT — default-initializes all fields
 blk |> push <| qmacro_block() { var entity := default<$t(st)> }
 ```
+
+### Push cluster consolidation
+
+When building an `array<Expression?>` for a `$b(...)` splice via two or more consecutive `arr |> push <| qmacro_expr() { ... }` calls into the same array, collapse the runs into a single emission. Two equivalent forms:
+
+**Form A** — `push_from` + `qmacro_block_to_array` (preferred — pure stdlib composition, no per-element clone):
+
+```das
+// BEFORE
+stmts |> push <| qmacro_expr() { var $i(accName) = 0 }
+stmts |> push <| qmacro_expr() { for ($i(itName) in $i(srcName)) { $e(loopBody) } }
+stmts |> push <| qmacro_expr() { return $i(accName) }
+
+// AFTER
+stmts |> push_from <| qmacro_block_to_array() {
+    var $i(accName) = 0
+    for ($i(itName) in $i(srcName)) { $e(loopBody) }
+    return $i(accName)
+}
+```
+
+**Form B** — `push_block_list` + `qmacro_block` (clones each element, right choice when the source block stays alive after the push):
+
+```das
+stmts |> push_block_list(qmacro_block() {
+    var $i(accName) = 0
+    for ($i(itName) in $i(srcName)) { $e(loopBody) }
+    return $i(accName)
+})
+```
+
+**When NOT to collapse.** Runs of pushes interleaved with `if`/`elif` branches (each branch contributing one push) cannot collapse into a single block — the conditionality lives outside the qmacro. Same for pushes interleaved with non-push statements. Only PURE consecutive runs into the same array, at the same indent, with no intermediate statements collapse cleanly.
 
 ## Pattern-matching call shapes — never rely on leading `!`
 
@@ -212,28 +451,9 @@ Loud failure tells the user that immediately; silent `return null`
 re-queues the macro and lets the daslang pipeline emit a confusing
 infer-time cascade instead.
 
-### Peel `ExprRef2Value` before `qmatch`
+### `ExprRef2Value` transparency (qmatch + match)
 
-Post-Mode-2-expansion AST walking will see field reads wrapped in
-`ExprRef2Value`. `qmatch` is RTTI-strict — it matches `ExprField` but
-not `ExprRef2Value(ExprField(...))`. Peel before matching:
-
-```
-if (node is ExprRef2Value) {
-    node = (node as ExprRef2Value).subexpr
-    if (node == null) {
-        macro_error(prog, at, "_where: ExprRef2Value with null subexpr")
-        return ""
-    }
-}
-// now `qmatch(node, _.$f(name))` etc. work as expected
-```
-
-Auto-peel inside `qmatch` itself is a TODO documented in
-`daslib/ast_match.das`. Until then, every analyzer entry point that
-takes an expression coming out of post-expansion (predicate body,
-projection body, classifier helpers like `is_const_or_captured_var`)
-needs the peel at the top.
+Post-typer AST walking sees field reads wrapped in `ExprRef2Value` (no surface syntax). Both matchers peel it automatically: `qmatch` strips it on the pattern AND source side at every dispatch (ast_match.das header; `$e` captures bind the peeled node), and `match` peels it for AST class patterns + `$v` captures via `match_peel_r2v` (an explicit `ExprRef2Value(...)` pattern in `match` still matches the wrapper itself — only `match` can spell it). Hand-written analyzers that DON'T go through a matcher still need `qm_peel_ref2value(node)` (the in-place helper in `daslib/ast_match.das`) at their entry — never hand-roll the `while (… is ExprRef2Value)` loop.
 
 ### When you really do need raw arguments
 

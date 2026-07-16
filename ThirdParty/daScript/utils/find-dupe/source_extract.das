@@ -22,13 +22,9 @@ def private split_lines(text : string) : array<string> {
 
 
 def private load_file(var cache : FileCache; path : string) : bool {
-    if (key_exists(cache.files, path)) {
-        return true
-    }
+    if (key_exists(cache.files, path)) return true
     let text = fread(path)
-    if (empty(text)) {
-        return false
-    }
+    if (empty(text)) return false
     // `array<string>` is non-copyable — assign through the table
     // index with `<-` so ownership moves into the table slot.
     cache.files[path] <- split_lines(text)
@@ -82,7 +78,7 @@ def public extract_source(var cache : FileCache; path : string;
     return build_string() $(var w) {
         for (i in range(lo, hi + 1)) {
             if (i > lo) {
-                w |> write_char(int('\n'))
+                w |> write_char('\n')
             }
             w |> write(lines[i])
         }

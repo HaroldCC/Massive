@@ -7,10 +7,25 @@ IF ((NOT DAS_HV_INCLUDED) AND ((NOT ${DAS_HV_DISABLED}) OR (NOT DEFINED DAS_HV_D
 
 	include(ExternalProject)
 
-	IF(WIN32)
-		set(OPENSSL_ROOT_DIR "${CMAKE_BINARY_DIR}/openssl")
-		find_package(OpenSSL QUIET PATHS ${OPENSSL_ROOT_DIR})
+	IF(WIN32 AND MSVC)
+		# MSVC: build OpenSSL from sources via `perl Configure VC-WIN64A` + nmake.
+		# Both are MSVC-only — perl invokes OpenSSL's MSVC-flavored config and
+		# nmake is the MSVC make tool. clang-mingw / gcc-mingw take the ELSE
+		# branch below and pick up the system OpenSSL from the mingw sysroot.
+		# OPENSSL_ROOT_DIR defaults to a build-dir-local openssl/, but honors an
+		# override (env DASLANG_OPENSSL_DIR, or -DOPENSSL_ROOT_DIR) so OpenSSL can
+		# be built once into a shared per-machine cache and reused across build
+		# dirs / worktrees instead of rebuilt per build dir. CI sets neither, so
+		# its per-build-dir path (and the build-clangcl/openssl cache) is unchanged.
+		if(NOT OPENSSL_ROOT_DIR AND DEFINED ENV{DASLANG_OPENSSL_DIR})
+			set(OPENSSL_ROOT_DIR "$ENV{DASLANG_OPENSSL_DIR}")
+		endif()
+		if(NOT OPENSSL_ROOT_DIR)
+			set(OPENSSL_ROOT_DIR "${CMAKE_BINARY_DIR}/openssl")
+		endif()
+		find_package(OpenSSL QUIET PATHS "${OPENSSL_ROOT_DIR}")
 		IF(NOT OpenSSL_FOUND)
+			MESSAGE(STATUS "dasHV: OpenSSL not found at ${OPENSSL_ROOT_DIR} - building 3.5.1 from source (one-time per OPENSSL_ROOT_DIR)")
 			# Build openssl from sources
 			if(${CMAKE_SIZEOF_VOID_P} EQUAL 8)
 				set(OPENSSL_ARCH "VC-WIN64A")
@@ -21,6 +36,19 @@ IF ((NOT DAS_HV_INCLUDED) AND ((NOT ${DAS_HV_DISABLED}) OR (NOT DEFINED DAS_HV_D
 			set(OPENSSL_LIBRARIES ${OPENSSL_ROOT_DIR}/lib)
 			set(OPENSSL_LIBRARIES_FILES ${OPENSSL_ROOT_DIR}/lib/libcrypto.lib ${OPENSSL_ROOT_DIR}/lib/libssl.lib)
 
+			# clang-cl also satisfies MSVC, but the VS ClangCL toolset puts clang's
+			# resource include (whose <stdint.h>/<vadefs.h> use #include_next) on
+			# INCLUDE; OpenSSL builds with plain cl, which rejects #include_next (C1021).
+			# Run nmake through a wrapper that strips the clang resource dir from INCLUDE
+			# so cl falls back to MSVC's stdint.h. (The strip propagates via env to
+			# nmake's recursive cl children; a `nmake CC=clang-cl` override does not.)
+			IF(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+				SET(_OSSL_BUILD_CMD ${CMAKE_COMMAND} -P ${DAS_HV_DIR}/scrub_clang_include.cmake -- nmake)
+				SET(_OSSL_INSTALL_CMD ${CMAKE_COMMAND} -P ${DAS_HV_DIR}/scrub_clang_include.cmake -- nmake install_sw)
+			ELSE()
+				SET(_OSSL_BUILD_CMD nmake)
+				SET(_OSSL_INSTALL_CMD nmake install_sw)
+			ENDIF()
 			# Note that under Ninja it should be run from VS developer code Prompt to setup all variables (or call vcvarsall.bat)
 			ExternalProject_Add(openssl_build
 				URL "https://www.openssl.org/source/openssl-3.5.1.tar.gz"
@@ -28,26 +56,55 @@ IF ((NOT DAS_HV_INCLUDED) AND ((NOT ${DAS_HV_DISABLED}) OR (NOT DEFINED DAS_HV_D
 				DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 				PREFIX ${OPENSSL_ROOT_DIR}
 				CONFIGURE_COMMAND perl Configure ${OPENSSL_ARCH} no-shared --prefix=${OPENSSL_ROOT_DIR} --openssldir=${OPENSSL_ROOT_DIR}
-				BUILD_COMMAND nmake
-				INSTALL_COMMAND nmake install_sw
+				BUILD_COMMAND ${_OSSL_BUILD_CMD}
+				INSTALL_COMMAND ${_OSSL_INSTALL_CMD}
 				BUILD_IN_SOURCE 1
 				BUILD_BYPRODUCTS ${OPENSSL_LIBRARIES_FILES}
 			)
 			list(APPEND OPENSSL_LIBRARIES_FILES Crypt32.lib)
 			SET(OPENSSL_FROM_SOURCES TRUE)
 		ELSE()
+			MESSAGE(STATUS "dasHV: using prebuilt OpenSSL ${OPENSSL_VERSION} (include: ${OPENSSL_INCLUDE_DIR}) - skipping source build")
 			SET(OPENSSL_LIBRARIES_FILES OpenSSL::Crypto OpenSSL::SSL)
 		ENDIF()
 
 		SET(HV_LIBRARIES ${DAS_HV_DIR}/hv/$<CONFIG>/lib/hv_static.lib)
 	ELSE()
+		# POSIX + mingw (clang-mingw / gcc-mingw): use system OpenSSL.
+		IF(WIN32 AND NOT DEFINED OPENSSL_ROOT_DIR)
+			# FindOpenSSL.cmake on Windows is MSVC-centric and doesn't look in
+			# the mingw sysroot by default. Derive the sysroot from the C
+			# compiler path: <SYSROOT>/bin/clang.exe -> <SYSROOT>. clang64
+			# ships <SYSROOT>/lib/libcrypto.dll.a + libssl.dll.a, which
+			# find_package then locates correctly with this hint.
+			get_filename_component(_MINGW_BIN ${CMAKE_C_COMPILER} DIRECTORY)
+			get_filename_component(OPENSSL_ROOT_DIR ${_MINGW_BIN} DIRECTORY)
+		ENDIF()
 		find_package(OpenSSL REQUIRED)
-		SET(HV_LIBRARIES ${DAS_HV_DIR}/hv/$<CONFIG>/lib/libhv_static.a)
+		# libhv ≥ master renames hv_static's OUTPUT_NAME to "hv" on POSIX
+		# (-> libhv.a) but keeps the original name on mingw (-> libhv_static.a).
+		IF(WIN32)
+			# mingw: also need winmm for timeSetEvent/timeKillEvent. MSVC
+			# auto-pulls it via libhv's #pragma comment(lib, "winmm"); mingw
+			# does not honor those reliably, so list it explicitly.
+			SET(HV_LIBRARIES
+				${DAS_HV_DIR}/hv/$<CONFIG>/lib/libhv_static.a
+				winmm
+			)
+		ELSE()
+			SET(HV_LIBRARIES ${DAS_HV_DIR}/hv/$<CONFIG>/lib/libhv.a)
+		ENDIF()
 		SET(OPENSSL_LIBRARIES_FILES OpenSSL::Crypto OpenSSL::SSL)
 	ENDIF()
 
 
 	SET(HV_CMAKE_FLAGS
+		# Pin the libhv sub-build's config. Multi-config generators (VS) honor
+		# the --config in BUILD/INSTALL_COMMAND below; single-config ones (Ninja)
+		# ignore --config, so without this libhv defaults to Debug and its
+		# debug-CRT hv_static.lib fails to link into Release dasModuleHV on MSVC
+		# (unresolved __imp__CrtDbgReport).
+		-DCMAKE_BUILD_TYPE=$<CONFIG>
 		-DCMAKE_OSX_ARCHITECTURES=${CMAKE_OSX_ARCHITECTURES}
 		-DCMAKE_INSTALL_PREFIX=${DAS_HV_DIR}/hv/Release
 		-DBUILD_EXAMPLES=OFF
@@ -61,15 +118,30 @@ IF ((NOT DAS_HV_INCLUDED) AND ((NOT ${DAS_HV_DISABLED}) OR (NOT DEFINED DAS_HV_D
 		-DOPENSSL_LIBRARIES="${OPENSSL_CRYPTO_LIBRARY};${OPENSSL_SSL_LIBRARY}"
 	)
 	IF(DAS_USE_SANITIZER STREQUAL "address" OR DAS_USE_SANITIZER STREQUAL "asan")
+		IF(MSVC)
+			SET(_HV_ASAN_FLAG "/fsanitize=address")
+		ELSE()
+			SET(_HV_ASAN_FLAG "-fsanitize=address")
+		ENDIF()
 		LIST(APPEND HV_CMAKE_FLAGS
-			"-DCMAKE_C_FLAGS=/fsanitize=address"
-			"-DCMAKE_CXX_FLAGS=/fsanitize=address"
+			"-DCMAKE_C_FLAGS=${_HV_ASAN_FLAG}"
+			"-DCMAKE_CXX_FLAGS=${_HV_ASAN_FLAG}"
 		)
+	ENDIF()
+	# libhv's ExternalProject picks its own CRT; if it disagrees with daslang's,
+	# hv_static.lib fails to link into dasModuleHV (LNK2038 RuntimeLibrary
+	# mismatch: MT_StaticRelease vs MD_DynamicRelease). daslang uses the dynamic
+	# CRT (/MD) by default and switches to the static CRT (/MT) only when
+	# DAS_USE_STATIC_STD_LIBS is ON (see CMakeCommon.txt). Mirror that exact knob
+	# into libhv's own BUILD_FOR_MT so the two always agree; when it is OFF,
+	# libhv's /MD default already matches and we leave it alone.
+	IF(MSVC AND DAS_USE_STATIC_STD_LIBS)
+		LIST(APPEND HV_CMAKE_FLAGS -DBUILD_FOR_MT=ON)
 	ENDIF()
 	ExternalProject_Add(
 		LIBHV
-		URL https://github.com/ithewei/libhv/archive/refs/tags/v1.3.4.tar.gz
-		URL_HASH SHA256=f0a9a197f90da55cc3ff104f9c7a27cc927f117b6c18613c3292726068588e10
+		URL https://github.com/ithewei/libhv/archive/5da5fc22cdfd1b59ba2b0520abb34f95d050975c.tar.gz
+		URL_HASH SHA256=b4f774936ccd6981df74b23f9e033e0b3ab584f6682d889490377dc9450b5f54
 		DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 		PREFIX ${CMAKE_CURRENT_BINARY_DIR}/libhv
 		CMAKE_ARGS ${HV_CMAKE_FLAGS}
@@ -113,6 +185,51 @@ IF ((NOT DAS_HV_INCLUDED) AND ((NOT ${DAS_HV_DISABLED}) OR (NOT DEFINED DAS_HV_D
 	ENDMACRO()
 	SETUP_HV(libDasModuleHV)
 	SETUP_HV(dasModuleHV)
+
+	IF(WIN32)
+		# Shared-OpenSSL builds (mingw sysroot, MSVC+vcpkg): land libssl-*.dll +
+		# libcrypto-*.dll NEXT TO daslang.exe so dasModuleHV.shared_module can
+		# resolve its openssl deps at dlopen time, and INSTALL them next to the
+		# .shared_module so release bundles work too (sysos.cpp loads modules
+		# with LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR — deps colocated under
+		# modules/dasHV/ resolve). The MSVC openssl-from-source path builds
+		# no-shared, so both globs stay empty there and this is a no-op.
+		# Without these copies, dlopen fails silently because
+		# register_dynamic_module's default overload
+		# (register_dynamic_module_silent) suppresses the LoadLibrary error
+		# and `require dashv` then surfaces as 20605 missing-prerequisite.
+		# Glob picks up the version suffix (libssl-3-x64.dll today, future
+		# major bumps without CMake churn).
+		FILE(GLOB _DAS_HV_OPENSSL_DLLS
+			"${OPENSSL_ROOT_DIR}/bin/libssl-*.dll"
+			"${OPENSSL_ROOT_DIR}/bin/libcrypto-*.dll")
+		IF(NOT _DAS_HV_OPENSSL_DLLS AND OPENSSL_INCLUDE_DIR)
+			# vcpkg layout: <triplet-root>/include + <triplet-root>/bin DLLs.
+			FILE(GLOB _DAS_HV_OPENSSL_DLLS
+				"${OPENSSL_INCLUDE_DIR}/../bin/libssl-*.dll"
+				"${OPENSSL_INCLUDE_DIR}/../bin/libcrypto-*.dll")
+		ENDIF()
+		IF(_DAS_HV_OPENSSL_DLLS)
+			# Mirror dasGlfw's multi-config / single-config split — Ninja
+			# (mingw default) is single-config; left in for symmetry with
+			# the glfw rule and any future generator switch.
+			IF(CMAKE_CONFIGURATION_TYPES)
+				SET(_DAS_HV_COPY_DIR "${EXECUTABLE_OUTPUT_PATH}/$<CONFIG>")
+			ELSE()
+				SET(_DAS_HV_COPY_DIR "${EXECUTABLE_OUTPUT_PATH}")
+			ENDIF()
+			ADD_CUSTOM_COMMAND(TARGET dasModuleHV POST_BUILD
+				COMMAND ${CMAKE_COMMAND} -E copy_if_different
+					${_DAS_HV_OPENSSL_DLLS}
+					"${_DAS_HV_COPY_DIR}/"
+			)
+			install(FILES ${_DAS_HV_OPENSSL_DLLS}
+				DESTINATION ${DAS_INSTALL_MODULESDIR}/dasHV
+			)
+		ELSEIF(NOT MSVC)
+			MESSAGE(WARNING "dasHV mingw: no libssl/libcrypto DLLs found under ${OPENSSL_ROOT_DIR}/bin — dasModuleHV.shared_module may fail to load at runtime")
+		ENDIF()
+	ENDIF()
 
 	ADD_MODULE_DAS(dashv dashv dashv_boost)
 

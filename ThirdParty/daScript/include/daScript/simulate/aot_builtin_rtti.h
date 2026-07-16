@@ -96,6 +96,14 @@ namespace das {
 
     struct AnnotationArgument;
     DAS_API RttiValue rtti_builtin_argument_value(const AnnotationArgument & info, Context * context, LineInfoArg * at);
+    DAS_API RttiValue rtti_builtin_argument_info_value(const AnnotationArgumentInfo & info, Context * context, LineInfoArg * at);
+
+    DAS_API const AnnotationInfo & rtti_builtin_struct_annotation ( const StructInfo & info, int32_t index, Context * context, LineInfoArg * at );
+    DAS_API const AnnotationInfo & rtti_builtin_func_annotation ( const FuncInfo & info, int32_t index, Context * context, LineInfoArg * at );
+    DAS_API const AnnotationInfo & rtti_builtin_enum_annotation ( const EnumInfo & info, int32_t index, Context * context, LineInfoArg * at );
+    DAS_API const AnnotationArgumentInfo & rtti_builtin_annotation_argument ( const AnnotationInfo & info, int32_t index, Context * context, LineInfoArg * at );
+    DAS_API const AnnotationArgumentInfo & rtti_builtin_var_annotation_argument ( const VarInfo & info, int32_t index, Context * context, LineInfoArg * at );
+    DAS_API Annotation * rtti_builtin_resolve_annotation ( const AnnotationInfo & info );
 
     DAS_API int32_t rtti_getDimTypeInfo(const TypeInfo & ti, int32_t index, Context * context, LineInfoArg * at);
     DAS_API int32_t rtti_getDimVarInfo(const VarInfo & ti, int32_t index, Context * context, LineInfoArg * at);
@@ -156,6 +164,9 @@ namespace das {
     DAS_API void lockThisContext ( const TBlock<void> & block, Context * context, LineInfoArg * lineInfo );
     DAS_API void lockAnyContext ( Context & ctx, const TBlock<void> & block, Context * context, LineInfoArg * lineInfo );
     DAS_API void lockAnyMutex ( recursive_mutex & rm, const TBlock<void> & block, Context * context, LineInfoArg * lineInfo );
+
+    DAS_API char * rtti_get_source_line ( FileInfo * info, uint32_t line, Context * context, LineInfoArg * at );
+    DAS_API bool rtti_is_nolint_suppressed ( FileInfo * info, uint32_t line, const char * code, Context * context, LineInfoArg * at );
 
     DAS_API TSequence<VarInfo&> each_FuncInfo ( FuncInfo & st, Context * context, LineInfoArg * at );
     DAS_API TSequence<const VarInfo&> each_const_FuncInfo ( const FuncInfo & st, Context * context, LineInfoArg * at );

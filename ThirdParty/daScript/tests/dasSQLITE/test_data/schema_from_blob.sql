@@ -1,5 +1,0 @@
-CREATE TABLE Files (
-    Id   INTEGER PRIMARY KEY,
-    Hash BLOB NOT NULL,
-    Body BLOB
-);

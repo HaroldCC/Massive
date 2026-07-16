@@ -113,10 +113,22 @@ struct OrbitBus {
         //! Scratch buffer receiving the chorus's wet output for mixing into the master.
     current_roomsize      : float = -1.0
         //! Most recently applied reverb roomsize (-1 = uninitialized).
+    current_quality       : int = -1
+        //! Most recently applied reverb quality tier (-1 = uninitialized; 0=high/1=medium/2=low).
+    current_stages        : int = -1
+        //! Most recently applied medium-tier allpass cascade depth (-1 = uninitialized).
     current_delaytime     : float = -1.0
         //! Most recently applied delay time in seconds (-1 = uninitialized).
     current_delayfeedback : float = -1.0
         //! Most recently applied delay feedback amount (-1 = uninitialized).
+    gain                  : float = 1.0
+        //! Continuous output level for this orbit (1.0 = unity). Multiplied into every routed
+        //! voice's gain each chunk, so it has no per-note latency — unlike a per-hap gain, which
+        //! is frozen at note onset. Ramped by fade_orbit / advanced by advance_orbit_gains.
+    target_gain           : float = 1.0
+        //! Fade target for `gain`.
+    fade_speed            : float = 0.0
+        //! Per-second ramp rate toward `target_gain` (0 = settled / snapped).
 }
 
 //! Bridges the pattern engine and audio output.
@@ -179,26 +191,114 @@ def private ensure_orbit(var sched : Scheduler; orbit : int) {
     }
 }
 
-// Initialize reverb on an orbit bus.
-def private init_orbit_reverb(var bus : OrbitBus; roomsize : float = 2.0) {
-    if (bus.reverb == null) {
-        let rs = clamp(roomsize, 0.1, 10.0)
-        bus.reverb = new ConvolutionReverb
-        conv_reverb_init(bus.reverb, SAMPLE_RATE, rs, 15000.0, 1000.0, 0.1)
-        bus.current_roomsize = rs
+//! Continuous output level for an orbit (1.0 when no bus exists). Read once per voice per chunk;
+//! also for introspection / tests.
+def orbit_gain(sched : Scheduler; orbit : int) : float {
+    if (orbit < 0 || orbit >= length(sched.orbit_buses)) return 1.0
+    let bus = sched.orbit_buses[orbit]
+    return bus == null ? 1.0 : bus.gain
+}
+
+//! Fade orbit `orbit`'s continuous output level to `target_gain` over `time` seconds (0 = snap).
+//! The orbit is a sub-bus: every voice routed to it fades with no per-note latency. Levels above
+//! 1.0 amplify. Advanced once per audio chunk by advance_orbit_gains (called from tick).
+def fade_orbit(var sched : Scheduler; orbit : int; target_gain : float; time : float) {
+    if (orbit < 0) return
+    ensure_orbit(sched, orbit)
+    var bus = sched.orbit_buses[orbit]
+    bus.target_gain = target_gain
+    if (time > 0.0) {
+        bus.fade_speed = abs(bus.target_gain - bus.gain) / time
+    } else {
+        bus.gain = target_gain
+        bus.fade_speed = 0.0
     }
 }
 
-// Update reverb decay time on an orbit bus. Only reconfigures if changed.
-def private update_orbit_reverb_roomsize(var bus : OrbitBus; roomsize : float) {
-    let rs = clamp(roomsize, 0.1, 10.0)
-    if (abs(rs - bus.current_roomsize) < 0.01) {
-        return
+//! Set an orbit's continuous output level immediately (no ramp).
+def set_orbit_gain(var sched : Scheduler; orbit : int; gain : float) {
+    fade_orbit(sched, orbit, gain, 0.0)
+}
+
+//! Advance every orbit's gain ramp one chunk of `dt` seconds toward its target (mirrors the
+//! per-track fade in strudel_player). Called once per tick before voice rendering.
+def advance_orbit_gains(var sched : Scheduler; dt : float) {
+    for (bus in sched.orbit_buses) {
+        if (bus == null || bus.fade_speed <= 0.0) continue
+        if (bus.gain < bus.target_gain) {
+            bus.gain = min(bus.gain + bus.fade_speed * dt, bus.target_gain)
+        } elif (bus.gain > bus.target_gain) {
+            bus.gain = max(bus.gain - bus.fade_speed * dt, bus.target_gain)
+        }
+        if (abs(bus.gain - bus.target_gain) < 0.0001) {
+            bus.gain = bus.target_gain
+            bus.fade_speed = 0.0
+        }
     }
+}
+
+// Global reverb overrides (-1 = off). When >= 0 they force every orbit reverb to that tier /
+// allpass depth regardless of per-event roomquality()/roomstages() — used to render A/B comparisons.
+var private g_force_reverb_quality : int = -1
+var private g_force_reverb_stages : int = -1
+
+def set_force_reverb_quality(q : int) {
+    //! Force all orbit reverbs to a quality tier (0=high, 1=medium, 2=low), overriding per-event
+    //! roomquality(). Pass -1 to disable the override (the default). Intended for A/B rendering.
+    g_force_reverb_quality = q
+}
+
+def set_force_reverb_stages(n : int) {
+    //! Force the medium-tier allpass cascade depth on all orbit reverbs, overriding per-event
+    //! roomstages(). Pass -1 to disable the override (the default). Intended for A/B rendering.
+    g_force_reverb_stages = n
+}
+
+// Initialize reverb on an orbit bus.
+def private conv_quality_from_int(q : int) : ConvReverbQuality {
+    let qq = g_force_reverb_quality >= 0 ? g_force_reverb_quality : q
+    if (qq == 1) return ConvReverbQuality.medium
+    if (qq == 2) return ConvReverbQuality.low
+    return ConvReverbQuality.high
+}
+
+// Returns the allpass depth as the reverb will actually apply it for this tier: 0 (= conv_reverb_init's
+// default) on high/low, which ignore it, so changing roomstages there never forces a needless reinit;
+// for medium, the override-or-event value clamped to [0, 8] (0 = default) to match the C++ clamp.
+def private effective_stages(eq : ConvReverbQuality; s : int) : int {
+    if (eq != ConvReverbQuality.medium) return 0
+    let v = g_force_reverb_stages >= 0 ? g_force_reverb_stages : s
+    return clamp(v, 0, 8)
+}
+
+// current_quality/current_stages store the EFFECTIVE (post-override, tier-applied) values, so a
+// changed global override re-triggers update_orbit_reverb's reinit even when the per-event values
+// are unchanged — and a high/low stages change (which the reverb ignores) does NOT.
+def private init_orbit_reverb(var bus : OrbitBus; roomsize : float = 2.0; quality : int = 0; stages : int = 0) {
+    if (bus.reverb == null) {
+        let rs = clamp(roomsize, 0.1, 10.0)
+        let eq = conv_quality_from_int(quality)
+        let es = effective_stages(eq, stages)
+        bus.reverb = new ConvolutionReverb
+        conv_reverb_init(bus.reverb, SAMPLE_RATE, rs, 15000.0, 1000.0, 0.1, eq, es)
+        bus.current_roomsize = rs
+        bus.current_quality = int(eq)
+        bus.current_stages = es
+    }
+}
+
+// Update reverb decay time / quality / allpass depth on an orbit bus. Only reconfigures if changed.
+def private update_orbit_reverb(var bus : OrbitBus; roomsize : float; quality : int; stages : int) {
+    let rs = clamp(roomsize, 0.1, 10.0)
+    let eq = conv_quality_from_int(quality)
+    let es = effective_stages(eq, stages)
+    if (abs(rs - bus.current_roomsize) < 0.01 && int(eq) == bus.current_quality && es == bus.current_stages) return
     bus.current_roomsize = rs
-    // Reinitialize with new decay time
+    bus.current_quality = int(eq)
+    bus.current_stages = es
+    // Reinitialize with new decay time / quality / allpass depth
     conv_reverb_uninit(bus.reverb)
-    conv_reverb_init(bus.reverb, SAMPLE_RATE, rs, 15000.0, 1000.0, 0.1)
+    conv_reverb_init(bus.reverb, SAMPLE_RATE, rs, 15000.0, 1000.0, 0.1, eq, es)
 }
 
 // Initialize delay on an orbit bus.
@@ -219,9 +319,7 @@ def private init_orbit_delay(var bus : OrbitBus; delaytime : float = 0.5; delayf
 def private update_orbit_delay_params(var bus : OrbitBus; delaytime, delayfeedback : float) {
     let dt = clamp(delaytime, 0.001, 2.0)
     let fb = clamp(delayfeedback, 0.0, 0.98)
-    if (abs(dt - bus.current_delaytime) < 0.0001 && abs(fb - bus.current_delayfeedback) < 0.001) {
-        return
-    }
+    if (abs(dt - bus.current_delaytime) < 0.0001 && abs(fb - bus.current_delayfeedback) < 0.001) return
     bus.current_delaytime = dt
     bus.current_delayfeedback = fb
     delay_set_params(bus.delay_proc, SAMPLE_RATE, dt, fb)
@@ -256,9 +354,9 @@ def private setup_orbit_for_event(var sched : Scheduler; event : Event) {
     var bus = sched.orbit_buses[orb]
     if (event.room > 0.0) {
         if (bus.reverb == null) {
-            init_orbit_reverb(*bus)
+            init_orbit_reverb(*bus, event.roomsize, event.reverb_quality, event.reverb_stages)
         }
-        update_orbit_reverb_roomsize(*bus, event.roomsize)
+        update_orbit_reverb(*bus, event.roomsize, event.reverb_quality, event.reverb_stages)
     }
     if (event.delay_amount > 0.0) {
         let dt = resolve_delaytime(event.delaytime, event.delaysync, float(sched.cps))
@@ -278,11 +376,9 @@ def private sf2_spawn_voices(var sched : Scheduler; event : Event; durSec : floa
     let note = int(event.note)
     let velocity = clamp(int(event.velocity * 127.0), 1, 127)
     let preset_idx = sf2_find_preset(*sched.sf2, event.sf2_bank, event.sf2_program)
-    if (preset_idx < 0) {
-        return
-    }
+    if (preset_idx < 0) return
     var zones <- sf2_find_zones(*sched.sf2, preset_idx, note, velocity)
-    if (length(zones) == 0) {
+    if (empty(zones)) {
         delete zones
         return
     }
@@ -357,25 +453,19 @@ def private sf2_spawn_voices(var sched : Scheduler; event : Event; durSec : floa
 
 // Get the reverb send buffer for a given orbit. Returns empty array ref if no reverb on that orbit.
 def private get_orbit_reverb_send(var sched : Scheduler; orbit : int) : array<float>? {
-    if (orbit < length(sched.orbit_buses) && sched.orbit_buses[orbit] != null && sched.orbit_buses[orbit].reverb != null) {
-        return unsafe(addr(sched.orbit_buses[orbit].reverb_send_buf))
-    }
+    if (orbit < length(sched.orbit_buses) && sched.orbit_buses[orbit] != null && sched.orbit_buses[orbit].reverb != null) return unsafe(addr(sched.orbit_buses[orbit].reverb_send_buf))
     return null
 }
 
 // Get the delay send buffer for a given orbit. Returns null if no delay on that orbit.
 def private get_orbit_delay_send(var sched : Scheduler; orbit : int) : array<float>? {
-    if (orbit < length(sched.orbit_buses) && sched.orbit_buses[orbit] != null && sched.orbit_buses[orbit].delay_proc != null) {
-        return unsafe(addr(sched.orbit_buses[orbit].delay_send_buf))
-    }
+    if (orbit < length(sched.orbit_buses) && sched.orbit_buses[orbit] != null && sched.orbit_buses[orbit].delay_proc != null) return unsafe(addr(sched.orbit_buses[orbit].delay_send_buf))
     return null
 }
 
 // Get the chorus send buffer for a given orbit. Returns null if no chorus on that orbit.
 def private get_orbit_chorus_send(var sched : Scheduler; orbit : int) : array<float>? {
-    if (orbit < length(sched.orbit_buses) && sched.orbit_buses[orbit] != null && sched.orbit_buses[orbit].chorus != null) {
-        return unsafe(addr(sched.orbit_buses[orbit].chorus_send_buf))
-    }
+    if (orbit < length(sched.orbit_buses) && sched.orbit_buses[orbit] != null && sched.orbit_buses[orbit].chorus != null) return unsafe(addr(sched.orbit_buses[orbit].chorus_send_buf))
     return null
 }
 
@@ -404,7 +494,7 @@ def private hrtf_render_voice(
                               var voice_hrtf_l : ma_hrtf?&;// L-channel HRTF — virtual source at az - 30°
                               var voice_hrtf_r : ma_hrtf?&;// R-channel HRTF — virtual source at az + 30°
                               azimuth, elevation : float;
-                              var stereo_in : array<float>;
+                              stereo_in : array<float>;
                               src_start : int;// source offset (interleaved sample index)
                               voice_gain : float;
                               chunkFrames : int
@@ -506,9 +596,7 @@ def private osc_render_chunk_routed(
 // reverb/chorus/delay send, and voice cleanup.
 // Reverb, delay, and chorus sends all accumulate into per-orbit bus buffers.
 def private sf2_render_voices(var sched : Scheduler; var output : array<float>; chunkFrames : int) {
-    if (length(sched.sf2_voices) == 0 || sched.sf2 == null) {
-        return
-    }
+    if (empty(sched.sf2_voices) || sched.sf2 == null) return
     var si = length(sched.sf2_voices) - 1
     while (si >= 0) {
         if (sched.sf2_voices[si].finished == 0) {
@@ -517,7 +605,9 @@ def private sf2_render_voices(var sched : Scheduler; var output : array<float>; 
                 unsafe { ma_sf2_voice_note_off(addr(sched.sf2_voices[si])); }
             }
             let saved_atten = sched.sf2_voices[si].attenuation
-            sched.sf2_voices[si].attenuation = saved_atten * meta.gain
+            // per-hap gain (meta.gain) and the continuous per-orbit level both ride the attenuation,
+            // re-applied every chunk (restored below) — so an orbit fade has no per-note latency.
+            sched.sf2_voices[si].attenuation = saved_atten * meta.gain * orbit_gain(sched, meta.orbit)
             let reverb_send = meta.reverb_send
             let chorus_send = meta.chorus_send
             let delay_send_amt = meta.delay_send
@@ -724,6 +814,9 @@ def private osc_render_voices(var sched : Scheduler; var output : array<float>; 
         let orb = sched.osc_voices[i].orbit
         let has_fx = sched.osc_voices[i].fx.active
         let hrtf_active = sched.osc_voices[i].hrtf_active
+        // fold the orbit's continuous level into this voice's gain for the chunk (restored below)
+        let saved_osc_gain = sched.osc_voices[i].gain
+        sched.osc_voices[i].gain = saved_osc_gain * orbit_gain(sched, orb)
         var reverb_buf : array<float>?
         var delay_buf : array<float>?
         var chorus_buf : array<float>?
@@ -805,6 +898,7 @@ def private osc_render_voices(var sched : Scheduler; var output : array<float>; 
             var empty_c : array<float>
             osc_render_chunk_routed(sched.osc_voices[i], output, reverb_buf, delay_buf, chorus_buf, empty_r, empty_d, empty_c, chunkFrames)
         }
+        sched.osc_voices[i].gain = saved_osc_gain
         if (sched.osc_voices[i].finished) {
             if (sched.osc_voices[i].hrtf_l != null) {
                 ma_hrtf_uninit(sched.osc_voices[i].hrtf_l)
@@ -825,9 +919,7 @@ def private osc_render_voices(var sched : Scheduler; var output : array<float>; 
 // Prepare orbit bus send buffers for a tick (resize + zero).
 def private prepare_orbit_buses(var sched : Scheduler; chunkSamples : int) {
     for (bus in sched.orbit_buses) {
-        if (bus == null) {
-            continue
-        }
+        if (bus == null) continue
         if (bus.reverb != null) {
             if (length(bus.reverb_send_buf) < chunkSamples) {
                 bus.reverb_send_buf |> resize(chunkSamples)
@@ -862,19 +954,18 @@ def private prepare_orbit_buses(var sched : Scheduler; chunkSamples : int) {
 def private process_orbit_buses(var sched : Scheduler; var output : array<float>; chunkFrames : int) {
     let chunkSamples = chunkFrames * 2
     for (bus in sched.orbit_buses) {
-        if (bus == null) {
-            continue
-        }
-        // Always process reverb when it exists — convolver needs continuous input
+        if (bus == null) continue
+        // Reverb tail-skip gating lives in conv_reverb_process: it returns 0 (and zeros the
+        // output) when the bus is idle and its tail has decayed, so we only mix when it ran.
         if (bus.reverb != null) {
-            for (s in range(chunkSamples)) {
-                bus.reverb_out_buf[s] = 0.0
-            }
+            var ran = 0
             unsafe {
-                conv_reverb_process(bus.reverb, addr(bus.reverb_send_buf[0]), addr(bus.reverb_out_buf[0]), chunkFrames)
+                ran = conv_reverb_process(bus.reverb, addr(bus.reverb_send_buf[0]), addr(bus.reverb_out_buf[0]), chunkFrames)
             }
-            for (s in range(chunkSamples)) {
-                output[s] += bus.reverb_out_buf[s]
+            if (ran != 0) {
+                for (s in range(chunkSamples)) {
+                    output[s] += bus.reverb_out_buf[s]
+                }
             }
         }
         // Always process delay when it exists — internal buffer needs to decay
@@ -982,7 +1073,8 @@ def tick(var sched : Scheduler; var pat : Pattern; bank : SampleBank; wall_time 
                     let adsr = resolve_adsr(h.value.attack, h.value.decay, h.value.sustain, h.value.release)
                     var oscv = OscVoice(
                         osc_type = oscType,
-                        freq = note_to_freq(h.value.note),
+                        // explicit freq() overrides note; 0 = derive from note (strudel.cc parity)
+                        freq = h.value.freq > 0.0 ? h.value.freq : note_to_freq(h.value.note),
                         duration = durSec,
                         attack = adsr._0,
                         decay = adsr._1,
@@ -1049,6 +1141,8 @@ def tick(var sched : Scheduler; var pat : Pattern; bank : SampleBank; wall_time 
 
     // prepare per-orbit send buffers
     prepare_orbit_buses(sched, chunkSamples)
+    // advance per-orbit gain ramps one chunk so voices read this chunk's level
+    advance_orbit_gains(sched, chunk_seconds)
 
     // mix all pre-rendered voices into the output using ma_volume_mixer (gain + pan per voice)
     if (!sched.mixer_ready) {
@@ -1058,6 +1152,9 @@ def tick(var sched : Scheduler; var pat : Pattern; bank : SampleBank; wall_time 
     var i = length(sched.voices) - 1
     while (i >= 0) {
         var voice = sched.voices[i]
+        // fold the orbit's continuous level into this voice's gain for the chunk (restored below)
+        let saved_voice_gain = voice.gain
+        voice.gain = saved_voice_gain * orbit_gain(sched, voice.orbit)
         let voiceLen = length(voice.samples)
         let dstStart = max(0, -voice.position)
         let srcStart = max(0, voice.position)
@@ -1084,7 +1181,7 @@ def tick(var sched : Scheduler; var pat : Pattern; bank : SampleBank; wall_time 
                     sched.voice_fx_buf |> resize(chunk_samples)
                 }
                 let pan = clamp(voice.pan, -1.0, 1.0)
-                let angle = (pan + 1.0) * 0.25 * float(TWO_PI / 2.0)
+                let angle = (pan + 1.0) * 0.25 * (TWO_PI / 2.0)
                 let lGain = voice.gain * cos(angle)
                 let rGain = voice.gain * sin(angle)
                 for (f in range(nf)) {
@@ -1131,7 +1228,7 @@ def tick(var sched : Scheduler; var pat : Pattern; bank : SampleBank; wall_time 
                     )
                 }
                 let pan = clamp(voice.pan, -1.0, 1.0)
-                let angle = (pan + 1.0) * 0.25 * float(TWO_PI / 2.0)
+                let angle = (pan + 1.0) * 0.25 * (TWO_PI / 2.0)
                 // reverb send for pre-rendered voices
                 if (voice.reverb_send > 0.0 && reverb_buf != null) {
                     let sL = voice.gain * voice.reverb_send * cos(angle)
@@ -1167,6 +1264,7 @@ def tick(var sched : Scheduler; var pat : Pattern; bank : SampleBank; wall_time 
                 }
             }
         }
+        voice.gain = saved_voice_gain
         voice.position += chunkSamples
         if (voice.position >= voiceLen) {
             if (sched.voices[i].hrtf_l != null) {
@@ -1201,25 +1299,19 @@ def tick(var sched : Scheduler; var pat : Pattern; bank : SampleBank; wall_time 
 
 def get_orbit_reverb(var sched : Scheduler; orbit : int = 0) : ConvolutionReverb? {
     //! Fetch the reverb instance for the given orbit (for inspection or tests). Returns null if no bus or no reverb configured.
-    if (orbit < length(sched.orbit_buses) && sched.orbit_buses[orbit] != null) {
-        return sched.orbit_buses[orbit].reverb
-    }
+    if (orbit < length(sched.orbit_buses) && sched.orbit_buses[orbit] != null) return sched.orbit_buses[orbit].reverb
     return null
 }
 
 def get_orbit_delay(var sched : Scheduler; orbit : int = 0) : ma_delay? {
     //! Fetch the delay instance for the given orbit (for inspection or tests). Returns null if no bus or no delay configured.
-    if (orbit < length(sched.orbit_buses) && sched.orbit_buses[orbit] != null) {
-        return sched.orbit_buses[orbit].delay_proc
-    }
+    if (orbit < length(sched.orbit_buses) && sched.orbit_buses[orbit] != null) return sched.orbit_buses[orbit].delay_proc
     return null
 }
 
 def get_orbit_chorus(var sched : Scheduler; orbit : int = 0) : ma_chorus? {
     //! Fetch the chorus instance for the given orbit (for inspection or tests). Returns null if no bus or no chorus configured.
-    if (orbit < length(sched.orbit_buses) && sched.orbit_buses[orbit] != null) {
-        return sched.orbit_buses[orbit].chorus
-    }
+    if (orbit < length(sched.orbit_buses) && sched.orbit_buses[orbit] != null) return sched.orbit_buses[orbit].chorus
     return null
 }
 

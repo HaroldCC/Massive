@@ -5,6 +5,104 @@
 
 namespace das {
 
+    class SetRefSpVisitor : public Visitor {
+    public:
+        SetRefSpVisitor ( bool r, bool c, uint32_t s, uint32_t o )
+            : ref(r), cmres(c), sp(s), off(o) {}
+    protected:
+        bool ref, cmres;
+        uint32_t sp, off;
+
+        void applyFields ( ExprMakeLocal * e ) {
+            e->useStackRef = ref;
+            e->useCMRES = cmres;
+            e->doesNotNeedSp = true;
+            e->doesNotNeedInit = true;
+            e->stackTop = sp;
+            e->extraOffset = off;
+        }
+
+        static void markCmresSkip ( Expression * val ) {
+            if ( val->rtti_isCall() ) {
+                auto cll = static_cast<ExprCall*>(val);
+                if ( cll->allowCmresSkip() ) cll->doesNotNeedSp = true;
+            } else if ( val->rtti_isInvoke() ) {
+                auto cll = static_cast<ExprInvoke*>(val);
+                if ( cll->allowCmresSkip() ) cll->doesNotNeedSp = true;
+            }
+        }
+
+        void recurse ( Expression * val, uint32_t childOff ) {
+            if ( val->rtti_isMakeLocal() ) {
+                SetRefSpVisitor sub(ref, cmres, sp, childOff);
+                val->dispatch(sub);
+            } else {
+                markCmresSkip(val);
+            }
+        }
+
+        virtual void preVisit ( ExprMakeTuple * expr ) override {
+            applyFields(expr);
+            int total = int(expr->values.size());
+            for ( int index=0; index != total; ++index ) {
+                recurse(expr->values[index], expr->extraOffset + expr->makeType->getTupleFieldOffset(index));
+            }
+        }
+
+        virtual void preVisit ( ExprMakeArray * expr ) override {
+            applyFields(expr);
+            int total = int(expr->values.size());
+            uint32_t stride = expr->recordType->getSizeOf();
+            for ( int index=0; index != total; ++index ) {
+                recurse(expr->values[index], expr->extraOffset + index*stride);
+            }
+        }
+
+        virtual void preVisit ( ExprMakeStruct * expr ) override {
+            applyFields(expr);
+            auto mkBaseT = expr->makeType;
+            while ( mkBaseT->baseType==Type::tFixedArray && mkBaseT->firstType ) mkBaseT = mkBaseT->firstType;
+            if ( mkBaseT->baseType == Type::tHandle ) return;
+            int total = int(expr->structs.size());
+            int stride = expr->makeType->getStride();
+            for ( int index=0; index != total; ++index ) {
+                auto & fields = expr->structs[index];
+                for ( const auto & decl : *fields ) {
+                    auto field = mkBaseT->structType->findField(decl->name);
+                    DAS_ASSERT(field && "should have failed in type infer otherwise");
+                    recurse(decl->value, expr->extraOffset + index*stride + field->offset);
+                }
+            }
+        }
+
+        virtual void preVisit ( ExprMakeVariant * expr ) override {
+            applyFields(expr);
+            auto mkBaseT = expr->makeType;
+            while ( mkBaseT->baseType==Type::tFixedArray && mkBaseT->firstType ) mkBaseT = mkBaseT->firstType;
+            int stride = expr->makeType->getStride();
+            int index = 0;
+            for ( const auto & decl : expr->variants ) {
+                auto fieldVariant = mkBaseT->findArgumentIndex(decl->name);
+                DAS_ASSERT(fieldVariant!=-1 && "should have failed in type infer otherwise");
+                if ( decl->value->rtti_isMakeLocal() ) {
+                    auto fieldOffset = mkBaseT->getVariantFieldOffset(fieldVariant);
+                    uint32_t offset = expr->extraOffset + index*stride + fieldOffset;
+                    SetRefSpVisitor sub(ref, cmres, sp, offset);
+                    decl->value->dispatch(sub);
+                    static_cast<ExprMakeLocal*>(decl->value)->doesNotNeedInit = false;
+                } else {
+                    markCmresSkip(decl->value);
+                }
+                index++;
+            }
+        }
+    };
+
+    static void applySetRefSp ( ExprMakeLocal * mkl, bool ref, bool cmres, uint32_t sp, uint32_t off ) {
+        SetRefSpVisitor vis(ref, cmres, sp, off);
+        mkl->dispatch(vis);
+    }
+
     class VarCMRes : public Visitor {
     public:
         VarCMRes( const ProgramPtr & prog, bool everything ) {
@@ -214,7 +312,7 @@ namespace das {
                             << "\tinit global " << var->name << " [[ ]], line " << var->init->at.line << "\n";
                     }
                     auto mkl = static_cast<ExprMakeLocal*>(var->init);
-                    mkl->setRefSp(true, false, refStackTop, 0);
+                    applySetRefSp(mkl, true, false, refStackTop, 0);
                     mkl->doesNotNeedInit = false;
                     mkl->doesNotNeedSp = true;
                 } else if ( var->init->rtti_isCall() ) {
@@ -296,7 +394,11 @@ namespace das {
                 DAS_ASSERT(!expr->returnInBlock);
             }
             if ( expr->subexpr ) {
-                if ( expr->subexpr->rtti_isMakeLocal() ) {
+                // only route a make-local return through CMRES when the function returns via
+                // CMRES; a register-returned (non-cmres) function has no result buffer, so
+                // writing the make-local through one segfaults — build a normal local instead.
+                bool makeLocalCMRES = expr->returnInBlock || !func || func->copyOnReturn || func->moveOnReturn;
+                if ( expr->subexpr->rtti_isMakeLocal() && makeLocalCMRES ) {
                     uint32_t sz = sizeof(void *);
                     expr->refStackTop = allocateStack(sz);
                     expr->takeOverRightStack = true;
@@ -306,9 +408,9 @@ namespace das {
                     }
                     auto mkl = static_cast<ExprMakeLocal*>(expr->subexpr);
                     if ( expr->returnInBlock ) {
-                        mkl->setRefSp(true, false, expr->refStackTop, 0);
+                        applySetRefSp(mkl, true, false, expr->refStackTop, 0);
                     } else {
-                        mkl->setRefSp(true, true, expr->refStackTop, 0);
+                        applySetRefSp(mkl, true, true, expr->refStackTop, 0);
                         expr->returnCMRES = true;
                     }
                     mkl->doesNotNeedInit = false;
@@ -352,6 +454,12 @@ namespace das {
             block->stackVarTop = allocateStack(0);
             block->stackCleanVars.clear();
             if ( inStruct ) return;
+            // A block with a `finally` section runs that section on EVERY exit, including
+            // an early return that precedes a later variable's declaration. Disable stack
+            // reuse for the whole block so its locals keep distinct slots and the
+            // block-entry memzero (SimulateVisitor::visit(ExprBlock*)) stays valid when
+            // the finally fires before a variable's initializer ran.
+            if ( block->finalList.size() ) doNotOptimize++;
             if ( block->isClosure ) {
                 blocks.push_back(block);
             }
@@ -368,6 +476,7 @@ namespace das {
             pushSp();
         }
         virtual ExpressionPtr visit ( ExprBlock * block ) override {
+            if ( !inStruct && block->finalList.size() ) doNotOptimize--;
             auto top = inStruct ? stackTop : popSp().maxStack;
             block->stackVarBottom = top;
 
@@ -575,7 +684,7 @@ namespace das {
             if ( var->init ) {
                 if ( var->init->rtti_isMakeLocal() ) {
                     auto mkl = static_cast<ExprMakeLocal*>(var->init);
-                    mkl->setRefSp(false, var->aliasCMRES, var->stackTop, 0);
+                    applySetRefSp(mkl, false, var->aliasCMRES, var->stackTop, 0);
                     mkl->doesNotNeedInit = false;
                 } else if ( var->init->rtti_isCall() ) {
                     auto cll = static_cast<ExprCall*>(var->init);
@@ -637,15 +746,26 @@ namespace das {
             Visitor::preVisit(expr);
             if ( inStruct ) return;
             if ( expr->subexpr->rtti_isMakeLocal() ) {
-                uint32_t sz = sizeof(void *);
-                expr->stackTop = allocateStack(sz);
-                expr->useStackRef = true;
-                if ( log ) {
-                    logs << "\t" << expr->stackTop << "\t" << sz
-                    << "\tascend, line " << expr->at.line << "\n";
-                }
                 auto mkl = static_cast<ExprMakeLocal*>(expr->subexpr);
-                mkl->setRefSp(true, false, expr->stackTop, 0);
+                if ( expr->allocate_on_stack && !expr->needTypeInfo ) {
+                    // build the value directly into the frame, no ref slot and no heap copy
+                    uint32_t sz = expr->subexpr->type->getSizeOf();
+                    expr->stackTop = allocateStack(sz);
+                    if ( log ) {
+                        logs << "\t" << expr->stackTop << "\t" << sz
+                        << "\tascend stack, line " << expr->at.line << "\n";
+                    }
+                    applySetRefSp(mkl, false, false, expr->stackTop, 0);
+                } else {
+                    uint32_t sz = sizeof(void *);
+                    expr->stackTop = allocateStack(sz);
+                    expr->useStackRef = true;
+                    if ( log ) {
+                        logs << "\t" << expr->stackTop << "\t" << sz
+                        << "\tascend, line " << expr->at.line << "\n";
+                    }
+                    applySetRefSp(mkl, true, false, expr->stackTop, 0);
+                }
             }
             pushSp();
         }
@@ -668,7 +788,7 @@ namespace das {
                     logs << "\t" << cStackTop << "\t" << sz
                         << "\t[[" << expr->type->describe() << "]], line " << expr->at.line << "\n";
                 }
-                expr->setRefSp(false, false, cStackTop, 0);
+                applySetRefSp(expr, false, false, cStackTop, 0);
                 expr->doesNotNeedSp = false;
                 expr->doesNotNeedInit = false;
             }
@@ -693,7 +813,9 @@ namespace das {
                     logs << "\t" << cStackTop << "\t" << sz
                     << "\t[[" << expr->type->describe() << "]], line " << expr->at.line << "\n";
                 }
-                expr->setRefSp(false, false, cStackTop, 0);
+                // heap array literal: slot holds the array<T> value (sizeof Array); element writes
+                // go into the heap buffer via cmres (set to arr.data by SimNode_MakeArrayHeap).
+                applySetRefSp(expr, false, expr->makeArrayOnHeap, cStackTop, 0);
                 expr->doesNotNeedSp = false;
                 expr->doesNotNeedInit = false;
             }
@@ -718,7 +840,7 @@ namespace das {
                     logs << "\t" << cStackTop << "\t" << sz
                     << "\t[[" << expr->type->describe() << "]], line " << expr->at.line << "\n";
                 }
-                expr->setRefSp(false, false, cStackTop, 0);
+                applySetRefSp(expr, false, false, cStackTop, 0);
                 expr->doesNotNeedSp = false;
                 expr->doesNotNeedInit = false;
             }
@@ -743,7 +865,7 @@ namespace das {
                     logs << "\t" << cStackTop << "\t" << sz
                     << "\t[[" << expr->type->describe() << "]], line " << expr->at.line << "\n";
                 }
-                expr->setRefSp(false, false, cStackTop, 0);
+                applySetRefSp(expr, false, false, cStackTop, 0);
                 expr->doesNotNeedSp = false;
                 expr->doesNotNeedInit = false;
             }
@@ -760,12 +882,19 @@ namespace das {
         virtual void preVisit ( ExprNew * expr ) override {
             Visitor::preVisit(expr);
             if ( inStruct ) return;
-            if ( expr->type->dim.size() ) {
+            if ( expr->type->baseType==Type::tFixedArray ) {
                 auto sz = uint32_t(expr->type->getCountOf()*sizeof(char *));
                 expr->stackTop = allocateStack(sz);
                 if ( log ) {
                     logs << "\t" << expr->stackTop << "\t" << sz
                     << "\tNEW " << expr->typeexpr->describe() << ", line " << expr->at.line << "\n";
+                }
+            } else if ( expr->allocate_on_stack ) {
+                auto sz = expr->type->firstType->getBaseSizeOf();
+                expr->stackTop = allocateStack(sz);
+                if ( log ) {
+                    logs << "\t" << expr->stackTop << "\t" << sz
+                    << "\tNEW stack " << expr->typeexpr->describe() << ", line " << expr->at.line << "\n";
                 }
             }
             onPreExprCallFunc(expr);
@@ -793,7 +922,7 @@ namespace das {
                         logs << "\t" << expr->stackTop << "\t" << sz
                             << "\tcopy [[ ]], line " << expr->at.line << "\n";
                     }
-                    mkl->setRefSp(true, false, expr->stackTop, 0);
+                    applySetRefSp(mkl, true, false, expr->stackTop, 0);
                     mkl->doesNotNeedInit = false;
                 }
             } else if ( expr->right->rtti_isCall() ) {
@@ -836,7 +965,7 @@ namespace das {
                         logs << "\t" << expr->stackTop << "\t" << sz
                             << "\tcopy [[ ]], line " << expr->at.line << "\n";
                     }
-                    mkl->setRefSp(true, false, expr->stackTop, 0);
+                    applySetRefSp(mkl, true, false, expr->stackTop, 0);
                     mkl->doesNotNeedInit = false;
                 }
             } else if ( expr->right->rtti_isCall() ) {

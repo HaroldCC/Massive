@@ -7,6 +7,8 @@
 #define STB_IMAGE_RESIZE_IMPLEMENTATION
 #include "stb_image_resize2.h"
 
+#include <vector>    // std::vector buffer for stbi write-to-memory callbacks
+
 // stb_image_write config variable wrappers
 void stbi_write_set_png_compression_level ( int level ) { stbi_write_png_compression_level = level; }
 int  stbi_write_get_png_compression_level ( ) { return stbi_write_png_compression_level; }
@@ -21,3 +23,6 @@ void stbi_write_to_vec_callback ( void * context, void * data, int size ) {
     auto * src = (const uint8_t *) data;
     vec->insert(vec->end(), src, src + size);
 }
+
+// APNG (animated PNG) writer — defined here so stb's static helpers are in scope.
+#include "apng_write_impl.h"

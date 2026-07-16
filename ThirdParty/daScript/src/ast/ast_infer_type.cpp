@@ -10,8 +10,62 @@
 
 namespace das {
 
+    // local or global (only used by type inference)
+    static bool isLocalOrGlobal ( ExpressionPtr expr ) {
+        if ( expr->rtti_isVar() ) {
+            auto ev = static_cast<ExprVar*>(expr);
+            return ev->local || !(ev->argument || ev->block);
+        } else if ( expr->rtti_isAt() ) {
+            auto ea = static_cast<ExprAt*>(expr);
+            if ( ea->subexpr && ea->subexpr->type && ea->subexpr->type->baseType==Type::tFixedArray ) {
+                return isLocalOrGlobal(ea->subexpr);
+            }
+        } else if ( expr->rtti_isField() ) {
+            auto ef = static_cast<ExprField*>(expr);
+            if ( ef->value && ef->value->type && (ef->value->type->baseType!=Type::tHandle || ef->value->type->isLocal()) ) {
+                return isLocalOrGlobal(ef->value);
+            }
+        } else if ( expr->rtti_isSwizzle() ) {
+            auto sw = static_cast<ExprSwizzle*>(expr);
+            if ( sw->value ) {
+                return isLocalOrGlobal(sw->value);
+            }
+        } else if ( expr->rtti_isCallLikeExpr() ) {
+            if ( expr->type && expr->type->ref ) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // in ast_handle of all places, due to reporting fields
     void reportTrait(const TypeDeclPtr &type, const string &prefix, const callable<void(const TypeDeclPtr &, const string &)> &report);
+
+    // True if `klass` has any non-generated user-defined function with the given name (mangled
+    // as `Klass`methodName`). For methodName == klass->name, this detects user ctors; for any
+    // other name, it detects user methods. Used at super(...) / super.method() walk-up sites to
+    // reject silent skip of an intermediate class's user-defined invariants.
+    // The class's ctors/methods live in the same module as the class itself (parser registers
+    // them together), so we look up by name hash on `klass->module->functionsByName` /
+    // `genericsByName` instead of scanning the entire library. The `classParent == klass`
+    // identity check defends against same-named classes in other modules bleeding in via
+    // generic instantiation (the in-tree corpus already has multiple `ContextStateAgent`).
+    static bool classHasUserNamedFunction(Program *, Structure * klass, const string & methodName) {
+        if (!klass || !klass->module) return false;
+        string funcName = klass->name + "`" + methodName;
+        uint64_t hName = hash64z(funcName.c_str());
+        if (auto kv = klass->module->functionsByName.find(hName)) {
+            for (auto * fn : kv->second) {
+                if (!fn->generated && fn->classParent == klass) return true;
+            }
+        }
+        if (auto kv = klass->module->genericsByName.find(hName)) {
+            for (auto * fn : kv->second) {
+                if (!fn->generated && fn->classParent == klass) return true;
+            }
+        }
+        return false;
+    }
 
     CaptureLambda::CaptureLambda(bool cm) : inClassMethod(cm) {}
     void CaptureLambda::preVisit(ExprVar *expr) {
@@ -42,6 +96,7 @@ namespace das {
         debugInferFlag = prog->options.getBoolOption("debug_infer_flag", prog->policies.debug_infer_flag);
         enableInferTimeFolding = prog->options.getBoolOption("infer_time_folding", !prog->policies.no_infer_time_folding);
         disableAot = prog->options.getBoolOption("no_aot", false);
+        noHeapArrayLiterals = prog->options.getBoolOption("no_heap_array_literals", false);
         multiContext = prog->options.getBoolOption("multiple_contexts", prog->policies.multiple_contexts);
         standaloneContext = prog->options.getBoolOption("standalone_context", prog->policies.standalone_context);
         checkNoGlobalVariablesAtAll = prog->options.getBoolOption("no_global_variables_at_all", prog->policies.no_global_variables_at_all);
@@ -142,7 +197,25 @@ namespace das {
         nextValue->type = enu->makeBaseType();
         return nextValue;
     }
+    void InferTypes::preVisitEnumerationValue(Enumeration *enu, const string &name, Expression *value, bool last) {
+        Visitor::preVisitEnumerationValue(enu, name, value, last);
+        checkEmptyName(name, "enumeration entry", value ? value->at : enu->at);
+        // Enum value initializers must fold to compile-time integer constants —
+        // force-enable infer-time folding for this value's subtree visit even when
+        // it was disabled (lint policies via no_infer_time_folding, or source-level
+        // `options infer_time_folding = false`, or any future reason). Save the
+        // prior state so visitEnumerationValue can restore it exactly, regardless
+        // of WHY folding was off. Auto-increment members (value == nullptr) have
+        // no subtree to visit, so we skip the toggle entirely for them.
+        savedFoldingForEnum = enableInferTimeFolding;
+        if (value && !enableInferTimeFolding) {
+            enableInferTimeFolding = true;
+        }
+    }
     ExpressionPtr InferTypes::visitEnumerationValue(Enumeration *enu, const string &name, Expression *value, bool last) {
+        // Restore folding state captured by preVisitEnumerationValue — same value
+        // we observed there, regardless of policy/option/etc.
+        enableInferTimeFolding = savedFoldingForEnum;
         if (!value) {
             if (lastEnuValue) {
                 if (lastEnuValue->rtti_isConstant() && lastEnuValue->type && lastEnuValue->type->isInteger()) {
@@ -190,6 +263,7 @@ namespace das {
     }
     void InferTypes::preVisit(Enumeration *enu) {
         Visitor::preVisit(enu);
+        checkEmptyName(enu->name, "enumeration declaration", enu->at);
         lastEnuValue = nullptr;
     }
     EnumerationPtr InferTypes::visit(Enumeration *enu) {
@@ -202,6 +276,7 @@ namespace das {
     }
     void InferTypes::preVisit(Structure *that) {
         Visitor::preVisit(that);
+        checkEmptyName(that->name, "structure declaration", that->at);
         currentStructure = that;
         fieldOffset = 0;
         cppLayout = that->cppLayout;
@@ -213,6 +288,7 @@ namespace das {
     }
     void InferTypes::preVisitStructureField(Structure *that, Structure::FieldDeclaration &decl, bool last) {
         Visitor::preVisitStructureField(that, decl, last);
+        checkEmptyName(decl.name, "structure field", decl.at);
         that->fieldLookup[decl.name] = fieldIndex++;
         if (decl.type->isAuto() && !decl.init) {
             error("structure field type can't be inferred, it needs an initializer", "", "",
@@ -299,6 +375,15 @@ namespace das {
 
         if (decl.init) {
             if (decl.init->type) {
+                {
+                    bool rangeError = false;
+                    if (auto promoted = tryPromoteConstInt(decl.init, decl.type, rangeError)) {
+                        reportAstChanged();
+                        decl.init = promoted;
+                        return;
+                    }
+                    if (rangeError) return;
+                }
                 if (!canCopyOrMoveType(decl.type, decl.init->type, TemporaryMatters::yes, decl.init,
                                        "structure field " + decl.name + " initialization type mismatch", CompilationError::invalid_initialization_type, decl.init->at)) {
                 } else if (!decl.type->canCopy() && !decl.moveSemantics) {
@@ -345,11 +430,26 @@ namespace das {
     }
     StructurePtr InferTypes::visit(Structure *var) {
         if (!var->genCtor) {
-            if (var->hasAnyInitializers()) {
+            // For a class whose ancestor chain contains a user ctor, synthesize a
+            // default ctor that chains super() to the immediate parent -- otherwise
+            // the user ctor's invariants get silently skipped on new Derived().
+            // findChainCtorAncestor walks past empty intermediates so the chain
+            // reaches the deepest user ctor in one call. Skipped when `var` already
+            // has any user ctor: the user is responsible for chaining via super(...),
+            // and the lint enforces that on every path.
+            Structure * chainTargetAnc = var->hasUserConstructor() ? nullptr : findChainCtorAncestor(var);
+            bool parentNeedsChain = chainTargetAnc != nullptr;
+            bool missingParentDefault = parentNeedsChain && !chainTargetAnc->hasUserDefaultConstructor();
+            if (missingParentDefault) {
+                error("class " + var->name + " inherits from " + chainTargetAnc->name +
+                      " which has no default constructor; provide an explicit def " + var->name + "()", "", "",
+                      var->at, CompilationError::missing_super_call);
+            }
+            if (!missingParentDefault && (var->hasAnyInitializers() || parentNeedsChain)) {
                 if (tryMakeStructureCtor(var, var->privateStructure, false)) {
                     var->genCtor = true;
                 }
-            } else {
+            } else if (!missingParentDefault) {
                 getOrCreateDummy(thisModule);
             }
         }
@@ -365,6 +465,7 @@ namespace das {
     }
     void InferTypes::preVisitGlobalLet(const VariablePtr &var) {
         Visitor::preVisitGlobalLet(var);
+        checkEmptyName(var->name, "global variable declaration", var->at);
         if (noUnsafeUninitializedStructs && !var->init && var->type->unsafeInit()) {
             if (!hasSafeWhenUninitialized(var->annotation)) {
                 error("Uninitialized variable " + var->name + " is unsafe. Use initializer syntax or @safe_when_uninitialized when intended.", "", "",
@@ -389,9 +490,26 @@ namespace das {
             }
         }
     }
+
+    static void seedTupleShorthandFromTargetType(const TypeDeclPtr &targetType, Expression *init) {
+        if (!targetType || !init) return;
+        if (targetType->baseType != Type::tTuple) return;
+        if (!init->rtti_isMakeTuple()) return;
+        auto mkt = static_cast<ExprMakeTuple *>(init);
+        if (mkt->shorthandRecordNames.empty() || mkt->recordType) return;
+        if (targetType->argNames.size() != mkt->shorthandRecordNames.size()) return;
+        for (size_t i = 0, n = targetType->argNames.size(); i != n; ++i) {
+            if (targetType->argNames[i] != mkt->shorthandRecordNames[i]) return;
+        }
+        mkt->recordType = new TypeDecl(*targetType);
+        mkt->recordType->ref = false;
+        mkt->recordType->constant = false;
+    }
+
     void InferTypes::preVisitGlobalLetInit(const VariablePtr &var, Expression *init) {
         Visitor::preVisitGlobalLetInit(var, init);
         globalVar = var;
+        seedTupleShorthandFromTargetType(var->type, init);
     }
     ExpressionPtr InferTypes::visitGlobalLetInit(const VariablePtr &var, Expression *init) {
         globalVar = nullptr;
@@ -414,7 +532,17 @@ namespace das {
                 var->type->sanitize();
                 reportAstChanged();
             }
-        } else if (!canCopyOrMoveType(var->type, var->init->type, TemporaryMatters::no, var->init,
+        } else {
+            bool rangeError = false;
+            if (auto promoted = tryPromoteConstInt(var->init, var->type, rangeError)) {
+                reportAstChanged();
+                var->init = promoted;
+                return Visitor::visitGlobalLetInit(var, var->init);
+            }
+            if (rangeError) {
+                return Visitor::visitGlobalLetInit(var, init);
+            }
+            if (!canCopyOrMoveType(var->type, var->init->type, TemporaryMatters::no, var->init,
                                       "global variable '" + var->name + "' initialization type mismatch", CompilationError::invalid_initialization_type, var->init->at)) {
         } else if (var->type->ref && !var->type->isConst() && var->init->type->isConst()) {
             error("global variable '" + var->name + "' initialization type mismatch, const matters " + describeType(var->type) + " = " + describeType(var->init->type), "", "",
@@ -455,6 +583,7 @@ namespace das {
                     return promoteToCloneToMove(var);
                 }
             }
+        }
         }
         if (var->init->rtti_isVar()) { // this folds specifically global a = b, where b is const
             auto ivar = static_cast<ExprVar*>(var->init);
@@ -527,6 +656,7 @@ namespace das {
     }
     void InferTypes::preVisit(Function *f) {
         Visitor::preVisit(f);
+        checkEmptyName(f->name, "function declaration", f->at);
         oneReturn = nullptr;
         returnCount = 0;
         canFoldResult = true;
@@ -550,6 +680,7 @@ namespace das {
     }
     void InferTypes::preVisitArgument(Function *fn, const VariablePtr &var, bool lastArg) {
         Visitor::preVisitArgument(fn, var, lastArg);
+        checkEmptyName(var->name, "function argument", var->at);
         if (var->type->isAlias()) {
             if (auto aT = inferAlias(var->type)) {
                 var->type = aT;
@@ -927,15 +1058,11 @@ namespace das {
         }
         // infer
         if (!expr->subexpr->type->isRef()) {
-            if (expr->subexpr->rtti_isConstant()) {
-                reportAstChanged();
-                return expr->subexpr;
-            } else {
-                TextWriter tw;
-                tw << *expr->subexpr;
-                error("can only dereference a reference", tw.str(), "",
-                      expr->at, CompilationError::cant_dereference);
-            }
+            // ref2value of a non-ref is a no-op load: the subexpr is already a value.
+            // Drops a stale R2V left by AST surgery — e.g. flatten's copy-prop substituting
+            // a value into a swizzle base that was a ref local before (else error[30921]).
+            reportAstChanged();
+            return expr->subexpr;
         } else if (!expr->subexpr->type->isSimpleType()) {
             error("can only dereference value types, not a " + describeType(expr->subexpr->type), "", "",
                   expr->at, CompilationError::cant_dereference);
@@ -1181,8 +1308,23 @@ namespace das {
         for (auto &arg : expr->arguments) {
             markNoDiscard(arg);
         }
+        // static_assert / concept_assert needs the cond to fold to a const
+        // before verifyAndFoldContracts runs. Mirror the static_if path
+        // above: with `no_infer_time_folding` set (lint policies) plus
+        // `no_optimizations`, `int_const op int_const` shapes (typically
+        // `typeinfo sizeof(X) <= typeinfo sizeof(Y)` after typeinfo rewrites
+        // itself to ExprConstInt) stay as unfolded ExprOp1/Op2/Op3, and the
+        // contract pass raises a spurious "static assert condition is not
+        // constexpr or const" (30151). Force-enable folding for the cond
+        // subtree; restore in visit().
+        savedFoldingForStaticAssert = enableInferTimeFolding;
+        if (!enableInferTimeFolding) {
+            enableInferTimeFolding = true;
+        }
     }
     ExpressionPtr InferTypes::visit(ExprStaticAssert *expr) {
+        // Restore folding state before any early-return path below.
+        enableInferTimeFolding = savedFoldingForStaticAssert;
         if (expr->argumentsFailedToInfer) {
             if (func)
                 func->notInferred();
@@ -1292,9 +1434,13 @@ namespace das {
         expr->type = new TypeDecl(Type::tPointer);
         expr->type->firstType = new TypeDecl(Type::tHandle);
         expr->type->firstType->annotation = (TypeAnnotation *)Module::require("ast_core")->findAnnotation("Expression");
-        // mark quote as noAot
+        // mark quote as noAot, unless daslib/quote lowering will replace it
+        // (aot_macros or jit_enabled policy, or per-module `options aot_macros` — same gate
+        // as QuotePass, including its macro-module exclusion for the jit trigger)
         if (func) {
-            if (!program->policies.aot_macros) {
+            if (!program->policies.aot_macros
+                    && !(program->policies.jit_enabled && !program->needMacroModule)
+                    && !program->options.getBoolOption("aot_macros", false)) {
                 func->noAot = true;
             }
         }
@@ -1414,6 +1560,25 @@ namespace das {
                                     return Visitor::visit(expr);
                                 }
                             }
+                            // super.<AncestorClassName>() is the legacy form for invoking that
+                            // ancestor's constructor. Allow only when the named class is the
+                            // immediate parent or reachable through an unbroken chain of empty
+                            // intermediates (no user ctors). Skipping a class with a user ctor
+                            // would silently bypass its invariants.
+                            for (Structure * anc = baseClass->parent; anc; anc = anc->parent) {
+                                if (anc->name == eField->name) {
+                                    for (Structure * mid = baseClass; mid != anc; mid = mid->parent) {
+                                        if (classHasUserNamedFunction(program, mid, mid->name)) {
+                                            error("call to super." + eField->name + " in " + func->name
+                                                    + " cannot skip " + mid->name
+                                                    + " which has its own constructor — call super." + mid->name + "(...) instead",
+                                                  "", "", expr->at, CompilationError::invalid_super_call);
+                                            return Visitor::visit(expr);
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
                             vector<TypeDeclPtr> argTypes;
                             auto selfType = new TypeDecl(Type::tStructure);
                             selfType->structType = func->classParent;
@@ -1437,6 +1602,16 @@ namespace das {
                                     error("too many candidates for super call " + callName,
                                     verbose ? program->describeCandidates(fnCandidates) : "", "",
                                         expr->at, CompilationError::ambiguous_super_call);
+                                    return Visitor::visit(expr);
+                                }
+                                // No matching method here. Before walking past, check: does this
+                                // baseClass have a user-defined method with the same name (different
+                                // sig)? If yes, we'd silently skip its definition — reject.
+                                if (classHasUserNamedFunction(program, baseClass, eField->name)) {
+                                    error("call to super." + eField->name + " in " + func->name
+                                            + " cannot skip " + baseClass->name + " which defines its own "
+                                            + eField->name + " — adjust args to match " + baseClass->name + "'s overload",
+                                          "", "", expr->at, CompilationError::invalid_super_call);
                                     return Visitor::visit(expr);
                                 }
                                 baseClass = baseClass->parent;
@@ -1497,6 +1672,7 @@ namespace das {
                             auto newCall = new ExprCall(expr->at, callName);
                             newCall->atEnclosure = expr->atEnclosure;
                             newCall->alwaysSafe = expr->alwaysSafe;
+                            newCall->pipedCallArgument = expr->pipedCallArgument;
                             if (value->rtti_isR2V()) {
                                 value = static_cast<ExprRef2Value*>(value)->subexpr;
                             }
@@ -1537,6 +1713,7 @@ namespace das {
                             }
                         }
                         if (auto mcall = makeCallMacro(expr->at, methodName)) {
+                            mcall->pipedCallArgument = expr->pipedCallArgument;
                             mcall->arguments.push_back(value);
                             for (size_t i = 2; i != expr->arguments.size(); ++i) {
                                 mcall->arguments.push_back(expr->arguments[i]);
@@ -1586,6 +1763,27 @@ namespace das {
                                                 } else {
                                                     int fnArgSize = int(fnAddr->func->arguments.size());
                                                     int fromFnArgSize = int(expr->arguments.size() - 1);
+                                                    // piped block lands on the first MATCHING block-like parameter; defaults in between are padded
+                                                    if (expr->pipedCallArgument && fromFnArgSize >= 1 && fromFnArgSize <= fnArgSize
+                                                            && expr->arguments.back()->type) {
+                                                        int pParam = fromFnArgSize - 1;
+                                                        int kParam = -1;
+                                                        for (int ai = pParam; ai < fnArgSize; ++ai) {
+                                                            if (isMatchingArgument(fnAddr->func, fnAddr->func->arguments[ai]->type, expr->arguments.back()->type, false, true)) {
+                                                                kParam = ai;
+                                                                break;
+                                                            }
+                                                            if (!fnAddr->func->arguments[ai]->init) break;
+                                                        }
+                                                        if (kParam > pParam) {
+                                                            for (int ai = kParam - 1; ai >= pParam; --ai) {
+                                                                expr->arguments.insert(expr->arguments.begin() + fromFnArgSize,
+                                                                    fnAddr->func->arguments[ai]->init->clone());
+                                                            }
+                                                            reportAstChanged();
+                                                            return Visitor::visit(expr);
+                                                        }
+                                                    }
                                                     bool allHaveInit = true;
                                                     for (int ai = fromFnArgSize; ai < fnArgSize; ++ai) {
                                                         if (!fnAddr->func->arguments[ai]->init) {
@@ -1611,7 +1809,7 @@ namespace das {
                                         }
                                     } else {
                                         auto stf = sttf->type;
-                                        if (stf && stf->dim.size() == 0 && (stf->baseType == Type::tBlock || stf->baseType == Type::tFunction || stf->baseType == Type::tLambda)) {
+                                        if (stf && (stf->baseType == Type::tBlock || stf->baseType == Type::tFunction || stf->baseType == Type::tLambda)) {
                                             reportAstChanged();
                                             expr->isInvokeMethod = false;
                                             // we replace invoke(foo.GetValue,cast<auto> foo,...) with invoke(foo.GetValue,...)
@@ -1951,7 +2149,7 @@ namespace das {
                   expr->at, CompilationError::not_resolved_yet_type);
             return Visitor::visit(expr);
         }
-        verifyType(expr->typeexpr, true);
+        verifyType(expr->typeexpr, true, false, /*allowTemplate*/ true);  // type<> introspects; template is fine here
         TypeDecl::clone(expr->type, expr->typeexpr);
         return Visitor::visit(expr);
     }
@@ -2003,7 +2201,7 @@ namespace das {
                       expr->at, CompilationError::not_resolved_yet_typeinfo);
                 return Visitor::visit(expr);
             }
-            verifyType(expr->typeexpr, true);
+            verifyType(expr->typeexpr, true, false, /*allowTemplate*/ true);  // typeinfo introspects; template is fine here
         }
         if (nErrors == program->errors.size()) {
             if (expr->trait == "sizeof") {
@@ -2033,16 +2231,16 @@ namespace das {
                 return new ExprConstInt(expr->at, align);
             } else if (expr->trait == "is_dim") {
                 reportAstChanged();
-                return new ExprConstBool(expr->at, expr->typeexpr->dim.size() != 0);
+                return new ExprConstBool(expr->at, expr->typeexpr->baseType == Type::tFixedArray);
             } else if (expr->trait == "dim") {
                 if (expr->typeexpr->isExprTypeAnywhere()) {
                     error("typeinfo(dim " + describeType(expr->typeexpr) + ") is not fully inferred, expecting resolved dim", "", "",
                           expr->at, CompilationError::not_resolved_yet_typeinfo_dim);
                     return Visitor::visit(expr);
                 }
-                if (expr->typeexpr->dim.size()) {
+                if (expr->typeexpr->baseType == Type::tFixedArray) {
                     reportAstChanged();
-                    return new ExprConstInt(expr->at, expr->typeexpr->dim[0]);
+                    return new ExprConstInt(expr->at, expr->typeexpr->fixedDim);
                 } else {
                     error("typeinfo(dim non_array) is prohibited, " + describeType(expr->typeexpr), "", "",
                           expr->at, CompilationError::invalid_typeinfo_dim);
@@ -2063,9 +2261,9 @@ namespace das {
                           expr->at, CompilationError::not_resolved_yet_typeinfo_dim_table);
                     return Visitor::visit(expr);
                 }
-                if (expr->typeexpr->secondType->dim.size()) {
+                if (expr->typeexpr->secondType->baseType == Type::tFixedArray) {
                     reportAstChanged();
-                    return new ExprConstInt(expr->at, expr->typeexpr->secondType->dim[0]);
+                    return new ExprConstInt(expr->at, expr->typeexpr->secondType->fixedDim);
                 } else {
                     error("typeinfo(dim_table_value table<...,non_array>) is prohibited, " + describeType(expr->typeexpr), "", "",
                           expr->at, CompilationError::invalid_typeinfo_dim_table);
@@ -2227,7 +2425,7 @@ namespace das {
             } else if (expr->trait == "is_iterable") {
                 reportAstChanged();
                 bool iterable = false;
-                if (expr->typeexpr->dim.size()) {
+                if (expr->typeexpr->baseType == Type::tFixedArray) {
                     iterable = true;
                 } else if (expr->typeexpr->isGoodIteratorType()) {
                     iterable = true;
@@ -2256,6 +2454,18 @@ namespace das {
             } else if (expr->trait == "is_numeric") {
                 reportAstChanged();
                 return new ExprConstBool(expr->at, expr->typeexpr->isNumeric());
+            } else if (expr->trait == "is_int") {
+                reportAstChanged();
+                return new ExprConstBool(expr->at, expr->typeexpr->baseType == Type::tInt);
+            } else if (expr->trait == "is_int64") {
+                reportAstChanged();
+                return new ExprConstBool(expr->at, expr->typeexpr->baseType == Type::tInt64);
+            } else if (expr->trait == "is_float") {
+                reportAstChanged();
+                return new ExprConstBool(expr->at, expr->typeexpr->baseType == Type::tFloat);
+            } else if (expr->trait == "is_double") {
+                reportAstChanged();
+                return new ExprConstBool(expr->at, expr->typeexpr->baseType == Type::tDouble);
             } else if (expr->trait == "is_numeric_comparable") {
                 reportAstChanged();
                 return new ExprConstBool(expr->at, expr->typeexpr->isNumericComparable());
@@ -2543,11 +2753,31 @@ namespace das {
                               "", "", expr->at, CompilationError::lookup_super_class);
                         return Visitor::visit(expr);
                     }
-                    // Walk up the inheritance chain to the nearest ancestor with a user-defined
-                    // finalizer (mirrors the super() / super.method() walk-ups). For structs, finalize
-                    // substitution via base type matches at the immediate parent even when only an
-                    // ancestor defines `def operator delete`. For classes there's no such substitution,
-                    // so we must skip empty intermediates and cast to the actual finalizer's class.
+                    // Classes chain through the IMMEDIATE parent: `delete cast<Parent>(self)`
+                    // resolves to the parent's user finalizer, or to a generated chain finalizer
+                    // (generateStructureFinalizer) that cleans the parent's own field slice and
+                    // recurses up — so every level's slice is finalized exactly once. We still
+                    // require SOME ancestor user finalizer; otherwise the chain is dead weight.
+                    if (selfStruct->isClass) {
+                        if (!findChainFinalizerAncestor(selfStruct)) {
+                            error("delete super.self in " + func->name + ": no ancestor of " + selfStruct->name + " defines a finalizer",
+                                  "", "", expr->at, CompilationError::lookup_super_finalizer);
+                            return Visitor::visit(expr);
+                        }
+                        reportAstChanged();
+                        auto selfVar = new ExprVar(expr->at, "self");
+                        auto castT = new TypeDecl(baseStruct);
+                        auto castExpr = new ExprCast(expr->at, selfVar, castT);
+                        auto newDel = new ExprDelete(expr->at, castExpr);
+                        newDel->alwaysSafe = true;
+                        newDel->native = expr->native;
+                        if (expr->sizeexpr)
+                            newDel->sizeexpr = expr->sizeexpr->clone();
+                        return newDel;
+                    }
+                    // Structs: walk up to the nearest ancestor with a user-defined finalizer.
+                    // Struct finalize substitution via base type matches at the immediate parent
+                    // even when only an ancestor defines `def operator delete`.
                     while (baseStruct) {
                         auto baseType = new TypeDecl(Type::tStructure);
                         baseType->structType = baseStruct;
@@ -2713,7 +2943,7 @@ namespace das {
                     reportMissingFinalizer("finalizer mismatch ", expr->at, expr->subexpr->type);
                     return Visitor::visit(expr);
                 }
-            } else if (finalizeType->dim.size()) {
+            } else if (finalizeType->baseType == Type::tFixedArray) {
                 reportAstChanged();
                 auto cloneFn = new ExprCall(expr->at, "finalize_dim");
                 cloneFn->arguments.push_back(expr->subexpr->clone());
@@ -2797,13 +3027,16 @@ namespace das {
                   expr->at, CompilationError::cant_ascend);
         } else if (expr->subexpr->type->baseType == Type::tHandle) {
             const auto &subt = expr->subexpr->type;
-            if (!subt->dim.empty()) {
-                error("array of handled type cannot be allocated on the heap: '" + describeType(subt) + "'", "", "",
-                      expr->at, CompilationError::invalid_ascend_array_handle_type);
-            }
             if (!subt->annotation->canNew()) {
                 error("cannot allocate on the heap this handled type at all: '" + describeType(subt) + "'", "", "",
                       expr->at, CompilationError::invalid_ascend_handle_type);
+            }
+        } else if (expr->subexpr->type->baseType == Type::tFixedArray) {
+            const TypeDecl * elemT = expr->subexpr->type;
+            while (elemT->baseType == Type::tFixedArray && elemT->firstType) elemT = elemT->firstType;
+            if (elemT->baseType == Type::tHandle) {
+                error("array of handled type cannot be allocated on the heap: '" + describeType(expr->subexpr->type) + "'", "", "",
+                      expr->at, CompilationError::invalid_ascend_array_handle_type);
             }
         }
         if (expr->ascType) {
@@ -2874,53 +3107,61 @@ namespace das {
         }
         expr->name.clear();
         expr->func = nullptr;
+        // `new Foo[10]` types as the typeexpr's dim chain rewrapped around a
+        // pointer-to-element ('array of pointers', as the old flat dim copy did)
+        TypeDecl * baseT = expr->typeexpr;
+        while (baseT->baseType == Type::tFixedArray && baseT->firstType) baseT = baseT->firstType;
+        auto wrapNewDimChain = [&](TypeDeclPtr pt) -> TypeDeclPtr {
+            if (expr->typeexpr->baseType != Type::tFixedArray) return pt;
+            auto chain = new TypeDecl(*expr->typeexpr);     // deep clone of the chain
+            auto inner = chain;
+            while (inner->firstType && inner->firstType->baseType == Type::tFixedArray) inner = inner->firstType;
+            inner->firstType = pt;                          // replace the element with the pointer
+            return chain;
+        };
         if (expr->typeexpr->ref) {
             error("a reference cannot be allocated on the heap", "", "",
                   expr->at, CompilationError::invalid_new_type);
-        } else if (expr->typeexpr->baseType == Type::tStructure) {
-            if (!expr->initializer && expr->typeexpr->structType->isClass) {
+        } else if (baseT->baseType == Type::tStructure) {
+            if (!expr->initializer && baseT->structType->isClass) {
                 error("invalid syntax for 'new' of class, expected syntax: 'new " + describeType(expr->typeexpr) + "()'", "", "",
                       expr->at, CompilationError::invalid_new_class_syntax);
             }
-            expr->type = new TypeDecl(Type::tPointer);
-            expr->type->firstType = new TypeDecl(*expr->typeexpr);
-            expr->type->firstType->dim.clear();
-            expr->type->dim = expr->typeexpr->dim;
-            expr->name = expr->typeexpr->structType->getMangledName();
-        } else if (expr->typeexpr->baseType == Type::tHandle) {
-            if (expr->typeexpr->annotation->canNew()) {
-                expr->type = new TypeDecl(Type::tPointer);
-                expr->type->firstType = new TypeDecl(*expr->typeexpr);
-                expr->type->firstType->dim.clear();
-                expr->type->dim = expr->typeexpr->dim;
-                expr->type->smartPtr = expr->typeexpr->annotation->isSmart();
-                expr->name = expr->typeexpr->annotation->module->name + "::" + expr->typeexpr->annotation->name;
+            auto pt = new TypeDecl(Type::tPointer);
+            pt->firstType = new TypeDecl(*baseT);
+            expr->type = wrapNewDimChain(pt);
+            expr->name = baseT->structType->getMangledName();
+        } else if (baseT->baseType == Type::tHandle) {
+            if (baseT->annotation->canNew()) {
+                auto pt = new TypeDecl(Type::tPointer);
+                pt->firstType = new TypeDecl(*baseT);
+                pt->smartPtr = baseT->annotation->isSmart();
+                expr->type = wrapNewDimChain(pt);
+                expr->name = baseT->annotation->module->name + "::" + baseT->annotation->name;
             } else {
                 error("cannot allocate this type on the heap: '" + describeType(expr->typeexpr) + "'", "", "",
                       expr->at, CompilationError::invalid_new_type);
             }
-        } else if (expr->typeexpr->baseType == Type::tTuple) {
-            if ( expr->typeexpr->isAutoOrAlias() ) {
+        } else if (baseT->baseType == Type::tTuple) {
+            if ( baseT->isAutoOrAlias() ) {
                 error("new expression cannot be auto or alias type '" + describeType(expr->typeexpr) + "'", "", "",
                       expr->at, CompilationError::invalid_new_type);
                 return Visitor::visit(expr);
             }
-            expr->type = new TypeDecl(Type::tPointer);
-            expr->type->firstType = new TypeDecl(*expr->typeexpr);
-            expr->type->firstType->dim.clear();
-            expr->type->dim = expr->typeexpr->dim;
-            expr->name = expr->typeexpr->getMangledName();
-        } else if (expr->typeexpr->baseType == Type::tVariant) {
-            if ( expr->typeexpr->isAutoOrAlias() ) {
+            auto pt = new TypeDecl(Type::tPointer);
+            pt->firstType = new TypeDecl(*baseT);
+            expr->type = wrapNewDimChain(pt);
+            expr->name = baseT->getMangledName();
+        } else if (baseT->baseType == Type::tVariant) {
+            if ( baseT->isAutoOrAlias() ) {
                 error("new expression cannot be auto or alias type '" + describeType(expr->typeexpr) + "'", "", "",
                       expr->at, CompilationError::invalid_new_type);
                 return Visitor::visit(expr);
             }
-            expr->type = new TypeDecl(Type::tPointer);
-            expr->type->firstType = new TypeDecl(*expr->typeexpr);
-            expr->type->firstType->dim.clear();
-            expr->type->dim = expr->typeexpr->dim;
-            expr->name = expr->typeexpr->getMangledName();
+            auto pt = new TypeDecl(Type::tPointer);
+            pt->firstType = new TypeDecl(*baseT);
+            expr->type = wrapNewDimChain(pt);
+            expr->name = baseT->getMangledName();
         } else {
             error("only tuples, variants, structures or handled types can be allocated on the heap, not '" + describeType(expr->typeexpr) + "'", "", "",
                   expr->at, CompilationError::invalid_new_type);
@@ -2932,22 +3173,26 @@ namespace das {
         if (expr->type && expr->initializer && !expr->name.empty()) {
             auto resultType = new TypeDecl(*expr->type);
             expr->func = inferFunctionCall(expr, InferCallError::functionOrGeneric, nullptr, false);
-            if (!expr->func && expr->typeexpr->baseType == Type::tStructure) {
+            if (!expr->func && baseT->baseType == Type::tStructure) {
                 auto saveName = expr->name;
-                expr->name = "_::" + expr->typeexpr->structType->name;
+                expr->name = "_::" + baseT->structType->name;
                 expr->func = inferFunctionCall(expr, InferCallError::functionOrGeneric, nullptr, false);
                 if (!expr->func)
                     expr->name = saveName;
             }
             swap(resultType, expr->type);
+            // pointer node re-derived from the rooted expr->type AFTER inferFunctionCall -
+            // a raw local held across it can be collected by the AST gc (proven on `new Class()`)
+            TypeDecl * ptrType = expr->type;
+            while (ptrType->baseType == Type::tFixedArray && ptrType->firstType) ptrType = ptrType->firstType;
             if (expr->func) {
-                if (!expr->type->firstType->isSameType(*resultType, RefMatters::yes, ConstMatters::yes, TemporaryMatters::yes)) {
-                    error("initializer returns '" + describeType(resultType) + "' vs '" + describeType(expr->type->firstType) + "'", "", "",
+                if (!ptrType->firstType->isSameType(*resultType, RefMatters::yes, ConstMatters::yes, TemporaryMatters::yes)) {
+                    error("initializer returns '" + describeType(resultType) + "' vs '" + describeType(ptrType->firstType) + "'", "", "",
                           expr->at, CompilationError::invalid_new_initializer_result_type);
                 }
             } else {
-                if (expr->typeexpr->baseType == Type::tStructure &&
-                    !expr->typeexpr->structType->hasAnyInitializers() && expr->arguments.empty()) {
+                if (baseT->baseType == Type::tStructure &&
+                    !baseT->structType->hasAnyInitializers() && expr->arguments.empty()) {
                     expr->initializer = false;
                     reportAstChanged();
                 }
@@ -2955,7 +3200,7 @@ namespace das {
                 if (func) {
                     extraError = "while compiling function " + func->describe();
                 }
-                error("'" + describeType(expr->type->firstType) + "' does not have default initializer", extraError, "",
+                error("'" + describeType(ptrType->firstType) + "' does not have default initializer", extraError, "",
                       expr->at, CompilationError::missing_new_default_initializer);
             }
         }
@@ -3051,14 +3296,24 @@ namespace das {
                 expr->type->constant |= seT->constant;
             }
         } else {
-            if (ixT->isRange() && (seT->isGoodArrayType() || seT->dim.size())) { // a[range(b)] into subset(a,range(b))
+            if (ixT->isRange() && (seT->isGoodArrayType() || seT->baseType==Type::tFixedArray)) { // a[range(b)] into subset(a,range(b))
                 auto subset = new ExprCall(expr->at, "subarray");
                 subset->arguments.push_back(expr->subexpr->clone());
                 subset->arguments.push_back(expr->index->clone());
                 reportAstChanged();
                 return subset;
             }
-            if (!ixT->isIndex()) {
+            if (seT->isGoodArrayType()) {
+                if (!ixT->isIndexExt()) {
+                    expr->type = nullptr;
+                    error("index type must be 'int', 'int64', 'uint', or 'uint64', not '" + describeType(ixT) + "'", "", "",
+                          expr->index->at, CompilationError::invalid_index_type);
+                    return Visitor::visit(expr);
+                }
+                TypeDecl::clone(expr->type, seT->firstType);
+                expr->type->ref = true;
+                expr->type->constant |= seT->constant;
+            } else if (!ixT->isIndex()) {
                 expr->type = nullptr;
                 error("index type must be 'int' or 'uint', not '" + describeType(ixT) + "'", "", "",
                       expr->index->at, CompilationError::invalid_index_type);
@@ -3067,11 +3322,7 @@ namespace das {
                 expr->type = new TypeDecl(seT->getVectorBaseType());
                 expr->type->ref = seT->ref;
                 expr->type->constant = seT->constant;
-            } else if (seT->isGoodArrayType()) {
-                TypeDecl::clone(expr->type, seT->firstType);
-                expr->type->ref = true;
-                expr->type->constant |= seT->constant;
-            } else if (!seT->dim.size()) {
+            } else if (seT->baseType != Type::tFixedArray) {
                 error("type can't be indexed: '" + describeType(seT) + "'", "", "",
                       expr->subexpr->at, CompilationError::cant_index);
                 return Visitor::visit(expr);
@@ -3080,12 +3331,9 @@ namespace das {
                       expr->subexpr->at, CompilationError::not_resolved_yet_array_dimension);
                 return Visitor::visit(expr);
             } else {
-                TypeDecl::clone(expr->type, seT);
+                // peel one level - same element-access pattern as tArray
+                TypeDecl::clone(expr->type, seT->firstType);
                 expr->type->ref = true;
-                expr->type->dim.erase(expr->type->dim.begin());
-                if (!expr->type->dimExpr.empty()) {
-                    expr->type->dimExpr.erase(expr->type->dimExpr.begin());
-                }
                 expr->type->constant |= seT->constant;
             }
         }
@@ -3140,11 +3388,13 @@ namespace das {
                 // }
                 // expr->type = seT->annotation->makeIndexType(expr->subexpr, expr->index);
                 // expr->type->constant |= seT->constant;
-            } else if (seT->isVectorType() || seT->isGoodArrayType() || seT->dim.size()) {
-                // bounded types — int/uint only
-                if (!ixT->isIndex()) {
+            } else if (seT->isVectorType() || seT->isGoodArrayType() || seT->baseType==Type::tFixedArray) {
+                // arrays accept int/int64/uint/uint64; vector and fixed_array — int/uint only
+                if (seT->isGoodArrayType() ? !ixT->isIndexExt() : !ixT->isIndex()) {
                     expr->type = nullptr;
-                    error("index type must be 'int' or 'uint', not '" + describeType(ixT) + "'", "", "",
+                    error(seT->isGoodArrayType()
+                          ? "index type must be 'int', 'int64', 'uint', or 'uint64', not '" + describeType(ixT) + "'"
+                          : "index type must be 'int' or 'uint', not '" + describeType(ixT) + "'", "", "",
                           expr->index->at, CompilationError::invalid_index_type);
                     return Visitor::visit(expr);
                 } else if (seT->isVectorType()) {
@@ -3159,18 +3409,14 @@ namespace das {
                     expr->type = new TypeDecl(Type::tPointer);
                     expr->type->firstType = new TypeDecl(*seT->firstType);
                     expr->type->firstType->constant |= seT->constant;
-                } else if (seT->dim.size()) {
+                } else if (seT->baseType==Type::tFixedArray) {
                     if (!seT->isAutoArrayResolved()) {
                         error("type dimensions are not resolved yet '" + describeType(seT) + "'", "", "",
                               expr->subexpr->at, CompilationError::not_resolved_yet_array_dimension);
                         return Visitor::visit(expr);
                     } else {
                         expr->type = new TypeDecl(Type::tPointer);
-                        expr->type->firstType = new TypeDecl(*seT);
-                        expr->type->firstType->dim.erase(expr->type->firstType->dim.begin());
-                        if (!expr->type->firstType->dimExpr.empty()) {
-                            expr->type->firstType->dimExpr.erase(expr->type->firstType->dimExpr.begin());
-                        }
+                        expr->type->firstType = new TypeDecl(*seT->firstType);
                         expr->type->firstType->constant |= seT->constant;
                     }
                 }
@@ -3195,8 +3441,8 @@ namespace das {
                 error("safe-index of array<> must be inside the 'unsafe' block", "", "",
                       expr->at, CompilationError::unsafe_array_safe_index);
             }
-            if (!ixT->isIndex()) {
-                error("index type must be 'int' or 'uint', not '" + describeType(ixT) + "'", "", "",
+            if (!ixT->isIndexExt()) {
+                error("index type must be 'int', 'int64', 'uint', or 'uint64', not '" + describeType(ixT) + "'", "", "",
                       expr->index->at, CompilationError::invalid_index_type);
                 return Visitor::visit(expr);
             }
@@ -3223,7 +3469,7 @@ namespace das {
             expr->type = new TypeDecl(Type::tPointer);
             expr->type->firstType = new TypeDecl(*seT->secondType);
             expr->type->constant |= seT->constant;
-        } else if (expr->subexpr->type->dim.size()) {
+        } else if (expr->subexpr->type->baseType==Type::tFixedArray) {
             if (!safeExpression(expr)) {
                 error("safe-index of fixed_array<> must be inside the 'unsafe' block", "", "",
                       expr->at, CompilationError::unsafe_fixed_array_safe_index);
@@ -3239,11 +3485,7 @@ namespace das {
                       expr->subexpr->at, CompilationError::not_resolved_yet_array_dimension);
             }
             expr->type = new TypeDecl(Type::tPointer);
-            expr->type->firstType = new TypeDecl(*seT);
-            expr->type->firstType->dim.erase(expr->type->firstType->dim.begin());
-            if (!expr->type->firstType->dimExpr.empty()) {
-                expr->type->firstType->dimExpr.erase(expr->type->firstType->dimExpr.begin());
-            }
+            expr->type->firstType = new TypeDecl(*seT->firstType);
             expr->type->firstType->constant |= seT->constant;
         } else if (expr->subexpr->type->isVectorType() && expr->subexpr->type->isRef()) {
             if (!ixT->isIndex()) {
@@ -3293,6 +3535,7 @@ namespace das {
     }
     void InferTypes::preVisitBlockArgument(ExprBlock *block, const VariablePtr &var, bool lastArg) {
         Visitor::preVisitBlockArgument(block, var, lastArg);
+        checkEmptyName(var->name, "block argument", var->at);
         if (!var->can_shadow && !program->policies.allow_block_variable_shadowing) {
             if (func) {
                 for (auto &fna : func->arguments) {
@@ -3700,6 +3943,7 @@ namespace das {
                             if (!found->init) {
                                 error("bitfield constant '" + expr->name + "' of type " + describeType(alias) + " is not initialized", "", "",
                                       expr->at, CompilationError::missing_bitfield_init);
+                                return Visitor::visit(expr);
                             } else if (!found->init->type || !found->init->type->constant || !found->init->type->isBitfield()) {
                                 error("not a valid bitfield constant " + expr->name + " of type " + describeType(found->type), "", "",
                                       expr->at, CompilationError::invalid_bitfield);
@@ -4030,6 +4274,7 @@ namespace das {
     }
     void InferTypes::preVisit(ExprVar *expr) {
         Visitor::preVisit(expr);
+        checkEmptyName(expr->name, "variable reference", expr->at);
         expr->variable = nullptr;
         expr->local = false;
         expr->block = false;
@@ -4044,7 +4289,7 @@ namespace das {
             if (ita.expr->alias == expr->name) {
                 reportAstChanged();
                 auto csub = ita.expr->subexpr->clone();
-                // forceAt(csub, ita.expr->at);
+                forceAt(csub, expr->at);
                 return csub;
             }
         }
@@ -4150,10 +4395,8 @@ namespace das {
                     error("can't access private variable '" + expr->name + "'", "not visible due to privacy:\n" + errs.str(), "",
                           expr->at, CompilationError::invalid_variable_private);
                 } else {
-                    if (verbose) {
-                        error("can't locate variable '" + expr->name + "'", "", "",
-                          expr->at, CompilationError::lookup_variable);
-                    }
+                    error("can't locate variable '" + expr->name + "'", "", "",
+                      expr->at, CompilationError::lookup_variable);
                 }
             } else {
                 error("can't locate variable '" + expr->name + "'", "", "",
@@ -4172,10 +4415,8 @@ namespace das {
                 error("too many matching variables '" + expr->name + "'", "candidates are:\n" + errs.str(), "",
                       expr->at, CompilationError::ambiguous_variable);
             } else {
-                if (verbose) {
-                    error("too many matching variables '" + expr->name + "'", "", "",
-                      expr->at, CompilationError::ambiguous_variable);
-                }
+                error("too many matching variables '" + expr->name + "'", "", "",
+                  expr->at, CompilationError::ambiguous_variable);
             }
         }
         return Visitor::visit(expr);
@@ -4192,8 +4433,20 @@ namespace das {
             if (scopes[i]->isClosure)
                 break;
         }
-        if (expr->subexpr)
+        if (expr->subexpr) {
             markNoDiscard(expr->subexpr);
+            // unnamed -> named tuple shorthand at return position:
+            // seed the makeTuple's recordType from the enclosing return type
+            // (function->result, or innermost block's declared returnType) so
+            // the regular ExprMakeTuple infer path can promote the literal.
+            if (blocks.empty()) {
+                if (func) seedTupleShorthandFromTargetType(func->result, expr->subexpr);
+            } else {
+                auto block = blocks.back();
+                if (block && block->returnType)
+                    seedTupleShorthandFromTargetType(block->returnType, expr->subexpr);
+            }
+        }
     }
     ExpressionPtr InferTypes::visit(ExprReturn *expr) {
         if (blocks.size()) {
@@ -4342,18 +4595,26 @@ namespace das {
         if (expr->cond)
             markNoDiscard(expr->cond);
         // static_if needs infer-time folding for its condition (e.g. typeinfo && typeinfo),
-        // even when no_infer_time_folding is set
-        if (expr->isStatic && !enableInferTimeFolding) {
-            enableInferTimeFolding = true;
-        }
-    }
-    void InferTypes::preVisitIfBlock(ExprIfThenElse *expr, Expression *) {
-        // restore folding state after visiting the static_if condition
-        if (expr->isStatic && program->policies.no_infer_time_folding) {
-            enableInferTimeFolding = false;
+        // even when folding is currently off (lint policies, source-level
+        // `options infer_time_folding = false`, or any future reason). Save the prior
+        // state so visit(ExprIfThenElse) below can restore it exactly. We can't restore
+        // via preVisitIfBlock / preVisitElseBlock because canVisitIfSubexpr returns
+        // false for static_if (line 4404) — the traversal skips both block hooks and
+        // goes straight from cond->visit to vis.visit(this). visit() is the only hook
+        // guaranteed to fire after the cond, so that's where the restore lives.
+        if (expr->isStatic) {
+            savedFoldingForStaticIf = enableInferTimeFolding;
+            if (!enableInferTimeFolding) {
+                enableInferTimeFolding = true;
+            }
         }
     }
     ExpressionPtr InferTypes::visit(ExprIfThenElse *expr) {
+        // Restore folding state for static_if before any early-return path below.
+        // See the matching preVisit above for why this is the right hook.
+        if (expr->isStatic) {
+            enableInferTimeFolding = savedFoldingForStaticIf;
+        }
         if (!expr->cond->type) {
             return Visitor::visit(expr);
         }
@@ -4594,7 +4855,7 @@ namespace das {
     ExpressionPtr InferTypes::visit(ExprWith *expr) {
         if (auto wT = expr->with->type) {
             StructurePtr pSt = nullptr;
-            if (wT->dim.size()) {
+            if (wT->baseType == Type::tFixedArray) {
                 error("with array in undefined, " + describeType(wT), "", "",
                       expr->at, CompilationError::invalid_with_array_type);
             } else if (wT->isStructure()) {
@@ -4686,13 +4947,10 @@ namespace das {
             pVar->name = expr->iterators[idx];
             pVar->aka = expr->iteratorsAka[idx];
             pVar->at = expr->iteratorsAt[idx];
-            if (src->type->dim.size()) {
-                pVar->type = new TypeDecl(*src->type);
+            if (src->type->baseType==Type::tFixedArray) {
+                pVar->type = new TypeDecl(*src->type->firstType);
                 pVar->type->ref = true;
-                pVar->type->dim.erase(pVar->type->dim.begin());
-                if (!pVar->type->dimExpr.empty()) {
-                    pVar->type->dimExpr.erase(pVar->type->dimExpr.begin());
-                }
+                pVar->type->constant |= src->type->constant;
             } else if (src->type->isGoodIteratorType()) {
                 if (src->type->isConst()) {
                     error("can't iterate over const iterator", "", "",
@@ -4758,7 +5016,7 @@ namespace das {
             }
             local.push_back(pVar);
             expr->iteratorVariables.push_back(pVar);
-            if (expr->iteratorsTupleExpansion.size() > idx && expr->iteratorsTupleExpansion[idx]) {
+            if (int64_t(expr->iteratorsTupleExpansion.size()) > idx && expr->iteratorsTupleExpansion[idx]) {
                 if (pVar->type && !pVar->type->isTuple()) {
                     error("for loop iterator variable " + pVar->name + " is not a tuple", "", "",
                           expr->at, CompilationError::invalid_for_iterator_tuple);
@@ -4788,7 +5046,7 @@ namespace das {
         }
         // now, for the one where we did not find anything
         if (that->type) {
-            if (!that->type->dim.size() &&
+            if (that->type->baseType != Type::tFixedArray &&
                 !that->type->isGoodIteratorType() &&
                 !that->type->isGoodArrayType() &&
                 !that->type->isRange() &&
@@ -4876,6 +5134,7 @@ namespace das {
     }
     void InferTypes::preVisitLet(ExprLet *expr, const VariablePtr &var, bool last) {
         Visitor::preVisitLet(expr, var, last);
+        checkEmptyName(var->name, "variable declaration", var->at);
         var->single_return_via_move = false;
         var->consumed = false;
         if (var->type && var->type->isExprType()) {
@@ -4935,6 +5194,10 @@ namespace das {
             local.push_back(var);
         }
     }
+    void InferTypes::preVisitLetInit(ExprLet *expr, const VariablePtr &var, Expression *init) {
+        Visitor::preVisitLetInit(expr, var, init);
+        seedTupleShorthandFromTargetType(var->type, init);
+    }
     VariablePtr InferTypes::visitLet(ExprLet *expr, const VariablePtr &var, bool last) {
         if (var->type && var->type->isExprType()) {
             return Visitor::visitLet(expr, var, last);
@@ -4945,8 +5208,22 @@ namespace das {
         if (var->type->ref && !var->init)
             error("local reference has to be initialized", "", "",
                   var->at, CompilationError::missing_local_reference_init);
-        if (var->type->ref && var->init && !(var->init->alwaysSafe || isLocalOrGlobal(var->init)) && !safeExpression(expr) && !(var->init->type && var->init->type->temporary)) {
-            if (program->policies.local_ref_is_unsafe) {
+        // A reference can only bind to addressable storage. Split the non-local case in two:
+        //  - a freshly-materialized temporary - a *value* (type->ref==false) that is not a cast/view:
+        //    a make-local literal, or a value-returning call. It needs its own temp-stack slot and has
+        //    no storage to point at, so the reference would dangle. Never valid: a hard error,
+        //    regardless of `unsafe`. (`[1]` etc. is lowered to a value-returning call by this point, so
+        //    rtti_isMakeLocal no longer holds - hence the type->ref + !rtti_isCast test.)
+        //  - an addressable non-local - a deref, or an upcast/reinterpret view of real storage: merely
+        //    unsafe (the existing policy-gated diagnostic).
+        if (var->type->ref && var->init && !(var->init->alwaysSafe || isLocalOrGlobal(var->init))
+                && var->init->type && !var->init->type->temporary) {
+            if (!var->init->type->ref && !var->init->rtti_isCast()) {
+                error("local reference to a temporary value is not allowed",
+                      "a reference must bind to addressable storage (a variable, a field, or a function "
+                      "returning a reference); a freshly-built temporary has none", "",
+                      var->at, CompilationError::unsafe_local_reference);
+            } else if (!safeExpression(expr) && program->policies.local_ref_is_unsafe) {
                 error("local reference to non-local expression is unsafe", "", "",
                       var->at, CompilationError::unsafe_local_reference);
             }
@@ -5105,7 +5382,17 @@ namespace das {
                 var->type->sanitize();
                 reportAstChanged();
             }
-        } else if (!canCopyOrMoveType(var->type, var->init->type, TemporaryMatters::no, var->init,
+        } else {
+            bool rangeError = false;
+            if (auto promoted = tryPromoteConstInt(var->init, var->type, rangeError)) {
+                reportAstChanged();
+                var->init = promoted;
+                return Visitor::visitLetInit(expr, var, var->init);
+            }
+            if (rangeError) {
+                return Visitor::visitLetInit(expr, var, init);
+            }
+            if (!canCopyOrMoveType(var->type, var->init->type, TemporaryMatters::no, var->init,
                                       "local variable " + var->name + " initialization type mismatch", CompilationError::invalid_initialization_type, var->at)) {
         } else if (var->type->ref && !var->init->type->isRef()) {
             error("local variable " + var->name + " initialization type mismatch. reference can't be initialized via value, " + describeType(var->type) + " = " + describeType(var->init->type), "", "",
@@ -5156,6 +5443,7 @@ namespace das {
                     return promoteToCloneToMove(var);
                 }
             }
+        }
         }
         return Visitor::visitLetInit(expr, var, init);
     }
@@ -5266,6 +5554,7 @@ namespace das {
     void InferTypes::preVisit(ExprNamedCall *call) {
         callDepth++;
         Visitor::preVisit(call);
+        checkEmptyName(call->name, "named call", call->at);
         call->argumentsFailedToInfer = false;
         if (((call->arguments ? call->arguments->size() : 0) > DAS_MAX_FUNCTION_ARGUMENTS) || (call->nonNamedArguments.size() > DAS_MAX_FUNCTION_ARGUMENTS)) {
             error("too many arguments in " + call->name + ", max allowed is DAS_MAX_FUNCTION_ARGUMENTS=" DAS_STR(DAS_MAX_FUNCTION_ARGUMENTS), "", "",
@@ -5398,6 +5687,7 @@ namespace das {
     void InferTypes::preVisit(ExprCall *call) {
         callDepth++;
         Visitor::preVisit(call);
+        checkEmptyName(call->name, "function call", call->at);
         call->argumentsFailedToInfer = false;
         if (call->arguments.size() > DAS_MAX_FUNCTION_ARGUMENTS) {
             error("too many arguments in " + call->name + ", max allowed is DAS_MAX_FUNCTION_ARGUMENTS=" DAS_STR(DAS_MAX_FUNCTION_ARGUMENTS), "", "",
@@ -5408,7 +5698,19 @@ namespace das {
                   "use let _ = " + call->name + "(...)", "",
                   call->at, CompilationError::invalid_function_result_discarded);
         }
-        // super() constructor rewrite is done in visit(ExprCall*), once argument types are inferred
+        // Array/table literal: `[..]` / `array<T>(..)` parse to to_array_move(ExprMakeArray), and
+        // `{..}` table literals to to_table_move(ExprMakeArray of tuples). Flag the gen2 make_array
+        // (here, in preVisit, BEFORE the child is type-inferred) so it builds a heap `array<T>`
+        // directly instead of a stack `T[N]` that to_array_move/to_table_move then copies. The
+        // type carries the decision: to_array_move/to_table_move resolve their `array<T>` overload
+        // at compile time (no runtime check). Only the gen2 literal shape is flagged.
+        if ((call->name == "to_array_move" || call->name == "to_table_move")
+                && call->arguments.size() == 1 && call->arguments[0]->rtti_isMakeArray()) {
+            auto mka = static_cast<ExprMakeArray*>(call->arguments[0]);
+            if (mka->gen2 && !noHeapArrayLiterals) {
+                mka->makeArrayOnHeap = true;
+            }
+        }
     }
     void InferTypes::preVisitCallArg(ExprCall *call, Expression *arg, bool last) {
         Visitor::preVisitCallArg(call, arg, last);
@@ -5441,6 +5743,9 @@ namespace das {
         // Walks up the inheritance chain looking for a parent class constructor that matches the
         // argument types; this lets `super(...)` call the closest ancestor's constructor when an
         // intermediate class doesn't define its own (mirrors super.method() / delete super.self).
+        // The walk-up may only step past a class with NO user ctor — silently skipping a class
+        // whose user ctor establishes invariants is rejected (use the right `super(args)` shape
+        // to call the immediate parent).
         if (func && func->isClassMethod && func->classParent && expr->name == "super") {
             if (auto baseClass = func->classParent->parent) {
                 vector<TypeDeclPtr> argumentTypes;
@@ -5463,6 +5768,14 @@ namespace das {
                         error("too many candidates for super constructor " + candidateName,
                               verbose ? program->describeCandidates(matching) : "", "",
                               expr->at, CompilationError::ambiguous_super_constructor);
+                        return Visitor::visit(expr);
+                    }
+                    // No matching ctor here. Before walking past, check: does this baseClass
+                    // have ANY user-defined ctor? If yes, we'd silently skip its invariants — reject.
+                    if (classHasUserNamedFunction(program, baseClass, baseClass->name)) {
+                        error("call to super in " + func->name + " cannot skip " + baseClass->name
+                                + " which has its own constructor — adjust super(...) args to match " + baseClass->name,
+                              "", "", expr->at, CompilationError::invalid_super_call);
                         return Visitor::visit(expr);
                     }
                     baseClass = baseClass->parent;
@@ -5542,7 +5855,7 @@ namespace das {
         }
         if (!expr->func) {
             auto var = findMatchingBlockOrLambdaVariable(expr->name); // if this is lambda_var(args...) or such
-            if (var && var->type && var->type->dim.size() == 0) {     // we promote to vname(args...) to invoke(vname,args...)
+            if (var && var->type) {     // we promote to vname(args...) to invoke(vname,args...)
                 auto bt = var->type->baseType;
                 if (bt == Type::tBlock || bt == Type::tLambda || bt == Type::tFunction) {
                     reportAstChanged();
@@ -5562,7 +5875,7 @@ namespace das {
                 if (expr->name.find("::") == string::npos) { // we only promote to Struct`call() or self->call() if its not blah::call, _::call, or __::call
                     auto memFn = bt->structType->findField(expr->name);
                     if (memFn && memFn->type) {
-                        if (memFn->type->dim.size() == 0 && (memFn->type->baseType == Type::tBlock || memFn->type->baseType == Type::tLambda || memFn->type->baseType == Type::tFunction)) {
+                        if (memFn->type->baseType == Type::tBlock || memFn->type->baseType == Type::tLambda || memFn->type->baseType == Type::tFunction) {
                             reportAstChanged();
                             if (memFn->classMethod) {
                                 auto self = new ExprVar(expr->at, "self");
@@ -5613,9 +5926,8 @@ namespace das {
                                 return newCall;
                             }
                         }
-                        // note: gc will collect, but why waste memory
-                        newCall->gc_unlink(); delete newCall;
-                        self->gc_unlink(); delete self;
+                        // newCall + self are orphaned here; the gc_guard sweep reclaims them
+                        // (per-pass GC replaces the old manual gc_unlink+delete).
                     }
                 }
             }
@@ -5709,14 +6021,16 @@ namespace das {
 
     // try infer, if failed - no macros
     // run macros til any of them does work, then reinfer and restart (i.e. infer after each macro)
-    void Program::inferTypes(TextWriter &logs, ModuleGroup &libGroup) {
-        newLambdaIndex = 1;
-        inferTypesDirty(logs, false);
+    void inferTypes(Program * program, TextWriter &logs, ModuleGroup &libGroup) {
+        program->newLambdaIndex = 1;
+        // inferPassesUsed is NOT reset here — parseDaScript resets it once per module
+        // before the restartInfer: loop, so multiple inferTypes legs accumulate properly.
+        inferTypesDirty(program, logs, false);
         bool anyMacrosDidWork = false;
         bool anyMacrosFailedToInfer = false;
         int pass = 0;
-        int32_t maxInferPasses = options.getIntOption("max_infer_passes", policies.max_infer_passes);
-        if (failed())
+        int32_t maxInferPasses = program->options.getIntOption("max_infer_passes", program->policies.max_infer_passes);
+        if (program->failed())
             goto failed_to_infer;
         do {
             if (pass++ >= maxInferPasses)
@@ -5724,19 +6038,19 @@ namespace das {
             anyMacrosDidWork = false;
             anyMacrosFailedToInfer = false;
             auto modMacro = [&](Module *mod) -> bool { // we run all macros for each module
-                if (thisModule->isVisibleDirectly(mod) && mod != thisModule.get()) {
+                if (program->thisModule->isVisibleDirectly(mod) && mod != program->thisModule.get()) {
                     for (const auto &pm : mod->macros) {
-                        bool anyWork = pm->apply(this, thisModule.get());
-                        if (failed()) { // if macro failed, we report it, and we are done
-                            error("macro '" + mod->name + "::" + pm->name + "' failed", "", "", LineInfo(), CompilationError::runtime_macro);
+                        bool anyWork = pm->apply(program, program->thisModule.get());
+                        if (program->failed()) { // if macro failed, we report it, and we are done
+                            program->error("macro '" + mod->name + "::" + pm->name + "' failed", "", "", LineInfo(), CompilationError::runtime_macro);
                             return false;
                         }
                         if (anyWork) { // if macro did anything, we done
-                            reportingInferErrors = true;
-                            inferTypesDirty(logs, true);
-                            reportingInferErrors = false;
-                            if (failed()) { // if it failed to infer types after, we report it
-                                error("macro '" + mod->name + "::" + pm->name + "' failed to infer", "", "", LineInfo(), CompilationError::runtime_macro_infer);
+                            program->reportingInferErrors = true;
+                            inferTypesDirty(program, logs, true);
+                            program->reportingInferErrors = false;
+                            if (program->failed()) { // if it failed to infer types after, we report it
+                                program->error("macro '" + mod->name + "::" + pm->name + "' failed to infer", "", "", LineInfo(), CompilationError::runtime_macro_infer);
                                 anyMacrosFailedToInfer = true;
                                 return false;
                             }
@@ -5748,67 +6062,115 @@ namespace das {
                 return true;
             };
             Module::foreach (modMacro);
-            if (failed())
+            if (program->failed())
                 break;
             if (anyMacrosDidWork)
                 continue;
-            if (relocatePotentiallyUninitialized(logs)) {
+            if (program->relocatePotentiallyUninitialized(logs)) {
                 anyMacrosDidWork = true;
-                reportingInferErrors = true;
-                inferTypesDirty(logs, true);
-                reportingInferErrors = false;
-                if (failed()) {
-                    error("internal compiler error: variable relocation infer to fail", "", "", LineInfo(), CompilationError::internal_relocate_infer);
+                program->reportingInferErrors = true;
+                inferTypesDirty(program, logs, true);
+                program->reportingInferErrors = false;
+                if (program->failed()) {
+                    program->error("internal compiler error: variable relocation infer to fail", "", "", LineInfo(), CompilationError::internal_relocate_infer);
                 }
                 continue;
             }
             libGroup.foreach (modMacro, "*");
-            if (inScopePodAnalysis(logs)) {
+            if (program->inScopePodAnalysis(logs)) {
                 anyMacrosDidWork = true;
-                reportingInferErrors = true;
-                inferTypesDirty(logs, true);
-                reportingInferErrors = false;
-                if (failed()) {
-                    error("internal compiler error: pod analysis infer to fail", "", "", LineInfo(), CompilationError::internal_pod_analysis_infer);
+                program->reportingInferErrors = true;
+                inferTypesDirty(program, logs, true);
+                program->reportingInferErrors = false;
+                if (program->failed()) {
+                    program->error("internal compiler error: pod analysis infer to fail", "", "", LineInfo(), CompilationError::internal_pod_analysis_infer);
                 }
                 continue;
             }
-        } while (!failed() && anyMacrosDidWork);
+            program->escapeAnalysis(logs);   // pure analysis: annotate Variable::does_not_escape (idempotent, no AST change)
+            if (program->scopeFreeOptimization(logs)) {
+                anyMacrosDidWork = true;
+                program->reportingInferErrors = true;
+                inferTypesDirty(program, logs, true);
+                program->reportingInferErrors = false;
+                if (program->failed()) {
+                    program->error("internal compiler error: escape free optimization infer to fail", "", "", LineInfo(), CompilationError::internal_pod_analysis_infer);
+                }
+                continue;
+            }
+        } while (!program->failed() && anyMacrosDidWork);
     failed_to_infer:;
-        if (failed() && !anyMacrosFailedToInfer && !macroException) {
-            reportingInferErrors = true;
-            inferTypesDirty(logs, true);
-            reportingInferErrors = false;
+        if (program->failed() && !anyMacrosFailedToInfer && !program->macroException) {
+            program->reportingInferErrors = true;
+            inferTypesDirty(program, logs, true);
+            program->reportingInferErrors = false;
         }
         if (pass >= maxInferPasses) {
-            error("type inference exceeded maximum allowed number of passes (" + to_string(maxInferPasses) + ")\n"
+            program->error("type inference exceeded maximum allowed number of passes (" + to_string(maxInferPasses) + ")\n"
                                                                                                              "this is likely due to a macro continuously being applied",
                   "", "",
                   LineInfo(), CompilationError::exceeds_infer_passes);
         }
     }
 
-    void Program::inferTypesDirty(TextWriter &logs, bool verbose) {
+    void inferTypesDirty(Program * program, TextWriter &logs, bool verbose) {
         int pass = 0;
-        int32_t maxInferPasses = options.getIntOption("max_infer_passes", policies.max_infer_passes);
-        bool logInferPasses = options.getBoolOption("log_infer_passes", false);
+        int32_t maxInferPasses = program->options.getIntOption("max_infer_passes", program->policies.max_infer_passes);
+        bool logInferPasses = program->options.getBoolOption("log_infer_passes", false);
         if (logInferPasses) {
             logs << "INITIAL CODE:\n"
-                 << *this;
+                 << *program;
         }
+        // Per-pass collect+swap: infer mints a lot of throwaway TypeDecls/Expressions. When a
+        // pass grows the working root enough, collect the live tree into a fresh root and swap
+        // it in (O(1)); the old root's dtor sweeps that pass's garbage. Fire when growth since
+        // the last collect crosses a node threshold (~2 MB) OR a fraction of the live set.
+        bool gcInferCollect = program->options.getBoolOption("gc_infer_collect", program->policies.gc_infer_collect);
+        int32_t gcInferNodes = program->options.getIntOption("gc_infer_collect_nodes", program->policies.gc_infer_collect_nodes);
+        int32_t gcInferPct = program->options.getIntOption("gc_infer_collect_pct", program->policies.gc_infer_collect_pct);
+        bool gcInferLog = program->options.getBoolOption("log_gc_infer_collect", false);
+        uint64_t gcLastCount = gc_root::gc_get_active_root()->gc_count;
+        // Collect the module's working root into a fresh root and swap it in (O(1)); the old
+        // root's dtor sweeps the garbage. Returns the live count. No-op outside the normal
+        // compile flow (the active root must BE the module's root) so tool/macro re-infer is safe.
+        auto gcCollectAndSwap = [&]() -> uint64_t {
+            gc_root * cur = gc_root::gc_get_active_root();
+            if ( cur != program->thisModule->module_gc_root.get() ) return gcLastCount;
+            auto fresh = make_unique<gc_root>();
+            program->thisModule->gc_collect(cur, fresh.get());        // live cur -> fresh (fresh target: full walk, no early-out)
+            gc_root * live = fresh.get();
+            gc_root::gc_get_active_root() = live;
+            program->thisModule->module_gc_root = das::move(fresh);   // deletes cur -> sweeps the garbage
+            return live->gc_count;
+        };
         for (pass = 0; pass < maxInferPasses; ++pass) {
-            if (macroException)
+            if ( gcInferCollect && pass > 0 ) {
+                uint64_t curCount = gc_root::gc_get_active_root()->gc_count;
+                uint64_t grown = curCount >= gcLastCount ? curCount - gcLastCount : 0;
+                bool fire = grown >= uint64_t(gcInferNodes)
+                         || ( gcLastCount && grown * 100 >= gcLastCount * uint64_t(gcInferPct) );
+                if ( gcInferLog ) {
+                    logs << "[gc-infer] " << program->thisModule->name << " pass " << pass
+                         << " live=" << curCount << " grown=" << grown
+                         << " (" << (gcLastCount ? grown * 100 / gcLastCount : 0) << "%)"
+                         << (fire ? " -> COLLECT" : "") << "\n";
+                }
+                if ( fire )
+                    gcLastCount = gcCollectAndSwap();
+            }
+            if (program->macroException)
                 break;
-            failToCompile = false;
-            errors.clear();
-            InferTypes context(this, &logs);
+            program->inferPassesUsed++;   // count each body invocation; avoids undercount when loop breaks early (pass is 0-based)
+            program->failToCompile = false;
+            program->errors.clear();
+            InferTypes context(program, &logs);
             context.verbose = verbose || logInferPasses;
-            visit(context);
+            program->visit(context);
             for (auto efn : context.extraFunctions) {
-                addFunction(efn);
+                program->addFunction(efn);
             }
             vector<tuple<Function *, uint64_t, uint64_t>> refreshFunctions;
-            thisModule->functions.foreach_with_hash([&](auto fn, uint64_t hash) {
+            program->thisModule->functions.foreach_with_hash([&](auto fn, uint64_t hash) {
                 auto mnh = fn->getMangledNameHash();
                 if ( hash != mnh ) {
                     refreshFunctions.emplace_back(make_tuple(fn, hash, mnh));
@@ -5816,28 +6178,28 @@ namespace das {
                     fn->notInferred();
                 } });
             for (auto rfn : refreshFunctions) {
-                if (!thisModule->functions.refresh_key(get<1>(rfn), get<2>(rfn))) {
-                    error("internal compiler error: failed to refresh '" + get<0>(rfn)->getMangledName() + "'", "", "", get<0>(rfn)->at, CompilationError::internal_function_refresh);
+                if (!program->thisModule->functions.refresh_key(get<1>(rfn), get<2>(rfn))) {
+                    program->error("internal compiler error: failed to refresh '" + get<0>(rfn)->getMangledName() + "'", "", "", get<0>(rfn)->at, CompilationError::internal_function_refresh);
                     goto failedIt;
                 }
             }
             bool anyMacrosDidWork = false;
             auto modMacro = [&](Module *mod) -> bool {
-                if (thisModule->isVisibleDirectly(mod) && mod != thisModule.get()) {
+                if (program->thisModule->isVisibleDirectly(mod) && mod != program->thisModule.get()) {
                     for (const auto &pm : mod->inferMacros) {
-                        anyMacrosDidWork |= pm->apply(this, thisModule.get());
+                        anyMacrosDidWork |= pm->apply(program, program->thisModule.get());
                     }
                 }
                 return true;
             };
             Module::foreach (modMacro);
-            library.foreach (modMacro, "*");
-            inferLint(logs);
+            program->library.foreach (modMacro, "*");
+            program->inferLint(logs);
             if (logInferPasses) {
                 logs << "PASS " << pass << ":\n"
-                     << *this;
-                sort(errors.begin(), errors.end());
-                for (auto &err : errors) {
+                     << *program;
+                sort(program->errors.begin(), program->errors.end());
+                for (auto &err : program->errors) {
                     logs << reportError(err.at, err.what, err.extra, err.fixme, err.cerr);
                 }
             }
@@ -5848,10 +6210,15 @@ namespace das {
         }
     failedIt:;
         if (pass == maxInferPasses) {
-            error("type inference exceeded maximum allowed number of passes (" + to_string(maxInferPasses) + ")\n"
+            program->error("type inference exceeded maximum allowed number of passes (" + to_string(maxInferPasses) + ")\n"
                                                                                                              "this is likely due to a loop in the type system",
                   "", "",
                   LineInfo(), CompilationError::exceeds_infer_passes);
         }
+        // End-of-leg collect: sweep this leg's accumulated garbage so the next inferTypes
+        // leg (macro restart / restartInfer) inherits only live nodes, not a compounding
+        // garbage pile. This is the lever that pulls the peak below one leg's worth.
+        if ( gcInferCollect )
+            gcCollectAndSwap();
     }
 }

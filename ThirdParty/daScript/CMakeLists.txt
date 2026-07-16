@@ -1,5 +1,11 @@
 cmake_minimum_required (VERSION 3.17)
-project (DAS VERSION 0.6.2)
+project (DAS VERSION 0.6.3)
+
+# Set build type to Debug by default. If not set it will break
+# dependencies for modules.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
+endif()
 # enable_testing() must live at the top-level scope of the top-level
 # CMakeLists.txt for `ninja test` / ctest to work from the build root.
 # The actual add_test() calls live under tests-cpp/.
@@ -13,10 +19,16 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 #set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Emit build/compile_commands.json (per-TU compiler flags). Honored by the
+# Ninja and Makefile generators; the Visual Studio generator ignores it (use a
+# side Ninja dir on Windows). Powers the MCP cpp_compile_check / cpp_build_info
+# tools (utils/mcp/tools/cpp_compile_check.das).
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 option(DAS_FLEX_BISON_DISABLED "Disable FLEX/BISON stage" OFF)
 option(DAS_CLANG_BIND_DISABLED "Disable dasClangBind (libclang bindings, C/C++ parsing)" ON)
 option(DAS_LLVM_DISABLED "Disable dasLLVM (llvm bindings)" ON)
-option(DAS_HV_DISABLED "Disable dasHV (websokets,http server and client)" ON)
+option(DAS_HV_DISABLED "Disable dasHV (websokets,http server and client)" OFF)
 option(DAS_GLFW_DISABLED "Disable dasGLFW (GLFW window for graphics apps)" OFF)
 option(DAS_AUDIO_DISABLED "Disable dasAudio (Miniaudio sound library)" OFF)
 option(DAS_STDDLG_DISABLED "Disable dasStdDlg (File new,open,save etc dialogs)" OFF)
@@ -68,6 +80,27 @@ set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 
 set(EXECUTABLE_OUTPUT_PATH  ${PROJECT_SOURCE_DIR}/bin/)
 
+# Disable vcpkg's per-target applocal deploy project-wide.
+#
+# When built through the vcpkg toolchain on Windows, VCPKG_APPLOCAL_DEPS
+# defaults to ON, which appends a POST_BUILD "vcpkg z-applocal" step to every
+# executable / shared library. Since all of our binaries emit into the single
+# shared bin/, that means dozens of targets (the ~40 integration tutorials, the
+# test exes, the modules) each concurrently re-copy the same runtime DLLs into
+# bin/. Under Ninja's parallel link those copies collide on Windows with
+# "The process cannot access the file because it is being used by another
+# process" — a flaky build failure (observed on win32 Release).
+#
+# That deploy is pure redundant work for this project: our own DLLs
+# (libDaScriptDyn*.dll, ...) build directly into bin/, and every module that
+# needs a third-party DLL deploys it itself with an idempotent, single-target
+# copy_if_different (openssl via dasHV, glfw3.dll via dasGlfw). openssl is the
+# only vcpkg-installed package in any workflow, and it is covered by dasHV — so
+# nothing relies on vcpkg's applocal pass. Turning it off removes the race for
+# all targets and loses no deployed dependency. No-op on non-Windows / non-vcpkg
+# builds, where the variable is unused.
+set(VCPKG_APPLOCAL_DEPS OFF)
+
 SET(LINUX_UUID FALSE)
 
 IF(NOT DAS_FLEX_BISON_DISABLED)
@@ -114,9 +147,17 @@ find_package(Threads REQUIRED)
 FILE(GLOB DAS_AOT_DASLIB_DEPENDS CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/daslib/*.das")
 
 MACRO(DAS_AOT_EXT input_files genList mainTarget dasAotTool dasAotToolArg)
-    set(all_depends ${dasAotTool} ${PROJECT_SOURCE_DIR}/utils/aot/main.das ${DAS_AOT_DASLIB_DEPENDS})
+    # DAS_AOT_EXTRA_DEPENDS lets a caller add inputs (e.g. the entry file's own
+    # require graph) that this macro can't discover; empty for normal callers.
+    set(all_depends ${dasAotTool} ${PROJECT_SOURCE_DIR}/utils/aot/main.das ${DAS_AOT_DASLIB_DEPENDS} ${DAS_AOT_EXTRA_DEPENDS})
     set(all_outputs "")
-    set(command_args "")
+    # Per-batch arg buffer; chunked to keep each invocation under Windows'
+    # 32K command-line limit when worktree paths are long.
+    set(_DAS_AOT_BATCH_SIZE 60)
+    set(_batches "")
+    set(_batch_idx 0)
+    set(_batch_count 0)
+    set(_current_batch "")
     list(LENGTH input_files num_files)
 
     foreach(input ${input_files})
@@ -140,18 +181,36 @@ MACRO(DAS_AOT_EXT input_files genList mainTarget dasAotTool dasAotToolArg)
         list(APPEND all_outputs ${out_src})
         list(APPEND ${genList} ${out_src})
 
-        # Build command arguments: tool_arg input1 output1 tool_arg input2 output2 ...
-        list(APPEND command_args ${dasAotToolArg} ${input_src} ${out_arg})
+        # Build command arguments for the current batch
+        list(APPEND _current_batch ${dasAotToolArg} ${input_src} ${out_arg})
 
         file(MAKE_DIRECTORY ${out_dir})
         set_source_files_properties(${out_src} PROPERTIES GENERATED TRUE)
+
+        math(EXPR _batch_count "${_batch_count} + 1")
+        if(_batch_count GREATER_EQUAL ${_DAS_AOT_BATCH_SIZE})
+            set(_batches_${_batch_idx} "${_current_batch}")
+            list(APPEND _batches ${_batch_idx})
+            math(EXPR _batch_idx "${_batch_idx} + 1")
+            set(_current_batch "")
+            set(_batch_count 0)
+        endif()
+    endforeach()
+    if(_batch_count GREATER 0)
+        set(_batches_${_batch_idx} "${_current_batch}")
+        list(APPEND _batches ${_batch_idx})
+    endif()
+
+    set(_commands "")
+    foreach(i ${_batches})
+        list(APPEND _commands COMMAND ${dasAotTool} ${PROJECT_SOURCE_DIR}/utils/aot/main.das -- ${_batches_${i}} ${CROSS_PLATFORM})
     endforeach()
 
     ADD_CUSTOM_COMMAND(
         OUTPUT  ${all_outputs}
         DEPENDS ${all_depends}
         COMMENT "AOT compiling files..."
-        COMMAND ${dasAotTool} ${PROJECT_SOURCE_DIR}/utils/aot/main.das -- ${command_args} ${CROSS_PLATFORM}
+        ${_commands}
     )
     set(custom_name ${mainTarget}_genaot)
     ADD_CUSTOM_TARGET(${custom_name} DEPENDS ${all_outputs})
@@ -282,22 +341,43 @@ ENDIF()
 
 # All shared libraries should pass through this macro.
 # It sets required properties for shared libraries.
+# Mingw's ADD_LIBRARY auto-prepends "lib" to the output filename. When the
+# target name already starts with "lib" (libDaScript / libDaScriptDyn /
+# libDasModuleX), this produces ugly double-lib names like liblibDaScript.a
+# or liblibDaScriptDyn.dll on disk. Strip the auto-prefix so output names
+# match MSVC convention. Only fires on Windows-non-MSVC: Linux/macOS keep
+# their conventional `lib` prefix (which they need to be linkable as -lname).
+MACRO(STRIP_DOUBLE_LIB_PREFIX_ON_MINGW lib)
+    IF(WIN32 AND NOT MSVC AND "${lib}" MATCHES "^lib")
+        SET_TARGET_PROPERTIES(${lib} PROPERTIES PREFIX "" IMPORT_PREFIX "")
+    ENDIF()
+ENDMACRO()
+
 MACRO(SETUP_DAS_SHARED_LIBRARY lib)
     ADD_LIBRARY(${lib} SHARED ${ARGN})
     SETUP_LIB_DEFINITIONS(${lib})
-    if(WIN32)
+    SET_TARGET_PROPERTIES(${lib} PROPERTIES
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
+    )
+    SETUP_LTO(${lib})
+    STRIP_DOUBLE_LIB_PREFIX_ON_MINGW(${lib})
+    if(MSVC)
         # We export a lot of structures, some of them has not exported internals.
         # Instead of marking everything as exported let's disable
         # warning and refactor our public API in future.
+        # MSVC-frontend gate (not WIN32) — clang-mingw doesn't understand /wd flags.
         TARGET_COMPILE_OPTIONS(${lib} PUBLIC /wd4251 /wd4661 /wd4275)
     else()
         SET_TARGET_PROPERTIES(${lib} PROPERTIES POSITION_INDEPENDENT_CODE ON)
     endif()
+    TARGET_COMPILE_DEFINITIONS(${lib} PUBLIC DAS_ENABLE_DLL=1)
 ENDMACRO()
 
 MACRO(ADD_DAS_STATIC_LIBRARY lib)
     ADD_LIBRARY(${lib} STATIC ${ARGN})
     SETUP_LIB_DEFINITIONS(${lib})
+    STRIP_DOUBLE_LIB_PREFIX_ON_MINGW(${lib})
 ENDMACRO()
 
 
@@ -329,6 +409,7 @@ FILE(GLOB _modules RELATIVE "${PROJECT_SOURCE_DIR}/modules" CONFIGURE_DEPENDS "m
 MACRO(ADD_DAS_SHARED_MODULE_LIB module_name)
     MESSAGE("REGISTER DAS SHARED MODULE ${module_name}")
     SETUP_DAS_SHARED_LIBRARY(${module_name} ${ARGN})
+    DAS_APPLY_STRICT_WARNINGS(${module_name})
 
     # extract from modules/dasLLVM -> dasLLVM
     SET(SHARED_OUTPUT_PATH "${CMAKE_CURRENT_LIST_DIR}/")
@@ -382,7 +463,7 @@ MACRO(ADD_DAS_SHARED_MODULE_LIB module_name)
             DESTINATION ${DAS_INSTALL_MODULESDIR}/${FOLDER_NAME}
         )
     ENDIF()
-    TARGET_COMPILE_DEFINITIONS(${module_name} PRIVATE DAS_MOD_EXPORTS DAS_ENABLE_DLL=1)
+    TARGET_COMPILE_DEFINITIONS(${module_name} PRIVATE DAS_MOD_EXPORTS)
     TARGET_LINK_LIBRARIES(${module_name} PUBLIC libDaScriptDyn)
     ADD_DEPENDENCIES(${module_name} libDaScriptDyn)
     # Each shared module needs its own copy of the global new/delete overrides:
@@ -398,6 +479,7 @@ ENDMACRO()
 MACRO(ADD_DAS_STATIC_MODULE_LIB lib)
     MESSAGE("REGISTER DAS STATIC MODULE ${lib}")
     ADD_DAS_STATIC_LIBRARY(${lib} ${ARGN})
+    DAS_APPLY_STRICT_WARNINGS(${lib})
     TARGET_LINK_LIBRARIES(${lib} PUBLIC libDaScript)
     # Compiled dynamic module is useless without config.
     # Build only static lib or create .das_module file if no config exists.
@@ -428,6 +510,9 @@ ENDMACRO()
 MACRO(ADD_MODULE_PUB_LIB lib module_name)
     ADD_MODULE_LIB(${lib} ${module_name} ${ARGN})
     SET_TARGET_PROPERTIES(${module_name} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS TRUE)
+    IF(WIN32)
+        set_property(TARGET ${module_name} PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE FALSE)
+    ENDIF()
 ENDMACRO()
 
 MACRO(ADD_EXAMPLE tgt)
@@ -438,13 +523,22 @@ ENDMACRO()
 # Register a .das file to be run as a headless example check.
 # Modules call this from their CMakeLists.txt for examples that
 # can run without GUI, audio, or user interaction.
+#
+# When DAS_TOOLS_DISABLED=ON the `daslang` target is never created, so the
+# run_examples target below (which references $<TARGET_FILE:daslang>) cannot
+# be generated. Gate the registration here so every call site is automatically
+# safe and DAS_EXAMPLES_TO_RUN stays empty.
 MACRO(ADD_EXAMPLE_RUN das_file)
-    SET(_exe TRUE)
-    IF("${ARGN}" STREQUAL "FALSE")
-        SET(_exe FALSE)
+    IF(DAS_TOOLS_DISABLED)
+        MESSAGE(STATUS "EXAMPLE_RUN ${das_file} skipped (DAS_TOOLS_DISABLED=ON)")
+    ELSE()
+        SET(_exe TRUE)
+        IF("${ARGN}" STREQUAL "FALSE")
+            SET(_exe FALSE)
+        ENDIF()
+        MESSAGE("EXAMPLE_RUN ${das_file} (exe=${_exe})")
+        LIST(APPEND DAS_EXAMPLES_TO_RUN "${das_file}|${_exe}")
     ENDIF()
-    MESSAGE("EXAMPLE_RUN ${das_file} (exe=${_exe})")
-    LIST(APPEND DAS_EXAMPLES_TO_RUN "${das_file}|${_exe}")
 ENDMACRO()
 
 ADD_EXAMPLE_RUN("${PROJECT_SOURCE_DIR}/examples/dasbind/dasbind_example.das")
@@ -640,6 +734,16 @@ src/parser/ds2_lexer.cpp
 src/parser/lex2.yy.h
 )
 
+# Funnel the bison/flex generation through ONE custom target. libDaScript
+# AND libDaScriptDyn both list PARSER_GENERATED_SRC, so with MSBuild's per-
+# vcxproj parallelism each library independently triggers the custom commands
+# and they race on the shared output files (ds_parser.hpp / ds_lexer.cpp /
+# ds2_*) -- "Device or resource busy" from bison and C1083 "Permission
+# denied" from cl on the same file. A single parser_generated target both
+# libraries depend on serialises the generation once before either library
+# compiles, while the libraries themselves still compile in parallel.
+add_custom_target(parser_generated DEPENDS ${PARSER_GENERATED_SRC})
+
 SET(PARSER_SRC
 src/parser/ds_parser.ypp
 src/parser/ds_lexer.lpp
@@ -654,9 +758,13 @@ SOURCE_GROUP_FILES("parser" PARSER_SRC)
 SOURCE_GROUP_FILES("parser/generated" PARSER_GENERATED_SRC)
 
 IF(MSVC)
-    # Don't use precompiled headers with flex/bison generated files
+    # flex/bison output is not ours to clean: no PCH (/Y-) and no warnings (/W0)
     FOREACH(file ${PARSER_GENERATED_SRC})
-        SET_SOURCE_FILES_PROPERTIES(${file} PROPERTIES COMPILE_FLAGS "/Y-" )
+        SET_SOURCE_FILES_PROPERTIES(${file} PROPERTIES COMPILE_FLAGS "/Y- /W0" )
+    ENDFOREACH()
+ELSE()
+    FOREACH(file ${PARSER_GENERATED_SRC})
+        SET_SOURCE_FILES_PROPERTIES(${file} PROPERTIES COMPILE_FLAGS "-w" )
     ENDFOREACH()
 ENDIF()
 
@@ -678,40 +786,25 @@ src/ast/ast_dispatch.cpp
 src/ast/ast_interop.cpp
 src/ast/ast_tls.cpp
 src/ast/ast_visitor.cpp
-src/ast/ast_generate.cpp
 src/ast/ast_simulate.cpp
 src/ast/ast_typedecl.cpp
 src/ast/ast_match.cpp
 src/ast/ast_module.cpp
 src/ast/ast_print.cpp
 src/ast/ast_program.cpp
-src/ast/ast_infer_type.cpp
-src/ast/ast_infer_type_report.cpp
-src/ast/ast_infer_type_function.cpp
-src/ast/ast_infer_type_helper.cpp
-src/ast/ast_infer_type_op.cpp
-src/ast/ast_infer_type_make.cpp
-src/ast/ast_lint.cpp
 src/ast/ast_allocate_stack.cpp
-src/ast/ast_derive_alias.cpp
-src/ast/ast_const_folding.cpp
-src/ast/ast_block_folding.cpp
 src/ast/ast_gc_collect.cpp
-src/ast/ast_inscope_pod.cpp
-src/ast/ast_unused.cpp
 src/ast/ast_annotations.cpp
 src/ast/ast_export.cpp
-src/ast/ast_parse.cpp
-src/ast/ast_validate.cpp
 src/ast/ast_debug_info_helper.cpp
 src/ast/ast_handle.cpp
-src/ast/dyn_modules.cpp
 include/daScript/ast/compilation_errors.h
 include/daScript/ast/ast_typedecl.h
 include/daScript/ast/ast_typefactory.h
 include/daScript/ast/ast.h
 include/daScript/ast/ast_expressions.h
 include/daScript/ast/ast_visitor.h
+include/daScript/ast/ast_gc_report.h
 include/daScript/ast/ast_generate.h
 include/daScript/ast/ast_match.h
 include/daScript/ast/ast_interop.h
@@ -736,23 +829,15 @@ src/builtin/module_builtin_vector_ctor.cpp
 src/builtin/module_builtin_array.cpp
 src/builtin/module_builtin_math.cpp
 src/builtin/module_builtin_string.cpp
+src/builtin/module_builtin_ast_serialize.cpp
 src/builtin/module_builtin_rtti.h
 src/builtin/module_builtin_rtti.cpp
-src/builtin/module_builtin_ast.cpp
-src/builtin/module_builtin_ast_serialize.cpp
-src/builtin/module_builtin_ast_flags.cpp
-src/builtin/module_builtin_ast_annotations.cpp
-src/builtin/module_builtin_ast_annotations_1.cpp
-src/builtin/module_builtin_ast_annotations_2.cpp
-src/builtin/module_builtin_ast_annotations_3.cpp
-src/builtin/module_builtin_ast_adapters.cpp
 src/builtin/module_builtin_ast.h
 src/builtin/module_builtin_uriparser.h
 src/builtin/module_builtin_uriparser.cpp
 src/builtin/module_jit.cpp
 src/builtin/module_builtin_fio.cpp
 src/builtin/module_builtin_dasbind.cpp
-src/builtin/module_builtin_network.cpp
 src/builtin/module_builtin_debugger.cpp
 src/builtin/module_builtin_jobque.cpp
 src/builtin/module_file_access.cpp
@@ -785,6 +870,7 @@ include/daScript/misc/job_que.h
 include/daScript/misc/handle_registry.h
 include/daScript/misc/uric.h
 include/daScript/misc/lexer_alloc_track.h
+src/misc/das_common.cpp
 src/misc/gc_node.cpp
 src/misc/globals.cpp
 src/misc/sysos.cpp
@@ -819,6 +905,7 @@ src/simulate/simulate_fusion_op2_scalar_vec.cpp
 src/simulate/simulate_fusion_at.cpp
 src/simulate/simulate_fusion_at_array.cpp
 src/simulate/simulate_fusion_tableindex.cpp
+src/simulate/simulate_fusion_tablewithhash.cpp
 src/simulate/simulate_fusion_misc_copy.cpp
 src/simulate/simulate_fusion_call1.cpp
 src/simulate/simulate_fusion_call2.cpp
@@ -854,6 +941,7 @@ src/misc/network.cpp
 src/simulate/hash.cpp
 src/simulate/debug_info.cpp
 src/simulate/runtime_string.cpp
+src/simulate/runtime_iterator.cpp
 src/simulate/runtime_array.cpp
 src/simulate/runtime_table.cpp
 src/simulate/runtime_profile.cpp
@@ -874,6 +962,7 @@ include/daScript/simulate/debug_info.h
 include/daScript/simulate/interop.h
 include/daScript/simulate/runtime_string.h
 include/daScript/simulate/runtime_string_delete.h
+include/daScript/simulate/runtime_iterator.h
 include/daScript/simulate/runtime_array.h
 include/daScript/simulate/runtime_table.h
 include/daScript/simulate/runtime_table_nodes.h
@@ -926,15 +1015,29 @@ SET(DASCRIPT_FMT_SRC
         CACHE INTERNAL "DAS_DASCRIPT_FMT_SRC"
 )
 
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  set_source_files_properties(src/builtin/module_builtin_ast_serialize.cpp PROPERTIES
-    COMPILE_FLAGS "-fexceptions"
-  )
-elseif(MSVC)
+# MSVC first so clang-cl (CXX_COMPILER_ID==Clang but MSVC driver) takes /EHsc, not -fexceptions
+if(MSVC)
   set_source_files_properties(src/builtin/module_builtin_ast_serialize.cpp PROPERTIES
     COMPILE_FLAGS "/EHsc"
   )
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  set_source_files_properties(src/builtin/module_builtin_ast_serialize.cpp PROPERTIES
+    COMPILE_FLAGS "-fexceptions"
+  )
 endif()
+
+# flex/bison output (das-fmt's own copy) is not ours to clean
+IF(MSVC)
+  set_source_files_properties(${PROJECT_SOURCE_DIR}/utils/dasFormatter/ds_parser.cpp PROPERTIES COMPILE_FLAGS "/W0")
+ELSE()
+  set_source_files_properties(${PROJECT_SOURCE_DIR}/utils/dasFormatter/ds_parser.cpp PROPERTIES COMPILE_FLAGS "-w")
+  # fmt's vendored format-inl.h noreturn helper: GCC needs -Wno-error, clang -Wno-invalid-noreturn
+  IF("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
+    set_source_files_properties(src/misc/format.cpp PROPERTIES COMPILE_FLAGS "-Wno-error")
+  ELSE()
+    set_source_files_properties(src/misc/format.cpp PROPERTIES COMPILE_FLAGS "-Wno-invalid-noreturn")
+  ENDIF()
+ENDIF()
 
 list(SORT SIMULATE_SRC)
 SOURCE_GROUP_FILES("simulate" SIMULATE_SRC)
@@ -976,7 +1079,6 @@ MACRO(SETUP_LIBDASCRIPT library shared_lib full_setup sources exports_def)
     IF(${shared_lib})
         SETUP_DAS_SHARED_LIBRARY(${library} ${${sources}})
         TARGET_COMPILE_DEFINITIONS(${library} PRIVATE ${exports_def}=1 DAS_MOD_EXPORTS=1)
-        TARGET_COMPILE_DEFINITIONS(${library} PUBLIC DAS_ENABLE_DLL=1)
     ELSE()
         ADD_DAS_STATIC_LIBRARY(${library} ${${sources}})
     ENDIF()
@@ -1005,10 +1107,16 @@ MACRO(SETUP_LIBDASCRIPT library shared_lib full_setup sources exports_def)
             TARGET_LINK_LIBRARIES(${library} network uuid)
         ENDIF()
         IF(WIN32)
-            target_link_libraries(${library} dbghelp)
+            # System libs that source files reference via `#pragma comment(lib,...)`.
+            # MSVC honors those pragmas, but clang-mingw + ld.lld does not always
+            # pick up the .drectve defaultlib directives — list them explicitly so
+            # every Windows toolchain links the same set. Harmless on MSVC (each
+            # lib gets added once regardless of how it was requested).
+            target_link_libraries(${library} dbghelp ws2_32 mswsock advapi32 rpcrt4)
         ENDIF()
     ENDIF()
     SETUP_CPP11(${library})
+    DAS_APPLY_STRICT_WARNINGS(${library})
     target_compile_features(${library} PUBLIC cxx_std_17)
     #target_precompile_headers(${library} PUBLIC include/daScript/misc/platform.h)
 
@@ -1020,16 +1128,46 @@ MACRO(SETUP_LIBDASCRIPT library shared_lib full_setup sources exports_def)
 ENDMACRO()
 
 SET(LIBDASCRIPT_RUNTIME_SRC
-    ${PARSER_GENERATED_SRC}
-    ${PARSER_SRC} ${VECMATH_SRC} ${AST_SRC} ${SIMULATE_SRC} ${BUILTIN_SRC}
+    ${VECMATH_SRC} ${AST_SRC} ${SIMULATE_SRC} ${BUILTIN_SRC}
     ${MISC_SRC} ${MAIN_SRC}
-    ${DAGOR_NOISE_SRC} ${DAS_HASH_MAP_SRC} ${FAST_FLOAT_SRC} ${DASCRIPT_FMT_SRC}
+    ${DAGOR_NOISE_SRC} ${DAS_HASH_MAP_SRC} ${FAST_FLOAT_SRC}
 )
 
 SET(LIBDASCRIPT_COMPILER_SRC
     ${SIMULATE_FUSION_SRC}
+    ${PARSER_GENERATED_SRC}
+    ${PARSER_SRC}
+    ${DASCRIPT_FMT_SRC}
+    src/ast/ast_parse.cpp
+    src/ast/ast_optimize.cpp
+    src/ast/ast_const_folding.cpp
+    src/ast/ast_block_folding.cpp
+    src/ast/ast_unused.cpp
+    src/ast/ast_lint.cpp
+    src/ast/dyn_modules.cpp
     src/misc/daScriptC.cpp
     src/builtin/modules.cpp
+    src/ast/ast_infer_type.cpp
+    src/ast/ast_infer_type_report.cpp
+    src/ast/ast_infer_type_function.cpp
+    src/ast/ast_infer_type_helper.cpp
+    src/ast/ast_infer_type_op.cpp
+    src/ast/ast_infer_type_make.cpp
+    src/ast/ast_derive_alias.cpp
+    src/ast/ast_gc_report.cpp
+    src/ast/ast_generate.cpp
+    src/ast/ast_inscope_pod.cpp
+    src/ast/ast_escape_analysis.cpp
+    src/ast/ast_validate.cpp
+
+    src/builtin/module_builtin_ast.cpp
+    src/builtin/module_builtin_ast_flags.cpp
+    src/builtin/module_builtin_ast_annotations.cpp
+    src/builtin/module_builtin_ast_annotations_1.cpp
+    src/builtin/module_builtin_ast_annotations_2.cpp
+    src/builtin/module_builtin_ast_annotations_3.cpp
+    src/builtin/module_builtin_ast_adapters.cpp
+    src/builtin/module_builtin_network.cpp
 )
 
 # Eventually libDaScript_runtime will contain only minimal subset of sources
@@ -1041,6 +1179,16 @@ SETUP_LIBDASCRIPT(libDaScriptDyn_runtime ON ON LIBDASCRIPT_RUNTIME_SRC DAS_EXPOR
 
 SETUP_LIBDASCRIPT(libDaScript OFF OFF LIBDASCRIPT_COMPILER_SRC DAS_CC_EXPORTS)
 SETUP_LIBDASCRIPT(libDaScriptDyn ON OFF LIBDASCRIPT_COMPILER_SRC DAS_CC_EXPORTS)
+
+# Make both compiler libraries wait for the single parser_generated target so
+# the bison/flex custom commands run exactly once per build (see definition
+# above PARSER_GENERATED_SRC). Without this both vcxprojs race over the
+# shared ds_parser.hpp / ds_lexer.cpp / ds2_* outputs under MSBuild's
+# per-project parallelism, intermittently failing with "Device or resource
+# busy" (bison can't open the .hpp the other proc is writing) and C1083
+# "Permission denied" (cl can't open the .cpp bison's still writing).
+add_dependencies(libDaScript parser_generated)
+add_dependencies(libDaScriptDyn parser_generated)
 
 # Heap leak tracking: permanently enabled in RelWithDebInfo only.
 # DAS_FREE_LIST=0 forces the reuse cache off so every aligned allocation reaches
@@ -1060,6 +1208,11 @@ target_compile_definitions(libDaScriptDyn_runtime PUBLIC
 # compiles empty in Release/Debug.
 target_sources(libDaScript_runtime    PRIVATE src/misc/alloc_tracker_overrides.cpp)
 target_sources(libDaScriptDyn_runtime PRIVATE src/misc/alloc_tracker_overrides.cpp)
+# The compiler lib is a separate binary (own CRT new/delete on Windows). Without
+# its own copy of the override, parser/infer/ast allocations escape the tracker
+# and read as cross-module orphan frees (false leaks in the RelWithDebInfo report).
+target_sources(libDaScript    PRIVATE src/misc/alloc_tracker_overrides.cpp)
+target_sources(libDaScriptDyn PRIVATE src/misc/alloc_tracker_overrides.cpp)
 
 target_link_libraries(libDaScript libDaScript_runtime)
 target_link_libraries(libDaScriptDyn libDaScriptDyn_runtime)
@@ -1114,7 +1267,11 @@ SET(DAS_DASCRIPT_MAIN_SRC
 
 # Tests
 if (NOT ${DAS_TESTS_DISABLED})
-    include(examples/pathTracer/CMakeLists.txt)
+    # pathTracer links against libDaScriptAot, which is only created when
+    # AOT examples are enabled — gate the inclusion accordingly.
+    if(NOT ${DAS_AOT_EXAMPLES_DISABLED})
+        include(examples/pathTracer/CMakeLists.txt)
+    endif()
     include(examples/crash/CMakeLists.txt)
     if(NOT ${DAS_AOT_EXAMPLES_DISABLED} AND NOT (WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 4))
         include(tests/aot/CMakeLists.txt)
@@ -1136,7 +1293,22 @@ if (NOT ${DAS_TOOLS_DISABLED})
         # Static modules generated include.
         target_include_directories(${target_name} PRIVATE ${NEED_MODULES_PATH})
         SETUP_CPP11(${target_name})
+        DAS_APPLY_STRICT_WARNINGS(${target_name})
         SETUP_LTO(${target_name})
+    ENDMACRO()
+
+    # Relative RPATH so an installed binary in bin/ finds the shared libs in ../lib.
+    MACRO(SETUP_BIN_RPATH target_name)
+        if(APPLE)
+            SET_TARGET_PROPERTIES(${target_name} PROPERTIES
+                INSTALL_RPATH "@loader_path/../lib"
+                CMAKE_MACOSX_RPATH ON
+            )
+        elseif(UNIX)
+            SET_TARGET_PROPERTIES(${target_name} PROPERTIES
+                INSTALL_RPATH "\$ORIGIN/../lib"
+            )
+        endif()
     ENDMACRO()
 
     SETUP_COMPILER_BINARY(daslang_static libDaScript DAS_MODULES_LIBS "")
@@ -1148,16 +1320,7 @@ if (NOT ${DAS_TOOLS_DISABLED})
     target_sources(daslang        PRIVATE src/misc/alloc_tracker_overrides.cpp)
     target_sources(daslang_static PRIVATE src/misc/alloc_tracker_overrides.cpp)
     # relative RPATH from install location
-    if(APPLE)
-        SET_TARGET_PROPERTIES(daslang PROPERTIES
-            INSTALL_RPATH "@loader_path/../lib"
-            CMAKE_MACOSX_RPATH ON
-        )
-    elseif(UNIX)
-        SET_TARGET_PROPERTIES(daslang PROPERTIES
-            INSTALL_RPATH "\$ORIGIN/../lib"
-        )
-    endif()
+    SETUP_BIN_RPATH(daslang)
     # Export daslang target, so it can be found
     # as a target (for example in aot).
     INSTALL(
@@ -1165,6 +1328,61 @@ if (NOT ${DAS_TOOLS_DISABLED})
         EXPORT DASTargets
         RUNTIME DESTINATION ${DAS_INSTALL_BINDIR}
     )
+
+    # cpp-mcp: standalone AOT C++-only MCP server (gated, OFF by default).
+    # Statically links libDaScript + the AOT-compiled cpp_main.das into one
+    # self-contained binary (no shared modules). The cpp tools still shell out
+    # to ast-grep / cl at runtime (environmental); the ast-grep rules YAML is
+    # read from the SDK tree via getDasRoot(), so the binary lands in bin/.
+    option(DAS_BUILD_CPP_MCP "Build the standalone AOT cpp-only MCP server (cpp-mcp)" OFF)
+    if(DAS_BUILD_CPP_MCP)
+        SET(CPP_MCP_AOT_GENERATED_SRC)
+        add_custom_target(cpp_mcp_dasAotStub)
+        # DAS_AOT only tracks cpp_main.das + daslib/*.das as inputs; cpp_main's own
+        # require graph (protocol_core / registry_cpp / tools/*.das / utils/common)
+        # is invisible to it, so edits there would NOT regenerate the AOT C++.
+        # Feed the graph in via DAS_AOT_EXTRA_DEPENDS BEFORE the DAS_AOT call so it
+        # lands in the generated command's DEPENDS list (clean builds unaffected;
+        # this only fixes local incremental iteration). Scoped: unset right after.
+        # cpp_main's require graph = its (stable) top-level server files, listed
+        # explicitly so the full-server / test / setup peers (main.das,
+        # registry_das.das, test_tools.das, setup.das) don't re-trigger the AOT;
+        # plus the tool modules (GLOB, so a new cpp tool tracks automatically) and
+        # utils/common. NOT GLOB_RECURSE -> tests/ fixtures stay out.
+        file(GLOB CPP_MCP_DAS_DEPS CONFIGURE_DEPENDS
+            ${PROJECT_SOURCE_DIR}/utils/mcp/tools/*.das
+            ${PROJECT_SOURCE_DIR}/utils/common/*.das)
+        list(APPEND CPP_MCP_DAS_DEPS
+            ${PROJECT_SOURCE_DIR}/utils/mcp/cpp_main.das
+            ${PROJECT_SOURCE_DIR}/utils/mcp/protocol_core.das
+            ${PROJECT_SOURCE_DIR}/utils/mcp/registry_cpp.das
+            ${PROJECT_SOURCE_DIR}/utils/mcp/cpp_search_config.das)
+        set(DAS_AOT_EXTRA_DEPENDS ${CPP_MCP_DAS_DEPS})
+        DAS_AOT("utils/mcp/cpp_main.das" CPP_MCP_AOT_GENERATED_SRC cpp_mcp_dasAotStub daslang)
+        unset(DAS_AOT_EXTRA_DEPENDS)
+        add_executable(cpp-mcp
+            ${PROJECT_SOURCE_DIR}/utils/mcp/cpp_mcp_main.cpp
+            ${CPP_MCP_AOT_GENERATED_SRC}
+        )
+        target_sources(cpp-mcp PRIVATE src/misc/alloc_tracker_overrides.cpp)
+        # cpp_main.das requires only daslib + builtin modules (jobque / json /
+        # fio / logger / strings), all of which live in libDaScript. It pulls NO
+        # external module (dasHV / SQLITE / GLFW / ...), so they are deliberately
+        # NOT linked -> a lean, dependency-light binary. For a cpp-mcp-only build,
+        # also pass -DDAS_HV_DISABLED=ON (and friends) so they are never built.
+        TARGET_LINK_LIBRARIES(cpp-mcp libDaScript ${SRC_LIBRARIES})
+        ADD_DEPENDENCIES(cpp-mcp libDaScript daslang cpp_mcp_dasAotStub)
+        target_include_directories(cpp-mcp PRIVATE ${NEED_MODULES_PATH})
+        SETUP_CPP11(cpp-mcp)
+        SETUP_BIN_RPATH(cpp-mcp)
+        SET_TARGET_PROPERTIES(cpp-mcp PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/bin)
+        # Strip the shipped binary (Linux/macOS); on MSVC symbols live in a side PDB.
+        if(NOT MSVC AND CMAKE_BUILD_TYPE STREQUAL "Release")
+            add_custom_command(TARGET cpp-mcp POST_BUILD
+                COMMAND ${CMAKE_STRIP} $<TARGET_FILE:cpp-mcp>
+                COMMENT "Stripping cpp-mcp")
+        endif()
+    endif()
 
     # daslang-live: live-reloading application host
     SET(DAS_LIVE_MAIN_SRC
@@ -1178,16 +1396,12 @@ if (NOT ${DAS_TOOLS_DISABLED})
     target_include_directories(daslang-live PRIVATE
         ${NEED_MODULES_PATH})
     SETUP_CPP11(daslang-live)
+    DAS_APPLY_STRICT_WARNINGS(daslang-live)
     SETUP_LTO(daslang-live)
+    SETUP_BIN_RPATH(daslang-live)
     if(APPLE)
-        SET_TARGET_PROPERTIES(daslang-live PROPERTIES
-            INSTALL_RPATH "@loader_path/../lib"
-            CMAKE_MACOSX_RPATH ON
-        )
-    elseif(UNIX)
-        SET_TARGET_PROPERTIES(daslang-live PROPERTIES
-            INSTALL_RPATH "\$ORIGIN/../lib"
-        )
+        # Foundation: NSProcessInfo, used to disable App Nap at startup (dasImgui #190).
+        TARGET_LINK_LIBRARIES(daslang-live "-framework Foundation")
     endif()
     INSTALL(
         TARGETS daslang-live
@@ -1218,11 +1432,14 @@ if (NOT ${DAS_TOOLS_DISABLED})
     )
 
     add_executable(das-fmt ${PROJECT_SOURCE_DIR}/utils/dasFormatter/main.cpp)
-    TARGET_LINK_LIBRARIES(das-fmt libDaScript ${SRC_LIBRARIES} ${DAS_MODULES_LIBS})
+    TARGET_LINK_LIBRARIES(das-fmt libDaScriptDyn ${SRC_LIBRARIES})
+    ADD_DEPENDENCIES(das-fmt libDaScriptDyn ${DAS_DYN_MODULES_LIBS})
     target_include_directories(das-fmt PRIVATE ${NEED_MODULES_PATH})
 
     SETUP_CPP11(das-fmt)
+    DAS_APPLY_STRICT_WARNINGS(das-fmt)
     SETUP_LTO(das-fmt)
+    SETUP_BIN_RPATH(das-fmt)
     install(TARGETS das-fmt RUNTIME DESTINATION ${DAS_INSTALL_BINDIR})
 get_target_property(DAS_FMT_INCLUDES libDaScriptDyn INCLUDE_DIRECTORIES)
 get_target_property(DAS_FMT_DEFS das-fmt COMPILE_DEFINITIONS)
@@ -1285,7 +1502,6 @@ SET(DAS_RELEASE_INCLUDE
     include/daScript/daScript.h
     include/daScript/daScriptBind.h
     include/daScript/daScriptModule.h
-    include/daScript/das_common.h
     include/daScript/das_config.h
     include/daScript/das_project_specific.h
 )
@@ -1295,6 +1511,7 @@ SET(DAS_RELEASE_MISC_INCLUDE
     include/daScript/misc/arraytype.h
     include/daScript/misc/callable.h
     include/daScript/misc/crash_handler.h
+    include/daScript/misc/das_common.h
     include/daScript/misc/debug_break.h
     include/daScript/misc/enums.h
     include/daScript/misc/fpe.h
@@ -1343,6 +1560,7 @@ SET(DAS_SIMULATE_INCLUDES
     include/daScript/simulate/bind_enum.h
     include/daScript/simulate/bin_serializer.h
     include/daScript/simulate/cast.h
+    include/daScript/simulate/das_qsort_r.h
     include/daScript/simulate/data_walker.h
     include/daScript/simulate/debug_info.h
     include/daScript/simulate/debug_print.h
@@ -1353,6 +1571,7 @@ SET(DAS_SIMULATE_INCLUDES
     include/daScript/simulate/interop.h
     include/daScript/simulate/jit_abi.h
     include/daScript/simulate/runtime_array.h
+    include/daScript/simulate/runtime_iterator.h
     include/daScript/simulate/runtime_matrices.h
     include/daScript/simulate/runtime_profile.h
     include/daScript/simulate/runtime_range.h
@@ -1497,9 +1716,17 @@ install(FILES ${PROJECT_SOURCE_DIR}/include/vecmath/LICENSE DESTINATION ${DAS_IN
 install(FILES ${PROJECT_SOURCE_DIR}/utils/aot/main.das DESTINATION utils/aot)
 
 # Install MCP server (stdio transport, no dasHV dependency)
+#   main.das        — full server entry point
+#   cpp_main.das    — cpp/agnostic-subset entry point
+#   protocol_core.das + registry_das.das + registry_cpp.das — shared dispatch + tool registry
 install(FILES
     ${PROJECT_SOURCE_DIR}/utils/mcp/main.das
-    ${PROJECT_SOURCE_DIR}/utils/mcp/protocol.das
+    ${PROJECT_SOURCE_DIR}/utils/mcp/cpp_main.das
+    ${PROJECT_SOURCE_DIR}/utils/mcp/protocol_core.das
+    ${PROJECT_SOURCE_DIR}/utils/mcp/registry_das.das
+    ${PROJECT_SOURCE_DIR}/utils/mcp/registry_cpp.das
+    ${PROJECT_SOURCE_DIR}/utils/mcp/cpp_search_config.das
+    ${PROJECT_SOURCE_DIR}/utils/mcp/daslang-mcp-msvc.cmd
     ${PROJECT_SOURCE_DIR}/utils/mcp/README.md
     DESTINATION utils/mcp
 )
@@ -1559,18 +1786,13 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/find-dupe/tests/
     FILES_MATCHING PATTERN "*.das"
 )
 
-# Install blind-mouse (personal Q&A cache MCP server).
-file(GLOB DAS_MOUSE_FILES ${PROJECT_SOURCE_DIR}/utils/mouse/*.das)
-install(FILES ${DAS_MOUSE_FILES} DESTINATION utils/mouse)
-install(FILES
-    ${PROJECT_SOURCE_DIR}/utils/mouse/README.md
-    ${PROJECT_SOURCE_DIR}/utils/mouse/OVERVIEW.md
-    ${PROJECT_SOURCE_DIR}/utils/mouse/.das_package
-    DESTINATION utils/mouse
-)
-install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/mouse/tests/
-    DESTINATION utils/mouse/tests
-    FILES_MATCHING PATTERN "*.das" PATTERN "*.md"
+# Install utils/common (git-aware staleness signature used by
+# utils/mcp/tools/cpp_common for source-search staleness tracking).
+file(GLOB DAS_UTILS_COMMON_FILES ${PROJECT_SOURCE_DIR}/utils/common/*.das)
+install(FILES ${DAS_UTILS_COMMON_FILES} DESTINATION utils/common)
+install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/common/tests/
+    DESTINATION utils/common/tests
+    FILES_MATCHING PATTERN "*.das"
 )
 
 # Install daspkg (package manager)
@@ -1729,7 +1951,13 @@ install(FILES
 add_subdirectory(tutorials)
 
 # ── Documentation build (optional) ──────────────────────────────────────────
+# Requires the `daslang` target (das2rst stdlib RST generator runs it). If the
+# user explicitly asked for docs but also disabled tools, fail early rather
+# than silently skipping — mirrors the DAS_AOT_EXAMPLES check above.
 if(DAS_BUILD_DOCUMENTATION)
+    if(DAS_TOOLS_DISABLED)
+        message(FATAL_ERROR "DAS_BUILD_DOCUMENTATION requires DAS_TOOLS_DISABLED to be OFF (the docs pipeline runs daslang via das2rst.das)")
+    endif()
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_FOUND)
         execute_process(

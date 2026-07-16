@@ -7,9 +7,9 @@ The repo builds on **Windows, Linux, macOS, iOS, Android, and WASM** (CI runs th
 ## Build & run
 
 - **Build system:** CMake. On Windows the default generator is MSVC (Visual Studio 2022); on Linux/macOS use Ninja or Make; on Android/iOS/WASM see the platform docs.
-- **Generate** (Windows convenience):
-  - `generate_msvc_2022.bat` → creates `build/DAS.sln`
-  - On Linux/macOS: `cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release` (or omit `-G Ninja` to use the system default)
+- **Generate**:
+  - Windows: `cmake -B build` (default generator is MSVC; creates `build/DAS.sln`)
+  - Linux/macOS: `cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release` (or omit `-G Ninja` to use the system default)
 - **Build:** `cmake --build build --config Release -j 64 -- /nodeReuse:false` (the `/nodeReuse:false` is MSBuild-only; drop it on Ninja/Make)
 - **Compiler binary:**
   - Windows MSVC (multi-config): `bin/Release/daslang.exe`
@@ -29,6 +29,17 @@ This skill uses `bin/Release/daslang.exe` in examples below (the dominant local-
 - **Always use `timeout: 0`** (no timeout) when running `cmake --build` commands. A build that hasn't finished is not stuck or broken, it's just compiling
 - **Do not assume build failure** from lack of output — MSVC and most generators are silent during compilation and only print when there are warnings/errors or when it finishes
 - For incremental builds after editing a single `.cpp` file, expect ~2-5 minutes. For changes touching headers, expect longer
+- **MSVC `C1001` / `LNK1000` during "Generating code"** (Windows) — link-time codegen (LTCG) choking on a **stale incremental database** (`.ipdb`/`.iobj`) in a long-lived `build/`, *not* a code bug. The line `"no usable IPDB/IOBJ from previous compilation … fall back to full compilation"` on a clean retry confirms it. Fix: clean-rebuild just the offending target — `cmake --build build --target <name> --clean-first` — rather than nuking `build/`. Commonly triggered when a config change (e.g. flipping a `DAS_*_DISABLED` flag) forces a recompile of an object whose stale LTCG state no longer matches.
+
+### Shared OpenSSL cache (Windows/MSVC) — the big first-build lever
+
+On **Windows/MSVC**, the dominant cost of a *fresh* build dir is **dasHV building OpenSSL 3.5.1 from source** (~15 min of the clean build): `modules/dasHV/CMakeLists.txt` defaults `OPENSSL_ROOT_DIR` to `${CMAKE_BINARY_DIR}/openssl` (per build dir), so every new `build*/` and every worktree rebuilds it. The configure prints which path it took — `dasHV: … building 3.5.1 from source` vs `dasHV: using prebuilt OpenSSL <version> (include: <dir>) - skipping source build`.
+
+To build OpenSSL **once and reuse it everywhere**, point it at a shared cache (it's an `IF(NOT OpenSSL_FOUND)` gate — first build populates the dir, all later builds `find_package` → skip):
+- **Env (covers CLI + VS Code):** set `DASLANG_OPENSSL_DIR=%LOCALAPPDATA%/daslang/openssl` once in your environment.
+- **Per-configure:** `cmake … -DOPENSSL_ROOT_DIR=<shared-dir>`.
+
+The default (no env, no flag) stays per-build-dir, so **CI is unchanged** — its lanes use vcpkg (`vcpkg install openssl` + the vcpkg toolchain) or a cached from-source `build-clangcl/openssl` for the same effect. Linux/macOS use the system OpenSSL (brew/apt/mingw sysroot), so this is MSVC-only.
 
 ## Debugging runtime crashes
 

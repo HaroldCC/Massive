@@ -2,6 +2,52 @@
 
 Tests use the `dastest` framework. Test files live in `tests/` with per-module subfolders.
 
+## AOT registration (REQUIRED for new test directories)
+
+CI's `test_aot` binary runs EVERY test under `tests/` with AOT enabled (`fail_on_no_aot`).
+Creating a new test directory ⇒ register it in `tests/aot/CMakeLists.txt` (5-step pattern in
+`skills/aot_testing.md` § "Registering a New Test Directory"), or CI fails with
+`error[50101]: AOT link failed`.
+
+If a specific file genuinely can't AOT (emitter bug, interpreted-only by design): put
+`options no_aot` IN THE FILE **and** exclude it from the directory's AOT glob, with a
+comment + issue link on both. Glob exclusion alone is NOT enough — test_aot still *runs*
+the file and trips 50101 on its missing stubs; `options no_aot` is what makes the runtime
+skip AOT linking for it. (2026-06-11: in-file `options no_aot` currently fails in the AOT
+hash itself — fix incoming on master; until it lands, interp-only tests are gated by the
+directory filter below instead.)
+
+## The `tests/.das_test` directory filter — and its root-path caveat
+
+`tests/.das_test` is a daslang script dastest compiles per run; its `can_visit_folder`
+pinvoke gates whole directories per mode — e.g. `no_aot/`, `ast/`, `ast_match/` are
+skipped under `--use-aot`, module dirs (dasSQLITE, dasPUGIXML…) skip when the
+module isn't built in. **The filter is looked up only at the `--test` ROOT path** —
+`--test tests` finds and applies it, but `--test tests/flatten` looks for
+`tests/flatten/.das_test` (absent) and walks into `no_aot/` unfiltered, producing
+false `error[50101]` / JIT failures. For AOT/JIT validation, sweep `--test tests`
+(CI's form) or target individual files — never a subtree that contains gated dirs.
+
+## Per-folder sweep gating (`tests/.das_test`)
+
+`tests/.das_test` defines `can_visit_folder(folder_name, result)` — dastest consults it
+per subfolder during file collection (only for the `.das_test` at the `--test <root>`
+argument; directly naming a child folder bypasses it). It gates folders on module
+availability (`dasHV`, `dasSQLITE`, …) and on sweep mode by scanning argv — `--use-aot`
+skips `ast`, `ast_match`, `no_aot`; `-jit` skips only `gc` (heap_collect can't see heap
+pointers whose only reference is a local in a jitted frame — native-stack locals are
+invisible to the collector, so GC-semantics tests are interp-only; the other former `-jit`
+skips were lifted once `jit_enabled` started triggering daslib/quote lowering). Two traps:
+a whole-folder JIT/AOT failure usually means a missing entry here, NOT a per-file fix; and
+the `jit_cache_all_tests` prewarm target (utils/CMakeLists.txt) does NOT consult it — its
+`--exclude` list mirrors the skips manually and must be updated in the same change.
+Per-function `[no_jit]` is the finer-grained alternative when only some functions in a
+kept folder can't JIT — put it on the function whose CODE diverges under JIT, not just the
+`[test]` wrapper (JITted callees replace their SimNode bodies, so an interpreted wrapper
+still calls jitted workers). Beware Release-blind divergence: memory bugs (double-free,
+reuse-after-collect) only trip the Debug memory_model.h assert, so a green local Release
+sweep does NOT prove a lifted skip is sound — Debug CI is the oracle.
+
 ## Test file structure
 
 ```das

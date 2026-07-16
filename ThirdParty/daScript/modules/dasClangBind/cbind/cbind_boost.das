@@ -38,8 +38,8 @@ let CXTranslationUnit_IgnoreNonErrorsFromIncludedFiles = 0x4000
 let CXTranslationUnit_RetainExcludedConditionalBlocks = 0x8000
 
 def describe(var c : CXCursor) {
-    var sp = clang_getCursorSpelling(c)
-    var kd = clang_getCursorKindSpelling(clang_getCursorKind(c))
+    let sp = clang_getCursorSpelling(c)
+    let kd = clang_getCursorKindSpelling(clang_getCursorKind(c))
     return "<{string(sp)}>:`{string(kd)}`"
 }
 
@@ -58,9 +58,7 @@ def clang_typeToDasTypeUnqEx(var t : CXType; topLevel : bool; rules : TypeRules;
     } elif (t.kind == CXTypeKind.Bool) {
         return "bool"
     } elif (t.kind == CXTypeKind.Char_U || t.kind == CXTypeKind.UChar) {
-        if (topLevel && rules.top_level_uint8_is_bool) {
-            return "bool"
-        }
+        if (topLevel && rules.top_level_uint8_is_bool) return "bool"
         return "uint8"
     } elif (t.kind == CXTypeKind.Char_S || t.kind == CXTypeKind.SChar) {
         return "int8"
@@ -116,7 +114,7 @@ def clang_typeToDasTypeUnqEx(var t : CXType; topLevel : bool; rules : TypeRules;
             return "\u00BF"
         }
     } elif (t.kind == CXTypeKind.IncompleteArray) {
-        var pt = clang_getCanonicalType(clang_getPointeeType(t))
+        let pt = clang_getCanonicalType(clang_getPointeeType(t))
         return "void?"
     } elif (t.kind == CXTypeKind.Enum) {
         return string(clang_getTypeSpelling(t))
@@ -164,30 +162,22 @@ def clang_getCursorLocationFileName(var c : CXCursor) {
     var file : CXFile
     var line, column, offset : uint
     clang_getSpellingLocation(clang_getCursorLocation(c), safe_addr(file), safe_addr(line), safe_addr(column), safe_addr(offset))
-    var fname = clang_getFileName(file)
+    let fname = clang_getFileName(file)
     return "{string(fname)}"
 }
 
 def clang_isForwardDeclaration(var cursor : CXCursor) {
     var definition = clang_getCursorDefinition(cursor)
-    if (clang_equalCursors(definition, clang_getNullCursor()) != 0u) {
-        return true
-    }
+    if (clang_equalCursors(definition, clang_getNullCursor()) != 0u) return true
     return clang_equalCursors(cursor, definition) == 0u
 }
 
 def clang_das_isRef(var c : CXType) {
-    if (c.kind == CXTypeKind.LValueReference) {
-        return true
-    }
-    return false
+    return c.kind == CXTypeKind.LValueReference
 }
 
 def clang_das_isCopyOnReturn(var c : CXType) {
-    if (c.kind == CXTypeKind.Record) {
-        return true
-    }
-    return false
+    return c.kind == CXTypeKind.Record
 }
 
 let private unsafe_names <- {
@@ -236,7 +226,12 @@ class AnyGenBind {
     }
     def init_args(pfn, pfp : string; args : array<string>) {
         PARSE_FILE_NAME = pfn
-        PARSE_FILE_PREFIX = pfp
+        // Normalize backslashes — libclang's cursor-location paths (see
+        // clang_getCursorLocationFullPath) come back with forward slashes,
+        // so for the starts_with prefix-strip in
+        // clang_getCursorLocationDescription to match on every OS+path-form
+        // combination the stored prefix must use forward slashes too.
+        PARSE_FILE_PREFIX = pfp |> replace_multiple([(text = "\\", replacement = "/")])
         ARGV := args
     }
     def openFile(path : string) {
@@ -261,10 +256,8 @@ class AnyGenBind {
     }
     // strip the parsed library's header root — paths stay stable across OS and install folder
     def clang_getCursorLocationDescription(var c : CXCursor) : string {
-        var full = clang_getCursorLocationFullPath(c)
-        if (!empty(PARSE_FILE_PREFIX) && full |> starts_with(PARSE_FILE_PREFIX)) {
-            return full |> slice(length(PARSE_FILE_PREFIX))
-        }
+        let full = clang_getCursorLocationFullPath(c)
+        if (!empty(PARSE_FILE_PREFIX) && full |> starts_with(PARSE_FILE_PREFIX)) return full |> slice(length(PARSE_FILE_PREFIX))
         return full
     }
     def skip_file(fname : string) : bool {
@@ -275,7 +268,7 @@ class AnyGenBind {
         var unit = clang_parseTranslationUnit(
             index,
             open_file_name(),
-            length(ARGV) == 0 ? null : unsafe(addr(ARGV[0])), length(ARGV),
+            empty(ARGV) ? null : unsafe(addr(ARGV[0])), length(ARGV),
             null, 0u,
             CXTranslationUnit_SkipFunctionBodies)
         if (unit == null) {
@@ -286,7 +279,7 @@ class AnyGenBind {
         let ndiag = clang_getNumDiagnostics(unit)
         for (i in urange(ndiag)) {
             var diag = clang_getDiagnostic(unit, i)
-            var diags = string(clang_formatDiagnostic(diag, clang_defaultDiagnosticDisplayOptions()))
+            let diags = string(clang_formatDiagnostic(diag, clang_defaultDiagnosticDisplayOptions()))
             print("{diags}\n")
         }
         clang_disposeTranslationUnit(unit)
@@ -304,7 +297,7 @@ class AnyGenBind {
         return unsafe_names?[name] ?? name
     }
     def namespace_struct_name(dash : string = "::") : string {
-        return build_string <| $(wr) {
+        return build_string() $(wr) {
             for (n, i in nspaces, count()) {
                 if (i != 0) {
                     wr |> write(dash)
@@ -314,7 +307,7 @@ class AnyGenBind {
         }
     }
     def namespace_name(name : string; dash : string = "::") : string {
-        return build_string <| $(wr) {
+        return build_string() $(wr) {
             for (n in nspaces) {
                 wr |> write(n)
                 wr |> write(dash)
@@ -348,16 +341,14 @@ class AnyGenBind {
             return true
         }
         if (function_name |> starts_with("operator")) {
-            let Ch = character_at(function_name, 8)
+            let Ch = character_at(function_name, 8) // nolint:PERF003
             if (!(is_alpha(Ch) || is_number(Ch) || Ch == '_')) {
                 if (!isMethod) {
                     to_log(LOG_INFO, "skipping global operator {function_name} at {clang_getCursorLocationDescription(c)}\n")
                     return true
                 }
                 let op_name = function_name |> slice(8)
-                if (op_name == "=") {
-                    return true
-                }
+                if (op_name == "=") return true
             }
         }
         var fun_type = clang_getCursorType(c)
@@ -389,15 +380,11 @@ class AnyGenBind {
     }
     def skip_type(var _c : CXType) {
         let nc_name = string(clang_getTypeSpelling(_c))
-        if (nc_name == "va_list") {
-            return true
-        }
+        if (nc_name == "va_list") return true
         var c = clang_getCanonicalType(_c)
         if (c.kind == CXTypeKind.Pointer) {
             var pc = clang_getPointeeType(c)
-            if (pc.kind == CXTypeKind.FunctionProto) {
-                return true
-            }
+            if (pc.kind == CXTypeKind.FunctionProto) return true
             return skip_type(pc)
         } elif (c.kind == CXTypeKind.Record) {
             var rname = string(clang_getTypeSpelling(c))
@@ -406,12 +393,7 @@ class AnyGenBind {
             } elif (rname |> starts_with("class ")) {
                 rname = rname |> slice(6)
             }
-            if (skip_struct_by_access |> key_exists(rname)) {
-                return true
-            }
-            if (skip_struct(rname)) {
-                return true
-            }
+            return true if (skip_struct_by_access |> key_exists(rname) || skip_struct(rname))
         }
         return false
     }
@@ -450,12 +432,12 @@ class AnyGenBind {
         return true
     }
     def parse(var cursor : CXCursor) {
-        clang_visitChildren(cursor) <| $(var c, parent) {
+        clang_visitChildren(cursor) $(var c, parent) {
             var file : CXFile
             var line, column, offset : uint
             clang_getSpellingLocation(clang_getCursorLocation(c), safe_addr(file), safe_addr(line), safe_addr(column), safe_addr(offset))
-            var fname = clang_getFileName(file)
-            peek(fname) <| $(fn) {
+            let fname = clang_getFileName(file)
+            peek(fname) $(fn) {
                 if (prevFileName != fn) {
                     prevFileName := fn
                     if (skip_file(prevFileName) && verbose_file_skipping) {
@@ -464,9 +446,7 @@ class AnyGenBind {
                 }
             }
             if (!skip_file(prevFileName)) {
-                if (parent.kind == CXCursorKind.ClassTemplate) {// skipping just about everything from template body
-                    return CXChildVisitResult.Continue
-                }
+                if (parent.kind == CXCursorKind.ClassTemplate) return CXChildVisitResult.Continue // skip template body
                 let kind = clang_getCursorKind(c)
                 if (kind == CXCursorKind.TypedefDecl) {
                     let tdn = string(clang_getCursorDisplayName(c))
@@ -579,7 +559,7 @@ class AnyGenBind {
                         if (!skip_struct(struct_name)) {
                             let acs = clang_getCXXAccessSpecifier(c)
                             if (acs != CX_CXXAccessSpecifier.Public && acs != CX_CXXAccessSpecifier.InvalidAccessSpecifier) {
-                                var canonical = clang_getCanonicalType(clang_getCursorType(c))
+                                let canonical = clang_getCanonicalType(clang_getCursorType(c))
                                 let sname = string(clang_getTypeSpelling(clang_getCursorType(c)))
                                 to_log(LOG_INFO, "skipping structure {struct_name} aka {sname} due to access specifier {acs}\n")
                                 skip_struct_by_access |> insert(sname)
@@ -662,14 +642,14 @@ class AnyGenBind {
                 */
                 elif (kind == CXCursorKind.CXXBaseSpecifier) {
                     let class_name = back(nspaces)
-                    var tps = string(clang_getTypeSpelling(clang_getCursorType(c)))
+                    let tps = string(clang_getTypeSpelling(clang_getCursorType(c)))
                     var tpq <- split(tps, "::") // TODO: better inheritance?
                     let base_name = back(tpq)
                     delete tpq
                     if (!(lsp |> key_exists(class_name))) {
                         lsp[class_name] = base_name
                     } else {
-                        var acs = clang_getCXXAccessSpecifier(c)
+                        let acs = clang_getCXXAccessSpecifier(c)
                         if (acs == CX_CXXAccessSpecifier.Public) {
                             interfaces[class_name] |> push(base_name)
                         } else {
@@ -694,16 +674,13 @@ class AnyGenBind {
         return false
     }
     def skip_enum(ns_en, en : string) {
-        if (ns_en |> starts_with("(unnamed enum")) {
-            return true
-        }
-        return false
+        return ns_en |> starts_with("(unnamed enum")
     }
     def getGenConstType(name, default_name : string) {
         return const_type_table?[name] ?? default_name
     }
     def searchAndGenConst(var regex_def : Regex; defTName, suffix : string; hex : bool; var ofs : table<int; bool>; data : string; var dup : table<string; bool>) {
-        regex_foreach(regex_def, data) <| $(r) {
+        regex_foreach(regex_def, data) $(r) {
             if (!ofs |> key_exists(r.x)) {
                 let DEF = regex_group(regex_def, 1, data)
                 let VAL = regex_group(regex_def, 2, data)
@@ -734,6 +711,57 @@ class AnyGenBind {
             return true
         }
     }
+    // Reconstruct only the preprocessor-ACTIVE #define lines of `fname`.
+    // The const regexes are not preprocessor-aware: a header may carry the same
+    // macro twice (e.g. imgui.h's IM_COL32_*_SHIFT under #ifdef
+    // IMGUI_USE_BGRA_PACKED_COLOR / #else), and a raw-text scan picks the first
+    // textual match — which can be the INACTIVE branch. libclang only emits a
+    // MacroDefinition cursor for the branch the preprocessor actually took, so
+    // we slice each such cursor's extent out of `data` and feed the regexes only
+    // the active definitions. Macros from #include'd files are filtered out so
+    // the constant set matches the prior single-file scan.
+    def collectActiveDefines(fname, data : string) : string {
+        var index = clang_createIndex(0, 0)
+        var unit = clang_parseTranslationUnit(
+            index, fname,
+            empty(ARGV) ? null : unsafe(addr(ARGV[0])), length(ARGV),
+            null, 0u,
+            CXTranslationUnit_DetailedPreprocessingRecord)
+        if (unit == null) {
+            clang_disposeIndex(index)
+            to_log(LOG_WARNING, "collectActiveDefines: cannot parse {fname}, falling back to raw scan\n")
+            return data
+        }
+        // libclang returns backslashes on Windows; normalize both sides so the suffix
+        // match is OS-independent (else every MacroDefinition cursor filters out)
+        let fnameNorm = fname |> replace_multiple([(text = "\\", replacement = "/")])
+        let result = build_string() $(var wr : StringBuilderWriter) {
+            clang_visitChildren(clang_getTranslationUnitCursor(unit)) $(var c, _parent) {
+                if (clang_getCursorKind(c) == CXCursorKind.MacroDefinition) {
+                    var mfile : CXFile
+                    var ml, mc, mo : uint
+                    clang_getSpellingLocation(clang_getCursorLocation(c), safe_addr(mfile), safe_addr(ml), safe_addr(mc), safe_addr(mo))
+                    // builtin / command-line macros have a null CXFile — skip them
+                    if (mfile != null && (string(clang_getFileName(mfile)) |> replace_multiple([(text = "\\", replacement = "/")])) |> ends_with(fnameNorm)) {
+                        var ext = clang_getCursorExtent(c)
+                        var sfile, efile : CXFile
+                        var sl, scol, so, el, ecol, eo : uint
+                        clang_getSpellingLocation(clang_getRangeStart(ext), safe_addr(sfile), safe_addr(sl), safe_addr(scol), safe_addr(so))
+                        clang_getSpellingLocation(clang_getRangeEnd(ext), safe_addr(efile), safe_addr(el), safe_addr(ecol), safe_addr(eo))
+                        if (eo > so && int(eo) <= length(data)) {
+                            wr |> write("#define ")
+                            wr |> write(data |> slice(int(so), int(eo)))
+                            wr |> write("\n")
+                        }
+                    }
+                }
+                return CXChildVisitResult.Continue
+            }
+        }
+        clang_disposeTranslationUnit(unit)
+        clang_disposeIndex(index)
+        return result
+    }
     def generateConstantsFrom(fnames : array<string>) {
         var reg_def_hex <- %regex~#define\s+(\w+)\s+(0x[0-9A-Fa-f]+)%%
         var reg_def_dec <- %regex~#define\s+(\w+)\s+(\d+)%%
@@ -743,19 +771,20 @@ class AnyGenBind {
         var reg_def_UINT64 <- %regex~#define\s+(\w+)\s+UINT64_C\s*\((0x[0-9A-Fa-f]+)\)%%
         // for all the files where we need to generate
         for (fname in fnames) {
-            fopen(fname, "rb") <| $(f) {
+            fopen(fname, "rb") $(f) {
                 if (f == null) {
                     panic("can't open {fname}")
                 }
                 var ofs : table<int; bool>
                 let data = fread(f)
+                let activeText = collectActiveDefines(fname, data)
                 var dup : table<string; bool>
-                searchAndGenConst(reg_def_hex, define_const_style_das ? "uint" : "uint32_t", "u", true, ofs, data, dup)
-                searchAndGenConst(reg_def_dec, define_const_style_das ? "int" : "int32_t", "", false, ofs, data, dup)
-                searchAndGenConst(reg_def_UINT8, define_const_style_das ? const_uint8_type : const_uint8_cpp_type, "u", true, ofs, data, dup)
-                searchAndGenConst(reg_def_UINT16, define_const_style_das ? const_uint16_type : const_uint16_cpp_type, "u", true, ofs, data, dup)
-                searchAndGenConst(reg_def_UINT32, define_const_style_das ? "uint" : "uint32_t", "u", true, ofs, data, dup)
-                searchAndGenConst(reg_def_UINT64, define_const_style_das ? "uint64" : "uint64_t", "ul", true, ofs, data, dup)
+                searchAndGenConst(reg_def_hex, define_const_style_das ? "uint" : "uint32_t", "u", true, ofs, activeText, dup)
+                searchAndGenConst(reg_def_dec, define_const_style_das ? "int" : "int32_t", "", false, ofs, activeText, dup)
+                searchAndGenConst(reg_def_UINT8, define_const_style_das ? const_uint8_type : const_uint8_cpp_type, "u", true, ofs, activeText, dup)
+                searchAndGenConst(reg_def_UINT16, define_const_style_das ? const_uint16_type : const_uint16_cpp_type, "u", true, ofs, activeText, dup)
+                searchAndGenConst(reg_def_UINT32, define_const_style_das ? "uint" : "uint32_t", "u", true, ofs, activeText, dup)
+                searchAndGenConst(reg_def_UINT64, define_const_style_das ? "uint64" : "uint64_t", "ul", true, ofs, activeText, dup)
             }
         }
     }
@@ -779,15 +808,13 @@ class DasGenBind : AnyGenBind {
             "options" => "_options",
         }
         for (k, v in keys(to_replace), values(to_replace)) {
-            if (s == k) {
-                return v
-            }
+            if (s == k) return v
         }
         return s
     }
 
     def DasGenBind(pfn, pfp : string; args : array<string>; mod_name : string = "") {
-        init_args(pfn, pfp, args)
+        super(pfn, pfp, args)
         define_const_file = fstdout()
         func_decl_file = fstdout()
         module_name = mod_name
@@ -810,9 +837,7 @@ class DasGenBind : AnyGenBind {
     def clang_knownType(var nctype : CXType; rules : TypeRules) {
         let ncname = string(clang_getTypeSpelling(nctype))
         let tname = known_type?[ncname] ?? ""
-        if (tname != "") {
-            return tname
-        }
+        if (tname != "") return tname
         var ctype = clang_getCanonicalType(nctype)
         return clang_typeToDasType(ctype, rules)
     }
@@ -820,10 +845,7 @@ class DasGenBind : AnyGenBind {
         fprint(func_decl_file, "[extern(name=\"{function_name}\")]\n")
     }
     def override parse_Struct(var c : CXCursor; struct_name : string) {
-        if (struct_class_file == null) {
-            return
-        }
-        return if (struct_name |> starts_with <| "(") // do nothing for anonymous unions/structs
+        return if (struct_class_file == null || struct_name |> starts_with <| "(") // do nothing for anonymous unions/structs
         let struct_namespace_name = namespace_name(struct_name)
         let dashing_name = namespace_name(struct_name, "_")
         fprint(struct_class_file, "struct {filter_das_words(struct_name)} \{\}\n")
@@ -835,15 +857,11 @@ class DasGenBind : AnyGenBind {
         fprint(struct_class_file, "typedef {tdn} = {src_type}\n")
     }
     def override parse_Enum(var cursor : CXCursor; enum_name : string) {
-        if (enum_class_file == null) {
-            return
-        }
+        if (enum_class_file == null) return
         let ns_en = namespace_name(enum_name)
-        if (skip_enum(ns_en, enum_name)) {
-            return
-        }
+        if (skip_enum(ns_en, enum_name)) return
         fprint(enum_class_file, "enum {filter_das_words(enum_name)} \{\n")
-        clang_visitChildren(cursor) <| $(var c, parent) {
+        clang_visitChildren(cursor) $(var c, _parent) {
             if (c.kind == CXCursorKind.EnumConstantDecl) {
                 let een = string(clang_getCursorDisplayName(c))
                 let val = clang_getEnumConstantDeclValue(c)
@@ -945,11 +963,17 @@ class CppGenBind : AnyGenBind {
     abstract_class : array<bool>
     wrapper_count : int
     local_type_names : table<string; bool>
+    // Types whose generated annotation should advertise a trivial constructor
+    // (emit hasNonTrivialCtor()->false) and/or value-copyability (canCopy()->true).
+    // Lets a binder mark a bitwise-zero-init-safe handled type as inline-storable
+    // without a manual post-regen patch on the generated struct.class.inc.
+    trivial_ctor_type_names : table<string; bool>
+    copyable_type_names : table<string; bool>
     // Affects // from <prefix>/<actual path>
     prefix : string
 
     def CppGenBind(pfn, pfp : string; args : array<string>) {
-        init_args(pfn, pfp, args)
+        super(pfn, pfp, args)
         setDefaultFiles()
     }
     def setDefaultFiles {
@@ -1087,6 +1111,12 @@ class CppGenBind : AnyGenBind {
     def isLocalType(name, cppname : string) {
         return local_type_names[name]
     }
+    def isTrivialCtorType(name, cppname : string) {
+        return trivial_ctor_type_names[name]
+    }
+    def isCopyableType(name, cppname : string) {
+        return copyable_type_names[name]
+    }
     def isArgByValue(name : string) {
         return false
     }
@@ -1119,17 +1149,21 @@ class CppGenBind : AnyGenBind {
             return
         }
         struct_ann[struct_namespace_name] = true
-        if (isAotAlias || isAlreadyDefined) {
-            return
-        }
+        if (isAotAlias || isAlreadyDefined) return
         let dashing_name = namespace_name(struct_name, "_")
-        let st = build_string() <| $(var writer : StringBuilderWriter) {
+        let st = build_string() $(var writer : StringBuilderWriter) {
             swrite |> push(unsafe(addr(writer)))
             writer |> write("// from {clang_getCursorLocationDescription(c)}\n")
             writer |> write("struct {dashing_name}_GeneratedAnnotation : ManagedStructureAnnotation<{struct_namespace_name}> \{\n")
             if (isLocalType(struct_name, struct_namespace_name)) {
                 writer |> write("\tvirtual bool isLocal() const override \{ return true; \}\n")
                 writer |> write("\tvirtual bool canBePlacedInContainer() const override \{ return true; \}\n")
+            }
+            if (isTrivialCtorType(struct_name, struct_namespace_name)) {
+                writer |> write("\tvirtual bool hasNonTrivialCtor() const override \{ return false; \}\n")
+            }
+            if (isCopyableType(struct_name, struct_namespace_name)) {
+                writer |> write("\tvirtual bool canCopy() const override \{ return true; \}\n")
             }
             writer |> write("\t{dashing_name}_GeneratedAnnotation(ModuleLibrary & ml) : ManagedStructureAnnotation (\"{struct_name}\", ml, \"{struct_namespace_name}\") \{\n")
             writer |> write("\t\}\n")
@@ -1156,16 +1190,11 @@ class CppGenBind : AnyGenBind {
     }
     def typeSpelling(var c : CXType) {
         let nspl = string(clang_getTypeSpelling(c))
-        if (nspl == "size_t" || nspl == "std::size_t" || nspl == "intptr_t" || nspl == "uintptr_t" || nspl == "size_t *") {
-            return nspl
-        }
+        if (nspl == "size_t" || nspl == "std::size_t" || nspl == "intptr_t" || nspl == "uintptr_t" || nspl == "size_t *") return nspl
         var t = clang_getCanonicalType(c)
-        var spl = string(clang_getTypeSpelling(t))
-        if (c.kind == CXTypeKind.Enum) {
-            return enum2enum?[spl] ?? spl
-        } elif (t.kind == CXTypeKind.Long || t.kind == CXTypeKind.LongLong || t.kind == CXTypeKind.ULong || t.kind == CXTypeKind.ULongLong) {
-            return nspl // if its a fancy type, which may be different on different platform
-        }
+        let spl = string(clang_getTypeSpelling(t))
+        if (c.kind == CXTypeKind.Enum) return enum2enum?[spl] ?? spl
+        if (t.kind == CXTypeKind.Long || t.kind == CXTypeKind.LongLong || t.kind == CXTypeKind.ULong || t.kind == CXTypeKind.ULongLong) return nspl // fancy type, may differ per platform
         return spl
     }
     def functionHeaderSpelling(var c : CXCursor; isMethod, needMethodQualifier, needArgumentNames : bool; function_name, self_type : string) {
@@ -1174,7 +1203,7 @@ class CppGenBind : AnyGenBind {
         var res_type = clang_getResultType(fun_type)
         let function_result_type = typeSpelling(res_type)
         let isStatic = clang_Cursor_getStorageClass(c) == CX_StorageClass.Static
-        return build_string() <| $(str) {
+        return build_string() $(str) {
             str |> write("{function_result_type} {function_name}(")
             if (!empty(self_type)) {
                 if (isMethod && (clang_CXXMethod_isConst(c) != 0u || isStatic)) {
@@ -1209,7 +1238,7 @@ class CppGenBind : AnyGenBind {
         }
     }
     def functionPtrSpelling(var c : CXCursor; isMethod : bool) {
-        let function_name = build_string() <| $(str) {
+        let function_name = build_string() $(str) {
             str |> write("(")
             if (isMethod) {
                 for (n in nspaces) {
@@ -1246,9 +1275,7 @@ class CppGenBind : AnyGenBind {
              t.kind == CXTypeKind.Typedef ||
              t.kind == CXTypeKind.Elaborated) {
             let tname = string(clang_getTypeSpelling(t))
-            if (aot_alias |> key_exists(tname)) {
-                return true
-            }
+            if (aot_alias |> key_exists(tname)) return true
         }
         // let tname = string(clang_getTypeSpelling(t))
         // print("NOT AOT ALIAS {tname} {t.kind}\n")
@@ -1279,7 +1306,7 @@ class CppGenBind : AnyGenBind {
         fprint(func_file_aot_decl, "{header};\n")
         fprint(func_file_aot, "{header} \{\n\t")
         var fun_type = clang_getCursorType(c)
-        var res_type = clang_getCanonicalType(clang_getResultType(fun_type))
+        let res_type = clang_getCanonicalType(clang_getResultType(fun_type))
         if (res_type.kind != CXTypeKind.Void) {
             fprint(func_file_aot, "return ")
         }
@@ -1313,7 +1340,7 @@ class CppGenBind : AnyGenBind {
         var das_function_name = function_name
         var isOperator = false
         if (function_name |> starts_with("operator")) {
-            let Ch = character_at(function_name, 8)
+            let Ch = character_at(function_name, 8) // nolint:PERF003
             if (!(is_alpha(Ch) || is_number(Ch) || Ch == '_')) {
                 das_function_name = function_name |> slice(8)
                 isOperator = true
@@ -1321,7 +1348,7 @@ class CppGenBind : AnyGenBind {
         }
         let isVirtual = clang_CXXMethod_isVirtual(c) != 0u
         var fun_type = clang_getCanonicalType(clang_getCursorType(c))
-        var res_type = clang_getResultType(fun_type)
+        var res_type = clang_getResultType(fun_type) // nolint:LINT003 passed to non-const clang_das_isRef/isCopyOnReturn
         var nc_res_type = clang_getResultType(clang_getCursorType(c))
         let function_cpp_name = namespace_name(function_name)
         das_function_name = rename_function(das_function_name, function_cpp_name)
@@ -1373,7 +1400,12 @@ class CppGenBind : AnyGenBind {
             for (ai in urange(narg)) {
                 let aii = int(isMethod ? ai + 1u : ai)
                 var carg = clang_Cursor_getArgument(c, ai)
-                let cp = getCursorArgType(clang_getCursorType(carg))     // non-canonical
+                var cp = getCursorArgType(clang_getCursorType(carg))     // non-canonical
+                // a binder may pin a (function,arg) to its raw C int instead of the enum
+                // retype, to preserve a shipped signature; cp="" -> int + ExprConstInt default
+                if (cp != "" && keep_c_arg_type(das_function_name, string(clang_getCursorSpelling(carg)), aii)) {
+                    cp = ""
+                }
                 if (cp != "") {
                     fprint(func_file, "\n\t\t->arg_type({aii},makeType<{cp}>(lib))")
                 }
@@ -1426,13 +1458,17 @@ class CppGenBind : AnyGenBind {
             let aii = int(ai)
             var carg = clang_Cursor_getArgument(c, ai)
             var ct = clang_getCursorType(carg)
-            var cp = getCursorArgType(ct)
+            let cp = getCursorArgType(ct)
             let cv = getCursorInit(carg, cp)
             if (cv != "") {
                 fprint(func_file, "\n\t\t->arg_init({aii},{cv})")
             }
         }
         fprint(func_file, ";\n")
+    }
+    //! Override to keep a specific (function,arg) at its raw C type instead of the enum/alias retype — preserves a shipped public signature.
+    def keep_c_arg_type(funcName, argName : string; argIndex : int) : bool {
+        return false
     }
     def getCursorArgType(var t : CXType) {
         let tn = string(clang_getTypeSpelling(t))
@@ -1455,7 +1491,7 @@ class CppGenBind : AnyGenBind {
                 let value = uint(clang_EvalResult_getAsInt(res))
                 result = "new ExprConstUInt({value})"
             } elif (t.kind == CXTypeKind.Long || t.kind == CXTypeKind.LongLong) {
-                let value = int64(clang_EvalResult_getAsLongLong(res))
+                let value = clang_EvalResult_getAsLongLong(res)
                 result = "new ExprConstInt64({value})"
             } elif (t.kind == CXTypeKind.ULong || t.kind == CXTypeKind.ULongLong) {
                 let value = uint64(clang_EvalResult_getAsLongLong(res))
@@ -1470,7 +1506,7 @@ class CppGenBind : AnyGenBind {
                 let value = clang_EvalResult_getAsInt(res)
                 result = "new ExprConstBool({value != 0})"
             } elif (t.kind == CXTypeKind.Pointer) {
-                var pt = clang_getCanonicalType(clang_getPointeeType(t))
+                let pt = clang_getCanonicalType(clang_getPointeeType(t))
                 if (pt.kind == CXTypeKind.Char_S || pt.kind == CXTypeKind.SChar) {
                     let value = clang_EvalResult_getAsStr(res)
                     result = "new ExprConstString(\"{value}\")"
@@ -1493,7 +1529,7 @@ class CppGenBind : AnyGenBind {
             //      if we see IntegerLiteral - we check if it evals to 0, and if it does - we call it NULL
             if (t.kind == CXTypeKind.Pointer) {
                 var has_null = false
-                clang_visitChildren(c) <| $(var CC, parent) {
+                clang_visitChildren(c) $(var CC, _parent) {
                     if (CC.kind == CXCursorKind.IntegerLiteral) {
                         var nres = clang_Cursor_Evaluate(CC)
                         let nres_kind = clang_EvalResult_getKind(nres)
@@ -1515,7 +1551,7 @@ class CppGenBind : AnyGenBind {
                     return CXChildVisitResult.Recurse
                 }
                 if (has_null) {
-                    var pt = clang_getCanonicalType(clang_getPointeeType(t))
+                    let pt = clang_getCanonicalType(clang_getPointeeType(t))
                     if (pt.kind == CXTypeKind.Char_S || pt.kind == CXTypeKind.SChar) {
                         result = "new ExprConstString(\"\")"
                     } else {
@@ -1549,12 +1585,7 @@ class CppGenBind : AnyGenBind {
     def override parse_Enum(var cursor : CXCursor; enum_name : string) {
         let ns_en = namespace_name(enum_name)
         let das_enum_name = dasEnumName(enum_name, ns_en)
-        if (skip_enum(ns_en, enum_name)) {
-            return
-        }
-        if (clang_isForwardDeclaration(cursor)) {
-            return
-        }
+        return if (skip_enum(ns_en, enum_name) || clang_isForwardDeclaration(cursor))
         enumDecl |> push((ns_en = ns_en, enum_name = enum_name))
         let dashing_name = namespace_name(enum_name, "_")
         fprint(enum_class_file, from_comment(cursor))
@@ -1565,7 +1596,7 @@ class CppGenBind : AnyGenBind {
         fprint(enum_class_file, "\t\tcppName = \"{ns_en}\";\n")
         let itype = string(clang_getTypeSpelling(clang_getEnumDeclIntegerType(cursor)))
         fprint(enum_class_file, "\t\tbaseType = (das::Type) das::ToBasicType<{itype}>::type;\n")
-        clang_visitChildren(cursor) <| $(var c, parent) {
+        clang_visitChildren(cursor) $(var c, _parent) {
             if (c.kind == CXCursorKind.EnumConstantDecl) {
                 let een = string(clang_getCursorDisplayName(c))
                 let deen = enum_entry_name(enum_name, een)
@@ -1610,9 +1641,7 @@ class CppGenBind : AnyGenBind {
     def generateDummy {
         for (k, v in keys(struct_ann), values(struct_ann)) {
             if (!v) {
-                if (aot_alias |> key_exists(k) || already_defined |> key_exists(k)) {
-                    continue
-                }
+                if (aot_alias |> key_exists(k) || already_defined |> key_exists(k)) continue
                 let kname = nsst2st?[k] ?? "MissingDummy"
                 fprint(dummy_add_file, "addAnnotation(new DummyTypeAnnotation(\"{kname}\", \"{k}\", 1, 1));\n")
             }
@@ -1683,7 +1712,7 @@ class CppGenBind : AnyGenBind {
         for (rm in require_modules) {
             module_cpp_file |> fwrite("\tlib.addModule(mod_{rm});\n")
         }
-        if (length(aot_alias) != 0) {
+        if (!empty(aot_alias)) {
             module_cpp_file |> fwrite("\tinitAotAlias();\n")
         }
         if (generate_constant_decl) {
@@ -1718,7 +1747,7 @@ class CppGenBind : AnyGenBind {
         module_h_file |> fwrite("protected:\n")
         module_h_file |> fwrite("virtual bool initDependencies() override;\n")
         module_h_file |> fwrite("\tvoid initMain ();\n")
-        if (length(aot_alias) != 0) {
+        if (!empty(aot_alias)) {
             module_h_file |> fwrite("\tvoid initAotAlias ();\n")
         }
         module_h_file |> fwrite("\tvirtual ModuleAotType aotRequire ( TextWriter & tw ) const override;\n")
@@ -1810,12 +1839,12 @@ def clang_reportAst(PARSE_FILE_NAME, PARSE_FILE_PREFIX : string; ARGV : array<st
         panic("unable to parse translation unit {PARSE_FILE_PREFIX}{PARSE_FILE_NAME}")
     }
     var cursor = clang_getTranslationUnitCursor(unit)
-    var prevFileName : string
-    clang_visitChildren(cursor) <| $(var c, parent) {
+    var _prevFileName : string
+    clang_visitChildren(cursor) $(var c, parent) {
         var file : CXFile
         var line, column, offset : uint
         clang_getSpellingLocation(clang_getCursorLocation(c), safe_addr(file), safe_addr(line), safe_addr(column), safe_addr(offset))
-        var fname = string(clang_getFileName(file))
+        let fname = string(clang_getFileName(file))
         if (fname |> ends_with(PARSE_FILE_NAME)) {
             to_log(LOG_INFO, "{describe(c)} <- {describe(parent)} at {clang_getCursorLocationFullPath(c)}\n")
         }
@@ -1825,7 +1854,7 @@ def clang_reportAst(PARSE_FILE_NAME, PARSE_FILE_PREFIX : string; ARGV : array<st
     let ndiag = clang_getNumDiagnostics(unit)
     for (i in urange(ndiag)) {
         var diag = clang_getDiagnostic(unit, i)
-        var diags = string(clang_formatDiagnostic(diag, clang_defaultDiagnosticDisplayOptions()))
+        let diags = string(clang_formatDiagnostic(diag, clang_defaultDiagnosticDisplayOptions()))
         print("{diags}\n")
     }
     clang_disposeTranslationUnit(unit)

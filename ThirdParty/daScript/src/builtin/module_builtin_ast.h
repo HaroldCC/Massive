@@ -185,6 +185,7 @@ namespace das {
     TypeDeclPtr makeFunctionSideEffectFlags();
     TypeDeclPtr makeVariableFlags();
     TypeDeclPtr makeVariableAccessFlags();
+    TypeDeclPtr makeVariableAccessInfoFlags();
     TypeDeclPtr makeExprCopyFlags();
     TypeDeclPtr makeExprMoveFlags();
     TypeDeclPtr makeExprIfFlags();
@@ -298,6 +299,7 @@ namespace das {
             this->template addField<DAS_BIND_MANAGED_FIELD(recordType)>("recordType");
             this->template addField<DAS_BIND_MANAGED_FIELD(values)>("values");
             this->template addField<DAS_BIND_MANAGED_FIELD(gen2)>("gen2");
+            this->template addField<DAS_BIND_MANAGED_FIELD(makeArrayOnHeap)>("makeArrayOnHeap");
         }
     };
 
@@ -330,6 +332,8 @@ namespace das {
             :  AstExpressionAnnotation<EXPR> (na, ml) {
             using ManagedType = EXPR;
             this->template addField<DAS_BIND_MANAGED_FIELD(baseType)>("baseType");
+            this->template addField<DAS_BIND_MANAGED_FIELD(promotedFromInt)>("promotedFromInt");
+            this->template addField<DAS_BIND_MANAGED_FIELD(inexactFloatPromotion)>("inexactFloatPromotion");
         }
         template <typename TT>
         void init( ModuleLibrary & ml ) {

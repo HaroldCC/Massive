@@ -1,7 +1,5 @@
 options gen2
 options indenting = 4
-options no_unused_block_arguments = false
-options no_unused_function_arguments = false
 options strict_smart_pointers = true
 
 module module_path shared public
@@ -53,6 +51,7 @@ module module_path shared public
 //! The same call works fine inside any function body. Also affects
 //! ``let X = get_das_root()`` and ``let X = dir_name(get_module_file_name(M))``.
 
+require fio_core public
 require daslib/ast_boost
 require daslib/macro_boost
 require daslib/templates_boost
@@ -63,7 +62,7 @@ class private GetThisModuleDirMacro : AstCallMacro {
     //! call site's source-file path as a string literal so the resolver
     //! can derive the modules-relative suffix at runtime.
     def override visit(prog : ProgramPtr; mod : Module?; var call : ExprCallMacro?) : Expression? {
-        macro_verify(call.arguments |> length == 0, prog, call.at, "expecting get_this_module_dir()")
+        macro_verify(empty(call.arguments), prog, call.at, "expecting get_this_module_dir()")
         let baked = string(call.at.fileInfo.name)
         return qmacro(__builtin_resolve_this_module_dir($v(baked)))
     }

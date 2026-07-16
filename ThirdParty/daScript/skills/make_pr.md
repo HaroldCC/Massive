@@ -2,6 +2,8 @@
 
 Before creating a pull request, complete ALL of the following steps in order. Do not skip steps. If any step fails, fix the issue before proceeding.
 
+**Shortcut:** `daslang utils/preflight/main.das -- --full` runs most of the mechanical gates below in one command (`skills/preflight.md` maps each gate to its CI lane). The steps here remain the authority on fix policy and on the judgment steps (dupe triage, workaround audit, doc stubs) the tool can't do.
+
 ## 0. Sync with origin/master and rebase the branch
 
 **Always do this first.** If you skip it, a stale local `master` will cause your squashed commit to absorb other already-merged PRs as if they were branch-original work — the PR ends up touching files it has no business touching.
@@ -19,19 +21,31 @@ After the rebase, every file in `git diff --name-only origin/master..HEAD` shoul
 
 If a rebase produces conflicts on files that were independently changed on origin/master, resolve them by keeping origin/master's version (your branch's "modification" was an outdated copy of the same change) — verify with `git show origin/master:<path>` that the merged version subsumes yours.
 
-## 1. Lint all changed `.das` files
+## 1. Lint all changed `.das` files — **zero warnings required**
 
-Run the unified lint utility on changed directories:
+**Pre-push hook:** the repo ships `.githooks/pre-push` (formatter `--verify` on the whole tree + lint on changed `.das` files — same gates as CI's `extended_checks`). One-time enable per clone: `git config core.hooksPath .githooks`. After that, every `git push` runs lint+format before pushing — the manual command below is for debugging hook output or running ahead of `git push`. `git push --no-verify` skips it; reserve that for emergencies (CI catches the same issues ~25 minutes later, but the round-trip is the cost the hook exists to avoid). See [.githooks/README.md](../.githooks/README.md).
+
+CI's `extended_checks` job runs the same lint utility on every `.das` file changed vs `origin/master` and **exits non-zero on any warning** (`./bin/daslang ./utils/lint/main.das -- <files> --quiet` → exit code 2 on ≥1 warning). One STYLE/LINT/PERF warning anywhere in your diff fails CI. Local lint must be clean before push — there is no "minor warning, will ignore" tier here.
+
+Lint only the files changed relative to `origin/master` (matches what CI lints):
 ```bash
-bin/Release/daslang.exe utils/lint/main.das -- daslib/ modules/ tutorials/
+git diff --name-only origin/master..HEAD -- '*.das' | xargs bin/Release/daslang.exe utils/lint/main.das -- --quiet
 ```
 
-Or lint only the files changed relative to `master`:
-```bash
-git diff --name-only master -- '*.das' | xargs bin/Release/daslang.exe utils/lint/main.das --
-```
+Expect: `--- Summary --- N files, 0 issue(s), 0 error(s)` and exit code 0. Any other outcome blocks the PR.
 
-Fix significant issues (unused variables that indicate bugs, performance warnings in hot paths). Use `// nolint:CODE` comments to suppress false positives (LINT001-004, PERF001-011, STYLE001-010). Minor lint warnings in unchanged code can be ignored unless trivial to fix.
+Or via MCP: `mcp__daslang__lint` on each changed file.
+
+**Resolution policy** for every warning reported:
+1. **Fix it.** Most STYLE/PERF rules have a mechanical rewrite that's strictly better (postfix `return X if (cond)` instead of `if (cond) { return X }` for STYLE005, direct iteration for PERF018, bitfield-field assignment for STYLE022, etc.). The fix table in `CLAUDE.md` ("Code style — prefer idiomatic forms") covers the common ones.
+2. **Suppress with `// nolint:CODE`** only when the rule is a known false positive for the construct — e.g. handled types (`xml_node`, `sqlite3_stmt`) need `var` for non-const C++ binding access, so a `var`→`let` suggestion is wrong. Include the reason in the comment or in a same-line tail comment.
+3. **Never** push with warnings unsuppressed. CI will fail and the round-trip costs ~25 minutes per fix.
+
+For sweep-style validation on a broader scope before pushing, the directory form still works:
+```bash
+bin/Release/daslang.exe utils/lint/main.das -- daslib/ modules/ tutorials/ --quiet
+```
+but the changed-files form above is the gate.
 
 ## 1.5. Check for duplicates against the corpus
 
@@ -87,6 +101,22 @@ Skip this step for PRs that only touch tests, fixtures, or generated files.
 
 See `skills/detect_dupe.md` for the full workflow including B1 baseline / CI gate modes.
 
+## 1.7. Workaround audit — read every changed file for hacks
+
+Before the functional gates, **read the whole diff** and ask of every change: *is this compensating for something that should already work?* A workaround is always more total work than asking — it spreads, gets copied, calcifies into fake-API, and later needs an audit to unwind. Catch it at PR time, in your own diff.
+
+```bash
+git diff origin/master..HEAD
+```
+
+**Workaround smells — each is a STOP-and-decide signal, not a thing to ship silently:**
+- **Redundant step** — code that "shouldn't be necessary" if the underlying thing worked: an explicit close/reset/refresh after an action that already does it; a manual re-assert; a `sleep`/retry to make timing line up.
+- **Divergence compensation** — a synthetic/programmatic path gives a different result than the real user action and you added code to paper over the gap. **Invariant: synthetic input MUST equal real input, side-effects included** — synth mouse == real mouse, synth key == real key, an injected / L2 click == a real click, a remote value-set == a real edit. A divergence is a framework bug to fix at the source layer, never to route around in the app/test/recording.
+- **Special-case / "make it work" branch** — a button for an action that already has a key; an injection rail used because "the gesture doesn't fire"; disabling real input so synthetic input lands; a flag toggled only to dodge a misbehavior.
+- **Copied-from-here justification** — "the codebase already does it this way" is NOT validation, especially in heavily AI-assisted code where you may be copying a *past* workaround. Validate against native/upstream semantics, not local precedent.
+
+**Resolution:** the fix-vs-workaround call is the user's. Surface it — name the divergence, offer (1) fix at source vs (2) keep the workaround — and **ask before shipping the compensating code**. Never bury a workaround in a PR. If you fixed a root cause in a dependency, note the now-redundant compensations elsewhere so they can be swept. One question now beats a multi-file audit later.
+
 ## 2. Run all tests
 
 ```bash
@@ -104,6 +134,32 @@ Or use the MCP `run_test` tool with the `tests/` directory.
 - Tests MUST pass for the PR to merge
 
 **Module-specific testing:** CI enables ALL modules via `ci/release_modules.txt` (PUGIXML, LLVM, Audio, SQLite, GLFW, HV). If you changed files under `modules/X/daslib/`, explicitly run that module's tests even if your local build has the module disabled. Handled types (C++ interop like `xml_node`, `sqlite3_stmt`) often require `var` — lint's `var`→`let` suggestion is wrong for them because the C++ binding expects non-const.
+
+## 2.5. JIT smoke check — catch verifier failures before push
+
+The dasLLVM JIT path is a **third execution tier** alongside interpreter and AOT. Changes to runtime struct layouts (`Array`, `Table`, etc.), `SimNode_*` lowerings, or the dasLLVM module (`modules/dasLLVM/daslib/`) can break JIT codegen even when the interpreter and AOT tests are green. CI catches it on the second-line builds (decs / soa / jit_tests / language tests run under JIT), but the failure shape — `LLVMVerifyFunction: Both operands to a binary operator are not of the same type! %5 = mul i64 %3, i32 12` — is a 30-minute round-trip cost per discovery cycle.
+
+**Run a JIT smoke on a couple of tests:**
+
+```bash
+bin/Release/daslang.exe -jit tests/jit_tests/array.das 2>&1 | grep -iE "verifier|Both operands|verify"
+bin/Release/daslang.exe -jit tests/decs/test_bulk_create.das 2>&1 | grep -iE "verifier|Both operands|verify"
+```
+
+**Expected:** empty output (no verifier errors). The LLVM IR generation succeeded.
+
+**Windows local caveat:** `clang-cl` may report `unable to execute command: program not executable` when linking the JIT'd `.dll`. That's a local Windows env issue (linker discovery), **not the JIT codegen** — IR was already generated and verified before the link step. Treat the `clang-cl` link failure as a known-local artifact; the only signal you care about for this gate is *no verifier errors*. For full end-to-end JIT validation, use WSL/Linux (`feedback_wsl_tsan_repro`) where clang's link path works.
+
+**What this catches:** struct-layout drift (i32 vs i64 fields in JIT mirror), mixed-width arithmetic (i64 × i32), missing intrinsic lowering after a runtime-side widening. The two suggested tests cover array indexing + table operations; widen the smoke list to `tests/soa/test_soa_basic.das` and `tests/language/typeAlias.das` if you touched generic-instance lowering or capture frames.
+
+## 2.7. Type-system / daslib-generics changes — sequence smoke + externals sweep
+
+If the PR changes the type system, generic binding rules, AST node layout, or widely-instantiated daslib generics (`builtin.das`, `safe_addr.das`, …), two CI gates have no overlap with the standard test suite:
+
+1. **Sequence smoke** — the only pre-merge lane that compiles GLFW-gated `.das` (dasOpenGL helpers etc.). Build the runtime module targets and run `examples/games/sequence/ci_smoke_test.ps1` (`.sh` on POSIX) — exact commands in `skills/preflight.md`.
+2. **Externals sweep** — `extended_checks` installs external dasImgui from ITS master against your branch; an ABI break vs external repos reds CI on an unrelated-looking step. Follow `skills/abi_break_sweep.md` (both-worlds spellings, externals-merge-first ordering, daspkg-index scope).
+
+Skip for changes that can't alter what external/module-gated code sees (tests-only, docs-only, tool-local).
 
 ## 3. Build and run AOT tests
 
@@ -139,8 +195,11 @@ Use `timeout: 0` (no timeout) for the cmake build — it can take 2-25 minutes.
 - Public functions in `daslib/*.das` (added, removed, renamed, or signature changed)
 - `//!` doc-comments in `daslib/*.das` files
 - C++ bindings in `modules/*/src/*.cpp` or `src/builtin/*.cpp` that add new public functions, types, or struct fields
+- **Struct fields or enum values added, REMOVED, or reordered** in any C++ type documented under `doc/source/stdlib/handmade/` — das2rst validates handmade docs **positionally** (line 1 = type description, line N+1 = Nth field/value), so a removed field is just as CI-fatal as an added one
 - RST files in `doc/source/` (handwritten tutorials, reference pages, TOCs)
 - `doc/reflections/das2rst.das` or `doc/reflections/rst.das`
+
+Note that CI's doc workflow triggers on **any** `daslib/**` or `src/builtin/**` change and runs six gates (`skills/preflight.md` has the full list); das2rst **stops at the FIRST validation panic**, so a single CI round can hide N−1 further issues — loop step 4b locally until it runs clean.
 
 **Which substeps to run** — match what changed, not "all in order":
 
@@ -191,12 +250,13 @@ grep -c Uncategorized doc/source/stdlib/generated/*.rst | grep -v ':0$'
 
 Must return empty. If not, go back to step 4a and add the missing function to a group.
 
-### 4f. Clean Sphinx build
+### 4f. Clean Sphinx build — BOTH builders
 
-MUST delete cache — cached builds hide errors:
+CI runs `sphinx-build -W` for **latex AND html** — they catch different warning sets (latex chokes on some table/unicode constructs html accepts). MUST delete cache — cached builds hide errors:
 
 ```bash
-rm -rf doc/sphinx-build site/doc
+rm -rf doc/sphinx-build site/doc build/latex
+sphinx-build -W --keep-going -b latex -d doc/sphinx-build doc/source build/latex
 sphinx-build -b html -d doc/sphinx-build doc/source site/doc 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | tee /tmp/sphinx_out.txt
 tail -3 /tmp/sphinx_out.txt
 grep -iE "warning:|error:" /tmp/sphinx_out.txt
@@ -214,9 +274,13 @@ Common Sphinx issues:
 - **Malformed table**: Grid/simple table column widths don't align
 - **Unexpected indentation**: Content after directive must be indented consistently
 
-### 4g. Stage doc changes
+### 4g. Stage doc changes — including NEW generated files
 
-Add all changed/new files in `doc/` and `doc/reflections/` to the commit. For squashed branches, amend the existing commit.
+Add all changed/new files in `doc/` and `doc/reflections/` to the commit. For squashed branches, amend the existing commit. CI fails if das2rst generated files that aren't tracked — verify:
+
+```bash
+git ls-files --others --exclude-standard doc/source/stdlib/   # must be empty
+```
 
 See `skills/documentation_rst.md` for full details on doc conventions, tutorial RST, and cross-references.
 
@@ -228,21 +292,11 @@ Run the MCP `format_file` tool on all changed `.das` files in a single batched c
 
 Do NOT format files you didn't change — only format files that are part of the PR.
 
-### CI `das-fmt` ≠ MCP `format_file` — verify named-arg spacing
+### CI formatter = in-tree `utils/das-fmt/dasfmt.das`
 
-CI's `extended_checks` job runs `./bin/Release/daslang ./das-fmt/dasfmt.das -- --path ./ --verify` (plus a compiled `das-fmt.exe` pass). The `das-fmt/dasfmt.das` file is NOT in the repo tree — CI fetches it externally — and it is **stricter** than MCP `format_file` on at least one rule:
+CI's `extended_checks` runs `./bin/daslang ./utils/das-fmt/dasfmt.das -- --path ./ --verify` — the script is **in the repo tree** and wraps the same `daslib/das_source_formatter` engine as MCP `format_file`, so the two agree (probe-verified: both rewrite `Foo(a=1)` → `Foo(a = 1)`). The pre-push hook runs the exact CI command on tracked files; if the hook passes, the CI formatter gate passes.
 
-| MCP `format_file` accepts | CI `das-fmt` requires |
-|---|---|
-| `Foo(a=1, b=2)` | `Foo(a = 1, b = 2)` (spaces around `=` in named args) |
-
-`bin/Release/das-fmt.exe` built from `utils/dasFormatter/` is the **v1→v2 syntax converter**, NOT the same formatter — running it locally does not reproduce CI.
-
-**Before pushing:** mentally format named-arg constructor / call sites with spaces around `=`. If CI `extended_checks` fails on a format diff after MCP said "already formatted", fix the spacing and re-push (or amend, on a squashed branch).
-
-## 5.5. Run the task-wrap-up curation pass
-
-Pre-PR is a natural moment to close the blind-mouse loop — work is final, you know what was learned, diff is locked. The full curation steps (review log, surface un-asked, cost calculus) live in `skills/task_wrap_up.md` and apply to *any* major task wrap-up, not just PRs. Run that pass now if you keep a personal Q&A cache.
+**Name trap:** a locally built `bin/Release/das-fmt.exe` (the CMake `das-fmt` target, from `utils/dasFormatter/`) is the **v1→v2 syntax converter**, not the formatter. CI's `das-fmt.exe` verify pass works because CI first overwrites that binary with an `-exe`-compiled `dasfmt.das`. Locally, always invoke the formatter as `<daslang> utils/das-fmt/dasfmt.das -- ...` (or MCP `format_file`).
 
 ## 6. Create the PR
 
@@ -257,13 +311,16 @@ Stage, commit, push, and create the PR using GitHub MCP tools or `gh` CLI. Follo
 | Step | Tool/Command | Fix policy |
 |---|---|---|
 | Sync | `git fetch origin master && git rebase origin/master` | Always run first; verify diff vs origin/master is clean |
-| Lint | `utils/lint/main.das` | Fix significant issues in changed files |
+| Lint | `utils/lint/main.das --quiet` on `git diff --name-only origin/master..HEAD -- '*.das'` | **Zero warnings.** Fix or `// nolint:CODE` every one — CI exits 2 on any warning |
+| Workaround audit | `git diff origin/master..HEAD` — read every changed file | Smell (redundant step / synthetic≠real / special-case / copied-hack) → surface fix-vs-workaround and **ask**; never ship a buried workaround |
 | Tests | `dastest -- --test tests/` | Must pass. Fix own, fix obvious pre-existing, ask about unclear |
+| JIT smoke | `daslang.exe -jit <test>.das 2>&1 \| grep -iE "verifier\|Both operands"` | Empty output = pass. Windows `clang-cl` link fail is local-only, ignore |
+| Type-system/generics | sequence smoke (`skills/preflight.md`) + externals sweep (`skills/abi_break_sweep.md`) | Only for type-system / AST-layout / daslib-generics changes |
 | AOT build | `cmake --build build --config Release --target test_aot -j 64` | Kill daslang first. Register new test dirs |
 | AOT tests | `test_aot.exe -use-aot dastest/dastest.das -- --use-aot --test tests` | Same as regular tests |
-| Docs | `das2rst.das` + stubs + Sphinx | Only if daslib/C++ bindings/RST changed |
+| Docs | `das2rst.das` (loop until clean) + stubs + Uncategorized + untracked + Sphinx latex AND html | Any daslib/src-builtin/RST change triggers all six gates — `skills/preflight.md` |
 | Format | MCP `format_file` with comma-separated list or glob of changed `.das` files (single call) | Only changed files |
 | Wrap-up curation | `skills/task_wrap_up.md` | Optional. Add answers for cache misses, edit cached answers this PR invalidated |
 | `.md` stop | `git diff --name-only origin/master..HEAD \| grep '\.md$'` | If any match: STOP, list changes, ask user to review BEFORE push |
 | PR | GitHub MCP `create_pull_request` or `gh pr create` | — |
-| Review iter | Follow `skills/pr_review_iteration.md` | One round per Copilot pass; convergence in 1-3 rounds is normal |
+| Babysit | Follow `skills/babysit.md` | One round per Copilot pass; convergence in 1-3 rounds is normal |

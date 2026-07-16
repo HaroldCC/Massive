@@ -93,6 +93,9 @@ namespace das {
         virtual bool canVisitFunction ( Function * fun ) override {
             return !fun->stub && !fun->isTemplate;    // we don't do a thing with templates
         }
+        virtual bool canVisitStructure ( Structure * st ) override {
+            return !st->isTemplate;    // we don't do a thing with templates
+        }
         // virtual bool canVisitStructureFieldInit ( Structure * ) override { return false; }
         // virtual bool canVisitArgumentInit ( Function * , const VariablePtr &, Expression * ) override { return false; }
         // virtual bool canVisitQuoteSubexpression ( ExprQuote * ) override { return false; }
@@ -225,8 +228,22 @@ namespace das {
     // call
         virtual ExpressionPtr visit ( ExprCall * expr ) override {
             if ( !expr->func ) { reportNullFunc(expr, "call"); return Visitor::visit(expr); }
-            expr->noSideEffects = (expr->func->sideEffectFlags==0);
-            expr->noNativeSideEffects = (expr->func->sideEffectFlags & uint32_t(SideEffects::inferredSideEffects))==0;
+            uint32_t sef = expr->func->sideEffectFlags;
+            expr->noSideEffects = (sef==0);
+            // A call whose ONLY effect is modifyArgument, and whose every argument is a freshly-built
+            // make-local rvalue, is side-effect-free at this site: the writes land on temporaries the
+            // expression itself constructs and nothing else can observe. The function keeps its
+            // modifyArgument flag for callers that pass real lvalues. This is what makes move-through
+            // wrappers over array/table literals (to_array_move / to_table_move) pure.
+            if ( !expr->noSideEffects && !expr->arguments.empty()
+                    && (sef & ~uint32_t(SideEffects::modifyArgument))==0 ) {
+                bool allTemp = true;
+                for ( auto & a : expr->arguments ) {
+                    if ( !a->rtti_isMakeLocal() ) { allTemp = false; break; }
+                }
+                expr->noSideEffects = allTemp;
+            }
+            expr->noNativeSideEffects = (sef & uint32_t(SideEffects::inferredSideEffects))==0;
             if ( expr->noSideEffects ) {
                 for ( auto & arg : expr->arguments ) {
                     expr->noSideEffects &= arg->noSideEffects;
@@ -502,12 +519,16 @@ namespace das {
      */
     class ConstFolding : public FoldingVisitor {
     public:
+        using PassVisitor::visit;
         ConstFolding( const ProgramPtr & prog, int32_t round ) : FoldingVisitor(prog, round) {}
     public:
         vector<Function *> needRun;
     protected:
         virtual bool canVisitFunction ( Function * fun ) override {
             return !fun->stub && !fun->isTemplate && funcIsDirty(fun);    // we don't do a thing with templates
+        }
+        virtual bool canVisitStructure ( Structure * st ) override {
+            return !st->isTemplate;    // we don't do a thing with templates
         }
         // function which is fully a nop
         bool isNop ( const FunctionPtr & func ) {
@@ -760,7 +781,7 @@ namespace das {
     // ExprInvoke
         virtual ExpressionPtr visit ( ExprInvoke * expr ) override {
             auto what = expr->arguments[0];
-            if ( what->type->baseType==Type::tFunction && what->rtti_isAddr() ) {
+            if ( what->type && what->type->baseType==Type::tFunction && what->rtti_isAddr() ) {
                 auto pAddr = static_cast<ExprAddr*>(what);
                 auto funcC = pAddr->func;
                 auto pCall = new ExprCall(expr->at, funcC->name);
@@ -913,6 +934,7 @@ namespace das {
 
     class RunFolding : public FoldingVisitor {
     public:
+        using PassVisitor::visit;
         RunFolding( const ProgramPtr & prog, vector<Function *> & _needRun ) : FoldingVisitor(prog),
             runProgram(prog.get()), needRun(_needRun) {
         }
@@ -923,6 +945,9 @@ namespace das {
     protected:
         virtual bool canVisitFunction ( Function * fun ) override {
             return !fun->stub && !fun->isTemplate;    // we don't do a thing with templates
+        }
+        virtual bool canVisitStructure ( Structure * str ) override {
+            return !str->isTemplate;    // we don't do a thing with template structures
         }
         // ExprCall
         virtual ExpressionPtr visit ( ExprCall * expr ) override {

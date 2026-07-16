@@ -20,6 +20,15 @@ static void clear_store_data_locked() {
             ++it;
         }
     }
+    for (auto it = g_state.store_strings.begin(); it != g_state.store_strings.end(); ) {
+        const auto & key = it->first;
+        if (key.compare(0, 12, "__live_vars_") == 0 ||
+            key.compare(0, 7, "__decs_") == 0) {
+            it = g_state.store_strings.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 // Exported C functions for the host executable to access state.
@@ -28,20 +37,38 @@ extern "C" {
     DAS_EXPORT_DLL bool live_host_exit_requested()      { return g_state.exit_requested; }
     DAS_EXPORT_DLL bool live_host_reload_requested()    { return g_state.reload_requested; }
     DAS_EXPORT_DLL bool live_host_full_reload()         { return g_state.full_reload; }
+    DAS_EXPORT_DLL bool live_host_reset_requested()     { return g_state.reset_requested; }
     DAS_EXPORT_DLL bool live_host_is_paused()           { return g_state.paused; }
     DAS_EXPORT_DLL bool live_host_files_changed()       { return g_state.files_changed; }
 
     DAS_EXPORT_DLL void live_host_set_live_mode(bool v)  { g_state.live_mode = v; }
 
     DAS_EXPORT_DLL void live_host_set_dt(float v)       { g_state.dt = v; }
-    DAS_EXPORT_DLL void live_host_set_uptime(float v)   { g_state.uptime = v; }
+    // Keep the double accumulator in sync with any absolute set (legacy fallback path
+    // and resets), so a later advance_clock continues from the same point.
+    DAS_EXPORT_DLL void live_host_set_uptime(float v)   { g_state.uptime_accum = v; g_state.uptime = v; }
     DAS_EXPORT_DLL void live_host_set_fps(float v)      { g_state.fps = v; }
+
+    // Single per-frame clock advance for the host loop. The fixed-vs-wall branch
+    // lives here (one place) so the clock has a single source of truth: when the
+    // recorder has set fixed_dt > 0, the content clock steps by exactly fixed_dt
+    // each frame regardless of how long the frame actually took (encode stall,
+    // vsync, gc); otherwise it steps by the measured wall dt. Uptime accumulates
+    // in both modes.
+    DAS_EXPORT_DLL void live_host_advance_clock(float wall_dt) {
+        float step = (g_state.fixed_dt > 0.0f) ? g_state.fixed_dt : wall_dt;
+        g_state.dt = step;
+        g_state.uptime_accum += step;          // double accumulator — drift-free over long sessions
+        g_state.uptime = float(g_state.uptime_accum);
+    }
     DAS_EXPORT_DLL void live_host_set_is_reload(bool v) { g_state.is_reload = v; }
     DAS_EXPORT_DLL void live_host_set_paused(bool v)    { g_state.paused = v; }
+    DAS_EXPORT_DLL void live_host_bump_reload_generation() { g_state.reload_generation++; }
 
     DAS_EXPORT_DLL void live_host_clear_reload_flags() {
         g_state.reload_requested = false;
         g_state.full_reload = false;
+        g_state.reset_requested = false;
         g_state.files_changed = false;
     }
     DAS_EXPORT_DLL void live_host_clear_live_vars() {
@@ -51,6 +78,13 @@ extern "C" {
         for (auto it = g_state.store.begin(); it != g_state.store.end(); ) {
             if (it->first.compare(0, 12, "__live_vars_") == 0) {
                 it = g_state.store.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (auto it = g_state.store_strings.begin(); it != g_state.store_strings.end(); ) {
+            if (it->first.compare(0, 12, "__live_vars_") == 0) {
+                it = g_state.store_strings.erase(it);
             } else {
                 ++it;
             }
@@ -113,29 +147,67 @@ void live_request_reload(bool full) {
     if (full) g_state.full_reload = true;
 }
 
+void live_request_reset() {
+    g_state.reset_requested = true;
+}
+
+uint64_t live_get_reload_generation() {
+    return g_state.reload_generation;
+}
+
 bool live_is_reload() {
     return g_state.is_reload;
 }
 
-float live_get_dt() {
-    if (!g_state.live_mode) {
-        // Standalone mode: compute dt from elapsed time
-        auto now = std::chrono::steady_clock::now();
-        if (!g_state.time_initialized) {
-            g_state.last_time = now;
-            g_state.time_initialized = true;
-            return 0.0f;
-        }
-        float dt = std::chrono::duration<float>(now - g_state.last_time).count();
+// Measure the wall-clock delta since the last call and cache it into g_state.dt (+ uptime).
+// Shared by the frame-driven path (live_advance_frame_clock) and the undriven get_dt() fallback.
+static void measure_wall_clock_dt() {
+    auto now = std::chrono::steady_clock::now();
+    if (!g_state.time_initialized) {
         g_state.last_time = now;
-        g_state.dt = dt;
-        g_state.uptime += dt;
+        g_state.time_initialized = true;
+        g_state.dt = 0.0f;
+        return;
     }
-    return g_state.dt;
+    float dt = std::chrono::duration<float>(now - g_state.last_time).count();
+    g_state.last_time = now;
+    g_state.dt = dt;
+    g_state.uptime_accum += dt;            // double accumulator — drift-free over long sessions
+    g_state.uptime = float(g_state.uptime_accum);
+}
+
+// Standalone: compute THIS frame's dt once and cache it in g_state.dt. Call once per frame (from
+// live_begin_frame). Under the live host the host owns the clock, so this is a no-op. Caching makes
+// get_dt() idempotent within a frame — every get_dt() call in one frame returns the same value
+// (matching live-host behavior). Before this, standalone get_dt() recomputed a wall-clock delta on
+// EVERY call, so a frame's dt was split across however many times the frame called get_dt(): the sim
+// accumulator (first call) got the big slice and was fine, but later callers (e.g. the render pass's
+// pulse/crossfade/camera) got a near-zero sliver, freezing time-based effects.
+void live_advance_frame_clock() {
+    if (g_state.live_mode) return;
+    g_state.frame_clock_driven = true;     // a frame driver owns the clock now → get_dt() returns the cache
+    measure_wall_clock_dt();
+}
+
+float live_get_dt() {
+    // Undriven standalone caller (no frame loop calling advance_frame_clock, not under the host):
+    // self-advance per call so direct live_host users keep the legacy "get_dt computes time" contract.
+    // Once a frame driver has called advance_frame_clock, return the stable per-frame cache instead.
+    if (!g_state.live_mode && !g_state.frame_clock_driven) {
+        measure_wall_clock_dt();
+    }
+    return g_state.dt;   // per-frame cache: set by live_advance_frame_clock (standalone) or by the host
 }
 
 float live_get_uptime() {
     return g_state.uptime;
+}
+
+// Recorder lockstep toggle (daslang-facing). dt > 0 puts the host clock into
+// fixed-step mode at that dt; dt <= 0 returns to wall-clock. The recorder calls
+// this with 1/fps at record_start and 0 at record_stop.
+void live_set_fixed_dt(float v) {
+    g_state.fixed_dt = v > 0.0f ? v : 0.0f;
 }
 
 float live_get_fps() {
@@ -181,6 +253,21 @@ bool live_load_bytes(const char * key, TArray<uint8_t> & data, Context * ctx) {
     if (sz > 0) {
         memcpy(data.data, src.data(), sz);
     }
+    return true;
+}
+
+void live_store_string(const char * key, const char * value) {
+    if (!key) return;
+    lock_guard<mutex> lock(g_state.store_mutex);
+    g_state.store_strings[key] = value ? value : "";
+}
+
+bool live_load_string(const char * key, char * & value, Context * ctx) {
+    if (!key) return false;
+    lock_guard<mutex> lock(g_state.store_mutex);
+    auto it = g_state.store_strings.find(key);
+    if (it == g_state.store_strings.end()) return false;
+    value = ctx->allocateString(it->second, nullptr);
     return true;
 }
 
@@ -342,16 +429,25 @@ public:
         addExtern<DAS_BIND_FUN(live_request_reload)>(*this, lib, "request_reload",
             SideEffects::modifyExternal, "das::live_request_reload")
                 ->args({"full"});
+        addExtern<DAS_BIND_FUN(live_request_reset)>(*this, lib, "request_reset",
+            SideEffects::modifyExternal, "das::live_request_reset");
+        addExtern<DAS_BIND_FUN(live_get_reload_generation)>(*this, lib, "get_reload_generation",
+            SideEffects::accessGlobal, "das::live_get_reload_generation");
         addExtern<DAS_BIND_FUN(live_is_reload)>(*this, lib, "is_reload",
             SideEffects::accessGlobal, "das::live_is_reload");
 
         // Timing
         addExtern<DAS_BIND_FUN(live_get_dt)>(*this, lib, "get_dt",
             SideEffects::accessGlobal, "das::live_get_dt");
+        addExtern<DAS_BIND_FUN(live_advance_frame_clock)>(*this, lib, "advance_frame_clock",
+            SideEffects::modifyExternal, "das::live_advance_frame_clock");
         addExtern<DAS_BIND_FUN(live_get_uptime)>(*this, lib, "get_uptime",
             SideEffects::accessGlobal, "das::live_get_uptime");
         addExtern<DAS_BIND_FUN(live_get_fps)>(*this, lib, "get_fps",
             SideEffects::accessGlobal, "das::live_get_fps");
+        addExtern<DAS_BIND_FUN(live_set_fixed_dt)>(*this, lib, "set_fixed_dt",
+            SideEffects::modifyExternal, "das::live_set_fixed_dt")
+                ->args({"dt"});
 
         // Error state
         addExtern<DAS_BIND_FUN(live_is_paused)>(*this, lib, "is_paused",
@@ -378,6 +474,15 @@ public:
         addExtern<DAS_BIND_FUN(live_load_bytes)>(*this, lib, "live_load_bytes",
             SideEffects::modifyArgumentAndExternal, "das::live_load_bytes")
                 ->args({"key", "data", "context"});
+        // String siblings of live_store_bytes / live_load_bytes — JSON-text rail
+        // for the LiveVarsPassMacro / dasImgui widget serializer pivot. Separate
+        // store from `store` so runtime-debugger output of JSON text stays readable.
+        addExtern<DAS_BIND_FUN(live_store_string)>(*this, lib, "live_store_string",
+            SideEffects::modifyExternal, "das::live_store_string")
+                ->args({"key", "value"});
+        addExtern<DAS_BIND_FUN(live_load_string)>(*this, lib, "live_load_string",
+            SideEffects::modifyArgumentAndExternal, "das::live_load_string")
+                ->args({"key", "value", "context"});
 
         // GC
         addExtern<DAS_BIND_FUN(live_collect_gc)>(*this, lib, "live_collect_gc",

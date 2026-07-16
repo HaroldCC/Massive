@@ -1,0 +1,1 @@
+Pointer to a `TypeMacro` object. Used for registering and managing custom type declaration macros.

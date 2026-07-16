@@ -103,7 +103,7 @@ module.exports = grammar({
     [$.function_return_type, $.dim_type],
     [$.func_addr_expression, $.lambda_expression],
     [$.function_argument_list, $._variable_name],
-    [$.type_expression, $._type_macro_arg],
+    [$.type_expression, $.type_witness],
   ],
 
   rules: {
@@ -167,6 +167,7 @@ module.exports = grammar({
 
     require_declaration: $ => seq(
       'require',
+      optional(field('guard', seq('?', $.identifier))),  // optional require: `require ?guard target`
       field('module', $.require_module_name),
       optional(seq('as', field('alias', $.identifier))),
       optional('public'),
@@ -175,6 +176,7 @@ module.exports = grammar({
 
     require_module_name: $ => seq(
       optional('%'),
+      repeat(seq(choice('..', '.'), '/')),
       $.identifier,
       repeat(seq(choice('.', '/'), $.identifier)),
     ),
@@ -271,7 +273,13 @@ module.exports = grammar({
       field('name', $.function_name),
       optional($.function_argument_list),
       optional($.function_return_type),
+      $._function_body,
+    ),
+
+    // single-expression arrow body ( => expr / => <- expr ) or a brace block
+    _function_body: $ => choice(
       field('body', $.block),
+      seq('=>', optional('<-'), field('body', $._expression)),
     ),
 
     function_name: $ => choice(
@@ -390,7 +398,7 @@ module.exports = grammar({
       optional($.function_return_type),
       optional(choice(
         ';',
-        field('body', $.block),
+        $._function_body,
       )),
     ),
 
@@ -656,6 +664,10 @@ module.exports = grammar({
 
     for_statement: $ => seq(
       'for',
+      optional(field('annotations', choice(
+        seq('[', $.annotation_argument_list, ']'),
+        $.metadata_argument_list,
+      ))),
       '(',
       field('variables', sep1($.for_variable, ',')),
       'in',
@@ -672,6 +684,10 @@ module.exports = grammar({
 
     while_statement: $ => seq(
       'while',
+      optional(field('annotations', choice(
+        seq('[', $.annotation_argument_list, ']'),
+        $.metadata_argument_list,
+      ))),
       '(',
       field('condition', $._expression),
       ')',
@@ -1207,12 +1223,12 @@ module.exports = grammar({
       seq('clone', '(', $.identifier, ')'),
     ),
 
-    // ---- Reader macro: %name~ content %% ----
+    // ---- Reader macro: %name~ content %% (module-level) / %name! content %% (expression-level) ----
 
     reader_macro: $ => seq(
       '%',
       field('name', $.identifier),
-      token.immediate('~'),
+      token.immediate(choice('~', '!')),
       field('content', optional($.reader_macro_content)),
       '%%',
     ),
@@ -1392,6 +1408,7 @@ module.exports = grammar({
       $.variant_type,
       $.bitfield_type,
       $.typedecl_type,
+      $.type_witness,      // type<T> — type-witness form (e.g. `t : type<auto(T)>`)
       $.option_type,
       $._type_modifier,
       $.quote_type,        // $t(type) in macro quotes
@@ -1421,9 +1438,14 @@ module.exports = grammar({
     ),
 
     _type_macro_arg: $ => choice(
-      seq('type', '<', $._type, '>'),
+      $.type_witness,
       $._expression,
     ),
+
+    // type<T> as a TYPE (e.g. `t : type<auto(T)>` parameter, return type, struct field).
+    // Distinct node from type_expression (same shape, expression-context use only).
+    // Matches bison: type_declaration_no_options_no_dim → DAS_TYPE '<' type_declaration '>'.
+    type_witness: $ => seq('type', '<', field('type', $._type), '>'),
 
     auto_type: $ => prec.left(seq(
       'auto',

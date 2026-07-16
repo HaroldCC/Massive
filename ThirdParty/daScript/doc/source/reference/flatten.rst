@@ -1,0 +1,523 @@
+.. _flatten:
+
+==========================================================================
+Function flattening — ``[flatten]`` for branchless / callless backends
+==========================================================================
+
+``daslib/flatten`` rewrites a function into a semantically equivalent
+**branchless, call-free twin** ``<name>_flat``. Every user call is inlined
+away, all control flow is lowered to predicated ``cond ? a : b`` selects, and
+early ``return`` becomes a runtime *live mask*. The output contains no user
+calls, no branches, and no loops.
+
+This exists for backends that cannot represent calls or dynamic control flow —
+the canonical case is a **GPU shader-graph compiler** whose IR is pure
+dataflow (leaves are primitive nodes, accumulators are rebindable locals, the
+only conditional is a *select* node). On such a backend a user function or an
+``if`` is not slow — it is *unrepresentable*. Flattening is the front-half that
+makes those constructs expressible: the backend only has to add a *select*
+opcode (and a bool-mask local) to consume the flattened form.
+
+Flattening is **not** an optimization for the interpreter / AOT / JIT tiers —
+those already inline downstream via clang / LLVM. It is a correctness /
+expressibility prerequisite for the branchless target.
+
+.. note::
+
+   The original function is left intact. ``[flatten]`` declares the twin early
+   (so its symbol exists for inference and callers) and transforms the twin's
+   body across the compiler's re-infer passes. Call ``foo_flat`` exactly like
+   ``foo``.
+
+Overview
+========
+
+.. code-block:: das
+
+    options gen2
+    require daslib/flatten
+
+    [flatten]
+    def shade(x : float) : float {
+        if (x > 0.5) {
+            return x * 2.0
+        }
+        return x
+    }
+
+    // generated twin (conceptually):
+    //   def shade_flat(x : float) : float {
+    //       return (x > 0.5) ? (x * 2.0) : x
+    //   }
+
+The ``if`` became a select; the two ``return`` statements collapsed into the
+twin's single tail return. A real backend then walks ``shade_flat`` and emits a
+*compare* node feeding a *select* node — no branch required.
+
+The transform
+=============
+
+Flattening runs as a small set of compiler-driven phases. Each phase is a
+single shallow pass over the (uninferred) twin body; the compiler re-infers
+between phases, so types stay clean at every boundary.
+
+**Predicated lowering** threads two pieces of state down the body:
+
+- a **structural predicate** — the AND of the enclosing ``if`` conditions on
+  the current path (``null`` means statically ``true``);
+- a **live mask** — a ``bool`` local that tracks "are we still executing this
+  frame", narrowed by ``return``.
+
+The effective write predicate at any point is ``liveMask && structPred``. The
+core rules:
+
+- ``if (c) A else B`` hoists ``let c = …`` once, then lowers ``A`` under
+  ``structPred && c`` and ``B`` under ``structPred && !c`` — both straight-line.
+- ``lhs = rhs`` becomes ``lhs = P ? rhs : lhs`` (the select is elided when ``P``
+  is statically ``true``, so straight-line code stays clean).
+- ``return e`` becomes ``__ret = P ? e : __ret`` plus a narrow of the live mask
+  on the taken path, so later statements see the mask go false.
+- A **user call** is inlined: its parameters bind to value temps, it gets its
+  own frame live mask seeded from the caller's predicate, and its body is
+  lowered recursively. Inlining is transitive.
+- A **whitelisted leaf primitive** (see below) is kept, its arguments lowered.
+
+**Loop unrolling** turns a fixed-count ``for`` (over a constant ``range`` /
+``urange`` or an array literal) into straight-line copies — the loop variable is
+substituted by each iteration's constant and each copy is lowered under the same
+predicate. Per-iteration locals are renamed so the copies don't collide. Parallel
+multi-source loops (``for (a, b in xs, ys)``) unroll in lockstep — every source
+must have the same constant length — substituting each loop variable per copy.
+
+**Generated locals are reserved-namespaced.** Every flatten-introduced local takes a
+``__``-prefixed name — ``__flat_*`` for the lowering scaffold (live masks, value temps,
+unrolled-loop locals) and ``__ssa_*`` for the single-assignment versions of reassigned
+user locals. The language reserves the ``__`` prefix (a user cannot declare such a name),
+so the generated names never collide with anything in the source.
+
+**break / continue** lower to predication, not jumps:
+
+- ``break`` narrows a **loop-scoped mask** that is declared once and *persists
+  across the unrolled copies* — once a copy breaks, the rest of it and every
+  later copy mask off.
+- ``continue`` narrows a **per-iteration mask** that is re-declared ``= true``
+  at the head of each copy — the rest of *that* copy masks off, the next copy
+  resets.
+
+Both compose with the function live mask, so a ``return`` inside a loop and an
+inlined callee's own early ``return`` interact correctly (a callee return never
+kills the caller's masks).
+
+**Output cleanup** — a dead-store / constant-propagation / copy-propagation
+pipeline collapses the mask scaffolding. On a function with no surviving runtime
+mask (e.g. one with no early return), the live mask folds to constant ``true``
+and disappears entirely, so a branchless input flattens *byte-identical* to its
+source. A post-inference fold collapses ``const ? a : b`` selects to the live
+arm and drops the pure self-assigns a folded false-select leaves behind.
+
+**Constant folding.** Because the branchless target has no downstream optimizer,
+the twin is reduced as far as possible *before* the backend sees it. The
+post-inference fold applies algebraic identities — ``x*1``, ``x+0``, ``x-0`` and
+``x*-1`` — over the full **scalar + vector (float / int / uint)** family, with the
+constant operand either a scalar or an all-lanes-equal vector literal (``x * float3(1)``,
+``v + int3(0)``, ``uint3(0) - w``). Each returns the non-constant operand, gated on a
+matching result type so a scalar-broadcast ``s * float3(1)`` (which is ``float3(s,s,s)``,
+not ``s``) is left intact rather than collapsing to the scalar. ``x*0`` returns a zero of
+the **result type**, so both ``v * 0`` and ``v * float3(0)`` fold to a width-matched vector
+zero (``*-1`` is signed-only — an unsigned "-1" is not a negation factor). It also folds
+the boolean ``true && x``, ``c ? true : false``, ``!const``; collapses constant vector
+constructors (``float3(1, 2, 3)``, ``uint3(1, 2, 3)``) and const-argument pure builtins
+(``float(7)``, ``min(2, 3)``) to literals; and constant-propagates single-definition
+locals — so a fully-constant accumulator loop reduces to its final constant. It also
+**reassociates** scattered constants in commutative ``+``/``-`` and ``*`` chains —
+``0.5 + x + 0.6 → x + 1.1``, ``2 * x * 3 → x * 6`` — gathering the constant operands the
+general compiler leaves non-adjacent (it folds only *adjacent* constant arithmetic and never
+reassociates, for float rounding) into one adjacent group the all-const fold then collapses.
+The same pass sorts the chain's *variable* terms into a canonical (structural) order, so
+commutative chains converge to one form (``b + a`` and ``a + b`` both become ``a + b``) —
+gated on every term being side-effect-free, and intended to feed a later common-subexpression
+pass. Positive terms sort before subtracted ones, so the rebuilt chain spells ``b - a``
+(one sub node) rather than ``-a + b`` (a negate plus an add — whose uniform ``-a`` the
+preshader pass would hoist into a pass-through ``_preshader_ = -_preshader_`` alias). Integer ``+``/``*`` reassociate exactly; integer ``/`` is non-associative and excluded.
+These are exactly the folds the general compiler leaves for the downstream tiers (it folds
+constant *arithmetic* but not constant *constructors*, and never a runtime-operand identity
+or reassociation), done here under a shader's fast-math assumption (``x*0 → 0`` fires by
+default; ``options _flatten_no_fast_math`` turns the float forms off — see below).
+
+**Swizzle lane fold.** A swizzle over a value whose lanes are separable — a float
+constructor of any arity, a vector const literal, or another swizzle — resolves every
+output lane to its provenance and re-emits the cheapest equivalent form. A selection
+covering one whole base hands back the base itself (``float4(v, 1f).xyz → v`` — the
+endemic *helper-returns-float4-with-alpha* shape; the constructor, the extract and the
+dropped lanes' compute all die), or one composed swizzle (``float4(v.zyx, 1f).xz → v.zx``,
+``v.zyx.xz → v.zx``); a single lane hands back the scalar argument
+(``float3(a, b, c).y → b``); the rest re-pack as a narrower constructor, splat, or const
+literal (``float4(sin(x), x, 3f, cos(x)).yz → float2(x, 3f)`` — the ``sin``/``cos`` die).
+Component-read scalar arguments decompose too, so ``float3(v.x, v.y, v.z).xyz``
+re-vectorizes to ``v``. Pure lane selection is bit-exact, so the fold is never
+fast-math gated. The one cost gate: a *partial* run of a base inside a re-pack
+(``float3(v2, s).yz`` would need a ``v2.y`` extract the original didn't pay for) is left
+alone — lane reads are full instructions on the target ISA.
+
+The fold and the typer's const-fold are *mutually-enabling*, so the fold phase
+**iterates to a fixpoint**. Flattening folds the runtime-operand identities the
+typer will not (``0*b → 0``); the re-infer between passes then const-folds the
+freshly-constant operands the fold does not touch (``24 >> (24 & 31) → 0``),
+which can expose a fresh identity (``x - 0``) for the next pass. A single pass is
+therefore not enough — the fold re-runs until nothing changes before the twin is
+handed to the backend.
+
+**Preshader extraction and CSE.** Once the fold fixpoint converges, a final
+optimize pass runs **once** on the canonical body — preshader extraction then
+common-subexpression elimination (``flatten_optimize``):
+
+* **Preshader extraction** colours each subtree *uniform* (it reads only material
+  props / shader globals + literals) or *varying* (it transitively reads a function
+  parameter). Every maximal uniform subtree is hoisted to a top-of-body
+  ``_preshader_N`` ``let``; a backend recognises the name prefix and routes the node
+  to the **per-draw preshader**, so uniform work the general compiler would re-run
+  per pixel runs once per draw. Sampler / procedural intrinsics (``tex2d``, ``noise``)
+  are *barriers* — they cannot run in a preshader, so a subtree containing one stays
+  per-pixel even when its inputs are uniform.
+* **Regroup-to-share** repairs a sharing loss the reassociation pass can cause:
+  its canonical sum order (variables first, constants last) rewrites
+  ``1.0 - mask + edge`` into ``(edge - mask) + 1.0``, splitting the ``1.0 - mask``
+  another expression still carries whole — the shapes stop matching and the share
+  dies (burn's alpha cost one extra instruction exactly this way). A sum holding
+  ``{+C, -x, …}`` whose grouped ``C - x`` twin is live elsewhere in the body
+  re-emits as ``(C - x) + rest``, so the next CSE round shares the node. Gated on
+  the live twin (regrouping is count-neutral standalone, so it can never lose);
+  re-pairing moves the float association → **fast-math gated**.
+* **CSE** value-numbers the (now-canonical) body by structural key and shares any
+  pure subtree computed twice or more into one ``let`` before its first use, so the
+  backend emits one graph node and *N* links instead of *N* recomputations. The
+  reassociation pass's canonical operand order is what makes the key match across
+  ``a + b`` and ``b + a``; a uniform repeat routes to the preshader
+  (``_preshader_cse_``), a varying one stays in the body (``_cse_``).
+* **Alias elimination** then collapses every pure ``let X = <bare var V>`` copy (with
+  neither ``X`` nor ``V`` reassigned) into direct references to ``V`` and drops the ``let``. CSE can
+  leave such copies (a later round rewrites an earlier ``_cse_`` let's whole RHS down to
+  a bare var) and the unroll / fold can leave them (``let p_0 = ro``); both are
+  pass-through graph nodes for nothing. All three passes iterate to a **joint
+  fixpoint**: an eliminated alias can expose a fresh dup, and a CSE share or alias
+  substitution can re-expose *uniform* compute in the varying region (``!_preshader_0``,
+  a ``_cse_`` let whose operands converge to all-preshader references) that only
+  re-extraction hoists to the per-draw group.
+
+Hoisting and sharing are **value-exact** — existing subtrees move, nothing regroups or
+rounds (the exceptions are the fast-math regroup-to-share above and the
+division→reciprocal rewrite below) — and the passes exclude any subtree that reads a
+**reassigned** variable
+(a live/loop mask, a written global, or the base of an indexed store — ``G[i] = v``
+makes every ``G[...]`` read unstable), whose value is not stable across the body.
+
+**mad: disassemble early, re-fuse late. lerp: keep whole.** ``mad`` is pure
+arithmetic wearing a call: the fold phase **expands** it in place —
+``mad(a, b, c) → a*b + c`` — so every downstream pass sees through it (the
+identity arms collapse ``mad(a, 1, c) → a + c`` with **no per-builtin identity
+table**, reassociation canonicalises the exposed operands, CSE and preshader
+extraction work on the pieces). Once the optimize pass converges, a finishing
+**fuse** pass (``PHASE_FUSED``) re-packs what survived: ``a*b + c`` /
+``c + a*b`` (and the const-negatable ``a*b - C`` / ``C - a*b``) become one
+``mad(a, b, c)`` node — including the vector·scalar broadcast form. A leftover
+``(-a) + b`` (the ``0 - x`` / ``*-1`` folds produce bare negates) re-packs into
+``b - a``.
+
+``lerp`` is **not** expanded by default. A shader-graph backend computes
+``(b - a)*t + a`` in one native lerp instruction with constant operands free,
+so disassembly can at best break even (a full re-fuse) and loses 1–2
+instructions whenever reassociation or mad fusion merges a lerp piece with a
+*neighbor* term into a shape re-fusion cannot recover — the smooth-min idiom
+``lerp(d, ds, h) + k*h*(h - 1.0)`` loses its lerp six times over in the
+raymarch example shader. The
+constant-selector identities fire directly on the call instead
+(``lerp(a, b, 0) → a``, ``lerp(a, b, 1) → b``, ``lerp(a, a, t) → a``; fast-math
+gated — they drop an argument), the surviving call is one pure node for CSE,
+and a fully-uniform lerp hoists whole into the preshader. The fuse pass still
+canonicalises hand-written ``(b - a)*t + a`` arithmetic (via the
+``mad(b - a, t, a)`` shape) *into* one ``lerp(a, b, t)`` node, so organic
+lerp-shaped math reaches the backend as the native instruction too.
+
+A backend **without** a native lerp opts back into the disassembly with an
+integration setting in the modules that carry its shaders:
+
+.. code-block:: das
+
+    options _flatten_expand_lerp = true
+
+(or by passing ``expand_lerp = true`` when driving ``flatten_fold`` directly).
+Under the option ``lerp(a, b, t) → (b - a)*t + a`` exactly as mad: the folds
+see through it, CSE shares a repeated ``b - a`` across lerps, preshader
+extraction hoists a uniform ``b - a`` even when ``t`` is varying, and the fuse
+pass re-packs an unfolded survivor back into the single ``lerp`` node.
+
+Type gates keep the rewrites inside the das ``math`` overload set (float / int /
+uint, scalar + vector; lerp with scalar ``t``), and fusion only runs when a
+3-argument ``mad`` / ``lerp`` is visible from the twin's module (``math`` or a
+backend DSL). Fusion is value-exact at the das level (das ``mad`` computes
+``a*b + c``); the *backend* may contract it to a single-rounding FMA — that is
+its call.
+
+**Horizontal adds become dots.** On a shader-graph ISA every lane read is a
+full instruction (a splat node), so ``c.x + c.y + c.z`` costs three splats and
+two adds — and ``dot(c, float3(1, 1, 1))`` costs **one**, the mask riding free
+as a constant operand. The fuse pass collects each maximal ``+``/``-`` chain's
+terms that are lane reads of one vector — bare ``v.x``, const-weighted
+``v.x * 0.299``, negated, repeated — and collapses every ≥2-lane group into a
+single ``dot(v, mask)``: missing lanes mask as ``0``, weights land in the mask
+(the luma idiom ``c.x*0.299 + c.y*0.587 + c.z*0.114`` becomes one dot against
+``float3(0.299, 0.587, 0.114)``), repeated lanes accumulate, and non-lane
+terms stay in the sum (``v.x + v.y + b → dot(v, float2(1, 1)) + b``). Worst
+case — every splat already shared elsewhere — a 2-lane fold trades one add for
+one dot (neutral); everything else strictly drops nodes (triplanar's weight
+normalize ``an.x + an.y + an.z`` drops 4 instructions). The fold reorders the
+float adds and multiplies skipped lanes by 0, so it is **fast-math gated**, and
+it runs only when a 2-argument ``dot`` is visible from the twin's module.
+
+**Division becomes a reciprocal multiply.** A divide is the most expensive
+arithmetic node a shader carries, and most divisors never change per pixel. The
+fold rewrites ``x / C`` (const ``C``, float family) into ``x * (1/C)`` with the
+reciprocal computed at compile time (a zero lane keeps the division — no ``inf``
+literal is minted), and the optimize pass rewrites a *varying* division by a
+**uniform** scalar, ``x / U``, into ``x * _preshader_N`` with
+``let _preshader_N = 1f / U`` hoisted per draw — deduplicated by structural key,
+so N divisions by the same uniform share ONE reciprocal (raymarch's six
+smooth-min ``/ smoothK`` divides become six muls against one per-draw rcp, and
+the muls then mad-fuse). Both rewrites round (~1 ulp) and are **fast-math gated**.
+
+**Ctor lane algebra.** Per-lane scalar arithmetic wrapped in a vector
+constructor is the manual-vectorization tax shaders pay everywhere; flatten
+re-packs it from both ends:
+
+* **Zero-lane kill** (fold): ``floatN(e0, e1, …) * constVec`` with a zero const
+  lane zeroes the matching ctor lanes *in place* — no distribution — so the
+  dead lane's compute (a ``sin``, a texture-free chain) is eliminated by DSE,
+  and a fully-const product collapses to an embedded constant:
+  ``float2(sin(x)*12.0, 13.0) * float2(0.0, 123.0) → float2(0f, 1599f)``.
+  Float forms are fast-math (inf/NaN class); integer forms are exact.
+* **Splat collapse** (fold): ``v * floatN(s)`` / ``v / floatN(s)`` /
+  ``floatN(s) / v`` use das's native vector·scalar forms — the splat ctor node
+  disappears (``an / float3(sumW) → an / sumW``). Bit-exact, never gated.
+* **Lane re-vectorization** (fuse): same-op lanes whose sides vectorize re-pack
+  into one vector op — ``sin(float3(c.x + 0.1, c.y + 0.2, c.z + 0.3)) →
+  sin(c + float3(0.1, 0.2, 0.3))``: d scalar ops + d component reads collapse
+  to one add, the const gather embeds as a literal. Any component permutation
+  of one base becomes a swizzle (the natural full mask becomes the base
+  itself); an equal-scalar side broadcasts (``*``/``/``) or splats (``+``/``-``).
+  Bit-exact (the same per-lane IEEE ops), never gated.
+* **Shared-factor extraction** (fuse): every lane carrying the same scalar
+  factor or divisor re-packs to a broadcast —
+  ``float3(g*1.08, g*0.86, g*0.66) → float3(1.08, 0.86, 0.66) * g`` (3 muls +
+  ctor → 1 mul against an embedded const). Bit-exact, never gated.
+* **Majority-factor compensation** (fuse): when most lanes share a const factor
+  and the odd lane does not, the odd lane is compensated by the const ratio —
+  ``float3(x*13.0, y*13.0, z*12.0) → float3(x, y, z*(12.0/13.0)) * 13.0`` —
+  fired only when the per-pixel multiply count strictly drops. The ratio
+  rounds → **fast-math gated**.
+
+The fast-math opt-out
+=====================
+
+flatten's default contract is a shader compiler's: fast math. Every
+value-changing rewrite — the float ``x*0 → 0`` / ``x - x → 0`` folds (inf/NaN
+propagation), float reassociation (association order), regroup-to-share (same),
+the ``lerp`` const-selector short-circuits (they drop an argument),
+division→reciprocal, the float zero-lane kill, the horizontal-add→dot re-pack,
+and majority-factor compensation — assumes finite
+inputs and tolerates ~1-ulp drift. A module that cannot accept that opts out
+with a user option:
+
+.. code-block:: das
+
+    options _flatten_no_fast_math = true
+
+The option is module-local (it applies to the shaders/twins *written in* that
+module) and turns off exactly the value-changing set; everything bit-exact —
+flattening, predication, unrolling, preshader extraction, CSE, alias
+elimination, the mad expand/re-fuse round trip (and the lerp one, when
+``_flatten_expand_lerp`` enables it), splat collapse, lane re-vectorization,
+shared-factor extraction, and every *integer* fold — stays on. Under the
+option a twin computes bit-identical results to its original.
+The residual oracles take the same flag, so a unit compiled under the option
+validates clean without flagging the deliberately-skipped rewrites.
+
+Supported subset
+================
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - Construct
+     - Lowering
+   * - ``if`` / ``if … else`` (any nesting)
+     - dual-arm predicated ``?:`` selects under the path predicate
+   * - early / multiple ``return``
+     - function live mask + a single tail return of the result temp
+   * - user function call
+     - inlined transitively; parameters bound to value temps
+   * - fixed-count ``for``
+     - unrolled — ``range(CONST)``, ``range(A, B)``, ``urange(…)``, or an array literal ``[a, b, c]``
+   * - parallel multi-source ``for (a, b in xs, ys)``
+     - unrolled in lockstep; every source must share one constant length
+   * - ``break`` / ``continue``
+     - loop-scoped (persistent) / per-iteration (per-copy) bool masks
+   * - ``+=`` ``-=`` ``*=`` … and ``++`` / ``--``
+     - rewritten to a predicated select on the base operation
+   * - bare block ``{ … }`` / ``with (x) { … }``
+     - flattened in place / unwrapped to its body
+   * - copyable value assignment
+     - selects support scalars, vectors (``float4`` …), structs and tuples
+   * - bare local decl (``var a : float3``), partially assigned under a branch
+     - the implicit zero-init is materialized, so the predicated select's false path reads a real node
+   * - ``void`` functions
+     - predicated writes to output globals (the writes-to-globals shader model)
+
+Boundaries (loud errors)
+========================
+
+Everything outside the supported subset is rejected with a specific
+``flatten:`` error rather than emitting wrong output:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 60
+
+   * - Rejected
+     - Why
+   * - ``while`` loops
+     - no compile-time iteration count — not unrollable
+   * - ``for`` over a non-constant range
+     - same — the bound must be a constant ``range`` / ``urange`` or an array literal
+   * - parallel ``for`` sources of unequal length
+     - lockstep unroll needs one shared count; mismatched lengths are rejected
+   * - move ``<-`` / clone ``:=``
+     - predication is copy-only; a move/clone cannot be predicated
+   * - recursion
+     - cannot inline a self-referential call
+   * - a non-whitelisted leaf builtin
+     - not provably pure / GPU-expressible (e.g. ``print``, allocation, I/O)
+   * - a non-copyable type at an inline boundary
+     - ``array<T>``, ``table``, ``lambda`` — not copy-init-able into a select
+
+The leaf-primitive whitelist
+============================
+
+Inlining stops at **leaf primitives** — functions the backend implements
+natively and flatten must *keep* (not inline). These must be pure,
+branch-safe, and backend-expressible, since under predication both arms of a
+select are conceptually evaluated. The whitelist is **passed in by the backend**
+so it names exactly its own primitive set; the thin ``[flatten]`` annotation
+passes a standard pure-math default.
+
+A whitelisted name is matched by its *simple* (un-mangled) name, so an
+OR-typed primitive (e.g. ``saturate(x : float | int)``) is kept regardless of
+which monomorphization the call resolved to.
+
+Public API
+==========
+
+``[flatten]``
+    The thin annotation. Generates ``<name>_flat`` with the standard whitelist.
+    Use it when you just want a flattened twin to call.
+
+``flatten_function(var func, whitelist : table<string>) : FlatCtx?``
+    Flattens ``func``'s body in place using the caller-supplied primitive set.
+    Backends call this directly with their own ``[hint]`` primitives, before
+    their own macro walks the result. Inspect ``.ok`` / ``.err``. The body is
+    uninferred afterward — re-infer before reading types.
+
+``flatten_no_fast_math : bool``
+    True when the *compiling* module sets ``options _flatten_no_fast_math = true``.
+    Compile-time only (annotation/backend patch code reads it once per cycle and
+    threads the bool into the passes below); a runtime tool driving the passes
+    directly passes its own flag instead.
+
+``flatten_expand_lerp : bool``
+    True when the *compiling* module sets ``options _flatten_expand_lerp = true`` —
+    the opt-in lerp disassembly for backends *without* a native lerp instruction
+    (see the mad/lerp section above). Same compile-time-only contract as
+    ``flatten_no_fast_math``.
+
+``flatten_log_cse : bool``
+    True when the *compiling* module sets ``options _flatten_log_cse = true`` —
+    a debug dump of each twin's final CSE value-number cache (every pure-subtree
+    key with its occurrence count, plus the grouped ``C - x`` shape table) after
+    the optimize fixpoint, via ``to_log``. Same compile-time-only contract as
+    ``flatten_no_fast_math``.
+
+``flatten_fold(var func, no_fast_math = false, expand_lerp = false) : bool``
+    The post-inference fold pass: collapse ``const ? a : b`` selects, drop the
+    pure ``lhs = lhs`` self-assigns, strip redundant zero initializers. Run it
+    *after* re-inference (the constant conditions must already be folded to
+    ``ExprConstBool``). ``[flatten]`` runs it automatically; a backend calling
+    ``flatten_function`` runs it after its own re-infer, before consuming the
+    twin. A single call is **one shallow pass — it is not self-converging**.
+    A multi-step *reveal* cascade (a folded ``0*s → 0`` makes a local constant
+    that the next re-infer settles for const-prop, exposing a fresh ``v + 0``
+    identity) only fully collapses if the backend **re-enters the fold across
+    re-inference until it reports no change** — exactly as ``[flatten]``'s own
+    patch does (and as the ``[pixel_shader]`` backend now does).
+
+``flatten_fold_residuals(var func, no_fast_math = false) : array<string>``
+    Test-framework / fuzzer introspection: walks a compiled twin's final body
+    and returns a description for each const-foldable residual a complete fold
+    should have collapsed — an unconditional algebraic identity (``x*1``,
+    ``x+0``, …), an all-const foldable call, a const-condition select,
+    ``!const``, or a swizzle over decomposable lanes. Empty means clean. It runs over the *compiled* output (not at
+    transform time), so it covers backend paths such as ``[pixel_shader]`` and
+    is the fold-completeness oracle for both ``tests/flatten/test_flatten_fold.das``
+    (the ``[flatten]`` + const-identity corpus and every example shader) and the
+    ``flatten-fuzz`` ``--strict-fold`` mode. This is the *only* fold-completeness
+    check — there is no compile-time flag; a missed fold is suboptimal, not an
+    error, so it is validated by tests rather than gated in the macro.
+
+``flatten_optimize(var func, barriers : table<string>, no_fast_math = false, log_cse = false) : bool``
+    The post-fold optimize pass: hoist maximal uniform subtrees to per-draw
+    ``_preshader_`` lets, rewrite divisions by a uniform into per-draw
+    reciprocal multiplies (fast-math), regroup const-minus sums toward live
+    ``C - x`` twins (fast-math), CSE-dedup repeated subtrees, then
+    collapse pure-alias ``let`` copies — iterating to a joint fixpoint. Run it **once** after
+    the ``flatten_fold`` fixpoint converges (and *not* before — reassociation runs
+    in the fold and would reorder a hoisted reference back into a fresh uniform
+    subtree). ``barriers`` is the backend's sampler / intrinsic call-name set
+    (``{ "tex2d", "noise" }``) — those stay per-pixel. ``log_cse`` dumps the final
+    value-number cache. ``[flatten]`` runs it
+    automatically; the ``[pixel_shader]`` backend runs it after its fold fixpoint.
+
+``flatten_fuse(var func, no_fast_math = false) : bool``
+    The finishing fuse pass: collapse same-vector lane sums into
+    ``dot(v, mask)`` (fast-math), re-pack ctor lane patterns (re-vectorization,
+    shared-factor extraction, majority compensation), ``a*b ± c`` into
+    ``mad(a, b, c)``, and the expanded lerp shape ``mad(b - a, t, a)`` back
+    into ``lerp(a, b, t)``. Run it
+    after ``flatten_optimize``'s re-infer (the type gates need settled types) and
+    **iterate across re-inference while it reports change**, exactly like the
+    fold — each round strictly drops a ``+``/``-`` node, so it converges.
+    ``[flatten]`` runs it automatically; the ``[pixel_shader]`` backend mirrors it.
+
+``flatten_opt_residuals(var func, no_fast_math = false) : array<string>``
+    The optimize-completeness oracle (sibling of ``flatten_fold_residuals``):
+    walks a compiled twin and returns a description for each missed optimization —
+    a maximal uniform subtree still inline in the varying body, an un-rewritten
+    division by a uniform, a pure subtree computed twice or more left un-shared,
+    a sum still splitting a ``C - x`` apart from its grouped twin,
+    a pure-alias ``let`` copy left uncollapsed, a fusable mul-add left un-packed,
+    a mad still carrying the lerp shape, an un-fused same-vector lane sum, or an
+    un-packed ctor lane pattern.
+    Empty means complete. Drives the same
+    ``tests/flatten/test_flatten_fold.das`` corpus and the ``flatten-fuzz``
+    strict mode.
+
+A backend's typical pipeline is therefore: ``flatten_function`` → re-infer →
+``flatten_fold`` (to a fixpoint) → re-infer → ``flatten_optimize`` → re-infer →
+``flatten_fuse`` (to a fixpoint) → walk the now-branchless, call-free twin and
+emit its dataflow graph (mapping ``?:`` to a *select* node and the bool masks
+to a 0/1 selector).
+
+.. seealso::
+
+    Worked end-to-end examples — real shaders flattened through a stand-in
+    shader-graph backend, plus a capability tier (if/else, helpers, loops,
+    ``break`` / ``continue``) — live under ``examples/flatten/`` in the source
+    tree.

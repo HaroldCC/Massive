@@ -1,6 +1,4 @@
 options gen2
-options no_unused_block_arguments = false
-options no_unused_function_arguments = false
 options indenting = 4
 options strict_smart_pointers = true
 
@@ -36,16 +34,6 @@ struct Ray {
     //! ray (direction and origin)
     dir : float3    //! direction
     origin : float3 //! origin
-}
-
-def degrees(f : float) {
-    //! convert radians to degrees
-    return f * 180. / PI
-}
-
-def radians(f : float) {
-    //! convert degrees to radians
-    return f * PI / 180.
 }
 
 def RGBA_TO_UCOLOR(x, y, z, w : float) {

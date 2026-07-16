@@ -1,11 +1,15 @@
 #include "daScript/misc/platform.h"
 
 #include "daScript/ast/ast.h"
+#include "daScript/ast/ast_infer_type.h"
 #include "daScript/ast/ast_serializer.h"
 #include "daScript/ast/ast_expressions.h"
-#include "daScript/das_common.h"
+#include "daScript/ast/ast_gc_report.h"
+#include "daScript/misc/das_common.h"
 #include "daScript/simulate/aot_builtin_string.h"
 #include "daScript/simulate/aot_builtin_uriparser.h"
+#include "daScript/simulate/fs_file_info.h"
+#include "daScript/das_project_specific.h"
 
 #include "../parser/parser_state.h"
 
@@ -24,7 +28,49 @@ int das_yyparse(yyscan_t yyscanner);
 void das2_yybegin(const char * str, uint32_t len, yyscan_t yyscanner);
 int das2_yyparse(yyscan_t yyscanner);
 
+// get_file_access lives in the compiler lib: when given a pak it compiles the
+// project-config .das (compileDaScript), so it must sit on the compiler side.
+// The project-specific override stays in HAL (project_specific_file_info.cpp),
+// reached here via get_project_specific_file_access().
+DAS_CC_API das::smart_ptr<das::FileAccess> get_file_access( char * pak ) {
+    if ( auto specific = das::get_project_specific_file_access() )
+        return specific(pak);
+#if !DAS_NO_FILEIO
+    if ( pak && *pak ) {
+        das::ModuleGroup dummyLibGroup;
+        das::TextWriter tout;
+        auto program = das::compileDaScript(pak, das::make_smart<das::FsFileAccess>(), tout, dummyLibGroup);
+        return das::make_smart<das::FsFileAccess>(pak, program);
+    } else {
+        return das::make_smart<das::FsFileAccess>();
+    }
+#else
+    DAS_FATAL_ERROR(
+        "daslang is configured with DAS_NO_FILEIO. However file access is not specified."
+        "set_project_specific_fs_callbacks or link-time dependency needs to be specified."
+    )
+    return nullptr;
+#endif
+}
+
 namespace das {
+
+    // defined in ast_module.cpp (runtime); appends a parsed builtin module's content
+    bool appendBuiltinModuleContent ( Module * target, ProgramPtr program, const string & modName );
+
+    bool compileBuiltinModule ( Module * module, const string & modName, const unsigned char * const str, unsigned int str_len ) {
+        TextWriter issues;
+        auto access = make_smart<FileAccess>();
+        auto fileInfo = make_unique<TextFileInfo>((char *) str, uint32_t(str_len), false);
+        access->setFileInfo(modName, das::move(fileInfo));
+        ModuleGroup dummyLibGroup;
+        auto program = parseDaScript(modName, "", access, issues, dummyLibGroup, true);
+        module->ownFileInfo = access->letGoOfFileInfo(modName);
+        DAS_ASSERTF(module->ownFileInfo,"something went wrong and FileInfo for builtin module can not be obtained");
+        auto result = appendBuiltinModuleContent(module, program, modName);
+        program->thisModule->module_gc_root->gc_dump_to_thread_root();
+        return result;
+    }
 
     bool isUtf8Text ( const char * src, uint32_t length ) {
         if ( length>=3  ) {
@@ -152,6 +198,27 @@ namespace das {
                             if ( src >= src_end ) {
                                 continue;
                             }
+                            // Optional require `require ?guard target`: parse the guard module name.
+                            // When the guard module is unavailable, skip this require entirely (no
+                            // dependency collected, no error). Only `require` is guarded, not `include`.
+                            string reqGuard;
+                            bool hasReqGuard = false;
+                            if ( isReq && src[0]=='?' ) {
+                                hasReqGuard = true;
+                                src ++; // skip '?'
+                                while ( src < src_end && (src[0]==' ' || src[0]=='\t') ) {
+                                    src ++;
+                                }
+                                while ( src < src_end && (isalnumE(src[0]) || src[0]=='_') ) {
+                                    reqGuard += *src ++;
+                                }
+                                while ( src < src_end && (src[0]==' ' || src[0]=='\t') ) {
+                                    src ++;
+                                }
+                                if ( src >= src_end ) {
+                                    continue;
+                                }
+                            }
                             if ( src[0]=='_' || isalphaE(src[0]) || src[0] == '%' || src[0] == '.' || src[0]=='/' ) {
                                 string mod;
                                 mod += *src++;
@@ -159,6 +226,10 @@ namespace das {
                                     mod += *src ++;
                                 }
                                 if ( isReq ) {
+                                    // guarded optional require whose guard module is absent — skip
+                                    if ( hasReqGuard && Module::requireEx(reqGuard, false)==nullptr ) {
+                                        continue;
+                                    }
                                     bool isPublic = false;
                                     while ( src < src_end && src[0] == ' ' ) {
                                         src ++;
@@ -234,25 +305,6 @@ namespace das {
         return req;
     }
 
-    bool starts_with ( const string & name, const char * template_name ) {
-        auto len = strlen(template_name);
-        if ( name.size() < len ) return false;
-        return name.compare(0,len,template_name) == 0;
-    }
-
-    string getModuleName ( const string & nameWithDots ) {
-        auto idx = nameWithDots.find_last_of("./");
-        if ( idx==string::npos ) return nameWithDots;
-        return nameWithDots.substr(idx+1);
-    }
-
-    string getModuleFileName ( const string & nameWithDots ) {
-        auto fname = nameWithDots;
-        // TODO: should we?
-        replace ( fname.begin(), fname.end(), '.', '/' );
-        return fname;
-    }
-
     bool addRequirements(const string & fileName, ModuleGroup & libGroup, Module * mod, int32_t line, const FileAccessPtr & access,
             vector<RequireRecord> & notAllowed, vector<FileInfo*> & chain, TextWriter * log, int tab ) {
         if ( !access->isModuleAllowed(mod->name, fileName) ) {
@@ -322,16 +374,16 @@ namespace das {
                     }
                     return false;
                 }
-                auto module = Module::requireEx(mod, allowPromoted); // try native with that name
+                auto info = access->getModuleInfo(mod, fileName);
+                auto module = Module::requireEx(mod, allowPromoted, info.fileName);
                 if ( !module ) {
-                    auto info = access->getModuleInfo(mod, fileName);
                     if ( !info.moduleName.empty() ) {
                         mod = info.moduleName;
                         if ( log ) {
                             *log << string(tab,'\t') << " resolved as " << mod << "\n";
                         }
                     }
-                    module = Module::requireEx(mod, allowPromoted); // try native with that name AGAIN (promoted?)
+                    module = Module::requireEx(mod, allowPromoted, info.fileName); // try native with that name AGAIN (promoted?)
                     if ( !module ) {
                         auto it_r = find_if(req.begin(), req.end(), [&] ( const ModuleInfo & reqM ) {
                             return reqM.moduleName == mod;
@@ -665,17 +717,53 @@ namespace das {
         });
     }
 
+    // compileDaScript runs its top-level post-parse steps (deriveAliases/allocateStack/...)
+    // on a transient gc_guard root; on exit this merges that scratch into the program's
+    // module root, then clears the function/generic lookup caches before the gc_guard
+    // sweeps the rest (see clearAllFunctionLookups above for why). Only the top program
+    // sets prog; per-module parse uses ModuleGcFinalize instead.
     struct GcCollectOnExit {
         gc_guard & scope;
         Program * prog = nullptr;
-        GcCollectOnExit(gc_guard & s) : scope(s) {}
-        GcCollectOnExit(gc_guard & s, Program * p) : scope(s), prog(p) {}
+        explicit GcCollectOnExit ( gc_guard & s ) : scope(s) {}
         ~GcCollectOnExit() {
             if ( prog ) {
                 prog->thisModule->gc_collect(&scope.guard_root);
             }
             clearAllFunctionLookups();
         }
+        GcCollectOnExit ( const GcCollectOnExit & ) = delete;
+        GcCollectOnExit & operator = ( const GcCollectOnExit & ) = delete;
+    };
+
+    // parseDaScript runs with the module's own gc_root as the working/active root (via
+    // gc_active_scope), so live nodes accumulate directly on module_gc_root and per-pass
+    // swaps can replace it O(1). At scope exit this does the final collect+swap: walk the
+    // live tree into a fresh root, repoint active to it, then drop the old root (its dtor
+    // sweeps the remaining garbage). module_gc_root ends holding only the live survivors.
+    struct ModuleGcFinalize {
+        Program *   prog = nullptr;
+        TextWriter * logs = nullptr;
+        explicit ModuleGcFinalize ( Program * p ) : prog(p) {}
+        ~ModuleGcFinalize() {
+            if ( prog ) {
+                auto m = prog->thisModule.get();
+                gc_root * oldRoot = m->module_gc_root.get();
+                auto fresh = make_unique<gc_root>();
+                m->gc_collect(oldRoot, fresh.get());   // live oldRoot -> fresh; garbage stays on oldRoot
+                if ( logs && gcStageReportEnabled() ) {
+                    *logs << "=== gc survivors @ " << m->name << " : live="
+                          << fresh->gc_count << " garbage=" << oldRoot->gc_count << " ===\n";
+                    gcReportHistogram(*fresh, "live", *logs, 200);
+                }
+                gc_root * liveRoot = fresh.get();
+                gc_root::gc_get_active_root() = liveRoot;   // repoint active before the move frees oldRoot
+                m->module_gc_root = das::move(fresh);        // deletes oldRoot -> sweeps garbage
+            }
+            clearAllFunctionLookups();
+        }
+        ModuleGcFinalize ( const ModuleGcFinalize & ) = delete;
+        ModuleGcFinalize & operator = ( const ModuleGcFinalize & ) = delete;
     };
 
     ProgramPtr parseDaScript ( const string & fileName,
@@ -688,14 +776,26 @@ namespace das {
                               CodeOfPolicies policies ) {
         CompilationCallbackGuard compilationCallbackGuard(moduleName, fileName);
         ProgramPtr program = make_smart<Program>();
-        gc_guard parse_gc_scope;
-        GcCollectOnExit parse_gc_collect(parse_gc_scope, program.get());
+        // The module's own root is the working/active root for the whole compile, so live
+        // nodes land on module_gc_root and per-pass collects can swap it O(1). The scope
+        // restores the previous active root on exit without sweeping (the module owns it).
+        gc_active_scope parse_gc_scope(program->thisModule->module_gc_root.get());
+        ModuleGcFinalize parse_gc_collect(program.get());
+        parse_gc_collect.logs = &logs;
         program->library.renameModule(program->thisModule.get(), moduleName);
         ReuseCacheGuard rcg;
         auto time0 = ref_time_ticks();
+        // Per-module timing snapshots, used by log_module_compile_time. We still
+        // accumulate into *totParse/*totInfer/*totOpt/*totM for the top-level summary.
+        uint64_t myParseT = 0, myInferT = 0, myOptT = 0, myMacroModT = 0;
+        auto macroTicks0 = daScriptEnvironment::getBound()->macroTimeTicks;
+        program->inferPassesUsed = 0;  // reset once per module; inferTypesDirty accumulates across all inferTypes legs (incl. restartInfer)
 
         if ( trySerializeProgramModule(program, access, fileName, libGroup, logs) ) {
             return program;
+        } else {
+            // Serialization failed and the program changed, so set it for proper GC collection on exit.
+            parse_gc_collect.prog = program.get();
         }
 
         int err;
@@ -783,7 +883,8 @@ namespace das {
             return program;
         }
         parserState = DasParserState();
-        *totParse += get_time_usec(time0);
+        myParseT = get_time_usec(time0);
+        *totParse += myParseT;
         if ( err || program->failed() ) {
             daScriptEnvironment::getBound()->g_Program.reset();
             daScriptEnvironment::getBound()->g_compilerLog = nullptr;
@@ -801,11 +902,21 @@ namespace das {
             if ( policies.solid_context || program->options.getBoolOption("solid_context",false) ) {
                 program->thisModule->isSolidContext = true;
             }
+            gcStageReportDelta(moduleName.c_str(), fileName.c_str(), "parse", logs);
             callCompilationCallback(moduleName, fileName, "infer");
-            auto timeI = ref_time_ticks();
-            restartInfer: program->inferTypes(logs, libGroup);
-            if ( policies.macro_context_collect ) libGroup.collectMacroContexts();
-            *totInfer += get_time_usec(timeI);
+            // restartInfer: timer must be inside the label so each leg is timed independently.
+            // The pre-edit form (timeI set ONCE before the label) over-counted *totInfer on
+            // patchAnnotations() restarts: get_time_usec(timeI) included all previous legs,
+            // and we added it again each iteration.
+            restartInfer:
+            {
+                auto timeI = ref_time_ticks();
+                inferTypes(program.get(), logs, libGroup);
+                if ( policies.macro_context_collect ) libGroup.collectMacroContexts();
+                uint64_t inferLegT = get_time_usec(timeI);
+                myInferT += inferLegT;
+                *totInfer += inferLegT;
+            }
             if ( !program->failed() ) {
                 program->buildAccessFlags(logs);    // this is used by the lint pass
                 if ( program->patchAnnotations() ) {
@@ -815,6 +926,7 @@ namespace das {
                     goto restartInfer;
                 }
             }
+            gcStageReportDelta(moduleName.c_str(), fileName.c_str(), "infer", logs);
             if ( !program->failed() ) {
                 program->normalizeOptionTypes();
                 if (!program->failed())
@@ -826,13 +938,15 @@ namespace das {
                 if (!program->failed()) {
                     if (program->getOptimize()) {
                         callCompilationCallback(moduleName, fileName, "optimize");
-                        program->optimize(logs,libGroup);
+                        optimizeProgram(program.get(),logs,libGroup);
                     } else {
                         program->buildAccessFlags(logs);
                     }
                 }
                 if ( policies.macro_context_collect ) libGroup.collectMacroContexts();
-                *totOpt += get_time_usec(timeO);
+                myOptT = get_time_usec(timeO);
+                *totOpt += myOptT;
+                gcStageReportDelta(moduleName.c_str(), fileName.c_str(), "optimize", logs);
                 if (!program->failed())
                     program->verifyAndFoldContracts();
                 if (!program->failed()) {
@@ -853,6 +967,7 @@ namespace das {
                     program->finalizeAnnotations();
                 if (!program->failed())
                     program->updateSemanticHash();
+                gcStageReportDelta(moduleName.c_str(), fileName.c_str(), "finalize", logs);
                 if ( policies.macro_context_collect ) libGroup.collectMacroContexts();
             }
             if (!program->failed()) {
@@ -883,12 +998,29 @@ namespace das {
                         program->allocateStack(logs,true,false);
                     if (!program->failed())
                         program->makeMacroModule(logs);
-                    *totM += get_time_usec(timeM);
+                    myMacroModT = get_time_usec(timeM);
+                    *totM += myMacroModT;
                 }
             }
             daScriptEnvironment::getBound()->g_Program.reset();
             if ( policies.macro_context_collect ) libGroup.collectMacroContexts();
-            if ( program->options.getBoolOption("log_compile_time",policies.log_compile_time) ) {
+            bool logModule = program->options.getBoolOption("log_module_compile_time",policies.log_module_compile_time);
+            // For the entry script (isDep == false) the heaviest post-parseDaScript work
+            // (markExecutableSymbolUse / removeUnusedSymbols / deriveAliases / allocateStack /
+            // validateAst) runs in compileDaScript AFTER this point, so the per-module
+            // breakdown here would be misleadingly low. The top-level summary emitted later
+            // in compileDaScript covers the entry's full cost authoritatively.
+            if ( logModule && isDep ) {
+                auto dt = get_time_usec(time0) / 1000000.;
+                auto macroDelta = ref_time_delta_to_usec(daScriptEnvironment::getBound()->macroTimeTicks - macroTicks0);
+                logs << "compiler took " << dt << ", " << program->thisModule->name << " (" << fileName << ") -- " << program->totalFunctions << " functions\n"
+                     << "\tparse    " << (myParseT     / 1000000.) << "\n"
+                     << "\tinfer    " << (myInferT     / 1000000.) << " (" << program->inferPassesUsed << " passes)\n"
+                     << "\toptimize " << (myOptT       / 1000000.) << "\n"
+                     << "\tmacro (in infer) " << (macroDelta   / 1000000.) << "\n"
+                     << "\tmacro mods " << (myMacroModT / 1000000.) << "\n"
+                ;
+            } else if ( program->options.getBoolOption("log_compile_time",policies.log_compile_time) ) {
                 auto dt = get_time_usec(time0) / 1000000.;
                 logs << "compiler took " << dt << ", " << fileName << "\n";
             }
@@ -969,10 +1101,10 @@ namespace das {
         return true;
     }
 
-    bool aotModuleHasName ( ProgramPtr program, const ModuleInfo & mod ) {
+    bool aotModuleHasModuleDecl ( ProgramPtr program, const ModuleInfo & mod ) {
         if ( bool no_aot = program->options.getBoolOption("no_aot",false); no_aot )
             return true;
-        if ( !program->thisModule->name.empty() )
+        if ( program->thisModule->isModule )
             return true;
         program->error("Module " + mod.moduleName + " is not setup correctly for AOT",
             "module " + mod.moduleName + " is required", "", LineInfo(),
@@ -1214,6 +1346,9 @@ namespace das {
                                 TextWriter & logs,
                                 ModuleGroup & libGroup,
                                 CodeOfPolicies policies ) {
+        DAS_ASSERTF(policies.no_init_check || (daScriptEnvironment::getBound() && daScriptEnvironment::getBound()->g_modulesInitialized),
+            "compileDaScript on an environment that never called Module::Initialize(); "
+            "call das::Module::Initialize() after registering modules in this environment.");
         gc_guard compile_gc_scope;
         GcCollectOnExit compile_gc_collect(compile_gc_scope);
         ReuseCacheGuard rcg;
@@ -1234,7 +1369,7 @@ namespace das {
         vector<NamelessMismatch> namelessMismatches;
         uint64_t preqT = 0;
         string modName;
-        auto builtinModule = Module::require("$");
+        [[maybe_unused]] auto builtinModule = Module::require("$");
         DAS_ASSERTF(builtinModule, "Somehow `builtin` module is missing.");
         auto builtin_path = getDasRoot() + "/daslib/builtin.das";
         bool allGood = addExtraDependency("builtin", builtin_path, missing, circular, notAllowed, req, dependencies, namelessReq, namelessMismatches, access, libGroup, policies, &logs);
@@ -1282,7 +1417,7 @@ namespace das {
                 if ( program->failed() ) {
                     return program;
                 }
-                if ( policies.fail_on_lack_of_aot_export && !aotModuleHasName(program, mod) ) {
+                if ( policies.fail_on_lack_of_aot_export && !aotModuleHasModuleDecl(program, mod) ) {
                     return program;
                 }
                 if ( program->thisModule->name.empty() ) {
@@ -1347,14 +1482,15 @@ namespace das {
                 res->thisNamespace = "_anon_" + to_string(normalizedPathHash(fileName, getDasRoot()));
             }
             res->validateAst();
-            if ( res->options.getBoolOption("log_total_compile_time",policies.log_total_compile_time) ) {
+            if ( res->options.getBoolOption("log_total_compile_time",policies.log_total_compile_time)
+                 || res->options.getBoolOption("log_module_compile_time",policies.log_module_compile_time) ) {
                 auto totT = get_time_usec(time0);
-                logs << "compiler took " << (totT  / 1000000.) << ", " << fileName << "\n"
+                logs << "total compile took " << (totT  / 1000000.) << ", " << fileName << " -- " << res->totalFunctions << " functions\n"
                      << "\trequire  " << (preqT    / 1000000.) << "\n"
                      << "\tparse    " << (*totParse / 1000000.) << "\n"
                      << "\tinfer    " << (*totInfer / 1000000.) << "\n"
                      << "\toptimize " << (*totOpt   / 1000000.) << "\n"
-                     << "\tmacro    " << (ref_time_delta_to_usec(daScriptEnvironment::getBound()->macroTimeTicks)  / 1000000.) << "\n"
+                     << "\tmacro (in infer) " << (ref_time_delta_to_usec(daScriptEnvironment::getBound()->macroTimeTicks)  / 1000000.) << "\n"
                      << "\tmacro mods " << (*totM     / 1000000.) << "\n"
                 ;
             }

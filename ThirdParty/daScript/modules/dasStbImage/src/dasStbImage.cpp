@@ -9,6 +9,8 @@
 #include "stb_image_write.h"
 #include "stb_image_resize2.h"
 
+#include <vector>    // std::vector buffer for stbi write-to-memory callbacks
+
 // stb_image_write config variable wrappers (defined in dasStbImage_impl.cpp)
 void stbi_write_set_png_compression_level ( int level );
 int  stbi_write_get_png_compression_level ( );
@@ -53,6 +55,14 @@ DAS_BASE_BIND_ENUM_FACTORY(stbir_datatype_DasProxy, "stbir_datatype")
 
 // stbi_write_*_to_func callback (defined in dasStbImage_impl.cpp)
 void stbi_write_to_vec_callback ( void * context, void * data, int size );
+
+// APNG writer (defined in apng_write_impl.h via dasStbImage_impl.cpp)
+extern "C" {
+    void * stbi_apng_begin ( const char * filename, int w, int h, int channels );
+    int    stbi_apng_frame ( void * writer, const void * pixels, int stride_bytes, int delay_ms );
+    int    stbi_apng_end ( void * writer );
+    int    stbi_apng_dropped ( void * writer );
+}
 
 namespace das {
 
@@ -219,6 +229,20 @@ public:
                 ->arg("rle");
         addExtern<DAS_BIND_FUN(stbi_write_get_tga_with_rle)> (*this, lib, "stbi_write_get_tga_with_rle",
             SideEffects::accessExternal, "stbi_write_get_tga_with_rle");
+
+        // ---- stb_image_write: APNG animated writer (streaming, threaded) ----
+        addExtern<DAS_BIND_FUN(stbi_apng_begin)> (*this, lib, "stbi_apng_begin",
+            SideEffects::modifyExternal, "stbi_apng_begin")
+                ->args({"filename","w","h","channels"});
+        addExtern<DAS_BIND_FUN(stbi_apng_frame)> (*this, lib, "stbi_apng_frame",
+            SideEffects::modifyExternal, "stbi_apng_frame")
+                ->args({"writer","pixels","stride_bytes","delay_ms"});
+        addExtern<DAS_BIND_FUN(stbi_apng_end)> (*this, lib, "stbi_apng_end",
+            SideEffects::modifyExternal, "stbi_apng_end")
+                ->arg("writer");
+        addExtern<DAS_BIND_FUN(stbi_apng_dropped)> (*this, lib, "stbi_apng_dropped",
+            SideEffects::accessExternal, "stbi_apng_dropped")
+                ->arg("writer");
 
         // ---- stb_image_write: write to memory (block API) ----
         addExtern<DAS_BIND_FUN(stbi_write_png_to_memory)> (*this, lib, "stbi_write_png_to_memory",

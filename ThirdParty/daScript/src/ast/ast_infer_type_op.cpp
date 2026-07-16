@@ -25,6 +25,128 @@ namespace das {
         }
         return false;
     }
+
+    ExpressionPtr InferTypes::tryPromoteConstInt(const ExpressionPtr & expr, const TypeDeclPtr & targetType, bool & rangeError) {
+        rangeError = false;
+        if (!expr) return nullptr;
+        if (!targetType) return nullptr;
+        if (targetType->baseType==Type::tFixedArray) return nullptr;
+        // Source: ExprConstInt/ExprConstUInt directly, OR ExprOp1("-", such const)
+        // (when const-folding is disabled, the parser leaves -N as ExprOp1).
+        Expression *constExpr = expr;
+        bool negate = false;
+        if (!constExpr->rtti_isConstant() && expr->rtti_isOp1()) {
+            auto op1 = static_cast<ExprOp1 *>(expr);
+            if (op1->op == "-" && op1->subexpr && op1->subexpr->rtti_isConstant()) {
+                constExpr = op1->subexpr;
+                negate = true;
+            }
+        }
+        if (!constExpr->rtti_isConstant()) return nullptr;
+        auto srcConst = static_cast<ExprConst *>(constExpr);
+        int64_t value = 0;
+        if (srcConst->baseType == Type::tInt) {
+            value = static_cast<int64_t>(static_cast<ExprConstInt *>(srcConst)->getValue());
+        } else if (srcConst->baseType == Type::tUInt) {
+            value = static_cast<int64_t>(static_cast<ExprConstUInt *>(srcConst)->getValue());
+        } else {
+            return nullptr;
+        }
+        if (negate) value = -value;
+        if (srcConst->baseType == targetType->baseType) return nullptr;
+        // upper bound is passed as string so unsigned 64-bit types print their actual max
+        // (UINT64_MAX), not a misleading INT64_MAX from a signed int64_t.
+        auto reportRange = [&](const char *typeName, int64_t lo, const string &hi) {
+            rangeError = true;
+            error("constant value " + to_string(value) + " does not fit in " + typeName,
+                  "expected range [" + to_string(lo) + ".." + hi + "]", "",
+                  expr->at, CompilationError::exceeds_constant_range);
+        };
+        ExprConst *newNode = nullptr;
+        switch (targetType->baseType) {
+        case Type::tInt8:
+            if (value < -128 || value > 127) { reportRange("int8", -128, "127"); return nullptr; }
+            newNode = new ExprConstInt8(expr->at, int8_t(value));
+            break;
+        case Type::tInt16:
+            if (value < -32768 || value > 32767) { reportRange("int16", -32768, "32767"); return nullptr; }
+            newNode = new ExprConstInt16(expr->at, int16_t(value));
+            break;
+        case Type::tInt:
+            if (value < int64_t(INT32_MIN) || value > int64_t(INT32_MAX)) { reportRange("int", INT32_MIN, to_string(INT32_MAX)); return nullptr; }
+            newNode = new ExprConstInt(expr->at, int32_t(value));
+            break;
+        case Type::tInt64:
+            newNode = new ExprConstInt64(expr->at, value);
+            break;
+        case Type::tUInt8:
+            if (value < 0 || value > 255) { reportRange("uint8", 0, "255"); return nullptr; }
+            newNode = new ExprConstUInt8(expr->at, uint8_t(value));
+            break;
+        case Type::tUInt16:
+            if (value < 0 || value > 65535) { reportRange("uint16", 0, "65535"); return nullptr; }
+            newNode = new ExprConstUInt16(expr->at, uint16_t(value));
+            break;
+        case Type::tUInt:
+            if (value < 0 || value > int64_t(UINT32_MAX)) { reportRange("uint", 0, to_string(UINT32_MAX)); return nullptr; }
+            newNode = new ExprConstUInt(expr->at, uint32_t(value));
+            break;
+        case Type::tUInt64:
+            if (value < 0) { reportRange("uint64", 0, "18446744073709551615"); return nullptr; }
+            newNode = new ExprConstUInt64(expr->at, uint64_t(value));
+            break;
+        case Type::tBitfield8: {
+            if (value < 0 || value > 255) { reportRange("bitfield8", 0, "255"); return nullptr; }
+            auto bf = new ExprConstBitfield(expr->at, uint64_t(value));
+            bf->baseType = Type::tBitfield8;
+            bf->bitfieldType = new TypeDecl(*targetType);
+            newNode = bf;
+            break;
+        }
+        case Type::tBitfield16: {
+            if (value < 0 || value > 65535) { reportRange("bitfield16", 0, "65535"); return nullptr; }
+            auto bf = new ExprConstBitfield(expr->at, uint64_t(value));
+            bf->baseType = Type::tBitfield16;
+            bf->bitfieldType = new TypeDecl(*targetType);
+            newNode = bf;
+            break;
+        }
+        case Type::tBitfield: {
+            if (value < 0 || value > int64_t(UINT32_MAX)) { reportRange("bitfield", 0, to_string(UINT32_MAX)); return nullptr; }
+            auto bf = new ExprConstBitfield(expr->at, uint64_t(value));
+            bf->baseType = Type::tBitfield;
+            bf->bitfieldType = new TypeDecl(*targetType);
+            newNode = bf;
+            break;
+        }
+        case Type::tBitfield64: {
+            if (value < 0) { reportRange("bitfield64", 0, "18446744073709551615"); return nullptr; }
+            auto bf = new ExprConstBitfield(expr->at, uint64_t(value));
+            bf->baseType = Type::tBitfield64;
+            bf->bitfieldType = new TypeDecl(*targetType);
+            newNode = bf;
+            break;
+        }
+        case Type::tFloat: {
+            float fval = float(value);
+            auto cf = new ExprConstFloat(expr->at, fval);
+            if (int64_t(fval) != value) cf->inexactFloatPromotion = true;
+            newNode = cf;
+            break;
+        }
+        case Type::tDouble: {
+            double dval = double(value);
+            auto cd = new ExprConstDouble(expr->at, dval);
+            if (int64_t(dval) != value) cd->inexactFloatPromotion = true;
+            newNode = cd;
+            break;
+        }
+        default:
+            return nullptr;
+        }
+        newNode->promotedFromInt = true;
+        return newNode;
+    }
     ExpressionPtr InferTypes::visit(ExprOp1 *expr) {
         if (!expr->subexpr->type || expr->subexpr->type->isAliasOrExpr())
             return Visitor::visit(expr); // failed to infer
@@ -221,6 +343,9 @@ namespace das {
                 }
             } else if (expr->left->rtti_isAt()) {
                 ExprAt *eat = (ExprAt *)(expr->left);
+                if ( !eat->subexpr->type || eat->subexpr->type->isExprType() ) {
+                    return nullptr;
+                }
                 auto complexName = "[]" + expr->name;
                 if (auto atComplex = inferGenericOperator3(complexName, eat->at, eat->subexpr, eat->index, expr->right)) {
                     atComplex->alwaysSafe = eat->alwaysSafe | expr->alwaysSafe;
@@ -322,10 +447,31 @@ namespace das {
                 }
             }
         }
-        if (expr->left->type->isEnum() && expr->right->type->isEnum())
-            if (!expr->left->type->isSameType(*expr->right->type, RefMatters::no, ConstMatters::no, TemporaryMatters::no))
-                error("operations on different enumerations are prohibited", "", "",
-                      expr->at, CompilationError::invalid_enumeration);
+        // NOTE: mismatched-enum operands are gated AFTER the custom-operator lookup
+        // below (see reportOp2Errors) — a user-defined operator |(E1;E2) must win over
+        // the "different enumerations" error, so the gate can't run before resolution.
+        // try promoting int literal on either side to match the other side's type
+        {
+            bool rangeError = false;
+            if (auto promoted = tryPromoteConstInt(expr->right, expr->left->type, rangeError)) {
+                reportAstChanged();
+                expr->right = promoted;
+                return Visitor::visit(expr);
+            }
+            if (rangeError) {
+                expr->type = new TypeDecl(); // suppress downstream mismatching_numeric_type
+                return Visitor::visit(expr);
+            }
+            if (auto promoted = tryPromoteConstInt(expr->left, expr->right->type, rangeError)) {
+                reportAstChanged();
+                expr->left = promoted;
+                return Visitor::visit(expr);
+            }
+            if (rangeError) {
+                expr->type = new TypeDecl();
+                return Visitor::visit(expr);
+            }
+        }
         auto opName = "_::" + expr->op;
         auto tempCall = new ExprLooksLikeCall(expr->at, opName);
         tempCall->arguments.push_back(expr->left);
@@ -582,6 +728,19 @@ namespace das {
         }
         if (!expr->left->type || !expr->right->type)
             return Visitor::visit(expr);
+        // try promoting RHS int literal to LHS type
+        {
+            bool rangeError = false;
+            if (auto promoted = tryPromoteConstInt(expr->right, expr->left->type, rangeError)) {
+                reportAstChanged();
+                expr->right = promoted;
+                return Visitor::visit(expr);
+            }
+            if (rangeError) {
+                expr->type = new TypeDecl(); // suppress downstream type-mismatch
+                return Visitor::visit(expr);
+            }
+        }
         // infer
         if (!canCopyOrMoveType(expr->left->type, expr->right->type, TemporaryMatters::no, expr->right,
                                "can only copy compatible type", CompilationError::cant_copy, expr->at)) {
@@ -693,6 +852,19 @@ namespace das {
         if (expr->left->type->isAliasOrExpr() || expr->right->type->isAliasOrExpr()) {
             return Visitor::visit(expr); // failed to infer
         }
+        // try promoting RHS int literal to LHS type
+        {
+            bool rangeError = false;
+            if (auto promoted = tryPromoteConstInt(expr->right, expr->left->type, rangeError)) {
+                reportAstChanged();
+                expr->right = promoted;
+                return Visitor::visit(expr);
+            }
+            if (rangeError) {
+                expr->type = new TypeDecl(); // suppress downstream mismatching_clone_type
+                return Visitor::visit(expr);
+            }
+        }
         // lets infer clone call (and instance generic if need be)
         auto opName = "_::clone";
         auto tempCall = new ExprLooksLikeCall(expr->at, opName);
@@ -734,6 +906,16 @@ namespace das {
             } else if (cloneType->isPointer() && cloneType->smartPtr) {
                 if ( !cloneType->firstType || !cloneType->firstType->annotation ) {
                     error("can only clone smart pointer to handled type", "", "",
+                          expr->at, CompilationError::invalid_clone_smart_pointer_type);
+                    return Visitor::visit(expr);
+                }
+                if ( !cloneType->firstType->isHandle() ) {
+                    error("can only clone smart pointer to handled type", "", "",
+                          expr->at, CompilationError::invalid_clone_smart_pointer_type);
+                    return Visitor::visit(expr);
+                }
+                if ( !cloneType->firstType->annotation->isSmart() ) {
+                    error("pointer to " + cloneType->describe() + " can't be a smart pointer", "", "",
                           expr->at, CompilationError::invalid_clone_smart_pointer_type);
                     return Visitor::visit(expr);
                 }
@@ -815,7 +997,7 @@ namespace das {
                 } else {
                     return Visitor::visit(expr);
                 }
-            } else if (cloneType->dim.size()) {
+            } else if (cloneType->baseType==Type::tFixedArray) {
                 reportAstChanged();
                 auto cloneFn = new ExprCall(expr->at, "clone_dim");
                 cloneFn->arguments.push_back(expr->left->clone());

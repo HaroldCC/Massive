@@ -10,8 +10,46 @@ IF ((NOT DAS_LLVM_INCLUDED) AND ((NOT ${DAS_LLVM_DISABLED}) OR (NOT DEFINED DAS_
     set(DAS_CLANG_OUTPUT "${PROJECT_SOURCE_DIR}/bin")
     set(DAS_LLVM_DLL_NAME LLVM.dll)
 
+    # Cache-invalidating sentinel: ${DAS_LLVM_LIB_OUTPUT}/LLVM.dll.version
+    # holds the LLVM target version of the prebuilt currently on disk. Mismatch
+    # (or missing file) forces re-discovery / re-download. Without this, bumping
+    # the LLVM version in this file does NOT replace a stale lib/LLVM.dll from
+    # a prior build.
+    SET(DAS_LLVM_TARGET_VERSION "22.1.5")
+    # Sentinel value carries a -r<N> revision on top of the LLVM version: the
+    # prebuilt can change (different cmake flags) without an LLVM version bump.
+    SET(DAS_LLVM_SENTINEL_VERSION "${DAS_LLVM_TARGET_VERSION}-r3")
+    SET(DAS_LLVM_REFETCH FALSE)
     IF (NOT EXISTS "${DAS_LLVM_LIB_OUTPUT}/${DAS_LLVM_DLL_NAME}")
-        find_package(LLVM 16.0.6)
+        SET(DAS_LLVM_REFETCH TRUE)
+    ELSEIF (NOT EXISTS "${DAS_LLVM_LIB_OUTPUT}/LLVM.dll.version")
+        SET(DAS_LLVM_REFETCH TRUE)
+    ELSE()
+        file(READ "${DAS_LLVM_LIB_OUTPUT}/LLVM.dll.version" _das_llvm_cached_ver)
+        STRING(STRIP "${_das_llvm_cached_ver}" _das_llvm_cached_ver)
+        IF (NOT _das_llvm_cached_ver STREQUAL DAS_LLVM_SENTINEL_VERSION)
+            MESSAGE(STATUS "dasLlvm: cached LLVM ${_das_llvm_cached_ver} != target ${DAS_LLVM_SENTINEL_VERSION}, refetching")
+            SET(DAS_LLVM_REFETCH TRUE)
+        ENDIF()
+    ENDIF()
+
+    IF (DAS_LLVM_REFETCH)
+        find_package(LLVM ${DAS_LLVM_TARGET_VERSION})
+        # A system LLVM is only usable here if it ships the prebuilt-release
+        # layout we copy from. On Windows that means bin/clang-cl.exe +
+        # bin/LLVM-C.dll. msys2/mingw clang64 provides LLVMConfig.cmake but lays
+        # the binaries out differently (libLLVM-NN.dll, no LLVM-C.dll); a
+        # 2026-06 msys2 package update started reporting a matching version so
+        # find_package now succeeds where it used to fail the version match.
+        # Treat that as not-found and fall through to the prebuilt download.
+        IF (LLVM_FOUND AND WIN32 AND
+            ((NOT EXISTS "${LLVM_INSTALL_PREFIX}/bin/clang-cl.exe") OR
+             (NOT EXISTS "${LLVM_INSTALL_PREFIX}/bin/LLVM-C.dll")))
+            MESSAGE(STATUS "dasLlvm: system LLVM at ${LLVM_INSTALL_PREFIX} lacks "
+                "Windows-release clang-cl.exe/LLVM-C.dll (msys2/mingw layout); "
+                "using prebuilt download")
+            SET(LLVM_FOUND FALSE)
+        ENDIF()
         IF (LLVM_FOUND)
             MESSAGE(STATUS "LLVM found at: ${LLVM_INSTALL_PREFIX}")
             IF(WIN32)
@@ -31,34 +69,42 @@ IF ((NOT DAS_LLVM_INCLUDED) AND ((NOT ${DAS_LLVM_DISABLED}) OR (NOT DEFINED DAS_
                 "${DAS_LLVM_LIB_OUTPUT}/${DAS_LLVM_DLL_NAME}"
                 COPYONLY
             )
+            file(WRITE "${DAS_LLVM_LIB_OUTPUT}/LLVM.dll.version" "${DAS_LLVM_SENTINEL_VERSION}")
         ELSE()
             # File not exists locally and LLVM lib not found.
-            # I created prebuilt LLVM.dll for various platforms, let's download it.
-            # Prebuilt archive contains single file named as LLVM.dll, on Windows it also should contain
-            # clang-cl.exe
+            SET(DAS_LLVM_HAS_PREBUILT TRUE)
             IF(WIN32)
                 SET(DAS_LLVM_FILE_PLATFORM win64)
-                SET(DAS_LLVM_FILE_HASH "429f819c7e9b12f225f1754a8208ea2a2645a8f5b814de213e8201e299d2191e")
+                SET(DAS_LLVM_FILE_HASH "94e4ee54fc7aa7a02b80b968f08c188dcc1859577a024aca2f81d0dc7c037896")
             ELSEIF(APPLE)
                 MESSAGE(STATUS ${CMAKE_SYSTEM_PROCESSOR})
                 IF(${CMAKE_SYSTEM_PROCESSOR} MATCHES "arm|aarch64")
                     SET(DAS_LLVM_FILE_PLATFORM mac_arm64)
-                    SET(DAS_LLVM_FILE_HASH "5a697ff554d2b41aa47a4baf67516548db2ca348e7f39e92e53b5e52e77f518a")
+                    SET(DAS_LLVM_FILE_HASH "b721a50325304973178f030a9a2aa2e58bf25affcd5154fdb15121218d6e6b02")
                 ELSE()
-                    SET(DAS_LLVM_FILE_PLATFORM mac_64)
-                    SET(DAS_LLVM_FILE_HASH "6b919de9d013828c0bb0ef8297c7aee5c2c1859b748fb54f949615c08c57166b")
+                    SET(DAS_LLVM_HAS_PREBUILT FALSE)
                 ENDIF()
             ELSEIF(UNIX)
                 MESSAGE(STATUS ${CMAKE_SYSTEM_PROCESSOR})
                 IF(${CMAKE_SYSTEM_PROCESSOR} MATCHES "arm|aarch64")
                     SET(DAS_LLVM_FILE_PLATFORM linux_arm64)
-                    SET(DAS_LLVM_FILE_HASH "9d86a9d078ca95e3797ecbca5fb590d1b57156474c43df141b7f9ee8a5e6826e")
+                    SET(DAS_LLVM_FILE_HASH "4fc5f0f7ff84f93259f07019371c070dbd0a18f75e01e89b2f23291689afefcd")
                 ELSE()
                     SET(DAS_LLVM_FILE_PLATFORM linux_64)
-                    SET(DAS_LLVM_FILE_HASH "b2553e1cbf71a939584366aa896752a5f598f2f26eaa79d8105288fb58f47da7")
+                    SET(DAS_LLVM_FILE_HASH "8baf01f51ff60aef9ce3e231773f89b77988f1f3ff4a8a204fdeb12231c1c8ae")
                 ENDIF()
             ENDIF()
-            SET(LLVM_LINK https://github.com/aleksisch/llvm-16-prebuilt/releases/download/v2.0.0/${DAS_LLVM_FILE_PLATFORM}_llvm.tar.gz)
+            IF (NOT DAS_LLVM_HAS_PREBUILT)
+                MESSAGE(FATAL_ERROR
+                    "dasLlvm: no prebuilt LLVM.dll for this platform "
+                    "(${CMAKE_SYSTEM_NAME} ${CMAKE_SYSTEM_PROCESSOR}) at "
+                    "the llvm-v${DAS_LLVM_TARGET_VERSION} release. "
+                    "Install LLVM ${DAS_LLVM_TARGET_VERSION} system-wide "
+                    "(e.g. `brew install llvm` on macOS Intel) and re-run "
+                    "cmake; find_package will pick it up. To disable the "
+                    "module entirely set -DDAS_LLVM_DISABLED=ON.")
+            ENDIF()
+            SET(LLVM_LINK https://github.com/GaijinEntertainment/daScript/releases/download/llvm-v${DAS_LLVM_TARGET_VERSION}/${DAS_LLVM_FILE_PLATFORM}_llvm.tar.gz)
             MESSAGE(STATUS "Download LLVM at: ${LLVM_LINK}")
             include(FetchContent)
 
@@ -76,6 +122,7 @@ IF ((NOT DAS_LLVM_INCLUDED) AND ((NOT ${DAS_LLVM_DISABLED}) OR (NOT DEFINED DAS_
             IF(WIN32)
                 file(COPY ${das_llvm_shared_lib_SOURCE_DIR}/clang-cl.exe DESTINATION ${CMAKE_SOURCE_DIR}/bin)
             ENDIF()
+            file(WRITE "${DAS_LLVM_LIB_OUTPUT}/LLVM.dll.version" "${DAS_LLVM_SENTINEL_VERSION}")
         ENDIF()
     ELSE()
         MESSAGE(STATUS "LLVM lib exists at: ${DAS_LLVM_LIB_OUTPUT}/${DAS_LLVM_DLL_NAME}")

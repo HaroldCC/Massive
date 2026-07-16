@@ -1,0 +1,554 @@
+.. _strudel_vs_strudel_cc:
+
+====================================================
+daslang strudel vs strudel.cc — Feature Comparison
+====================================================
+
+This page compares the daslang ``strudel`` library
+(``modules/dasAudio/strudel/``) to its inspiration, the strudel.cc
+live-coding system.  It is the **only** documentation page that names
+strudel.cc explicitly — all other pages should reference this one for
+anything comparative.
+
+Read this before porting a strudel.cc pattern to daslang. The
+Claude-assistant porting workflow lives in the repository at
+``skills/strudel_port.md``. For the
+generated reference of every strudel symbol, see
+:ref:`stdlib_strudel_section`. For the tutorial series, see
+:ref:`tutorials_dastrudel`.
+
+.. contents:: Contents
+   :local:
+   :depth: 2
+
+
+.. _strudel_cc_overview:
+
+Scope and philosophy
+====================
+
+The daslang port is **feature-focused, not code-ported**.  We implement
+the musical primitives of strudel.cc on top of daslang's compiler,
+pattern matcher, and audio engine — but with no JavaScript runtime, no
+web UI, no REPL, and no external DSP graph.  Everything runs in one
+daslang context, with a per-voice synthesis pipeline and per-orbit
+effect busses.
+
+Two consequences of that design:
+
+* **The core pattern algebra, mini-notation, scales, SF2/MIDI, and
+  live-reload are first-class.**  For the vast majority of strudel.cc
+  patterns you can rewrite the code almost verbatim — same names,
+  same mini-notation, same combinators.
+* **The synth engine and effect routing are daslang-native and
+  sometimes diverge.**  Per-voice FX, orbit busses, and ADSR defaults
+  all have specific semantics that do not match strudel.cc exactly.
+  Those cases are enumerated below.
+
+
+.. _strudel_cc_have:
+
+What we have
+============
+
+Parity or near-parity with strudel.cc:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 20 50
+
+   * - Feature area
+     - daslang module
+     - Notes
+   * - Mini-notation
+     - ``strudel_mini``
+     - ``"bd sd ~ cp"`` literals via ``s``, ``n``, ``note``, ``seq``;
+       subdivisions ``[a b]``, repeats ``a*4``, rests ``~``, angle
+       brackets ``<a b c>``, elongation ``@``, degrade ``?``,
+       replicate ``!``
+   * - Pattern algebra
+     - ``strudel_pattern``
+     - ``Pattern`` as a time-span → haps function; ``pure``,
+       ``silence``, ``stack``, ``cat``, ``fastcat``, ``fmap``
+   * - Time combinators
+     - ``strudel_pattern``
+     - ``fast``, ``slow``, ``rev``, ``hurry``, ``compress``,
+       ``linger``, ``palindrome``, ``ply``, ``iter``, ``iterBack``,
+       ``chunk``, ``striate``, ``when_cycle``, ``every``
+   * - Per-voice combinators
+     - ``strudel_pattern``
+     - ``jux``, ``off``, ``layer``, ``superimpose``, ``echo``,
+       ``stut``, ``transpose``, ``add``
+   * - Choice combinators
+     - ``strudel_pattern``
+     - ``choose``, ``wchoose``, ``randcat``, ``chooseCycles``,
+       ``shuffle``, ``scramble``, ``sometimes``, ``often``,
+       ``sometimesby``, ``degrade``, ``degradeBy``
+   * - Euclidean rhythms
+     - ``strudel_pattern``
+     - ``euclid(k, n)``, ``euclidRot(k, n, rot)``, ``bjorklund``, and
+       the mini-notation ``"bd(3,8)"`` / ``"bd(3,8,2)"`` forms
+   * - Scales
+     - ``strudel_scales``
+     - ``scale("c:minor")``, ``note`` with scale context, modes
+       (dorian, mixolydian, …), pentatonic, blues, major/minor
+   * - Signals
+     - ``strudel_pattern``
+     - ``sine``/``cosine``/``saw``/``tri``/``square``/``isaw``/``itri``
+       and their bipolar ``*2`` variants, ``perlin``, ``rand``/``irand``,
+       ``run``, ``range``, and the generic ``signal(fn)`` constructor
+       (an arbitrary time-to-value function)
+   * - Synthesis
+     - ``strudel_synth``
+     - oscillators (``sine``, ``sawtooth``, ``square``, ``triangle``,
+       ``supersaw``), noise (``white``, ``pink``), FM via ``fm`` +
+       ``fmh``, ``freq`` for direct-Hz pitch, vowel/formant filter,
+       per-voice biquads. Note the oscillator *sound* is named
+       ``sawtooth`` — there is a ``saw`` *signal* generator (a ramp
+       LFO) but no ``saw`` sound-name alias
+   * - Samples
+     - ``strudel_samples``
+     - WAV / MP3 / FLAC / OGG loading via ``load_audio_file`` /
+       ``strudel_load_sound`` / ``strudel_load_sample_dir``; sample
+       banks, per-pattern speed/pitch via ``speed``
+   * - SF2 soundfonts
+     - ``strudel_sf2`` + ``strudel_sf2_voice``
+     - Full SF2 parser (format 0/1 meta-events, generators,
+       modulators), per-voice envelope / LFO / biquad, GM drum map
+       compatibility, expression and mod-wheel CCs
+   * - MIDI playback
+     - ``strudel_midi`` + ``strudel_midi_player``
+     - Format 0/1 parser, merged-track playback, GM preset mapping,
+       integration with synth or SF2 backend
+   * - Live-reload
+     - ``strudel_live``
+     - Persistent state across source reload via
+       ``save_strudel_state`` / ``restore_strudel_state`` and the
+       ``daslang-live`` host; ``[live_command]``,
+       ``[before_reload]``, ``[after_reload]``
+   * - Effects (send busses)
+     - ``strudel_scheduler``
+     - Per-orbit ``room`` / ``delay`` / ``chorus``; each orbit
+       number routes to one ``OrbitBus``
+   * - Effects (per-voice)
+     - ``strudel_synth`` (``VoiceFX``)
+     - ``lpf``/``hpf``/``bpf`` filters, phaser, tremolo, compressor,
+       waveshaper (``shape``), DJ filter, bitcrush (``crush``),
+       sample-rate reduction (``coarse``), plus ``gain``/``pan``/
+       ``speed``/``fm``/``vowel`` — all applied per voice before the
+       orbit mix
+   * - Pattern-valued setters
+     - ``strudel_pattern``
+     - Every scalar setter (``gain``, ``lpf``, ``pan``, ``speed``,
+       ``freq``, …) also has a *pattern* overload: pass a signal or
+       pattern and it is sampled per event — e.g.
+       ``lpf(p, sine() |> range(200, 2000))`` or ``gain(p, saw())``
+   * - Numeric arguments
+     - ``strudel_pattern``
+     - Every scalar modifier accepts ``int``, ``float`` **or**
+       ``double`` — ``fast(2)``, ``gain(0.5)``, and ``speed(2.0lf)``
+       all work; no ``.0`` / ``lf`` suffix juggling needed
+
+
+.. _strudel_cc_missing:
+
+What we don't have (yet)
+========================
+
+Features that are present in strudel.cc and absent in the daslang port:
+
+* **``jux_rev`` and other one-letter convenience wrappers** — the
+  parametric forms (``jux(pat, fn)``, ``stutter``, etc.) are public;
+  a few bare-name convenience wrappers were not ported.  Note
+  ``chop`` and ``slice`` *are* available (granulation via the sample
+  ``begin``/``end`` window), as are ``euclidRot`` and the
+  mini-notation ``"bd(3,8)"`` Euclidean form.
+* **Web sample packs** — strudel.cc streams sample packs from
+  the web at runtime; daslang loads local samples from disk (via
+  ``strudel_load_sample_dir``).  Bring your own sample library.
+* **REPL UI** — strudel.cc has a browser REPL with visualisation;
+  daslang uses ``daslang-live`` for hot-reload and a separate
+  visualiser example (``examples/daStrudel/strudel_visualizer/``).
+* **OSC / tidalcycles output** — the daslang port renders audio
+  directly.  There is no equivalent of strudel.cc's SuperDirt /
+  OSC backend.
+* **Hydra-style visual patterns** — out of scope; daslang is
+  audio-only.
+* **Some mini-notation modifiers** — a handful of exotic forms
+  (e.g. some of the richer polymeter notations) may be missing;
+  check ``strudel_mini.das`` for the authoritative list of
+  supported tokens.
+
+
+.. _strudel_cc_differences:
+
+Behavioural differences
+=======================
+
+Cases where a primitive with the **same name** behaves differently
+in the daslang port.  Before porting a pattern that uses one of
+these, read the table — the output may differ even if the code
+looks identical.
+
+ADSR defaults are tempo-aware
+-----------------------------
+
+**Divergence:** daslang scales the default attack / decay / sustain /
+release values with the current CPS so that a default envelope feels
+right at any tempo.  strudel.cc uses fixed-millisecond defaults.
+
+**Why:** When you change tempo with ``strudel_set_cps`` mid-pattern,
+you don't want the envelope to suddenly overpower the note or shorten
+to a click.  The defaults are defined so that a whole-note envelope
+fills one cycle at the current tempo.
+
+**How to apply:**
+
+* For patterns that relied on strudel.cc's fixed ADSR, pass explicit
+  values: ``pat |> attack(0.01) |> release(0.5)``.
+* If you want the daslang behaviour in strudel.cc, multiply the
+  attack / release by the period (1 / CPS).
+
+See the ``adsr-defaults`` branch history for the full introduction.
+
+Per-voice vs per-orbit FX
+-------------------------
+
+daslang splits effects into two groups, and this matches strudel.cc's
+model closely:
+
+* **Per-voice** — ``lpf``/``hpf``/``bpf``, ``phaser``, ``tremolo``,
+  ``compressor``, ``shape``, ``crush``, ``coarse``, ``djf``, plus
+  ``gain``/``pan``/``speed``/``fm``/``vowel``.  These are baked into
+  each playing voice (the ``VoiceFX`` struct) and run *before* the
+  voice is mixed into its orbit.  strudel.cc likewise applies these
+  per event — daslang does **not** diverge here.
+* **Per-orbit (send bus)** — ``room``/``roomsize`` (reverb),
+  ``delay``/``delaytime``/``delayfeedback``, and ``chorus``.  One
+  shared instance per orbit number; voices send wet/dry into it.
+
+**How to apply:** because the first group is per-voice, two stacked
+voices stay independent — each transformed copy from ``jux`` /
+``superimpose`` carries its own FX chain.  For shared reverb/delay,
+route patterns to the same ``orbit`` number (see below); for
+independent bus FX, split orbits.
+
+Orbit bus model
+---------------
+
+**Divergence:** daslang has an explicit ``OrbitBus`` per orbit
+number.  ``room`` sends to that orbit's reverb, ``delay`` to that
+orbit's delay, and ``chorus`` to that orbit's chorus — each FX
+instance is allocated lazily on first send.  strudel.cc routes
+reverb/delay through SuperDirt differently.
+
+**How to apply:** if your strudel.cc pattern mixes two orbits to
+share a reverb, in daslang they need the same ``orbit`` number.
+If you want independent reverbs/choruses per voice, split orbits.
+
+Beyond effects, each orbit also carries a **continuous output level** — a
+per-orbit gain applied to every routed voice each audio block, ramped smoothly
+by ``strudel_fade_orbit(track, orbit, level, seconds)`` (or set instantly with
+``strudel_set_orbit_gain``).  Because it scales the bus rather than each note,
+it has no per-onset latency; see *Host-driven / adaptive control* below for why
+that matters for layer crossfades.
+
+Reverb quality
+--------------
+
+**Extension (no strudel.cc equivalent):** the convolution reverb has a
+per-orbit *quality* tier, selected with ``roomquality``:
+
+* ``"high"`` (default) — two decorrelated impulse responses, one full
+  partitioned convolution per channel.  Most expensive.
+* ``"medium"`` — a single mono impulse response convolved once, then
+  split into stereo by a Schroeder allpass cascade per channel.  Roughly
+  **half** the per-block convolution cost.  The cascade depth defaults to
+  five stages but is adjustable from one to eight with ``roomstages`` —
+  the allpass phase response is non-monotonic in depth (some depths are
+  wide in stereo yet cancel in mono), so there is no single "best" value;
+  pick one by ear.
+* ``"low"`` — a Freeverb-style algorithmic reverb (eight damped comb
+  filters plus four series allpasses per channel).  No FFT, so it is by
+  far the cheapest tier (roughly **6x** cheaper than ``"high"`` per
+  block, and with no per-block convolution burst its peak CPU is far
+  lower too).  The trade is a less natural, more "metallic" tail; per-comb
+  feedback still tracks ``roomsize`` and the tail brightness still tracks
+  the lowpass, so it responds to the same controls as the other tiers.
+
+.. code-block:: das
+
+    // a cheaper reverb on this orbit, with a 6-stage allpass decorrelation
+    note("c2 e2 g2") |> s("supersaw") |> room(0.6) |> roomsize(6.0)
+        |> roomquality("medium") |> roomstages(6) |> orbit(2)
+
+Quality (and ``roomstages``) is chosen when the orbit's reverb is first
+allocated and is re-applied if it changes; like ``roomsize``, set it once
+per orbit.
+
+Mini-notation parsing
+---------------------
+
+**Divergence:** mini-notation strings are **only parsed** by
+``parse_pattern`` / ``s`` / ``n`` / ``note`` / ``seq`` — not by
+any implicit string coercion.  ``pat = "bd sd"`` is a string
+literal, not a ``Pattern``.
+
+**Why:** daslang is statically typed; implicit coercion from
+``string`` to ``Pattern`` would require custom conversion at every
+call site.  Explicit constructors are clearer and play better with
+type-dispatched combinators.
+
+**How to apply:** always wrap mini-notation in ``s("bd sd")``,
+``n("0 2 4")``, ``note("c4 e4 g4")``, or ``parse_pattern("...")``.
+
+``fast`` at non-integer ratios
+------------------------------
+
+**Divergence:** both engines allow fractional factors (``fast(1.5)``),
+but the underlying hap-slicing uses floor-division in daslang's
+``splitSpans`` helper.  Edge cases where the speedup causes a hap to
+straddle a cycle boundary are resolved by keeping the earlier half;
+strudel.cc may keep the later half.
+
+**How to apply:** for rhythms near integer factors, behaviour is
+identical.  For oddly fractional ``fast`` values, compare audibly
+and adjust.
+
+Scheduler and voice pool
+------------------------
+
+**Divergence:** daslang has a fixed voice-pool size (set at
+``Scheduler`` init); when exceeded, the oldest voice is stolen.
+strudel.cc allocates voices dynamically per hap.
+
+**How to apply:** very dense polyphony may drop notes in daslang.
+Raise the pool size at ``Scheduler`` construction or thin the
+pattern.
+
+
+.. _strudel_cc_extensions:
+
+Extensions over strudel.cc
+==========================
+
+daslang adds a few primitives strudel.cc does not have.  These ride
+on top of the underlying ``audio_boost`` engine, so the existing
+strudel.cc syntax keeps working — the extensions only activate when
+you reach for them.
+
+HRTF positional override
+------------------------
+
+**Extension:** per-event ``hrtf_azimuth`` / ``hrtf_elevation`` (and
+the combined ``hrtf(az, el)``) replace the equal-power stereo
+``pan`` *render path* with a binaural-stereo HRTF: each input
+channel becomes a virtual source at azimuth -/+ 30° (the standard
+ITU listening triangle), each through its own ``ma_hrtf``
+instance, summed at the output.  Pan and HRTF become orthogonal —
+``pan`` shapes the inherent stereo width / image of the source,
+``hrtf`` positions the source in 3D.  Same CIPIC-based dataset
+``audio_boost`` uses; baked into the binary at compile time, no
+extra setup needed.
+
+**API:**
+
+.. code-block:: das
+
+   pat |> hrtf_azimuth(deg)        // numeric, -180..180
+   pat |> hrtf_elevation(deg)      // numeric, -90..90
+   pat |> hrtf(az, el)             // combined numeric
+
+   // pattern-valued (animated):
+   pat |> hrtf_azimuth(sine() |> range(-90.0, 90.0) |> slow(4.0lf))
+
+Setting any of the three flips the event's ``hrtf_active`` flag.
+The two HRTF outputs are summed and re-used for the
+reverb / delay / chorus sends, so the entire wet path follows the
+spatialised source (full physical accuracy) before being scaled
+into the orbit effect buses.
+
+**Cost:** each HRTF voice carries *two* ``ma_hrtf`` instances
+(one per input channel, both allocated lazily on first render).
+Practical for a handful of simultaneous voices; reach for plain
+``pan`` when you don't need externalisation, depth, or front/back
+disambiguation.
+
+**See also:**
+- Tutorial: :ref:`tutorial_dastrudel_hrtf_position`
+- Demo: ``examples/daStrudel/hrtf/``
+- Engine reference: :ref:`ma_hrtf <handle-audio-ma_hrtf>`
+
+
+Host-driven / adaptive control
+------------------------------
+
+**Extension:** daStrudel runs **in-process inside a host program** (a game, a
+tool), not only a browser REPL - so the host can drive any pattern parameter
+from live runtime state.
+
+The key primitive is ``signal(fn : lambda<(t : double) : float>)``: a control
+signal built from an arbitrary time-to-value function.  Point it at a host
+variable and the value is read live on each cycle query, so flipping the
+variable re-shapes the running pattern.  Combined with the pattern-valued
+setters (``gain``, ``lpf``, ...), this gates or morphs layers straight from
+host state:
+
+.. code-block:: das
+
+   var DRUMS_ON = false                 // host flag, flipped at runtime
+   drums |> gain(signal(@(t : double) => DRUMS_ON ? 1.0 : 0.0))
+
+One continuous ``stack`` whose layers are gated by host flags is the whole of
+*vertical-layering adaptive music* - a switch is one variable write, no
+crossfade machinery.  The flag is sampled per query (at each event's onset), so
+a flip takes effect on the next scheduler query as upcoming events are
+scheduled - sub-cycle, not aligned to an exact cycle boundary.
+
+That per-onset sampling is the catch for **sparse** layers: a sustained pad or
+a drone whose notes are seconds apart only re-reads the flag when its *next*
+note onsets, so a gate change can lag audibly.  The fix is to fade the layer's
+**orbit level** instead of its per-note gain.  Route the layer to its own orbit
+and ramp that orbit's continuous output level:
+
+.. code-block:: das
+
+   let DRONE_ORBIT = 6
+   drone |> orbit(DRONE_ORBIT)                       // layer rides its own sub-bus
+   strudel_fade_orbit(track, DRONE_ORBIT, 0.0, 0.3)  // fade out over 0.3s, smoothly
+
+Because the orbit level scales every routed voice each audio block (not at note
+onset), the fade is heard immediately and continuously, no matter how sparse the
+notes are - a true crossfade in ~``seconds`` with no extra track or scheduler.
+``strudel_set_orbit_gain`` snaps instantly; levels above ``1.0`` amplify.  Rule
+of thumb: **dense** layers (a busy drum bus) switch cleanly with signal-gating;
+**sparse / sustained** layers (pads, drones, sparkle) want an orbit fade.  Either
+way it stays one ``stack`` / one track.
+
+Whole patterns can also be added or dropped live with
+``strudel_add_track`` / ``strudel_remove_track``.  The host drives playback
+from its own loop with ``strudel_tick`` (main thread), or bakes a fixed render
+offline (no audio device) via the ``examples/daStrudel/features`` harness
+(``--wav`` / ``--duration``).
+
+The result is the basis for interactive / game-adaptive audio: the host emits
+state, control signals read it, and the single running pattern adapts - all in
+one daslang context, no REPL and no external sequencer.  See the
+``examples/daStrudel/strudel_sf2_live/`` demo and the state-driven game music
+in ``examples/games/river_run/rr_audio.das``.
+
+
+One-shot patterns (fire-and-forget stings)
+------------------------------------------
+
+**Extension:** a strudel.cc pattern is an endless loop — it has no notion of
+"play this phrase once, then stop".  daStrudel patterns can **self-terminate**,
+and a one-shot **track** can **self-retire**, which together make a pattern
+usable as an event-triggered sound effect.
+
+There are two layers:
+
+* ``playFor(pat, n)`` / ``once(pat)`` gate a pattern to its first ``n`` cycles
+  (``once`` = ``playFor(pat, 1)``) and emit silence forever after.  This is the
+  *stop* half — purely a ``Pattern`` combinator, usable anywhere a pattern is.
+* ``strudel_one_shot(pat, gain, quant_cycles, len_cycles)`` fires ``pat`` as a
+  **self-retiring track**: it plays for ``len_cycles``, goes silent, and the
+  track auto-removes from the mix once every voice has finished ringing — so the
+  release tail is never clipped.  This is the *die* half.  It returns the track
+  index, and it is the primitive you call on a host event (a hit, a pickup, a
+  win).  ``strudel_active_tracks`` reports how many tracks are live, so a host or
+  test can ask "is a sting still ringing?".
+
+.. code-block:: das
+
+    // fire a short arpeggiated sting on a game event, quantized to the next beat
+    let sting <- (note("c5 e5 g5 c6", "triangle")
+        |> gain(0.8) |> room(0.6) |> orbit(2))
+    strudel_one_shot(sting, 1.0, 0.25, 0.5)   // gain 1.0, snap to next 1/4 beat, half a cycle long
+
+**Quantize to the beat.**  ``quant_cycles`` snaps the start to the global beat
+grid (``0`` = fire immediately; ``0.25`` = the next quarter-cycle beat), so a
+sting triggered at an arbitrary instant still lands musically in time instead of
+on the exact frame of the event.
+
+**Why this matters in a host.**  Because each one-shot is an independent track
+built fresh per call, the same mechanism scales to *parametric* SFX — vary the
+pattern per event (pitch by impact, instrument by surface) and fire a different
+sting each time, all without baking or shipping a single audio asset.  The
+continuous-control story above (``signal`` + orbit fades) covers the *sustained*
+layers of adaptive audio; one-shots cover the *discrete* events.
+
+**See also:**
+
+- Tutorial: :ref:`tutorial_dastrudel_one_shots`
+- Reference: ``strudel_one_shot`` / ``playFor`` / ``once`` /
+  ``strudel_active_tracks`` in :ref:`stdlib_strudel_section`
+
+
+.. _strudel_cc_naming:
+
+Naming map (quick reference)
+============================
+
+For porting at speed: the daslang name is the **same** as strudel.cc
+for ~95% of primitives.  When it differs:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 35 35 30
+
+   * - strudel.cc
+     - daslang
+     - Notes
+   * - ``s("bd sd")``
+     - ``s("bd sd")``
+     - identical
+   * - ``n("0 2 4")``
+     - ``n("0 2 4")``
+     - identical
+   * - ``note("c4")``
+     - ``note("c4")``
+     - identical; for scale-degree use ``note(0.0)`` after ``scale(...)``
+   * - ``.fast(2)``
+     - ``|> fast(2)``
+     - same name; bare int / float / double all accepted.  Use the
+       pipe ``|>`` — ``Pattern`` is a lambda, so ``.method()`` does
+       **not** work on it
+   * - ``.jux(rev)``
+     - ``|> jux(@(x) => rev(x))``
+     - daslang expects a typed lambda — use ``@(x) =>``, **not**
+       ``@@(x) =>`` (a function pointer won't match ``PatternTransform``)
+   * - ``.velocity(0.5)`` / ``.vel(...)``
+     - ``|> velocity(0.5)`` / ``|> vel(...)``
+     - both aliases exist
+   * - ``.stack(a, b)``
+     - ``stack(a, b)``
+     - top-level function, not a method
+   * - ``.euclidRot(3, 8, 1)``
+     - ``|> euclidRot(3, 8, 1)``
+     - same name; rotates the Euclidean pattern left by ``rot`` steps
+   * - ``"bd(3,8)"``
+     - ``s("bd(3,8)")`` or ``euclid(s("bd"), 3, 8)``
+     - mini-notation Euclid form is parsed; ``"bd(3,8,2)"`` adds rotation
+   * - ``.chop(4)`` / ``.slice(4, "0 1 2 3")``
+     - ``|> chop(4)`` / ``|> slice(4, note("0 1 2 3"))``
+     - sample granulation via the ``begin``/``end`` window
+   * - ``.freq(440)``
+     - ``|> freq(440)``
+     - sets oscillator frequency in Hz directly, overriding ``note``
+
+For everything else, assume the name is identical.  Use the MCP
+``list_module_api`` tool on ``strudel_pattern`` /
+``strudel_synth`` / ``strudel_scales`` to confirm.
+
+
+.. seealso::
+
+   :ref:`stdlib_strudel_section` — generated reference for every
+   strudel symbol.
+
+   :ref:`tutorials_dastrudel` — 15-tutorial numbered series covering
+   patterns, mini-notation, effects, synthesis, samples, MIDI, and
+   live-reload.
+
+   :ref:`tutorial_dastrudel_hello_pattern` — start here for a tour.

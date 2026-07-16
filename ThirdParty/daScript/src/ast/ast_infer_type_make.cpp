@@ -351,20 +351,25 @@ namespace das {
     }
     void InferTypes::preVisit(ExprMakeVariant *expr) {
         Visitor::preVisit(expr);
+        for (auto & mfd : expr->variants) {
+            if (mfd) checkEmptyName(mfd->name, "variant initializer", mfd->at);
+        }
         if (expr->makeType && expr->makeType->isExprType()) {
             return;
         }
         verifyType(expr->makeType);
-        if (expr->makeType->baseType != Type::tVariant) {
+        auto mkBaseT = expr->makeType;
+        while (mkBaseT->baseType==Type::tFixedArray && mkBaseT->firstType) mkBaseT = mkBaseT->firstType;
+        if (mkBaseT->baseType != Type::tVariant) {
             error("[[variant" + describeType(expr->makeType) + "]] with non-variant type", "", "",
                   expr->at, CompilationError::invalid_variant_type);
         }
-        if (expr->makeType->dim.size() > 1) {
+        if (expr->makeType->baseType==Type::tFixedArray && expr->makeType->firstType->baseType==Type::tFixedArray) {
             error("[[" + describeType(expr->makeType) + "]] variant can only initialize single dimension arrays", "", "",
                   expr->at, CompilationError::invalid_variant_array);
-        } else if (expr->makeType->dim.size() == 1 && expr->makeType->dim[0] != int32_t(expr->variants.size())) {
+        } else if (expr->makeType->baseType==Type::tFixedArray && expr->makeType->fixedDim != int32_t(expr->variants.size())) {
             error("[[" + describeType(expr->makeType) + "]] variant dimension mismatch, provided " +
-                      to_string(expr->variants.size()) + " elements, expecting " + to_string(expr->makeType->dim[0]),
+                      to_string(expr->variants.size()) + " elements, expecting " + to_string(expr->makeType->fixedDim),
                   "", "",
                   expr->at, CompilationError::mismatching_variant_dimension);
         } else if (expr->makeType->ref) {
@@ -376,9 +381,22 @@ namespace das {
         if (!decl->value->type) {
             return Visitor::visitMakeVariantField(expr, index, decl, last);
         }
-        auto fieldVariant = expr->makeType->findArgumentIndex(decl->name);
+        auto mkBaseT = expr->makeType;
+        while (mkBaseT->baseType==Type::tFixedArray && mkBaseT->firstType) mkBaseT = mkBaseT->firstType;
+        auto fieldVariant = mkBaseT->findArgumentIndex(decl->name);
         if (fieldVariant != -1) {
-            auto fieldType = expr->makeType->argTypes[fieldVariant];
+            auto fieldType = mkBaseT->argTypes[fieldVariant];
+            {
+                bool rangeError = false;
+                if (auto promoted = tryPromoteConstInt(decl->value, fieldType, rangeError)) {
+                    reportAstChanged();
+                    decl->value = promoted;
+                    return Visitor::visitMakeVariantField(expr, index, decl, last);
+                }
+                if (rangeError) {
+                    return Visitor::visitMakeVariantField(expr, index, decl, last);
+                }
+            }
             if (!canCopyOrMoveType(fieldType, decl->value->type, TemporaryMatters::yes, decl->value,
                                    "can't initialize field " + decl->name, CompilationError::cant_copy, decl->value->at)) {
             } else if (decl->value->type->isTemp(true, false)) {
@@ -406,8 +424,10 @@ namespace das {
         if (expr->makeType && expr->makeType->isExprType()) {
             return Visitor::visit(expr);
         }
-        // result type
-        auto resT = new TypeDecl(*expr->makeType);
+        // result type - element view; the literal's own count replaces any declared dim
+        auto mkBaseT = expr->makeType;
+        while (mkBaseT->baseType==Type::tFixedArray && mkBaseT->firstType) mkBaseT = mkBaseT->firstType;
+        auto resT = new TypeDecl(*mkBaseT);
         if ( resT->isAlias() ) {
             auto aT = inferAlias(resT);
             if (aT) {
@@ -429,13 +449,8 @@ namespace das {
             return Visitor::visit(expr);
         }
         uint32_t resDim = uint32_t(expr->variants.size());
-        if (resDim == 0) {
-            resT->dim.clear();
-        } else if (resDim != 1) {
-            resT->dim.resize(1);
-            resT->dim[0] = resDim;
-        } else {
-            resT->dim.clear();
+        if (resDim > 1) {
+            resT = makeFixedArrayTypeDecl(int32_t(resDim), resT);
         }
         expr->type = resT;
         verifyType(expr->type);
@@ -499,23 +514,32 @@ namespace das {
     void InferTypes::preVisit(ExprMakeStruct *expr) {
         callDepth ++;
         Visitor::preVisit(expr);
+        for (auto & ms : expr->structs) {
+            if (!ms) continue;
+            for (auto & mfd : *ms) {
+                if (mfd) checkEmptyName(mfd->name, "field initializer", mfd->at);
+            }
+        }
         if (expr->makeType && expr->makeType->isExprType()) {
             return;
         }
         expr->constructor = nullptr;
         verifyType(expr->makeType);
-        if (expr->makeType->baseType != Type::tStructure && expr->makeType->baseType != Type::tHandle) {
+        auto mkBaseT = expr->makeType;
+        while (mkBaseT->baseType==Type::tFixedArray && mkBaseT->firstType) mkBaseT = mkBaseT->firstType;
+        if (mkBaseT->baseType != Type::tStructure && mkBaseT->baseType != Type::tHandle) {
             if (expr->structs.size()) {
                 error("[[" + describeType(expr->makeType) + "]] with non-structure type", "", "",
                       expr->at, CompilationError::invalid_structure_type);
             }
         }
-        if (expr->makeType->dim.size() > 1) {
+        // zero provided elements (default<T[N]>, [[T[N]]]) means "zero/default-init the whole array" - any depth
+        if (expr->makeType->baseType==Type::tFixedArray && expr->makeType->firstType->baseType==Type::tFixedArray && expr->structs.size()) {
             error("[[" + describeType(expr->makeType) + "]] struct can only initialize single dimension arrays", "", "",
                   expr->at, CompilationError::invalid_structure_array);
-        } else if (expr->makeType->dim.size() == 1 && expr->makeType->dim[0] != int32_t(expr->structs.size())) {
+        } else if (expr->makeType->baseType==Type::tFixedArray && expr->structs.size() && expr->makeType->fixedDim != int32_t(expr->structs.size())) {
             error("[[" + describeType(expr->makeType) + "]] struct dimension mismatch, provided " +
-                      to_string(expr->structs.size()) + " elements, expecting " + to_string(expr->makeType->dim[0]),
+                      to_string(expr->structs.size()) + " elements, expecting " + to_string(expr->makeType->fixedDim),
                   "", "",
                   expr->at, CompilationError::mismatching_structure_dimension);
         } else if (expr->makeType->ref) {
@@ -534,7 +558,7 @@ namespace das {
                       describeLocalType(expr->makeType), "",
                       expr->at, CompilationError::invalid_structure_local);
             }
-        } else if (expr->makeType->baseType == Type::tHandle && expr->isNewHandle && !expr->useInitializer) {
+        } else if (mkBaseT->baseType == Type::tHandle && expr->isNewHandle && !expr->useInitializer) {
             error("'new [[" + describeType(expr->makeType) + "]]' struct requires initializer syntax", "",
                   "use 'new [[" + describeType(expr->makeType) + "()]]' instead",
                   expr->at, CompilationError::invalid_structure_initializer_required);
@@ -543,9 +567,9 @@ namespace das {
                 error("Constructing class on stack is unsafe. Allocate it on the heap via new [[...]] or new " + expr->makeType->structType->name + "() instead.", "", "",
                       expr->at, CompilationError::unsafe_class_local);
             }
-        } else if (noUnsafeUninitializedStructs && !(expr->useInitializer || expr->usedInitializer) && expr->makeType->structType && !expr->makeType->structType->safeWhenUninitialized && !expr->makeType->structType->isLambda && expr->makeType->structType->hasInitFields) {
+        } else if (noUnsafeUninitializedStructs && !(expr->useInitializer || expr->usedInitializer) && mkBaseT->structType && !mkBaseT->structType->safeWhenUninitialized && !mkBaseT->structType->isLambda && mkBaseT->structType->hasInitFields) {
             if (!safeExpression(expr)) {
-                error("Uninitialized structure " + expr->makeType->structType->name + " is unsafe. Use initializer syntax or [safe_when_uninitialized] when intended.", "", "",
+                error("Uninitialized structure " + mkBaseT->structType->name + " is unsafe. Use initializer syntax or [safe_when_uninitialized] when intended.", "", "",
                       expr->at, CompilationError::unsafe_structure_uninitialized);
             }
         }
@@ -566,8 +590,10 @@ namespace das {
         }
         auto blk = static_cast<ExprBlock*>(mkb->block);
         bool ignoreCapturedConstant = false;
-        if (expr->makeType->baseType == Type::tStructure) {
-            if (auto field = expr->makeType->structType->findField(decl->name)) {
+        auto mkBaseT = expr->makeType;
+        while (mkBaseT->baseType==Type::tFixedArray && mkBaseT->firstType) mkBaseT = mkBaseT->firstType;
+        if (mkBaseT->baseType == Type::tStructure) {
+            if (auto field = mkBaseT->structType->findField(decl->name)) {
                 if (field->capturedConstant) {
                     ignoreCapturedConstant = true;
                 }
@@ -589,17 +615,30 @@ namespace das {
                 return Visitor::visitMakeStructureField(expr, index, decl, last);
             }
         }
-        if (expr->makeType->baseType == Type::tStructure) {
-            if (auto field = expr->makeType->structType->findField(decl->name)) {
+        auto mkBaseT = expr->makeType;
+        while (mkBaseT->baseType==Type::tFixedArray && mkBaseT->firstType) mkBaseT = mkBaseT->firstType;
+        if (mkBaseT->baseType == Type::tStructure) {
+            if (auto field = mkBaseT->structType->findField(decl->name)) {
                 auto copyFieldType = field->type;
                 if (field->capturedConstant) {
                     copyFieldType = new TypeDecl(*field->type);
                     copyFieldType->constant = true;
                 }
+                {
+                    bool rangeError = false;
+                    if (auto promoted = tryPromoteConstInt(decl->value, copyFieldType, rangeError)) {
+                        reportAstChanged();
+                        decl->value = promoted;
+                        return Visitor::visitMakeStructureField(expr, index, decl, last);
+                    }
+                    if (rangeError) {
+                        return Visitor::visitMakeStructureField(expr, index, decl, last);
+                    }
+                }
                 if (!canCopyOrMoveType(copyFieldType, decl->value->type, TemporaryMatters::yes, decl->value,
                                        "can't initialize field " + decl->name, CompilationError::cant_copy, decl->value->at)) {
                 } else if (decl->value->type->isTemp(true, false)) {
-                    if (expr->makeType->structType->isLambda) {
+                    if (mkBaseT->structType->isLambda) {
                         error("can't capture temporary lambda variable " + decl->name, "", "",
                               decl->value->at, CompilationError::cant_capture_variable);
                     } else {
@@ -628,7 +667,7 @@ namespace das {
             } else {
                 TextWriter extra;
                 vector<TypeDeclPtr> args;
-                args.push_back(expr->makeType);
+                args.push_back(mkBaseT);
                 args.push_back(decl->value->type);
                 auto compareName = ".`" + decl->name + "`clone";
                 auto opName = "_::" + compareName;
@@ -641,7 +680,7 @@ namespace das {
                         if (verbose) {
                             extra
                                 << "since there is operator ." << decl->name << " := ("
-                                << expr->makeType->structType->name << "," << decl->value->type->describe() << ") , try "
+                                << mkBaseT->structType->name << "," << decl->value->type->describe() << ") , try "
                                 << decl->name << " := " << *(decl->value);
                         }
                     } else {
@@ -672,11 +711,22 @@ namespace das {
                 error("field not found, " + decl->name, extra.str(), "",
                       decl->at, CompilationError::lookup_structure_field);
             }
-        } else if (expr->makeType->baseType == Type::tHandle) {
-            if (auto fldt = expr->makeType->annotation->makeFieldType(decl->name, false)) {
+        } else if (mkBaseT->baseType == Type::tHandle) {
+            if (auto fldt = mkBaseT->annotation->makeFieldType(decl->name, false)) {
                 if (!fldt->isRef()) {
                     error("field is a property, not a value; " + decl->name, "", "",
                           decl->at, CompilationError::invalid_annotation_field);
+                }
+                {
+                    bool rangeError = false;
+                    if (auto promoted = tryPromoteConstInt(decl->value, fldt, rangeError)) {
+                        reportAstChanged();
+                        decl->value = promoted;
+                        return Visitor::visitMakeStructureField(expr, index, decl, last);
+                    }
+                    if (rangeError) {
+                        return Visitor::visitMakeStructureField(expr, index, decl, last);
+                    }
                 }
                 if (!canCopyOrMoveType(fldt, decl->value->type, TemporaryMatters::no, decl->value,
                                        "can't initialize field " + decl->name, CompilationError::cant_copy, decl->value->at)) {
@@ -702,12 +752,14 @@ namespace das {
         }
         return Visitor::visitMakeStructureField(expr, index, decl, last);
     }
-    ExpressionPtr InferTypes::structToTuple(const TypeDeclPtr &makeType, const MakeStructPtr &st, const LineInfo &at) {
-        if (makeType->isAutoOrAlias()) { // not fully inferred?
-            error("can't infer tuple type " + describeType(makeType), "", "",
+    ExpressionPtr InferTypes::structToTuple(const TypeDeclPtr &mkT, const MakeStructPtr &st, const LineInfo &at) {
+        if (mkT->isAutoOrAlias()) { // not fully inferred?
+            error("can't infer tuple type " + describeType(mkT), "", "",
               at, CompilationError::not_resolved_yet_tuple_type);
             return nullptr;
         }
+        auto makeType = mkT;    // element view - promote-to-tuple passes the (possibly fixed-array) make type
+        while (makeType->baseType==Type::tFixedArray && makeType->firstType) makeType = makeType->firstType;
         auto mkt = new ExprMakeTuple(at);
         mkt->recordType = new TypeDecl(*makeType);
         mkt->values.resize(makeType->argTypes.size());
@@ -753,6 +805,8 @@ namespace das {
                 return Visitor::visit(expr);
             }
         }
+        auto mkBaseT = expr->makeType;
+        while (mkBaseT && mkBaseT->baseType==Type::tFixedArray && mkBaseT->firstType) mkBaseT = mkBaseT->firstType;
         auto isClassCtor = !expr->nativeClassInitializer &&
                            (expr->useInitializer || expr->usedInitializer) &&
                            expr->makeType && (expr->makeType->isClass() || (expr->alwaysUseInitializer && expr->makeType->isStructure() && !expr->makeType->structType->noGenCtor));
@@ -801,10 +855,9 @@ namespace das {
                     int32_t rec = 0;
                     if (expr->structs.size() > 1)
                         rec = int32_t(expr->structs.size());
-                    auto passT = new TypeDecl(*expr->makeType);
-                    passT->dim.clear();
+                    TypeDeclPtr passT = new TypeDecl(*mkBaseT);
                     if (rec)
-                        passT->dim.push_back(rec);
+                        passT = makeFixedArrayTypeDecl(rec, passT);
                     if (arg->type->isAuto()) {
                         auto nargT = TypeDecl::inferGenericType(passT, arg->type, false, false, nullptr);
                         if (nargT) {
@@ -830,7 +883,7 @@ namespace das {
             }
         }
         // promote to make variant
-        if (expr->makeType->baseType == Type::tVariant) {
+        if (mkBaseT->baseType == Type::tVariant) {
             if (expr->forceClass) {
                 error(expr->makeType->describe() + " is not a class, but a variant", "", "",
                       expr->at, CompilationError::invalid_class_variant);
@@ -867,7 +920,7 @@ namespace das {
             }
         }
         // promote to make tuple
-        if (expr->makeType->baseType == Type::tTuple && expr->structs.size()) {
+        if (mkBaseT->baseType == Type::tTuple && expr->structs.size()) {
             if (expr->forceClass) {
                 error(expr->makeType->describe() + " is not a class, but a tuple", "", "",
                       expr->at, CompilationError::invalid_class_tuple);
@@ -908,13 +961,13 @@ namespace das {
         }
 
         // see if there are any duplicate fields
-        if (expr->makeType->baseType == Type::tStructure) {
-            if (expr->makeType->structType->isTemplate) {
+        if (mkBaseT->baseType == Type::tStructure) {
+            if (mkBaseT->structType->isTemplate) {
                 string extraError;
                 if (func) {
                     extraError = "while compiling function " + func->describe();
                 }
-                error("can't initialize template structure " + expr->makeType->structType->name, extraError, "",
+                error("can't initialize template structure " + mkBaseT->structType->name, extraError, "",
                       expr->at, CompilationError::invalid_structure_template);
                 return Visitor::visit(expr);
             }
@@ -934,11 +987,11 @@ namespace das {
             if (anyDuplicates)
                 return Visitor::visit(expr);
             // see if we need to fill in missing fields
-            if (expr->useInitializer && expr->makeType->structType) {
-                for (auto &stf : expr->makeType->structType->fields) {
+            if (expr->useInitializer && mkBaseT->structType) {
+                for (auto &stf : mkBaseT->structType->fields) {
                     if (stf.init) {
                         if (!stf.init->type || stf.init->type->isAuto()) {
-                            error("structure '" + expr->makeType->structType->name + "' is not fully resolved yet", "", "", expr->at, CompilationError::not_resolved_yet_structure);
+                            error("structure '" + mkBaseT->structType->name + "' is not fully resolved yet", "", "", expr->at, CompilationError::not_resolved_yet_structure);
                             return Visitor::visit(expr);
                         }
                     }
@@ -949,7 +1002,7 @@ namespace das {
                 }
                 if (!isClassCtor) {
                     for (auto &st : expr->structs) {
-                        for (auto &fi : expr->makeType->structType->fields) {
+                        for (auto &fi : mkBaseT->structType->fields) {
                             if (fi.init) {
                                 auto it = find_if(st->begin(), st->end(), [&](const MakeFieldDeclPtr &fd) { return fd->name == fi.name; });
                                 if (it == st->end()) {
@@ -965,10 +1018,10 @@ namespace das {
                 expr->usedInitializer = true;
             }
             // see if we need to init fields
-            if (expr->makeType->structType) {
+            if (mkBaseT->structType) {
                 expr->initAllFields = !expr->structs.empty();
                 for (auto &st : expr->structs) {
-                    if (st->size() == expr->makeType->structType->fields.size()) {
+                    if (st->size() == mkBaseT->structType->fields.size()) {
                         for (auto &va : *st) {
                             if (va->value->rtti_isMakeLocal()) {
                                 auto mkl = static_cast<ExprMakeLocal*>(va->value);
@@ -984,7 +1037,7 @@ namespace das {
                 expr->initAllFields = false;
             }
         } else {
-            if (expr->makeType->baseType == Type::tTuple && expr->structs.size() == 0) {
+            if (mkBaseT->baseType == Type::tTuple && expr->structs.size() == 0) {
                 expr->initAllFields = true;
             }
         }
@@ -995,24 +1048,23 @@ namespace das {
         }
         // if unresolved - but we still return.  cause sometimes we pass [], and then we want it resolved
         bool isAutoOrAlias = expr->makeType->isAutoOrAlias();
-        // result type
-        auto resT = new TypeDecl(*expr->makeType);
+        // result type - element view, re-wrapped per the literal's element count
+        TypeDeclPtr resT;
         uint32_t resDim = uint32_t(expr->structs.size());
+        bool mkSingleDim = expr->makeType->baseType==Type::tFixedArray && expr->makeType->firstType->baseType!=Type::tFixedArray;
         if (resDim == 0) {
-            // resT->dim.clear();
+            resT = new TypeDecl(*expr->makeType);   // keep declared shape
         } else if (resDim != 1) {
-            resT->dim.resize(1);
-            resT->dim[0] = resDim;
+            resT = makeFixedArrayTypeDecl(int32_t(resDim), new TypeDecl(*mkBaseT));
         } else {
-            if (expr->makeType->dim.size() == 1 && expr->makeType->dim[0] == 1) {
-                // do nothing
-            } else if (expr->makeType->dim.size() == 1 && expr->makeType->dim[0] == TypeDecl::dimAuto) {
-                resT->dim.resize(1);
-                resT->dim[0] = 1;
-                expr->makeType->dim[0] = 1;
+            if (mkSingleDim && expr->makeType->fixedDim == 1) {
+                resT = new TypeDecl(*expr->makeType);   // keep [1]
+            } else if (mkSingleDim && expr->makeType->fixedDim == TypeDecl::dimAuto) {
+                resT = makeFixedArrayTypeDecl(1, new TypeDecl(*mkBaseT));
+                expr->makeType->fixedDim = 1;
                 reportAstChanged();
             } else {
-                resT->dim.clear();
+                resT = new TypeDecl(*mkBaseT);
             }
         }
         expr->type = resT;
@@ -1064,19 +1116,19 @@ namespace das {
             error("skipping initializer for class initialization requires unsafe", "", "",
                   expr->at, CompilationError::unsafe_class_initializer);
         }
-        if (expr->forceClass && !(expr->makeType->baseType == Type::tStructure && expr->makeType->structType && expr->makeType->structType->isClass)) {
+        if (expr->forceClass && !(mkBaseT->baseType == Type::tStructure && mkBaseT->structType && mkBaseT->structType->isClass)) {
             error(expr->type->describe() + " is not a class", "", "",
                   expr->at, CompilationError::invalid_class);
         }
-        if (expr->forceStruct && !(expr->makeType->baseType == Type::tStructure && expr->makeType->structType && !expr->makeType->structType->isClass)) {
+        if (expr->forceStruct && !(mkBaseT->baseType == Type::tStructure && mkBaseT->structType && !mkBaseT->structType->isClass)) {
             error(expr->type->describe() + " is not a struct", "", "",
                   expr->at, CompilationError::invalid_structure);
         }
-        if (expr->forceVariant && !(expr->makeType->baseType == Type::tVariant)) {
+        if (expr->forceVariant && !(mkBaseT->baseType == Type::tVariant)) {
             error(expr->type->describe() + " is not a variant", "", "",
                   expr->at, CompilationError::invalid_variant);
         }
-        if (expr->forceTuple && !(expr->makeType->baseType == Type::tTuple)) {
+        if (expr->forceTuple && !(mkBaseT->baseType == Type::tTuple)) {
             error(expr->type->describe() + " is not a tuple", "", "",
                   expr->at, CompilationError::invalid_tuple);
         }
@@ -1093,7 +1145,7 @@ namespace das {
             return Visitor::visitMakeTupleIndex(expr, index, init, lastField);
         }
         if (expr->recordType && expr->recordType->baseType == Type::tTuple) {
-            if (expr->recordType->argTypes.size() <= index) {
+            if (int64_t(expr->recordType->argTypes.size()) <= index) {
                 error("tuple element _" + to_string(index) + " out of element range", "", "",
                       init->at, CompilationError::exceeds_tuple_index);
                 return Visitor::visitMakeTupleIndex(expr, index, init, lastField);
@@ -1119,6 +1171,23 @@ namespace das {
                 error("not fully defined tuple element type", "", "",
                   expr->at, CompilationError::not_resolved_yet_tuple_type);
                 return Visitor::visit(expr);
+            }
+        }
+        if (expr->recordType && expr->recordType->baseType == Type::tTuple
+            && !expr->shorthandRecordNames.empty()
+            && expr->recordNames.empty()
+            && expr->recordType->argNames.size() == expr->shorthandRecordNames.size()) {
+            bool matches = true;
+            for (size_t i = 0, n = expr->shorthandRecordNames.size(); i != n; ++i) {
+                if (expr->shorthandRecordNames[i] != expr->recordType->argNames[i]) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (matches) {
+                expr->recordNames = expr->shorthandRecordNames;
+                expr->shorthandRecordNames.clear();
+                reportAstChanged();
             }
         }
         if (expr->recordType) {
@@ -1216,20 +1285,21 @@ namespace das {
             }
             TypeDecl::clone(expr->recordType, expr->makeType);
         } else {
-            if (expr->makeType->dim.size() > 1) {
+            if (expr->makeType->baseType==Type::tFixedArray && expr->makeType->firstType->baseType==Type::tFixedArray) {
                 error("[[" + describeType(expr->makeType) + "]] array can only initialize single dimension arrays", "", "",
                       expr->at, CompilationError::invalid_array_dimension);
-            } else if (expr->makeType->dim.size() == 1 && expr->makeType->dim[0] != int32_t(expr->values.size())) {
+            } else if (expr->makeType->baseType==Type::tFixedArray && expr->makeType->fixedDim != int32_t(expr->values.size())) {
                 error("[[" + describeType(expr->makeType) + "]] array dimension mismatch, provided " +
-                          to_string(expr->values.size()) + " elements, expecting " + to_string(expr->makeType->dim[0]),
+                          to_string(expr->values.size()) + " elements, expecting " + to_string(expr->makeType->fixedDim),
                       "", "",
                       expr->at, CompilationError::mismatching_array_dimension);
             } else if (expr->makeType->ref) {
                 error("[[" + describeType(expr->makeType) + "]] array can't be reference", "", "",
                       expr->at, CompilationError::invalid_array);
             }
-            TypeDecl::clone(expr->recordType, expr->makeType);
-            expr->recordType->dim.clear();
+            auto mkBaseT = expr->makeType;
+            while (mkBaseT->baseType==Type::tFixedArray && mkBaseT->firstType) mkBaseT = mkBaseT->firstType;
+            TypeDecl::clone(expr->recordType, mkBaseT);
         }
         expr->initAllFields = true;
     }
@@ -1242,14 +1312,12 @@ namespace das {
                 if (init->type && !init->type->isAutoOrAlias()) {
                     // blah[] vs blah
                     TypeDeclPtr mkt = nullptr;
-                    if (!expr->gen2 && expr->makeType->dim.size() && !init->type->dim.size()) {
-                        if (expr->makeType->dim.size() == 1 && expr->makeType->dim[0] == TypeDecl::dimAuto) {
-                            auto infT = new TypeDecl(*expr->makeType);
-                            infT->dim.clear();
+                    if (!expr->gen2 && expr->makeType->baseType==Type::tFixedArray && init->type->baseType!=Type::tFixedArray) {
+                        if (expr->makeType->firstType->baseType!=Type::tFixedArray && expr->makeType->fixedDim == TypeDecl::dimAuto) {
+                            auto infT = new TypeDecl(*expr->makeType->firstType);
                             mkt = TypeDecl::inferGenericType(infT, init->type, false, false, nullptr);
                             if (mkt) {
-                                mkt->dim.resize(1);
-                                mkt->dim[0] = int32_t(expr->values.size());
+                                mkt = makeFixedArrayTypeDecl(int32_t(expr->values.size()), mkt);
                             }
                         }
                     } else {
@@ -1279,6 +1347,16 @@ namespace das {
         }
         if (!init->type || !expr->recordType) {
             return Visitor::visitMakeArrayIndex(expr, index, init, last);
+        }
+        {
+            bool rangeError = false;
+            if (auto promoted = tryPromoteConstInt(init, expr->recordType, rangeError)) {
+                reportAstChanged();
+                return promoted;
+            }
+            if (rangeError) {
+                return init;
+            }
         }
         if (!canCopyOrMoveType(expr->recordType, init->type, TemporaryMatters::no, init,
                                "can't initialize array element", CompilationError::cant_copy, init->at)) {
@@ -1388,13 +1466,25 @@ namespace das {
             error("array element has to be copyable or moveable", "", "",
                   expr->at, CompilationError::invalid_array_element_type);
         }
-        auto resT = new TypeDecl(*expr->makeType);
         uint32_t resDim = uint32_t(expr->values.size());
-        if (expr->gen2) {
-            resT->dim.push_back(resDim);
-        } else if (resDim != 1 || expr->makeType->dim.size()) {
-            resT->dim.resize(1);
-            resT->dim[0] = resDim;
+        TypeDeclPtr resT = nullptr;
+        if (expr->gen2 && expr->makeArrayOnHeap) {
+            // heap array literal: type directly as array<T> (not the stack fixed array); codegen
+            // builds it on the heap, and to_array_move/to_table_move resolve their array<T> overload.
+            resT = new TypeDecl(Type::tArray);
+            resT->at = expr->at;
+            resT->constant = false;
+            resT->removeConstant = true;
+            resT->firstType = new TypeDecl(*expr->recordType);
+            resT->firstType->ref = false;
+            resT->firstType->constant = false;
+        } else if (expr->gen2) {
+            // wrap outermost - element count is the outer dimension (old dim.push_back was inner-first, latent order bug)
+            resT = makeFixedArrayTypeDecl(int32_t(resDim), new TypeDecl(*expr->makeType));
+        } else if (resDim != 1 || expr->makeType->baseType==Type::tFixedArray) {
+            auto mkBaseT = expr->makeType;
+            while (mkBaseT->baseType==Type::tFixedArray && mkBaseT->firstType) mkBaseT = mkBaseT->firstType;
+            resT = makeFixedArrayTypeDecl(int32_t(resDim), new TypeDecl(*mkBaseT));
         } else {
             DAS_ASSERT(expr->values.size() == 1);
             auto eval = expr->values[0];

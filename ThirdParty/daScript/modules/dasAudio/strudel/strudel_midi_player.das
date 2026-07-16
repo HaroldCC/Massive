@@ -1,5 +1,7 @@
 options gen2
 options indenting = 4
+options persistent_heap
+options gc
 options no_unused_block_arguments = false
 options no_unused_function_arguments = false
 
@@ -71,7 +73,7 @@ def gm_preset(program : int) : GmPreset {
         return GmPreset(osc = OscType.osc_triangle, att = 0.002, dec = 0.7, sus = 0.0, rel = 0.05)
     } elif (program < 120) {   // Percussive (tinkle bell, agogo, steel drums)
         return GmPreset(osc = OscType.osc_sine, att = 0.001, dec = 0.5, sus = 0.0, rel = 0.05)
-    } elif (program < 128) {   // SFX (guitar fret, breath, seashore, etc.)
+    } elif (program < 128) {   // SFX (guitar fret, breath, seashore, etc.) — nolint:STYLE005 — last arm of preset-table elif chain
         return GmPreset(osc = OscType.osc_sine, att = 0.01, dec = 0.3, sus = 0.3, rel = 0.1)
     }
     return GmPreset()
@@ -123,9 +125,7 @@ def render_drum_hit(note : int; velocity : float) : array<float> {
         return <- render_crash(0.8, gain)           // splash
     } elif (note == 56) {
         return <- render_cowbell(0.25, gain)
-    } elif (note == 57) {
-        return <- render_crash(1.5, gain)           // crash 2
-    }
+    } elif (note == 57) return <- render_crash(1.5, gain)           // crash 2
     // fallback: short noise burst
     return <- render_hh(0.1, gain * 0.5)
 }
@@ -133,20 +133,20 @@ def render_drum_hit(note : int; velocity : float) : array<float> {
 // ─── GM Drum Note → Sample Bank Name ───
 
 def private gm_drum_name(note : int) : string {
-    if (note == 35 || note == 36) { return "bd"; }
-    if (note == 37) { return "sidestick"; }
-    if (note == 38 || note == 40) { return "sd"; }
-    if (note == 39) { return "cp"; }
-    if (note == 41 || note == 43) { return "tom_low"; }
-    if (note == 42) { return "hh"; }
-    if (note == 44) { return "hh_pedal"; }
-    if (note == 45 || note == 47 || note == 48 || note == 50) { return "tom_high"; }
-    if (note == 46) { return "hh_open"; }
-    if (note == 49 || note == 52 || note == 55 || note == 57) { return "crash"; }
-    if (note == 51) { return "ride"; }
-    if (note == 53) { return "ride_bell"; }
-    if (note == 54) { return "tambourine"; }
-    if (note == 56) { return "cowbell"; }
+    if (note == 35 || note == 36) return "bd";
+    if (note == 37) return "sidestick";
+    if (note == 38 || note == 40) return "sd";
+    if (note == 39) return "cp";
+    if (note == 41 || note == 43) return "tom_low";
+    if (note == 42) return "hh";
+    if (note == 44) return "hh_pedal";
+    if (note == 45 || note == 47 || note == 48 || note == 50) return "tom_high";
+    if (note == 46) return "hh_open";
+    if (note == 49 || note == 52 || note == 55 || note == 57) return "crash";
+    if (note == 51) return "ride";
+    if (note == 53) return "ride_bell";
+    if (note == 54) return "tambourine";
+    if (note == 56) return "cowbell";
     return ""
 }
 
@@ -173,9 +173,7 @@ def private piano_sample_name(midi_note : int) : tuple<name : string; speed : fl
 def midi_adsr(elapsed, note_off_elapsed, attack, decay, sustain, release : float) : float {
     //! Evaluate the MIDI-style ADSR at `elapsed` seconds since note-on and `note_off_elapsed` seconds since note-off.
     //! `note_off_elapsed < 0` means the note is still held. The sustain phase also decays exponentially so long-held notes fade.
-    if (elapsed < 0.0) {
-        return 0.0
-    }
+    if (elapsed < 0.0) return 0.0
     var env = 0.0
     if (elapsed < attack) {
         env = elapsed / attack
@@ -188,13 +186,9 @@ def midi_adsr(elapsed, note_off_elapsed, attack, decay, sustain, release : float
         env = sustain * exp(-sustain_time * 1.2)  // ~0.58 second half-life
     }
     // note still held
-    if (note_off_elapsed < 0.0) {
-        return env
-    }
+    if (note_off_elapsed < 0.0) return env
     // release phase
-    if (note_off_elapsed < release) {
-        return env * (1.0 - note_off_elapsed / release)
-    }
+    if (note_off_elapsed < release) return env * (1.0 - note_off_elapsed / release)
     return 0.0
 }
 
@@ -334,11 +328,9 @@ def private sf2_note_on(var state : MidiPlaybackState; ch, note, velocity : int)
     let bank = ch == 9 ? 128 : 0
     let program = state.channels[ch].program
     let preset_idx = sf2_find_preset(*state.sf2, bank, program)
-    if (preset_idx < 0) {
-        return
-    }
+    if (preset_idx < 0) return
     var zones <- sf2_find_zones(*state.sf2, preset_idx, note, velocity)
-    if (length(zones) == 0) {
+    if (empty(zones)) {
         delete zones
         return
     }
@@ -409,9 +401,7 @@ def process_events(var state : MidiPlaybackState) {
     //! Routes note events either to the SF2 voice allocator or to the legacy oscillator/sample path depending on `state.sf2`.
     while (state.event_index < length(state.events)) {
         let ev & = unsafe(state.events[state.event_index])
-        if (double(ev.tick) > state.current_tick) {
-            break
-        }
+        if (double(ev.tick) > state.current_tick) break
         let ch = ev.channel
         if (ev.kind == MidiEventKind.midi_note_on) {
             let vel = float(ev.data2) / 127.0
@@ -436,7 +426,7 @@ def process_events(var state : MidiPlaybackState) {
                             drum_stereo <- render_sample(*state.bank, drum_name, ev.data1 % 3, 1.0)
                         }
                     }
-                    if (length(drum_stereo) == 0) {
+                    if (empty(drum_stereo)) {
                         var drum_mono <- render_drum_hit(ev.data1, vel)
                         drum_stereo <- mono_to_stereo(drum_mono)
                     }
@@ -565,7 +555,7 @@ def midi_tick(var state : MidiPlaybackState; chunk_seconds : float) : array<floa
         state.mixer_ready = true
     }
     let iSr = 1.0 / float(SAMPLE_RATE)
-    let tp = float(TWO_PI)
+    let tp = TWO_PI
     var i = length(state.voices) - 1
     while (i >= 0) {
         var voice = state.voices[i]
@@ -774,7 +764,7 @@ def midi_tick(var state : MidiPlaybackState; chunk_seconds : float) : array<floa
     state.playback_time += double(chunk_seconds)
     state.current_tick += state.ticks_per_sec * double(chunk_seconds)
     // check if done
-    if (state.event_index >= length(state.events) && length(state.voices) == 0 && length(state.csf2_voices) == 0) {
+    if (state.event_index >= length(state.events) && empty(state.voices) && empty(state.csf2_voices)) {
         if (state.looping) {
             state.event_index = 0
             state.current_tick = 0.0lf
@@ -840,12 +830,12 @@ def private midi_thread_main(sid : uint64; var cmd_stream : Stream?; var done_st
     let TARGET_CHUNKS = 4
     let LOW_WATERMARK = 2
     var tracks : array<MidiPlaybackState?>
-    var status_box <- unsafe(lock_box_create())
+    var status_box <- lock_box_create()
     set_status_update(sid, status_box)
-    var pcm_box <- unsafe(lock_box_create())
+    var pcm_box <- lock_box_create()
     // initialize reverb (convolution: 2s decay, 15kHz→1kHz lowpass sweep)
     g_reverb = new ConvolutionReverb
-    conv_reverb_init(g_reverb, SAMPLE_RATE, 2.0, 15000.0, 1000.0, 0.01)
+    conv_reverb_init(g_reverb, SAMPLE_RATE, 2.0, 15000.0, 1000.0, 0.01, ConvReverbQuality.high, 0)
     // initialize chorus
     g_chorus = new ma_chorus
     chorus_init(g_chorus, float(SAMPLE_RATE))
@@ -874,7 +864,7 @@ def private midi_thread_main(sid : uint64; var cmd_stream : Stream?; var done_st
                     looping = tc.looping
                 ))
             } elif (cmd is remove_track) {
-                let name = string(cmd as remove_track)
+                let name = cmd as remove_track
                 var k = length(tracks) - 1
                 while (k >= 0) {
                     if (tracks[k].name == name) {
@@ -922,12 +912,10 @@ def private midi_thread_main(sid : uint64; var cmd_stream : Stream?; var done_st
             tracks |> push(ps)
         }
         pending_adds |> clear()
-        if (!running) {
-            break
-        }
+        if (!running) break
         // wait for tracks before producing audio, or for audio to consume
-        if (length(tracks) == 0 || !pcm_box.isReady) {
-            sleep(length(tracks) == 0 ? 10u : 1u)
+        if (empty(tracks) || !pcm_box.isReady) {
+            sleep(empty(tracks) ? 10u : 1u)
             continue
         }
         // render all tracks
@@ -939,7 +927,7 @@ def private midi_thread_main(sid : uint64; var cmd_stream : Stream?; var done_st
         while (ii >= 0) {
             var track = tracks[ii]
             var chunk <- midi_tick(*track, float(CHUNK_SEC))
-            if (length(chunk) > 0 && track.gain > 0.001) {
+            if (!empty(chunk) && track.gain > 0.001) {
                 let n = min(length(chunk), length(output))
                 for (j in range(n)) {
                     output[j] += chunk[j] * track.gain
@@ -965,7 +953,7 @@ def private midi_thread_main(sid : uint64; var cmd_stream : Stream?; var done_st
             }
             ii --
         }
-        if (length(output) > 0) {
+        if (!empty(output)) {
             // push PCM to visualization channel
             if (vis_ptr != null) {
                 var vis_ch = unsafe(reinterpret<Channel?>(vis_ptr))
@@ -1030,9 +1018,7 @@ def public midi_set_audio_vis_channel(var ch : Channel?) {
 def public midi_init() {
     //! Start the MIDI playback thread and attach it to the running audio stream.
     //! No-op if already running; panics if the audio system has not been initialised first.
-    if (g_midi_running) {
-        return
-    }
+    if (g_midi_running) return
     if (get_audio_command_stream() == null) {
         panic("midi_init: audio system not initialized. Call audio_system_create() first.")
     }
@@ -1040,7 +1026,7 @@ def public midi_init() {
         g_midi_sid = play_sound_from_pcm_stream(MA_SAMPLE_RATE, MA_CHANNELS)
     }
     g_midi_cmd_stream = unsafe(stream_create())
-    g_midi_done_status = unsafe(job_status_create())
+    g_midi_done_status = job_status_create()
     g_midi_done_status |> append(1)                   // expect one notification on worker exit
     // @capture auto-bumps refcount for Stream and JobStatus — no manual add_ref needed
     let sid = g_midi_sid
@@ -1080,7 +1066,7 @@ def public midi_play(name : string; path : string; gain : float = 1.0; looping :
     //! Parse a .mid file from disk and submit it for playback under `name`.
     //! Auto-starts the playback thread if needed; falls back to the oscillator/sample path when no SF2 is loaded or `use_sf2` is false.
     g_midi_files[name] <- load_midi(path)
-    if (length(g_midi_files[name].tracks) == 0) {
+    if (empty(g_midi_files[name].tracks)) {
         g_midi_files |> erase(name)
         return false
     }
@@ -1105,7 +1091,7 @@ def public midi_play_data(name : string; data : array<uint8>; gain : float = 1.0
     //! Parse a .mid file from an in-memory byte array and submit it for playback under `name`.
     //! Same semantics as `midi_play` but sourced from memory instead of disk.
     g_midi_files[name] <- parse_midi(data)
-    if (length(g_midi_files[name].tracks) == 0) {
+    if (empty(g_midi_files[name].tracks)) {
         g_midi_files |> erase(name)
         return false
     }
@@ -1128,9 +1114,7 @@ def public midi_play_data(name : string; data : array<uint8>; gain : float = 1.0
 
 def public midi_stop(name : string = "") {
     //! Stop a single track by name, or shut down the whole playback thread when `name` is empty.
-    if (!g_midi_running) {
-        return
-    }
+    if (!g_midi_running) return
     if (empty(name)) {
         // stop all — shutdown the thread
         midi_shutdown()
@@ -1141,25 +1125,19 @@ def public midi_stop(name : string = "") {
 
 def public midi_set_volume(name : string; volume : float; fade : float = 0.0) {
     //! Set the linear gain of a named track, optionally fading over `fade` seconds (0 = instantaneous).
-    if (!g_midi_running || g_midi_cmd_stream == null) {
-        return
-    }
+    if (!g_midi_running || g_midi_cmd_stream == null) return
     g_midi_cmd_stream |> push_archive(MidiCommand(set_volume = (name = name, volume = volume, fade = fade)))
 }
 
 def public midi_set_pause(paused : bool) {
     //! Pause or resume all MIDI playback (the underlying audio stream continues with silence while paused).
-    if (!g_midi_running || g_midi_cmd_stream == null) {
-        return
-    }
+    if (!g_midi_running || g_midi_cmd_stream == null) return
     g_midi_cmd_stream |> push_archive(MidiCommand(set_pause = paused))
 }
 
 def public midi_shutdown() {
     //! Stop the playback thread and release its stream/status; blocks until the audio thread confirms shutdown.
-    if (!g_midi_running || g_midi_cmd_stream == null) {
-        return
-    }
+    if (!g_midi_running || g_midi_cmd_stream == null) return
     g_midi_cmd_stream |> push_archive(MidiCommand(shutdown = true))
     g_midi_done_status |> join                        // blocks until worker notify_and_release
     // refcount was 2 after init; worker's release made it 1; stream_remove decrements to 0 and deletes
@@ -1187,7 +1165,7 @@ def public midi_init_reverb() {
     //! Initialise the module-global reverb and chorus effects for offline rendering (calling `midi_tick` without running the thread).
     if (g_reverb == null) {
         g_reverb = new ConvolutionReverb
-        conv_reverb_init(g_reverb, SAMPLE_RATE, 2.0, 15000.0, 1000.0, 0.01)
+        conv_reverb_init(g_reverb, SAMPLE_RATE, 2.0, 15000.0, 1000.0, 0.01, ConvReverbQuality.high, 0)
     }
     if (g_chorus == null) {
         g_chorus = new ma_chorus

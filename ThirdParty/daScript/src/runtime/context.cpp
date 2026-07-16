@@ -75,6 +75,7 @@ namespace das
         verySafeContext = options.getBoolOption("very_safe_context",policies.very_safe_context);
         breakOnException |= policies.debugger;
         gcEnabled = options.getBoolOption("gc", false);
+        gcLogTime = options.getBoolOption("log_gc_time", policies.log_gc_time);
         persistent = options.getBoolOption("persistent_heap", policies.persistent_heap);
         if ( persistent ) {
             heap = make_unique<PersistentHeapAllocator>();
@@ -364,15 +365,15 @@ namespace das
     }
 
     Context::~Context() {
-        if ( !failed ) {
-            on_debug_agent_mutex([&](){
-                // unregister
-                category.value |= uint32_t(ContextCategory::dead);
-                // register
-                for_each_debug_agent([&](const DebugAgentPtr & pAgent){
-                    pAgent->onDestroyContext(this);
-                });
+        on_debug_agent_mutex([&](){
+            // unregister
+            category.value |= uint32_t(ContextCategory::dead);
+            // register
+            for_each_debug_agent([&](const DebugAgentPtr & pAgent){
+                pAgent->onDestroyContext(this);
             });
+        });
+        if ( !failed ) {
             // shutdown
             runShutdownScript();
         }
@@ -407,7 +408,7 @@ namespace das
         SimNodeRelocator rel;
         rel.context = this;
         rel.newCode = make_shared<NodeAllocator>();
-        rel.newCode->customGrow = [&](int ) { return 4000; };   // because SimNode_Aot is 80 bytes
+        rel.newCode->customGrow = [&](uint64_t ) { return uint64_t(4000); };   // because SimNode_Aot is 80 bytes
         uint32_t codeSize = uint32_t(code->bytesAllocated());
         if ( code->prefixWithHeader && !pwh ) {
             // printf("[REL] %i adjusting\n", code->totalNodesAllocated);
@@ -847,13 +848,26 @@ namespace das
 
 
 
+    // Standalone-AOT contexts are constructed as member objects (see
+    // daslib/aot_standalone.das::writeStandaloneCtor), not via make_shared,
+    // so their weak_from_this() is empty and shared_from_this() throws
+    // bad_weak_ptr. The agent adapter only needs the context's raw pointer
+    // for dispatch (passed at make_debug_agent time); debugAgentContext is
+    // only consulted by getDebugAgentContext, which already returns an
+    // error for null. So fall back to a null shared_ptr in that case
+    // instead of aborting the process.
+    static inline shared_ptr<Context> debugAgentContextOrNull ( Context * context ) {
+        auto wp = context->weak_from_this();
+        return wp.expired() ? nullptr : wp.lock();
+    }
+
     void installThreadLocalDebugAgent ( DebugAgentPtr newAgent, LineInfoArg * at, Context * context ) {
         if ( *daScriptEnvironment::g_threadLocalDebugAgent && (*daScriptEnvironment::g_threadLocalDebugAgent)->debugAgent ) {
             context->throw_error_at(at, "thread local debug agent already installed");
         }
         std::lock_guard<std::recursive_mutex> guard(g_DebugAgentMutex);
         (*daScriptEnvironment::g_threadLocalDebugAgent) = new DebugAgentInstance{
-            context->shared_from_this(),
+            debugAgentContextOrNull(context),
             newAgent
         };
         DebugAgent * newAgentPtr = newAgent.get();
@@ -873,7 +887,7 @@ namespace das
             });
         }
         g_DebugAgents[category] = {
-            context->shared_from_this(),
+            debugAgentContextOrNull(context),
             newAgent
         };
         DebugAgent * newAgentPtr = newAgent.get();
@@ -1026,11 +1040,11 @@ namespace das
         throw_fatal_error(buffer, at);
     }
 
-    void Context::throw_out_of_memory ( bool isStringHeap, uint32_t size, const LineInfo * at ) {
+    void Context::throw_out_of_memory ( bool isStringHeap, uint64_t size, const LineInfo * at ) {
         if ( isStringHeap ) {
-            throw_error_at(at, "out of string heap memory, requested %u bytes, used %llu / limit %llu", size, (unsigned long long) stringHeap->bytesAllocated(), (unsigned long long) stringHeap->getLimit());
+            throw_error_at(at, "out of string heap memory, requested %llu bytes, used %llu / limit %llu", (unsigned long long) size, (unsigned long long) stringHeap->bytesAllocated(), (unsigned long long) stringHeap->getLimit());
         } else {
-            throw_error_at(at, "out of heap memory, requested %u bytes, used %llu / limit %llu", size, (unsigned long long) heap->bytesAllocated(), (unsigned long long) heap->getLimit());
+            throw_error_at(at, "out of heap memory, requested %llu bytes, used %llu / limit %llu", (unsigned long long) size, (unsigned long long) heap->bytesAllocated(), (unsigned long long) heap->getLimit());
         }
     }
 

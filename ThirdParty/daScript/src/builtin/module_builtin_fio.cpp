@@ -13,8 +13,10 @@
 
 #include "daScript/misc/performance_time.h"
 #include "daScript/misc/sysos.h"
+#include "daScript/misc/string_writer.h"   // LOG / LogLevel — env-gated module-load trace
 
 #include <sstream>
+#include <chrono>
 
 #define DAS_POPEN_TIMEOUT 0x7FFFFF01
 
@@ -65,6 +67,29 @@ namespace das {
         return t;
     }
 
+    // Current UTC wallclock as ISO 8601 with millisecond precision:
+    //   "YYYY-MM-DDTHH:MM:SS.mmmZ"
+    // Used by daslib/log for log-record timestamps; also general-purpose.
+    char * iso8601_now ( Context * context, LineInfoArg * at ) {
+        auto now = std::chrono::system_clock::now();
+        auto t = std::chrono::system_clock::to_time_t(now);
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000;
+        if ( ms < 0 ) ms += 1000;
+        struct tm utc;
+#if defined(__linux__) || defined(__APPLE__) || defined(__EMSCRIPTEN__)
+        gmtime_r(&t, &utc);          // desktop POSIX / wasm
+#elif _WIN32
+        gmtime_s(&utc, &t);          // MSVC: (tm*, time_t*)
+#else
+        gmtime_s(&t, &utc);          // consoles (PS4/PS5): POSIX-style gmtime_s(time_t*, tm*)
+#endif
+        char buf[32];
+        int n = snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
+            utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
+            utc.tm_hour, utc.tm_min, utc.tm_sec, (int)ms);
+        return context->allocateString(buf, uint32_t(n < 0 ? 0 : n), at);
+    }
+
     Time builtin_mktime(int year, int month, int mday, int hour, int min, int sec) {
         struct tm timeinfo = {};
         timeinfo.tm_year = year - 1900;
@@ -79,11 +104,37 @@ namespace das {
         return t;
     }
 
+    // Render a clock as local-time text via strftime. Empty/null `fmt` -> "%Y-%m-%d %H:%M".
+    // Companion to the type's `%c` walk() serialization, but caller-formatted. Uses the
+    // reentrant localtime_r/localtime_s into a stack tm (localtime() is not thread-safe and
+    // can return null); a failed conversion or empty render yields an empty string.
+    char * format_time ( Time t, const char * fmt, Context * context, LineInfoArg * at ) {
+        const char * f = ( fmt && *fmt ) ? fmt : "%Y-%m-%d %H:%M";
+        struct tm tmv;
+        bool ok;
+#if defined(__linux__) || defined(__APPLE__) || defined(__EMSCRIPTEN__)
+        ok = localtime_r(&t.time, &tmv) != nullptr;     // desktop POSIX / wasm
+#elif defined(_WIN32)
+        ok = localtime_s(&tmv, &t.time) == 0;           // MSVC: (tm*, const time_t*) -> errno_t
+#else
+        ok = localtime_s(&t.time, &tmv) == 0;           // consoles: POSIX-style (time_t*, tm*)
+#endif
+        char buf[256];
+        size_t n = ok ? strftime(buf, sizeof(buf), f, &tmv) : 0;
+        return context->allocateString(n != 0 ? buf : "", uint32_t(n), at);
+    }
+
     void Module_BuiltIn::addTime(ModuleLibrary & lib) {
         addAnnotation(new TimeAnnotation(lib));
         addExtern<DAS_BIND_FUN(builtin_clock)>(*this, lib, "get_clock", SideEffects::modifyExternal, "builtin_clock");
+        addExtern<DAS_BIND_FUN(iso8601_now)>(*this, lib, "iso8601_now",
+            SideEffects::accessExternal, "iso8601_now");
         addExtern<DAS_BIND_FUN(builtin_mktime)>(*this, lib, "mktime", SideEffects::modifyExternal, "builtin_mktime")
             ->args({"year","month","mday","hour","min","sec"});
+        // accessExternal (not none): reads process locale + timezone, so it must not be
+        // CSE'd or constant-folded across environment changes — same as iso8601_now.
+        addExtern<DAS_BIND_FUN(format_time)>(*this, lib, "format_time", SideEffects::accessExternal, "format_time")
+            ->args({"time","format","context","at"});
         // operations on time
         addExtern<DAS_BIND_FUN(time_equal)>(*this, lib, "==",
             SideEffects::none, "time_equal");
@@ -151,52 +202,58 @@ namespace das {
     char * builtin_fs_temp_directory ( char * & error, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     char * builtin_fs_create_temp_file ( const char * prefix, const char * ext, char * & error, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     char * builtin_fs_create_temp_directory ( const char * prefix, char * & error, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
+    char * builtin_fread_to_eof ( const FILE * f, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
+    int builtin_popen_argv ( const Array & args_arr, float timeout_sec, const TBlock<void,const FILE *> & blk, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
+    int builtin_popen_argv_pipe ( const Array & args_arr, const TBlock<void,const FILE *,const FILE *> & blk, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
+    void * register_dynamic_module_silent ( const char * path, const char * mod_name, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
+    void for_each_registered_native_path ( const TBlock<void,const char *,const char *,const char *> & block, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
+    void for_each_registered_dynamic_module ( const TBlock<void,const char *,const char *,const char *> & block, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
 #undef GENERATE_IO_STUB
 
-#define GENERATE_IO_STUB { DAS_FATAL_ERROR("%s is not implemented (because DAS_NO_FILEIO is enabled).", __FUNCTION__); }
-#define GENERATE_IO_STUB_RET { GENERATE_IO_STUB; return {}; }
-    void builtin_sleep ( uint32_t msec ) GENERATE_IO_STUB
+    // entry points that report via `ctx` instead of `context`
+#define GENERATE_IO_STUB { ctx->throw_error_at(at, "%s is not implemented (because DAS_NO_FILEIO is enabled)", __FUNCTION__); }
+    int64_t builtin_fs_file_size ( const char * path, char * & error, Context * ctx, LineInfoArg * at ) GENERATE_IO_STUB
+    bool builtin_fs_equivalent ( const char * a, const char * b, char * & error, Context * ctx, LineInfoArg * at ) GENERATE_IO_STUB
+    bool builtin_fs_is_symlink ( const char * path, char * & error, Context * ctx, LineInfoArg * at ) GENERATE_IO_STUB
+    bool builtin_fs_copy_file ( const char * src, const char * dst, bool overwrite, char * & error, Context * ctx, LineInfoArg * at ) GENERATE_IO_STUB
+    bool builtin_fs_set_mtime ( const char * path, Time time, char * & error, Context * ctx, LineInfoArg * at ) GENERATE_IO_STUB
+    bool builtin_fs_disk_space ( const char * path, DiskSpaceInfo & info, char * & error, Context * ctx, LineInfoArg * at ) GENERATE_IO_STUB
+    bool builtin_remove_file_ec ( const char * path, char * & error, Context * ctx, LineInfoArg * at ) GENERATE_IO_STUB
+    bool builtin_rename_file_ec ( const char * old_path, const char * new_path, char * & error, Context * ctx, LineInfoArg * at ) GENERATE_IO_STUB
+    bool builtin_mkdir_ec ( const char * path, char * & error, Context * ctx, LineInfoArg * at ) GENERATE_IO_STUB
+    bool builtin_rmdir_ec ( const char * path, char * & error, Context * ctx, LineInfoArg * at ) GENERATE_IO_STUB
+    bool builtin_rmdir_rec_ec ( const char * path, char * & error, Context * ctx, LineInfoArg * at ) GENERATE_IO_STUB
+#undef GENERATE_IO_STUB
+
+    // no usable context to report on: return an empty result / no-op (never crash)
+#define GENERATE_IO_STUB {}
+#define GENERATE_IO_STUB_RET { return {}; }
+    void builtin_sleep ( uint32_t ) GENERATE_IO_STUB
     const FILE * builtin_stdin() GENERATE_IO_STUB_RET
     const FILE * builtin_stdout() GENERATE_IO_STUB_RET
     const FILE * builtin_stderr() GENERATE_IO_STUB_RET
-    bool builtin_feof(const FILE* _f) GENERATE_IO_STUB_RET
-    const FILE * builtin_fopen  ( const char * name, const char * mode, Context *, LineInfoArg * ) GENERATE_IO_STUB_RET
-    vec4f builtin_read ( Context & context, SimNode_CallBase * call, vec4f * args ) GENERATE_IO_STUB_RET
-    vec4f builtin_write ( Context & context, SimNode_CallBase * call, vec4f * args ) GENERATE_IO_STUB_RET
-    vec4f builtin_load ( Context & context, SimNode_CallBase * node, vec4f * args ) GENERATE_IO_STUB_RET
-    bool builtin_stat ( const char * filename, FStat & fs ) GENERATE_IO_STUB_RET
-    bool builtin_chdir ( const char * path ) GENERATE_IO_STUB_RET
-    bool builtin_mkdir ( const char * path ) GENERATE_IO_STUB_RET
-    void builtin_exit ( int32_t ec ) GENERATE_IO_STUB
-    bool builtin_remove_file ( const char * path ) GENERATE_IO_STUB_RET
-    bool builtin_rename_file ( const char * old_path, const char * new_path ) GENERATE_IO_STUB_RET
-    bool builtin_rmdir ( const char * path ) GENERATE_IO_STUB_RET
-    bool builtin_fexist ( const char * path ) GENERATE_IO_STUB_RET
-    bool builtin_rmdir_rec ( const char * path ) GENERATE_IO_STUB_RET
-    bool builtin_fs_is_absolute ( const char * path ) GENERATE_IO_STUB_RET
-    int64_t builtin_fs_file_size ( const char * path, char * & error, Context * ctx, LineInfoArg * at ) GENERATE_IO_STUB_RET
-    bool builtin_fs_equivalent ( const char * a, const char * b, char * & error, Context * ctx, LineInfoArg * at ) GENERATE_IO_STUB_RET
-    bool builtin_fs_is_symlink ( const char * path, char * & error, Context * ctx, LineInfoArg * at ) GENERATE_IO_STUB_RET
-    bool builtin_fs_copy_file ( const char * src, const char * dst, bool overwrite, char * & error, Context * ctx, LineInfoArg * at ) GENERATE_IO_STUB_RET
-    bool builtin_fs_set_mtime ( const char * path, Time time, char * & error, Context * ctx, LineInfoArg * at ) GENERATE_IO_STUB_RET
-    bool builtin_fs_disk_space ( const char * path, DiskSpaceInfo & info, char * & error, Context * ctx, LineInfoArg * at ) GENERATE_IO_STUB_RET
-    bool builtin_remove_file_ec ( const char * path, char * & error, Context * ctx, LineInfoArg * at ) GENERATE_IO_STUB_RET
-    bool builtin_rename_file_ec ( const char * old_path, const char * new_path, char * & error, Context * ctx, LineInfoArg * at ) GENERATE_IO_STUB_RET
-    bool builtin_mkdir_ec ( const char * path, char * & error, Context * ctx, LineInfoArg * at ) GENERATE_IO_STUB_RET
-    bool builtin_rmdir_ec ( const char * path, char * & error, Context * ctx, LineInfoArg * at ) GENERATE_IO_STUB_RET
-    bool builtin_rmdir_rec_ec ( const char * path, char * & error, Context * ctx, LineInfoArg * at ) GENERATE_IO_STUB_RET
+    bool builtin_feof(const FILE*) GENERATE_IO_STUB_RET
+    const FILE * builtin_fopen  ( const char *, const char *, Context *, LineInfoArg * ) GENERATE_IO_STUB_RET
+    vec4f builtin_read ( Context &, SimNode_CallBase *, vec4f * ) GENERATE_IO_STUB_RET
+    vec4f builtin_write ( Context &, SimNode_CallBase *, vec4f * ) GENERATE_IO_STUB_RET
+    vec4f builtin_load ( Context &, SimNode_CallBase *, vec4f * ) GENERATE_IO_STUB_RET
+    bool builtin_stat ( const char *, FStat & ) GENERATE_IO_STUB_RET
+    bool builtin_chdir ( const char * ) GENERATE_IO_STUB_RET
+    bool builtin_mkdir ( const char * ) GENERATE_IO_STUB_RET
+    void builtin_exit ( int32_t ) GENERATE_IO_STUB
+    char * builtin_resolve_this_module_dir ( const char *, Context * ) GENERATE_IO_STUB_RET
+    bool builtin_remove_file ( const char * ) GENERATE_IO_STUB_RET
+    bool builtin_rename_file ( const char *, const char * ) GENERATE_IO_STUB_RET
+    bool builtin_rmdir ( const char * ) GENERATE_IO_STUB_RET
+    bool builtin_fexist ( const char * ) GENERATE_IO_STUB_RET
+    bool builtin_rmdir_rec ( const char * ) GENERATE_IO_STUB_RET
+    bool builtin_fs_is_absolute ( const char * ) GENERATE_IO_STUB_RET
+    void * register_dynamic_module ( const char *, const char *, int, Context *, LineInfoArg * ) GENERATE_IO_STUB_RET
+    void register_native_path ( const char *, const char *, const char *, Context *, LineInfoArg * ) GENERATE_IO_STUB
+    DAS_API void retry_pending_dynamic_modules () GENERATE_IO_STUB
+
 #undef GENERATE_IO_STUB
 #undef GENERATE_IO_STUB_RET
-
-
-    class Module_FIO : public Module {
-    public:
-        Module_FIO() : Module("fio") {
-        }
-        virtual ModuleAotType aotRequire ( TextWriter & tw ) const override {
-            return ModuleAotType::cpp;
-        }
-    };
 
 }
 #else // DAS_NO_FILEIO
@@ -209,6 +266,7 @@ namespace das {
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #else
+#include <fcntl.h>
 #include <signal.h>
 #include <sys/wait.h>
 #endif
@@ -217,35 +275,14 @@ namespace das {
 #include <fstream>
 #include <random>
 
-MAKE_TYPE_FACTORY(FStat, das::FStat)
-MAKE_TYPE_FACTORY(FILE,FILE)
-MAKE_TYPE_FACTORY(DiskSpaceInfo, das::DiskSpaceInfo)
-
 namespace das {
     void builtin_sleep ( uint32_t msec ) {
-#if defined(_MSC_VER)
+#if defined(_WIN32)
         _sleep(msec);
 #else
         usleep(1000 * msec);
 #endif
     }
-
-    struct FStatAnnotation : ManagedStructureAnnotation <FStat,true> {
-        FStatAnnotation(ModuleLibrary & ml) : ManagedStructureAnnotation ("FStat", ml) {
-            validationNeverFails = true;
-            addField<DAS_BIND_MANAGED_FIELD(is_valid)>("is_valid");
-            addProperty<DAS_BIND_MANAGED_PROP(size)>("size");
-            addProperty<DAS_BIND_MANAGED_PROP(atime)>("atime");
-            addProperty<DAS_BIND_MANAGED_PROP(ctime)>("ctime");
-            addProperty<DAS_BIND_MANAGED_PROP(mtime)>("mtime");
-            addProperty<DAS_BIND_MANAGED_PROP(is_reg)>("is_reg");
-            addProperty<DAS_BIND_MANAGED_PROP(is_dir)>("is_dir");
-        }
-        virtual bool canMove() const override { return true; }
-        virtual bool canCopy() const override { return true; }
-        virtual bool isLocal() const override { return true; }
-    };
-
 
     void builtin_fprint ( const FILE * f, const char * text, Context * context, LineInfoArg * at ) {
         if ( !f ) context->throw_error_at(at, "can't fprint NULL");
@@ -424,7 +461,7 @@ namespace das {
 
     char * builtin_dirname ( const char * name, Context * context, LineInfoArg * at ) {
         if ( name ) {
-#if defined(_MSC_VER)
+#if defined(_WIN32)
             char full_path[ _MAX_PATH ];
             char dir[ _MAX_DIR ];
             char fname[ _MAX_FNAME ];
@@ -452,7 +489,7 @@ namespace das {
 
     char * builtin_basename ( const char * name, Context * context, LineInfoArg * at ) {
         if ( name ) {
-#if defined(_MSC_VER)
+#if defined(_WIN32)
             char drive[ _MAX_DRIVE ];
             char full_path[ _MAX_PATH ];
             char dir[ _MAX_DIR ];
@@ -486,7 +523,7 @@ namespace das {
     }
 
      void builtin_dir ( const char * path, const Block & fblk, Context * context, LineInfoArg * at ) {
-#if defined(_MSC_VER)
+#if defined(_WIN32)
         _finddata_t c_file;
         intptr_t hFile;
         string findPath = string(path ? path : "") + "/*";
@@ -545,7 +582,7 @@ namespace das {
 
     bool builtin_mkdir ( const char * path ) {
         if ( path ) {
-#if defined(_MSC_VER)
+#if defined(_WIN32)
             return _mkdir(path) == 0;
 #elif defined(_EMSCRIPTEN_VER)
             return mkdir(path, S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH) == 0;
@@ -566,7 +603,7 @@ namespace das {
             context->throw_error_at(at, "popen of null");
             return -1;
         }
-#ifdef _MSC_VER
+#ifdef _WIN32
         FILE * f = _popen(cmd, bin ? "rb" : "rt");
 #elif defined(__linux__)
         FILE * f = popen(cmd, "r");
@@ -585,7 +622,7 @@ namespace das {
         vec4f args[1];
         args[0] = cast<FILE *>::from(f);
         context->invoke(blk, args, nullptr, at);
-#ifdef _MSC_VER
+#ifdef _WIN32
         return _pclose( f );
 #elif defined(__APPLE__)
         {
@@ -615,7 +652,7 @@ namespace das {
         if ( timeout_sec <= 0.0f ) {
             return builtin_popen_impl(cmd, false, blk, context, at);
         }
-#ifdef _MSC_VER
+#ifdef _WIN32
         // Windows: CreateProcess with stdout pipe + job object for process tree kill
         SECURITY_ATTRIBUTES sa;
         sa.nLength = sizeof(SECURITY_ATTRIBUTES);
@@ -739,7 +776,7 @@ namespace das {
 #endif
     }
 
-#ifdef _MSC_VER
+#ifdef _WIN32
     // Quote a single argv element for Windows CommandLineToArgvW parsing.
     // Wraps in double quotes if needed, doubles backslashes that precede a
     // quote (or end-of-string inside a quoted token), and escapes embedded
@@ -771,9 +808,9 @@ namespace das {
         return out;
     }
 
-    static string winBuildCommandLine ( char ** argv, uint32_t argc ) {
+    static string winBuildCommandLine ( char ** argv, uint64_t argc ) {
         string s;
-        for ( uint32_t i = 0; i < argc; ++i ) {
+        for ( uint64_t i = 0; i < argc; ++i ) {
             if ( i ) s += ' ';
             s += winArgvEscape(argv[i]);
         }
@@ -797,7 +834,7 @@ namespace das {
             context->throw_error_at(at, "popen_argv with null exe");
             return -1;
         }
-#ifdef _MSC_VER
+#ifdef _WIN32
         SECURITY_ATTRIBUTES sa;
         sa.nLength = sizeof(SECURITY_ATTRIBUTES);
         sa.bInheritHandle = TRUE;
@@ -819,9 +856,18 @@ namespace das {
                 SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
             }
         }
+        // Isolate child stdin from the parent's. Without this, the child
+        // inherits the parent's stdin handle (via bInheritHandles=TRUE), and
+        // any accidental read in the child silently steals bytes intended
+        // for the parent — fatal for MCP / language-server style stdio
+        // transports. NUL reads return EOF immediately.
+        HANDLE hNullInput = CreateFileA("NUL", GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
         STARTUPINFOA si;
         memset(&si, 0, sizeof(si));
         si.cb = sizeof(si);
+        si.hStdInput = (hNullInput == INVALID_HANDLE_VALUE) ? NULL : hNullInput;
         si.hStdOutput = hWritePipe;
         si.hStdError = hWritePipe;
         si.dwFlags = STARTF_USESTDHANDLES;
@@ -834,6 +880,7 @@ namespace das {
         BOOL created = CreateProcessA(NULL, (LPSTR)cmdLine.c_str(), NULL, NULL, TRUE,
             createFlags, NULL, NULL, &si, &pi);
         CloseHandle(hWritePipe);
+        if ( hNullInput != INVALID_HANDLE_VALUE ) CloseHandle(hNullInput);
         if ( !created ) {
             CloseHandle(hReadPipe);
             if ( hJob ) CloseHandle(hJob);
@@ -887,7 +934,7 @@ namespace das {
         // trailing NULL element.
         vector<char *> cargv;
         cargv.reserve(args_arr.size + 1);
-        for ( uint32_t i = 0; i < args_arr.size; ++i ) {
+        for ( uint64_t i = 0; i < args_arr.size; ++i ) {
             cargv.push_back(argv[i] ? argv[i] : (char *)"");
         }
         cargv.push_back(nullptr);
@@ -901,6 +948,15 @@ namespace das {
         }
         if ( pid == 0 ) {
             close(pipefd[0]);
+            // Isolate child stdin from the parent's: redirect to /dev/null so
+            // any accidental read in the child returns EOF instead of stealing
+            // bytes intended for the parent (fatal for MCP / language-server
+            // style stdio transports).
+            int devnull = open("/dev/null", O_RDONLY);
+            if ( devnull >= 0 ) {
+                dup2(devnull, STDIN_FILENO);
+                close(devnull);
+            }
             dup2(pipefd[1], STDOUT_FILENO);
             dup2(pipefd[1], STDERR_FILENO);
             close(pipefd[1]);
@@ -938,6 +994,190 @@ namespace das {
 #endif
     }
 
+    // popen_argv_pipe: argv-based subprocess with bidirectional pipes.
+    // Block receives two FILE*: writable stdin (parent → child) and readable
+    // stdout (child → parent, with stderr merged). After the block returns,
+    // parent closes stdin (signaling EOF), waits for the child to exit,
+    // closes stdout, and returns the exit code. Same shell-bypass semantics
+    // as popen_argv (CreateProcess / fork+execvp).
+    int builtin_popen_argv_pipe ( const Array & args_arr,
+                                  const TBlock<void,const FILE *,const FILE *> & blk,
+                                  Context * context, LineInfoArg * at ) {
+        if ( args_arr.size == 0 ) {
+            context->throw_error_at(at, "popen_argv_pipe with empty args");
+            return -1;
+        }
+        char ** argv = (char **) args_arr.data;
+        if ( !argv[0] ) {
+            context->throw_error_at(at, "popen_argv_pipe with null exe");
+            return -1;
+        }
+#ifdef _WIN32
+        SECURITY_ATTRIBUTES sa;
+        sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+        sa.bInheritHandle = TRUE;
+        sa.lpSecurityDescriptor = NULL;
+        HANDLE hStdinR = NULL, hStdinW = NULL;
+        HANDLE hStdoutR = NULL, hStdoutW = NULL;
+        if ( !CreatePipe(&hStdinR, &hStdinW, &sa, 0) ) {
+            vec4f cargs[2];
+            cargs[0] = cast<FILE *>::from(nullptr);
+            cargs[1] = cast<FILE *>::from(nullptr);
+            context->invoke(blk, cargs, nullptr, at);
+            return -1;
+        }
+        if ( !CreatePipe(&hStdoutR, &hStdoutW, &sa, 0) ) {
+            CloseHandle(hStdinR); CloseHandle(hStdinW);
+            vec4f cargs[2];
+            cargs[0] = cast<FILE *>::from(nullptr);
+            cargs[1] = cast<FILE *>::from(nullptr);
+            context->invoke(blk, cargs, nullptr, at);
+            return -1;
+        }
+        // Parent ends must not be inherited by the child.
+        SetHandleInformation(hStdinW, HANDLE_FLAG_INHERIT, 0);
+        SetHandleInformation(hStdoutR, HANDLE_FLAG_INHERIT, 0);
+        STARTUPINFOA si;
+        memset(&si, 0, sizeof(si));
+        si.cb = sizeof(si);
+        si.hStdInput = hStdinR;
+        si.hStdOutput = hStdoutW;
+        si.hStdError = hStdoutW;
+        si.dwFlags = STARTF_USESTDHANDLES;
+        PROCESS_INFORMATION pi;
+        memset(&pi, 0, sizeof(pi));
+        string cmdLine = winBuildCommandLine(argv, args_arr.size);
+        BOOL created = CreateProcessA(NULL, (LPSTR)cmdLine.c_str(), NULL, NULL, TRUE,
+            CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+        // Close child-side pipe ends in parent.
+        CloseHandle(hStdinR);
+        CloseHandle(hStdoutW);
+        if ( !created ) {
+            CloseHandle(hStdinW);
+            CloseHandle(hStdoutR);
+            vec4f cargs[2];
+            cargs[0] = cast<FILE *>::from(nullptr);
+            cargs[1] = cast<FILE *>::from(nullptr);
+            context->invoke(blk, cargs, nullptr, at);
+            return -1;
+        }
+        CloseHandle(pi.hThread);
+        // Wrap each pipe end in a FILE*. Check both fd and FILE* — if either
+        // conversion fails, close any raw handles/fds we still own to avoid
+        // leaking the child's stdin write end (would deadlock waitpid since
+        // child never sees EOF).
+        int stdinFd  = _open_osfhandle((intptr_t)hStdinW,  _O_WRONLY | _O_BINARY);
+        if ( stdinFd == -1 ) CloseHandle(hStdinW);
+        int stdoutFd = _open_osfhandle((intptr_t)hStdoutR, _O_RDONLY | _O_BINARY);
+        if ( stdoutFd == -1 ) CloseHandle(hStdoutR);
+        FILE * fStdin  = stdinFd  != -1 ? _fdopen(stdinFd,  "wb") : nullptr;
+        if ( !fStdin  && stdinFd  != -1 ) _close(stdinFd);
+        FILE * fStdout = stdoutFd != -1 ? _fdopen(stdoutFd, "rb") : nullptr;
+        if ( !fStdout && stdoutFd != -1 ) _close(stdoutFd);
+        vec4f cargs[2];
+        cargs[0] = cast<FILE *>::from(fStdin);
+        cargs[1] = cast<FILE *>::from(fStdout);
+        context->invoke(blk, cargs, nullptr, at);
+        // Block done: close stdin (EOF → child). Drain stdout on a thread
+        // while waiting — a child that writes more than the pipe buffer
+        // (~4-64KB) after EOF-on-stdin would otherwise block in write() and
+        // deadlock our WaitForSingleObject. Discard the drained bytes; the
+        // contract is "read what you care about inside the block".
+        if ( fStdin ) fclose(fStdin);
+        thread drain;
+        if ( fStdout ) {
+            FILE * f = fStdout;
+            drain = thread([f]() {
+                char buf[4096];
+                while ( fread(buf, 1, sizeof(buf), f) > 0 ) { /* discard */ }
+            });
+        }
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        DWORD exitCode = 0;
+        GetExitCodeProcess(pi.hProcess, &exitCode);
+        CloseHandle(pi.hProcess);
+        if ( drain.joinable() ) drain.join();
+        if ( fStdout ) fclose(fStdout);
+        return (int)exitCode;
+#else
+        int inPipe[2], outPipe[2];
+        if ( pipe(inPipe) == -1 ) {
+            vec4f cargs[2];
+            cargs[0] = cast<FILE *>::from(nullptr);
+            cargs[1] = cast<FILE *>::from(nullptr);
+            context->invoke(blk, cargs, nullptr, at);
+            return -1;
+        }
+        if ( pipe(outPipe) == -1 ) {
+            close(inPipe[0]); close(inPipe[1]);
+            vec4f cargs[2];
+            cargs[0] = cast<FILE *>::from(nullptr);
+            cargs[1] = cast<FILE *>::from(nullptr);
+            context->invoke(blk, cargs, nullptr, at);
+            return -1;
+        }
+        vector<char *> cargv;
+        cargv.reserve(args_arr.size + 1);
+        for ( uint64_t i = 0; i < args_arr.size; ++i ) {
+            cargv.push_back(argv[i] ? argv[i] : (char *)"");
+        }
+        cargv.push_back(nullptr);
+        pid_t pid = fork();
+        if ( pid == -1 ) {
+            close(inPipe[0]); close(inPipe[1]);
+            close(outPipe[0]); close(outPipe[1]);
+            vec4f cargs[2];
+            cargs[0] = cast<FILE *>::from(nullptr);
+            cargs[1] = cast<FILE *>::from(nullptr);
+            context->invoke(blk, cargs, nullptr, at);
+            return -1;
+        }
+        if ( pid == 0 ) {
+            close(inPipe[1]);
+            close(outPipe[0]);
+            dup2(inPipe[0], STDIN_FILENO);
+            dup2(outPipe[1], STDOUT_FILENO);
+            dup2(outPipe[1], STDERR_FILENO);
+            close(inPipe[0]);
+            close(outPipe[1]);
+            execvp(cargv[0], cargv.data());
+            _exit(127);
+        }
+        close(inPipe[0]);
+        close(outPipe[1]);
+        // Wrap each pipe end in a FILE*. If fdopen fails, close the raw fd
+        // we still own — otherwise the child's stdin write end leaks and
+        // waitpid would deadlock (child never sees EOF).
+        FILE * fStdin  = fdopen(inPipe[1],  "wb");
+        if ( !fStdin  ) close(inPipe[1]);
+        FILE * fStdout = fdopen(outPipe[0], "rb");
+        if ( !fStdout ) close(outPipe[0]);
+        vec4f cargs[2];
+        cargs[0] = cast<FILE *>::from(fStdin);
+        cargs[1] = cast<FILE *>::from(fStdout);
+        context->invoke(blk, cargs, nullptr, at);
+        // Block done: close stdin (EOF → child). Drain stdout on a thread
+        // while waiting — a child that writes more than the pipe buffer
+        // (~64KB on Linux) after EOF-on-stdin would otherwise block in
+        // write() and deadlock our waitpid. Discard the drained bytes;
+        // the contract is "read what you care about inside the block".
+        if ( fStdin ) fclose(fStdin);
+        thread drain;
+        if ( fStdout ) {
+            FILE * f = fStdout;
+            drain = thread([f]() {
+                char buf[4096];
+                while ( fread(buf, 1, sizeof(buf), f) > 0 ) { /* discard */ }
+            });
+        }
+        int status = 0;
+        waitpid(pid, &status, 0);
+        if ( drain.joinable() ) drain.join();
+        if ( fStdout ) fclose(fStdout);
+        return WIFEXITED(status) ? WEXITSTATUS(status) : WIFSIGNALED(status) ? WTERMSIG(status) : status;
+#endif
+    }
+
     int builtin_system ( const char * cmd, Context * context, LineInfoArg * at ) {
         if ( !cmd ) {
             context->throw_error_at(at, "system of null");
@@ -965,7 +1205,7 @@ namespace das {
 
     bool builtin_rmdir ( const char * path ) {
         if ( !path ) return false;
-#if defined(_MSC_VER)
+#if defined(_WIN32)
         return _rmdir(path) == 0;
 #else
         return rmdir(path) == 0;
@@ -978,7 +1218,7 @@ namespace das {
         return stat(path, &st) == 0;
     }
 
-#if defined(_MSC_VER)
+#if defined(_WIN32)
     static bool rmdir_rec_impl ( const string & path ) {
         _finddata_t c_file;
         intptr_t hFile;
@@ -1050,7 +1290,7 @@ namespace das {
     bool builtin_mkdir_ec ( const char * path, char * & error, Context * ctx, LineInfoArg * at ) {
         error = nullptr;
         if ( !path ) { error = empty_path_error(ctx, at); return false; }
-#if defined(_MSC_VER)
+#if defined(_WIN32)
         if ( _mkdir(path) != 0 ) { error = errno_to_string(ctx, at); return false; }
 #elif defined(_EMSCRIPTEN_VER)
         if ( mkdir(path, S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH) != 0 ) { error = errno_to_string(ctx, at); return false; }
@@ -1063,7 +1303,7 @@ namespace das {
     bool builtin_rmdir_ec ( const char * path, char * & error, Context * ctx, LineInfoArg * at ) {
         error = nullptr;
         if ( !path ) { error = empty_path_error(ctx, at); return false; }
-#if defined(_MSC_VER)
+#if defined(_WIN32)
         if ( _rmdir(path) != 0 ) { error = errno_to_string(ctx, at); return false; }
 #else
         if ( rmdir(path) != 0 ) { error = errno_to_string(ctx, at); return false; }
@@ -1085,15 +1325,34 @@ namespace das {
     }
 
     enum class RegisterOnError {
-        Quiet = 0,      // 'missing .shared_module' message is ignored
+        Quiet = 0,      // missing/unloadable .shared_module is silent (deferred for retry); broken artifacts still report
         ErrorMsg,       // error message is displayed
         Fail,           // error message is displayed and exception is thrown
     };
 
     static vector<tuple<string,string,string>> g_registered_dynamic_modules; // path, cpp_class_name, daslang_name
     static vector<tuple<string,string,string>> g_registered_native_paths;
+    // Modules whose dlopen failed in Quiet mode — typically a sibling-module
+    // DT_NEEDED dependency (e.g. node-editor -> dasModuleImgui) not yet loaded.
+    // retry_pending_dynamic_modules() re-attempts these in fixed-point passes
+    // after the folder scan, so module enumeration order stops mattering.
+    static vector<tuple<string,string>> g_pending_dynamic_modules; // path, cpp_class_name
 
-    // Returns DLL handle.
+    // Env-gated per-attempt module-load trace (default off). Set
+    // DAS_TRACE_MODULE_LOAD=1 to surface each dlopen — turns a swallowed
+    // 'missing prerequisite' into a visible "FAILED — <dlerror>" line.
+    static bool trace_module_load() {
+        static const bool on = []{
+            const char * e = getenv("DAS_TRACE_MODULE_LOAD");
+            return e && e[0] && e[0] != '0';
+        }();
+        return on;
+    }
+
+    // Returns DLL handle, nullptr on failure. on_error governs LOAD failures only:
+    // Quiet defers a failed dlopen to retry_pending_dynamic_modules() (sibling-dep
+    // ordering). A loadable-but-broken artifact (registrator missing, build-id
+    // mismatch) always reports — to the context if any, else LOG(error) (#2580).
     void *register_dynamic_module(const char *path, const char *mod_name, int on_error, Context * context, LineInfoArg * at ) {
         string actualPath(path);
 #ifndef NDEBUG
@@ -1105,24 +1364,37 @@ namespace das {
         }
 #endif
         auto lib = loadDynamicLibrary(actualPath.c_str());
+        // Capture the dlopen error once, before anything else can clear it.
+        string dlErr = lib ? string() : getDynamicLibraryError();
+        if ( trace_module_load() ) {
+            LOG(LogLevel::info) << "[module] " << (mod_name ? mod_name : "(null)") << " <- " << actualPath
+                << " : " << (lib ? "loaded" : ("FAILED — " + dlErr)) << "\n";
+        }
         if (!lib) {
             if (static_cast<RegisterOnError>(on_error) != RegisterOnError::Quiet) {
-                auto dlErr = getDynamicLibraryError();
                 auto err_msg = "dynamic module `" + string(mod_name) + "` — failed to load: " + actualPath
                     + (dlErr.empty() ? string("\n") : (" (" + dlErr + ")\n"));
-                context->to_err(at, err_msg.c_str());
-                if (static_cast<RegisterOnError>(on_error) == RegisterOnError::Fail) {
+                if (context) context->to_err(at, err_msg.c_str());
+                else LOG(LogLevel::error) << err_msg;
+                if (context && static_cast<RegisterOnError>(on_error) == RegisterOnError::Fail) {
                     context->throw_error(err_msg.c_str());
                 }
+            } else {
+                // Quiet: a sibling-module DT_NEEDED dependency may not be loaded yet
+                // (module .so's live in modules/<dep>/, not on RUNPATH, so a dependent
+                // enumerated before its dependency fails dlopen). Defer; the post-scan
+                // retry_pending_dynamic_modules() re-attempts once deps are loaded.
+                g_pending_dynamic_modules.emplace_back(string(path), string(mod_name));
             }
             return nullptr;
         }
         const auto regName = getDynModuleRegistratorName(mod_name);
         auto rawFn = getFunctionAddress(lib, regName.c_str());
         if (!rawFn) {
-            auto err_msg = "dynamic module `" + string(mod_name) + "` — function `" + regName + "` not found in `" + path + "`\n";
-            context->to_err(at, err_msg.c_str());
-            if (static_cast<RegisterOnError>(on_error) == RegisterOnError::Fail) {
+            auto err_msg = "dynamic module `" + string(mod_name) + "` — function `" + regName + "` not found in `" + actualPath + "`\n";
+            if (context) context->to_err(at, err_msg.c_str());
+            else LOG(LogLevel::error) << err_msg;
+            if (context && static_cast<RegisterOnError>(on_error) == RegisterOnError::Fail) {
                 context->throw_error(err_msg.c_str());
             }
             closeLibrary(lib);
@@ -1132,8 +1404,9 @@ namespace das {
         auto mod = fn(DAS_BUILD_ID);
         if (!mod) {
             auto err_msg = "dynamic module `" + string(mod_name) + "` — build-id mismatch (host " + to_string(DAS_BUILD_ID) + "); rebuild the module for current configuration\n";
-            context->to_err(at, err_msg.c_str());
-            if (static_cast<RegisterOnError>(on_error) == RegisterOnError::Fail) {
+            if (context) context->to_err(at, err_msg.c_str());
+            else LOG(LogLevel::error) << err_msg;
+            if (context && static_cast<RegisterOnError>(on_error) == RegisterOnError::Fail) {
                 context->throw_error(err_msg.c_str());
             }
             closeLibrary(lib);
@@ -1145,6 +1418,28 @@ namespace das {
     }
     void *register_dynamic_module_silent(const char *path, const char *mod_name, Context * context, LineInfoArg * at ) {
         return register_dynamic_module(path, mod_name, static_cast<int>(RegisterOnError::Quiet), context, at);
+    }
+
+    // Re-attempt modules whose dlopen was deferred (Quiet failure during the
+    // module-folder scan — usually a sibling-module DT_NEEDED dep not yet loaded
+    // because directory enumeration visited the dependent before its dependency).
+    // Fixed-point: each pass retries every deferred module; one whose deps loaded
+    // in a prior pass now succeeds and may unblock others. Keep iterating while a
+    // pass loads at least one; stop when a pass makes no progress (remaining
+    // entries have genuinely-missing .so files — left silent, matching Quiet).
+    DAS_API void retry_pending_dynamic_modules() {
+        bool progress = true;
+        while (progress && !g_pending_dynamic_modules.empty()) {
+            progress = false;
+            vector<tuple<string,string>> pending;
+            pending.swap(g_pending_dynamic_modules); // drain; failures re-push into the now-empty global
+            for (auto & pr : pending) {
+                if (register_dynamic_module(get<0>(pr).c_str(), get<1>(pr).c_str(),
+                        static_cast<int>(RegisterOnError::Quiet), nullptr, nullptr) != nullptr) {
+                    progress = true;
+                }
+            }
+        }
     }
 
     void register_native_path(const char *mod_name, const char *src_path, const char *dst_path, Context * /*context*/, LineInfoArg * /*at*/ ) {
@@ -1182,7 +1477,7 @@ namespace das {
         if ( !cmd ) return nullptr;
         stringstream ss;
         for ( const char * ch=cmd; *ch; ) {
-#if defined(_MSC_VER)
+#if defined(_WIN32)
             if ( *ch=='^' || *ch=='|' || *ch=='<' || *ch=='>' || *ch=='&' ||
                     *ch=='%' || *ch=='$' || *ch=='`' || *ch=='\'' || *ch=='@' ) {
                 ss.put('^');
@@ -1206,18 +1501,6 @@ namespace das {
         auto msg = ec.message();
         return ctx->allocateString(msg.data(), uint32_t(msg.size()), at);
     }
-
-    struct DiskSpaceInfoAnnotation : ManagedStructureAnnotation<DiskSpaceInfo, true> {
-        DiskSpaceInfoAnnotation(ModuleLibrary & ml) : ManagedStructureAnnotation("DiskSpaceInfo", ml) {
-            validationNeverFails = true;
-            addField<DAS_BIND_MANAGED_FIELD(capacity)>("capacity");
-            addField<DAS_BIND_MANAGED_FIELD(free)>("free");
-            addField<DAS_BIND_MANAGED_FIELD(available)>("available");
-        }
-        virtual bool canMove() const override { return true; }
-        virtual bool canCopy() const override { return true; }
-        virtual bool isLocal() const override { return true; }
-    };
 
     // path manipulation
 
@@ -1432,6 +1715,117 @@ namespace das {
         return true;
     }
 
+    // 3-tier directory resolver mirroring the shared-module resolution policy
+    // from PR #2579 (module_jit.cpp::resolve_dynamic_module_path), but for
+    // source-side asset directories.  Given a baked source-file path captured
+    // at macro expansion (e.g. ".../modules/das-cards/cards/card_mesh.das"),
+    // returns the directory where that module's runtime assets currently live:
+    //   1. <exe_dir>/<rel>            — daspkg-release standalone bundle
+    //   2. <das_root>/<rel>           — SDK / cmake install layout
+    //   3. dir_name(baked_path)       — dev (interpreted from source tree)
+    // <rel> is the substring of dir_name(baked) starting at the last
+    // "/modules/" segment.  Tiers 1+2 are skipped when baked has no /modules/
+    // segment (e.g. project-local code outside the package layout); when the
+    // baked dir has also gone missing on the target machine (relocated bundle),
+    // tier 3's fallback is <exe_dir> rather than the dead dev path.
+    char * builtin_resolve_this_module_dir ( const char * baked_path, Context * context ) {
+        namespace fs = std::filesystem;
+        if ( !baked_path || !*baked_path ) return context->allocateString("", nullptr);
+        // generic_string() (here and at every other path-to-string conversion
+        // in this function) emits forward-slash separators on every platform,
+        // matching getDasRoot() and the rest of daslang's path conventions.
+        // Without it Windows would return native backslashes that break string
+        // compares against `/`-formed paths from script-side daslang code.
+        fs::path baked(baked_path);
+        fs::path baked_dir = baked.parent_path();
+        std::string baked_dir_str = baked_dir.generic_string();
+        // Find the last "/modules/" boundary; everything from that segment
+        // onward is the bundle/SDK-relative suffix (e.g.
+        // "modules/das-cards/cards"). rfind, not find — for nested layouts
+        // like "<root>/modules/A/modules/B/x.das" the right answer is "B"'s
+        // package, not "A". Mirrors compute_modules_relative_suffix in
+        // modules/dasLLVM/daslib/llvm_exe.das.
+        const std::string sep = "/modules/";
+        std::string canon = baked_dir_str;
+        for ( char & c : canon ) if ( c == '\\' ) c = '/';
+        std::string rel;
+        size_t pos = canon.rfind(sep);
+        if ( pos != std::string::npos ) {
+            rel = canon.substr(pos + 1);  // drop leading '/' to keep it relative
+        }
+        // Tier 1 — exe_dir
+        if ( !rel.empty() ) {
+            das::string exeFile = das::getExecutableFileName();
+            if ( !exeFile.empty() ) {
+                fs::path exeDir = fs::path(exeFile.c_str()).parent_path();
+                if ( exeDir.empty() ) exeDir = ".";
+                fs::path candidate = exeDir / rel;
+                std::error_code ec;
+                if ( fs::is_directory(candidate, ec) ) {
+                    return context->allocateString(candidate.generic_string().c_str(), nullptr);
+                }
+            }
+            // Tier 2 — das_root
+            fs::path candidate = fs::path(das::getDasRoot().c_str()) / rel;
+            std::error_code ec;
+            if ( fs::is_directory(candidate, ec) ) {
+                return context->allocateString(candidate.generic_string().c_str(), nullptr);
+            }
+        }
+        // Tier 3 — baked dir as fallback. Special case: project-local code
+        // (rel empty so tiers 1+2 were skipped) running from a relocated
+        // bundle where the dev-time baked dir no longer exists — fall back
+        // to <exe_dir> so assets shipped next to the exe are findable.
+        if ( rel.empty() ) {
+            std::error_code ec;
+            if ( !fs::is_directory(baked_dir, ec) ) {
+                das::string exeFile = das::getExecutableFileName();
+                if ( !exeFile.empty() ) {
+                    fs::path exeDir = fs::path(exeFile.c_str()).parent_path();
+                    if ( exeDir.empty() ) exeDir = ".";
+                    return context->allocateString(exeDir.generic_string().c_str(), nullptr);
+                }
+            }
+        }
+        return context->allocateString(baked_dir_str.c_str(), nullptr);
+    }
+}
+#endif // DAS_NO_FILEIO
+
+MAKE_TYPE_FACTORY(FStat, das::FStat)
+MAKE_TYPE_FACTORY(FILE,FILE)
+MAKE_TYPE_FACTORY(DiskSpaceInfo, das::DiskSpaceInfo)
+
+namespace das {
+
+    struct FStatAnnotation : ManagedStructureAnnotation <FStat,true> {
+        FStatAnnotation(ModuleLibrary & ml) : ManagedStructureAnnotation ("FStat", ml) {
+            validationNeverFails = true;
+            addField<DAS_BIND_MANAGED_FIELD(is_valid)>("is_valid");
+            addProperty<DAS_BIND_MANAGED_PROP(size)>("size");
+            addProperty<DAS_BIND_MANAGED_PROP(atime)>("atime");
+            addProperty<DAS_BIND_MANAGED_PROP(ctime)>("ctime");
+            addProperty<DAS_BIND_MANAGED_PROP(mtime)>("mtime");
+            addProperty<DAS_BIND_MANAGED_PROP(is_reg)>("is_reg");
+            addProperty<DAS_BIND_MANAGED_PROP(is_dir)>("is_dir");
+        }
+        virtual bool canMove() const override { return true; }
+        virtual bool canCopy() const override { return true; }
+        virtual bool isLocal() const override { return true; }
+    };
+
+    struct DiskSpaceInfoAnnotation : ManagedStructureAnnotation<DiskSpaceInfo, true> {
+        DiskSpaceInfoAnnotation(ModuleLibrary & ml) : ManagedStructureAnnotation("DiskSpaceInfo", ml) {
+            validationNeverFails = true;
+            addField<DAS_BIND_MANAGED_FIELD(capacity)>("capacity");
+            addField<DAS_BIND_MANAGED_FIELD(free)>("free");
+            addField<DAS_BIND_MANAGED_FIELD(available)>("available");
+        }
+        virtual bool canMove() const override { return true; }
+        virtual bool canCopy() const override { return true; }
+        virtual bool isLocal() const override { return true; }
+    };
+
     class Module_FIO : public Module {
     public:
         Module_FIO() : Module("fio_core") {
@@ -1570,6 +1964,9 @@ namespace das {
             addExtern<DAS_BIND_FUN(builtin_popen_argv)>(*this, lib, "popen_argv",
                 SideEffects::modifyExternal, "builtin_popen_argv")
                     ->args({"args","timeout","scope","context","at"})->unsafeOperation = true;
+            addExtern<DAS_BIND_FUN(builtin_popen_argv_pipe)>(*this, lib, "popen_argv_pipe",
+                SideEffects::modifyExternal, "builtin_popen_argv_pipe")
+                    ->args({"args","scope","context","at"})->unsafeOperation = true;
             addExtern<DAS_BIND_FUN(builtin_fread_to_eof)>(*this, lib, "fread_to_eof",
                 SideEffects::modifyExternal, "builtin_fread_to_eof")
                     ->args({"f","context","at"})->unsafeOperation = true;
@@ -1580,6 +1977,9 @@ namespace das {
             addExtern<DAS_BIND_FUN(get_full_file_name)>(*this, lib, "get_full_file_name",
                 SideEffects::accessExternal, "get_full_file_name")
                     ->args({"path","context","at"});
+            addExtern<DAS_BIND_FUN(builtin_resolve_this_module_dir)>(*this, lib, "__builtin_resolve_this_module_dir",
+                SideEffects::accessExternal, "builtin_resolve_this_module_dir")
+                    ->args({"baked_path","context"});
             addExtern<DAS_BIND_FUN(get_env_variable)>(*this, lib, "get_env_variable",
                 SideEffects::accessExternal, "get_env_variable")
                     ->args({"var","context","at"});
@@ -1680,7 +2080,7 @@ namespace das {
     };
 }
 
-#if _WIN32
+#if _WIN32 && !DAS_NO_FILEIO
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -1712,5 +2112,4 @@ int munmap ( void* start, size_t ) {
 
 #endif
 
-#endif // !DAS_NO_FILEIO
 REGISTER_MODULE_IN_NAMESPACE(Module_FIO,das);

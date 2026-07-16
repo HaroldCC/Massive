@@ -1,0 +1,1 @@
+Pointer to a `ReaderMacro` object. Used for registering and managing custom reader (parsing) macros.

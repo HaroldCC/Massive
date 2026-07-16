@@ -21,14 +21,34 @@ IF((NOT DAS_GLFW_INCLUDED) AND ((NOT ${DAS_GLFW_DISABLED}) OR (NOT DEFINED DAS_G
 	ELSEIF(UNIX)
 		SET(DAS_GLFW_STATIC_PATH ${GLFW_STATIC_LIB_PATH}/lib/libglfw3.a)
 		SET(DAS_GLFW_DYN_PATH ${GLFW_DYNAMIC_LIB_PATH}/lib/libglfw.so.${GLFW_VERSION})
-	ELSE()
-		SET(DAS_GLFW_STATIC_PATH ${GLFW_STATIC_LIB_PATH}/lib/glfw3.lib)
-		SET(DAS_GLFW_DYN_PATH ${GLFW_DYNAMIC_LIB_PATH}/lib/glfw3dll.lib)
+	ELSE()  # WIN32
+		IF(MSVC)
+			SET(DAS_GLFW_STATIC_PATH ${GLFW_STATIC_LIB_PATH}/lib/glfw3.lib)
+			SET(DAS_GLFW_DYN_PATH ${GLFW_DYNAMIC_LIB_PATH}/lib/glfw3dll.lib)
+		ELSE()  # mingw (clang-mingw / gcc-mingw)
+			# GLFW v3.4 on mingw: static -> libglfw3.a; dynamic import lib ->
+			# libglfw3dll.a; .dll itself stays glfw3.dll (no lib prefix), so
+			# the runtime install line below is unchanged.
+			SET(DAS_GLFW_STATIC_PATH ${GLFW_STATIC_LIB_PATH}/lib/libglfw3.a)
+			SET(DAS_GLFW_DYN_PATH ${GLFW_DYNAMIC_LIB_PATH}/lib/libglfw3dll.a)
+		ENDIF()
 	ENDIF()
 
 	MACRO(BUILD_GLFW glfw_libraries glfw3_target build_shared_libs install_prefix prefix_dir)
 		LIST(APPEND CMAKE_MODULE_PATH ${DAS_GLFW_DIR})
 		IF(APPLE)
+			# Forward the macOS SDK sysroot into the GLFW sub-build. Without it the
+			# ExternalProject configures with no -isysroot and falls back to the
+			# header-less /System/Library/Frameworks, so framework headers Apple now
+			# ships SDK-only (e.g. Carbon.h) are not found. Guard against an unset
+			# value so we don't clobber CMake's own SDK auto-detection in the child.
+			SET(GLFW_APPLE_SDK_ARGS "")
+			IF(CMAKE_OSX_SYSROOT)
+				LIST(APPEND GLFW_APPLE_SDK_ARGS -DCMAKE_OSX_SYSROOT=${CMAKE_OSX_SYSROOT})
+			ENDIF()
+			IF(CMAKE_OSX_DEPLOYMENT_TARGET)
+				LIST(APPEND GLFW_APPLE_SDK_ARGS -DCMAKE_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET})
+			ENDIF()
 			ExternalProject_Add(
 				${glfw3_target}
 				URL ${GLFW_URL}
@@ -43,6 +63,7 @@ IF((NOT DAS_GLFW_INCLUDED) AND ((NOT ${DAS_GLFW_DISABLED}) OR (NOT DEFINED DAS_G
 					-DGLFW_BUILD_TESTS=OFF
 					-DGLFW_BUILD_DOCS=OFF
 					-DBUILD_SHARED_LIBS=${build_shared_libs}
+					${GLFW_APPLE_SDK_ARGS}
 				BUILD_BYPRODUCTS ${glfw_libraries}
 				BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --config $<CONFIG>
 				INSTALL_COMMAND ${CMAKE_COMMAND} --install <BINARY_DIR> --config $<CONFIG> --prefix ${install_prefix}/$<CONFIG>
@@ -165,10 +186,22 @@ IF((NOT DAS_GLFW_INCLUDED) AND ((NOT ${DAS_GLFW_DISABLED}) OR (NOT DEFINED DAS_G
 	# the user is shipping from an installed daslang or directly from the build
 	# tree (CI extended_checks does the latter).
 	IF(WIN32)
+		# Land glfw3.dll NEXT TO the daslang.exe on every generator:
+		# multi-config (MSBuild) puts the .exe in bin/<CONFIG>/, so we mirror
+		# that here; single-config (Ninja) puts it in bin/ directly. The old
+		# unconditional `$<CONFIG>` suffix worked for MSVC but stranded
+		# glfw3.dll in bin/Release/ on mingw where daslang.exe sits in bin/.
+		# (Computed at configure time -- avoids a $<TARGET_FILE_DIR:daslang>
+		# dependency cycle since daslang already depends on dasModuleGlfw.)
+		IF(CMAKE_CONFIGURATION_TYPES)
+			SET(_DAS_GLFW_COPY_DIR "${EXECUTABLE_OUTPUT_PATH}/$<CONFIG>")
+		ELSE()
+			SET(_DAS_GLFW_COPY_DIR "${EXECUTABLE_OUTPUT_PATH}")
+		ENDIF()
 		ADD_CUSTOM_COMMAND(TARGET dasModuleGlfw POST_BUILD
 			COMMAND ${CMAKE_COMMAND} -E copy_if_different
 				"${GLFW_DYNAMIC_LIB_PATH}/bin/glfw3.dll"
-				"${EXECUTABLE_OUTPUT_PATH}/$<CONFIG>/glfw3.dll"
+				"${_DAS_GLFW_COPY_DIR}/glfw3.dll"
 		)
 	ELSEIF(APPLE)
 		ADD_CUSTOM_COMMAND(TARGET dasModuleGlfw POST_BUILD

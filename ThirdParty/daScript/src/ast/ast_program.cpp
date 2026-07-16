@@ -327,7 +327,7 @@ namespace das {
     }
 
     ExpressionPtr Program::makeConst ( const LineInfo & at, const TypeDeclPtr & type, vec4f value ) {
-        if ( type->dim.size() || type->ref ) return nullptr;
+        if ( type->ref || type->baseType==Type::tFixedArray ) return nullptr;
         switch ( type->baseType ) {
             case Type::tBool:           return new ExprConstBool(at, cast<bool>::to(value));
             case Type::tInt8:           return new ExprConstInt8(at, cast<int8_t>::to(value));
@@ -629,56 +629,6 @@ namespace das {
 
     bool Program::getProfiler() const {
         return policies.profiler || options.getBoolOption("profiler",false);
-    }
-
-    void Program::optimize(TextWriter & logs, ModuleGroup & libGroup) {
-        bool logOpt = options.getBoolOption("log_optimization",false);
-        bool logPass = options.getBoolOption("log_optimization_passes",false);
-        bool log = logOpt || logPass;
-        bool any, last;
-        int optimizationRound = 1;
-        if (log) {
-            logs << *this << "\n";
-        }
-        do {
-            if ( log ) logs << "OPTIMIZE " << optimizationRound << ":\n"; if ( logPass ) logs << *this;
-            any = false;
-            last = optimizationRefFolding(optimizationRound);    if ( failed() ) break;  any |= last;
-            if ( log ) logs << "REF FOLDING: " << (last ? "optimized" : "nothing") << "\n"; if ( logPass ) logs << *this;
-            last = optimizationUnused(logs, optimizationRound);    if ( failed() ) break;  any |= last;
-            if ( log ) logs << "REMOVE UNUSED:" << (last ? "optimized" : "nothing") << "\n"; if ( logPass ) logs << *this;
-            last = optimizationConstFolding(optimizationRound);  if ( failed() ) break;  any |= last;
-            if ( log ) logs << "CONST FOLDING:" << (last ? "optimized" : "nothing") << "\n"; if ( logPass ) logs << *this;
-            last = optimizationCondFolding(optimizationRound);  if ( failed() ) break;  any |= last;
-            if ( log ) logs << "COND FOLDING:" << (last ? "optimized" : "nothing") << "\n"; if ( logPass ) logs << *this;
-            last = optimizationBlockFolding(optimizationRound);  if ( failed() ) break;  any |= last;
-            if ( log ) logs << "BLOCK FOLDING:" << (last ? "optimized" : "nothing") << "\n"; if ( logPass ) logs << *this;
-            // this is here again for a reason
-            last = optimizationUnused(logs, optimizationRound);    if ( failed() ) break;  any |= last;
-            if ( log ) logs << "REMOVE UNUSED:" << (last ? "optimized" : "nothing") << "\n"; if ( logPass ) logs << *this;
-            // now, user macros
-            last = false;
-            auto modMacro = [&](Module * mod) -> bool {    // we run all macros for each module
-                if ( thisModule->isVisibleDirectly(mod) && mod!=thisModule.get() ) {
-                    for ( const auto & pm : mod->optimizationMacros ) {
-                        last |= pm->apply(this, thisModule.get());
-                        if ( failed() ) {                       // if macro failed, we report it, and we are done
-                            error("optimization macro " + mod->name + "::" + pm->name + " failed", "","",LineInfo(), CompilationError::runtime_macro);
-                            return false;
-                        }
-                    }
-                }
-                return true;
-            };
-            Module::foreach(modMacro);
-            if ( failed() ) break;
-            any |= last;
-            libGroup.foreach(modMacro,"*");
-            if ( failed() ) break;
-            any |= last;
-            if ( log ) logs << "MACROS:" << (last ? "optimized" : "nothing") << "\n"; if ( logPass ) logs << *this;
-            optimizationRound++;
-        } while ( any );
     }
 
 }

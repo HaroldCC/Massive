@@ -17,10 +17,9 @@ namespace das {
         if (context) delete context;
     }
 
-    ModuleFileAccess::ModuleFileAccess ( const string & pak, const FileAccessPtr & access ) {
-        ModuleGroup dummyLibGroup;
+    ModuleFileAccess::ModuleFileAccess ( const string & pak, const ProgramPtr & program ) {
         TextWriter tout;
-        if ( auto program = compileDaScript(pak, access, tout, dummyLibGroup) ) {
+        if ( program ) {
             if ( program->failed() ) {
                 for ( auto & err : program->errors ) {
                     tout << reportError(err.at, err.what, err.extra, err.fixme, err.cerr );
@@ -46,6 +45,7 @@ namespace das {
                 canModuleBeRequired = context->findFunction("can_module_be_required");    // note, this one CAN be null
                 sameFileName = context->findFunction("is_same_file_name");    // note, this one CAN be null
                 optionAllowed = context->findFunction("option_allowed");    // note, this one CAN be null
+                optionBlocked = context->findFunction("option_blocked");    // note, this one CAN be null
                 annotationAllowed = context->findFunction("annotation_allowed");    // note, this one CAN be null
                 podInScopeAllowed = context->findFunction("is_pod_in_scope_allowed"); // note, this one CAN be null
                 dynModulesFolderGet = context->findFunction("dyn_modules_folder");          // note, this one CAN be null
@@ -180,6 +180,17 @@ namespace das {
         vec4f res = context->evalWithCatch(optionAllowed, args, nullptr);
         auto exc = context->getException(); exc;
         DAS_ASSERTF(!exc, "exception failed in `option_allowed`: %s", exc);
+        return cast<bool>::to(res);
+    }
+
+    bool ModuleFileAccess::isOptionBlocked ( const string & opt, const string & from ) const {
+        if (failed() || !optionBlocked) return FileAccess::isOptionBlocked(opt,from);
+        vec4f args[2];
+        args[0] = cast<const char *>::from(opt.c_str());
+        args[1] = cast<const char *>::from(from.c_str());
+        vec4f res = context->evalWithCatch(optionBlocked, args, nullptr);
+        auto exc = context->getException(); exc;
+        DAS_ASSERTF(!exc, "exception failed in `option_blocked`: %s", exc);
         return cast<bool>::to(res);
     }
 

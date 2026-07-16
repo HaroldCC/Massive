@@ -1,10 +1,13 @@
 #include "daScript/misc/platform.h"
 
 #include <future>
+#include <cstdlib>
 
 #include "../../../src/builtin/module_builtin_rtti.h"
 
 #include "dasHV.h"
+
+#include <hv/hlog.h>
 
 IMPLEMENT_EXTERNAL_TYPE_FACTORY(WebSocketClient,hv::WebSocketClient)
 IMPLEMENT_EXTERNAL_TYPE_FACTORY(WebSocketServer,hv::WebSocketServer)
@@ -387,108 +390,70 @@ public:
             swap(q, que);
         }
         for ( auto & ev : q ) ev();
-        lock_guard<mutex> guard(lock);
+        // onTick runs user das code on the main thread and touches none of the
+        // lock-protected state (`que`); holding `lock` here would block the libhv
+        // worker thread from enqueueing requests for the whole onTick duration.
         if ( auto fnOnTick = get_onTick(classPtr) ) {
             invoke_onTick(context,fnOnTick,classPtr);
         }
     }
+    // Non-blocking request handling. The lone libhv worker thread must never
+    // block: enqueue the das invocation to `que` (run on the main/tick thread,
+    // where the das context is valid) and return HTTP_STATUS_UNFINISHED so the
+    // worker returns to its loop immediately. The das handler fills the response
+    // on the tick thread, but the actual send is posted back to the connection's
+    // own event loop (runInLoop) — sending from the tick thread would touch the
+    // response/connection concurrently with libhv's teardown (HttpHandler dtor)
+    // on the loop thread, a data race. ctx is captured by value, keeping
+    // req/resp + connection alive until the send; no [&]-to-stack capture, so no
+    // deadlock on stop() and no UAF.
+    http_ctx_handler makeCtxHandler ( Lambda lmb, Context * context, LineInfoArg * at ) {
+        return [this,context,at,lmb](const HttpContextPtr & ctx) -> int {
+            // The server's worker event loop (persistent, owned by the server).
+            // worker_threads defaults to 1, so this is the loop the connection
+            // lives on — the send must run here, not on the tick thread.
+            auto connLoop = this->loop();
+            lock_guard<mutex> guard(lock);
+            que.emplace_back([context,at,lmb,ctx,connLoop](){
+                int st = das_invoke_lambda<int>::invoke<HttpRequest*,HttpResponse*>(
+                    context, at, lmb, ctx->request.get(), ctx->response.get());
+                ctx->response->status_code = (http_status) st;
+                if ( connLoop ) {
+                    connLoop->runInLoop([ctx](){ ctx->send(); });
+                } else {
+                    ctx->send();
+                }
+            });
+            return HTTP_STATUS_UNFINISHED;
+        };
+    }
     void GET ( const char * relative_path, Lambda lmb, Context * context, LineInfoArg * at ) {
         lock_guard<mutex> guard(lock);
-        router.GET(relative_path,[this,context,at,lmb](HttpRequest * req,HttpResponse * resp) -> int {
-            promise<int> p;
-            auto f = p.get_future();
-            {
-                lock_guard<mutex> guard(lock);
-                que.emplace_back([&](){
-                    p.set_value(das_invoke_lambda<int>::invoke<HttpRequest*,HttpResponse*>(context,at,lmb,req,resp));
-                });
-            }
-            return f.get();
-        });
+        router.GET(relative_path, makeCtxHandler(lmb, context, at));
     }
     void POST ( const char * relative_path, Lambda lmb, Context * context, LineInfoArg * at ) {
         lock_guard<mutex> guard(lock);
-        router.POST(relative_path,[this,context,at,lmb](HttpRequest * req,HttpResponse * resp) -> int {
-            promise<int> p;
-            auto f = p.get_future();
-            {
-                lock_guard<mutex> guard(lock);
-                que.emplace_back([&](){
-                    p.set_value(das_invoke_lambda<int>::invoke<HttpRequest*,HttpResponse*>(context,at,lmb,req,resp));
-                });
-            }
-            return f.get();
-        });
+        router.POST(relative_path, makeCtxHandler(lmb, context, at));
     }
     void PUT ( const char * relative_path, Lambda lmb, Context * context, LineInfoArg * at ) {
         lock_guard<mutex> guard(lock);
-        router.PUT(relative_path,[this,context,at,lmb](HttpRequest * req,HttpResponse * resp) -> int {
-            promise<int> p;
-            auto f = p.get_future();
-            {
-                lock_guard<mutex> guard(lock);
-                que.emplace_back([&](){
-                    p.set_value(das_invoke_lambda<int>::invoke<HttpRequest*,HttpResponse*>(context,at,lmb,req,resp));
-                });
-            }
-            return f.get();
-        });
+        router.PUT(relative_path, makeCtxHandler(lmb, context, at));
     }
     void DEL ( const char * relative_path, Lambda lmb, Context * context, LineInfoArg * at ) {
         lock_guard<mutex> guard(lock);
-        router.Delete(relative_path,[this,context,at,lmb](HttpRequest * req,HttpResponse * resp) -> int {
-            promise<int> p;
-            auto f = p.get_future();
-            {
-                lock_guard<mutex> guard(lock);
-                que.emplace_back([&](){
-                    p.set_value(das_invoke_lambda<int>::invoke<HttpRequest*,HttpResponse*>(context,at,lmb,req,resp));
-                });
-            }
-            return f.get();
-        });
+        router.Delete(relative_path, makeCtxHandler(lmb, context, at));
     }
     void PATCH ( const char * relative_path, Lambda lmb, Context * context, LineInfoArg * at ) {
         lock_guard<mutex> guard(lock);
-        router.PATCH(relative_path,[this,context,at,lmb](HttpRequest * req,HttpResponse * resp) -> int {
-            promise<int> p;
-            auto f = p.get_future();
-            {
-                lock_guard<mutex> guard(lock);
-                que.emplace_back([&](){
-                    p.set_value(das_invoke_lambda<int>::invoke<HttpRequest*,HttpResponse*>(context,at,lmb,req,resp));
-                });
-            }
-            return f.get();
-        });
+        router.PATCH(relative_path, makeCtxHandler(lmb, context, at));
     }
     void HEAD ( const char * relative_path, Lambda lmb, Context * context, LineInfoArg * at ) {
         lock_guard<mutex> guard(lock);
-        router.HEAD(relative_path,[this,context,at,lmb](HttpRequest * req,HttpResponse * resp) -> int {
-            promise<int> p;
-            auto f = p.get_future();
-            {
-                lock_guard<mutex> guard(lock);
-                que.emplace_back([&](){
-                    p.set_value(das_invoke_lambda<int>::invoke<HttpRequest*,HttpResponse*>(context,at,lmb,req,resp));
-                });
-            }
-            return f.get();
-        });
+        router.HEAD(relative_path, makeCtxHandler(lmb, context, at));
     }
     void ANY ( const char * relative_path, Lambda lmb, Context * context, LineInfoArg * at ) {
         lock_guard<mutex> guard(lock);
-        router.Any(relative_path,[this,context,at,lmb](HttpRequest * req,HttpResponse * resp) -> int {
-            promise<int> p;
-            auto f = p.get_future();
-            {
-                lock_guard<mutex> guard(lock);
-                que.emplace_back([&](){
-                    p.set_value(das_invoke_lambda<int>::invoke<HttpRequest*,HttpResponse*>(context,at,lmb,req,resp));
-                });
-            }
-            return f.get();
-        });
+        router.Any(relative_path, makeCtxHandler(lmb, context, at));
     }
     void STATIC ( const char * path, const char * dir ) {
         lock_guard<mutex> guard(lock);
@@ -514,6 +479,11 @@ public:
         lock_guard<mutex> guard(lock);
         router.error_page = filename ? filename : "";
     }
+    // SSE intentionally keeps the synchronous (blocking) form: its das handler
+    // streams events for the duration of one call, which the buffered ctx->send()
+    // async path does not model. Caveat: it therefore still parks the worker in
+    // f.get(), so an in-flight SSE request can still deadlock stop()/teardown —
+    // the deadlock fix above does NOT cover SSE. Not used by daslang-live.
     void SSE ( const char * path, Lambda lmb, Context * context, LineInfoArg * at ) {
         lock_guard<mutex> guard(lock);
         router.Any(path,[this,context,at,lmb](HttpRequest * req,HttpResponse * resp) -> int {
@@ -752,14 +722,9 @@ void das_httpr_set_header ( HttpRequest * req, const char * key, const char * va
 
 http_headers das_req_table_to_headers ( const TTable<char *,char *> & tab) {
     http_headers headers;
-    char ** keys = (char **)tab.keys;
-    char ** values = (char **)tab.data;
-    auto * hashes = (TableHashKey *)tab.hashes;
-    for ( uint32_t i=0; i!=tab.capacity; ++i ) {
-        if ( hashes[i]!=HASH_EMPTY64 && hashes[i]!=HASH_KILLED64 ) {
-            headers[keys[i]] = values[i];
-        }
-    }
+    table_for_each<char *, char *>(tab, [&]( char * key, char * value ) {
+        headers[key] = value;
+    });
     return headers;
 }
 
@@ -793,23 +758,17 @@ void das_req_POST_HF ( const char * url, const char * text, const TTable<char *,
     req->url = url ? url : "";
     req->headers =das_req_table_to_headers(tab);
     req->body = text ? text : "";
-    char ** keys = (char **)from.keys;
-    char ** values = (char **)from.data;
-    auto * hashes = (TableHashKey *)from.hashes;
-    for ( uint32_t i=0; i!=from.capacity; ++i ) {
-        if ( hashes[i]!=HASH_EMPTY64 && hashes[i]!=HASH_KILLED64 ) {
-            hv::FormData data;
-            auto value = values[i];
-            if ( value != nullptr ) {
-                if (*value == '@') {
-                    data.filename = value+1;
-                } else {
-                    data.content = value;
-                }
+    table_for_each<char *, char *>(from, [&]( char * key, char * value ) {
+        hv::FormData data;
+        if ( value != nullptr ) {
+            if (*value == '@') {
+                data.filename = value+1;
+            } else {
+                data.content = value;
             }
-            req->form[keys[i] ? keys[i] : ""] = data;
         }
-    }
+        req->form[key ? key : ""] = data;
+    });
     auto resp = request(req);
     das_invoke<void>::invoke<HttpResponse*>(context,at,block,resp.get());
 }
@@ -834,23 +793,17 @@ void das_req_PUT_HF ( const char * url, const char * text, const TTable<char *,c
     req->url = url ? url : "";
     req->headers = das_req_table_to_headers(tab);
     req->body = text ? text : "";
-    char ** keys = (char **)from.keys;
-    char ** values = (char **)from.data;
-    auto * hashes = (TableHashKey *)from.hashes;
-    for ( uint32_t i=0; i!=from.capacity; ++i ) {
-        if ( hashes[i]!=HASH_EMPTY64 && hashes[i]!=HASH_KILLED64 ) {
-            hv::FormData data;
-            auto value = values[i];
-            if ( value != nullptr ) {
-                if (*value == '@') {
-                    data.filename = value+1;
-                } else {
-                    data.content = value;
-                }
+    table_for_each<char *, char *>(from, [&]( char * key, char * value ) {
+        hv::FormData data;
+        if ( value != nullptr ) {
+            if (*value == '@') {
+                data.filename = value+1;
+            } else {
+                data.content = value;
             }
-            req->form[keys[i] ? keys[i] : ""] = data;
         }
-    }
+        req->form[key ? key : ""] = data;
+    });
     auto resp = request(req);
     das_invoke<void>::invoke<HttpResponse*>(context,at,block,resp.get());
 }
@@ -875,23 +828,17 @@ void das_req_PATCH_HF ( const char * url, const char * text, const TTable<char *
     req->url = url ? url : "";
     req->headers = das_req_table_to_headers(tab);
     req->body = text ? text : "";
-    char ** keys = (char **)from.keys;
-    char ** values = (char **)from.data;
-    auto * hashes = (TableHashKey *)from.hashes;
-    for ( uint32_t i=0; i!=from.capacity; ++i ) {
-        if ( hashes[i]!=HASH_EMPTY64 && hashes[i]!=HASH_KILLED64 ) {
-            hv::FormData data;
-            auto value = values[i];
-            if ( value != nullptr ) {
-                if (*value == '@') {
-                    data.filename = value+1;
-                } else {
-                    data.content = value;
-                }
+    table_for_each<char *, char *>(from, [&]( char * key, char * value ) {
+        hv::FormData data;
+        if ( value != nullptr ) {
+            if (*value == '@') {
+                data.filename = value+1;
+            } else {
+                data.content = value;
             }
-            req->form[keys[i] ? keys[i] : ""] = data;
         }
-    }
+        req->form[key ? key : ""] = data;
+    });
     auto resp = request(req);
     das_invoke<void>::invoke<HttpResponse*>(context,at,block,resp.get());
 }
@@ -1167,6 +1114,26 @@ char * das_httpreq_get_url_encoded ( HttpRequest * req, const char * key, Contex
 class Module_HV : public Module {
 public:
     Module_HV() : Module("dashv") {
+        // libhv defaults to file_logger (bin/libhv.YYYYMMDD.log). Invisible
+        // under popen + CI runners. Two env-gated opt-outs:
+        //   DASLIVE_HV_LOG=stderr (or =1)  → redirect libhv to stderr
+        //   DASLIVE_HV_LOG=stdout          → redirect libhv to stdout
+        //   DASLIVE_HV_LOG=silent          → disable libhv logging entirely
+        // DASLIVE_HV_LOG_LEVEL=DEBUG/INFO/WARN/ERROR overrides the level.
+        // Default unset → file_logger (unchanged).
+        if (const char * route = std::getenv("DASLIVE_HV_LOG")) {
+            if (!strcmp(route, "stderr") || !strcmp(route, "1")) {
+                hlog_set_handler(stderr_logger);
+            } else if (!strcmp(route, "stdout")) {
+                hlog_set_handler(stdout_logger);
+            } else if (!strcmp(route, "silent")) {
+                hlog_disable();
+            }
+        }
+        if (const char * lvl = std::getenv("DASLIVE_HV_LOG_LEVEL")) {
+            hlog_set_level_by_str(lvl);
+        }
+
         ModuleLibrary lib;
         lib.addModule(this);
         lib.addBuiltInModule();

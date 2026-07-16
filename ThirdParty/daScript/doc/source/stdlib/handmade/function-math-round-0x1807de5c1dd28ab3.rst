@@ -1,0 +1,1 @@
+Rounds each component of the scalar double, float, or vector float2, float3, float4 value x to the nearest integer; halfway cases round away from zero (roundf-style) on the vector path, and follow `::round` for scalar double.

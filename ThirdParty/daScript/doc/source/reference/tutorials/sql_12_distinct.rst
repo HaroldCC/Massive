@@ -1,0 +1,181 @@
+.. _tutorial_sql_distinct:
+
+==================================
+SQL-12 --- ``distinct``
+==================================
+
+.. index::
+    single: Tutorial; SQL
+    single: Tutorial; SQLite
+    single: Tutorial; distinct
+    single: Tutorial; DISTINCT
+
+``distinct()`` flips a single bool flag on the analyzer's
+``SqlQuery`` and emits ``SELECT DISTINCT`` instead of plain
+``SELECT``. The rest of the chain (column list, ``WHERE``,
+``ORDER BY``, ``LIMIT``) composes normally.
+
+Full-row DISTINCT
+=================
+
+Without a ``_select``, every column is in the row --- DISTINCT
+deduplicates whole rows:
+
+.. code-block:: das
+
+    let all_rows <- _sql(db |> select_from(type<Car>) |> distinct())
+    // SELECT DISTINCT "Id", "Name", "Price" FROM "Cars"
+
+Single-column DISTINCT
+======================
+
+Project one column with ``_select(_.Field)`` and dedupe it:
+
+.. code-block:: das
+
+    let names <- _sql(db |> select_from(type<Car>)
+                        |> _select(_.Name)
+                        |> distinct())
+    // SELECT DISTINCT "Name" FROM "Cars"
+
+Composes with ``_where``
+========================
+
+.. code-block:: das
+
+    let names_over_100 <- _sql(db |> select_from(type<Car>)
+                                 |> _where(_.Price > 100)
+                                 |> _select(_.Name)
+                                 |> distinct())
+    // SELECT DISTINCT "Name" FROM "Cars" WHERE "Price" > ?
+
+Distinct + first-row aggregates
+===============================
+
+``_distinct_by(_.K)`` followed by an aggregate terminator
+(``_count(_.field > X)`` / ``_long_count(_.field > X)``, or
+``_select(_.F) |> sum()`` / ``min()`` / ``max()`` / ``average()``)
+lowers to a SQLite bare-aggregate subquery that picks the row with the
+smallest ``@sql_primary_key`` per group:
+
+.. code-block:: das
+
+    // Count distinct names whose first-encountered Car has Price > 150
+    let n = _sql(db |> select_from(type<Car>)
+                    |> _distinct_by(_.Name)
+                    |> _count(_.Price > 150))
+    // SELECT COUNT(*) FROM (SELECT *, MIN("Id") FROM "Cars" GROUP BY "Name") AS "t0" WHERE "Price" > ?
+
+    // Same shape with _long_count for int64 result
+    let n64 = _sql(db |> select_from(type<Car>)
+                      |> _distinct_by(_.Name)
+                      |> _long_count(_.Price > 150))
+    // (identical SQL; result type widens to int64)
+
+    // Sum of price of the first-encountered Car per name
+    let total = _sql(db |> select_from(type<Car>)
+                        |> _distinct_by(_.Name)
+                        |> _select(_.Price)
+                        |> sum())
+    // SELECT SUM("Price") FROM (SELECT *, MIN("Id") FROM "Cars" GROUP BY "Name") AS "t0"
+
+"First-encountered" = the row with the minimum ``@sql_primary_key`` value
+per group. For tables where the PK is monotonic with insertion order (the
+common case), this matches the array/decs ``_distinct_by`` semantics
+("first row by source order"). Requires a single-column
+``@sql_primary_key`` on the source table; composite keys reject.
+
+Inside ``_sql(...)`` you must use the ``_count(_.field > X)`` /
+``_long_count(_.field > X)`` linq_boost shorthand for the predicate form
+— the explicit lambda form ``count($(c) => c.field > X)`` fails type
+inference because ``_sql``'s macro boundary blocks the typer from
+binding ``c`` through unexpanded chain operators (same constraint as
+``_where(_.field > X)``).
+
+For the no-predicate form ``_distinct_by(_.K) |> count()`` /
+``long_count()``, ``_sql`` continues to emit the simpler
+``COUNT(DISTINCT "K")`` (no subquery wrap); see
+:ref:`tutorial_sql_aggregates`.
+
+Distinct + composition (row passthrough)
+========================================
+
+``_distinct_by(_.K)`` followed by a row-returning terminator
+(implicit ``to_array``) wraps the source in the same bare-aggregate
+subquery, then composes with trailing ``_order_by(_.S)`` /
+``take(N)`` / ``skip(N)`` via the outer ``SELECT``:
+
+.. code-block:: das
+
+    // Cheapest first-encountered Car per Name, top 2
+    let rows <- _sql(db |> select_from(type<Car>)
+                        |> _distinct_by(_.Name)
+                        |> _order_by(_.Price)
+                        |> take(2))
+    // SELECT "Id", "Name", "Price"
+    //   FROM (SELECT *, MIN("Id") FROM "Cars" GROUP BY "Name") AS "t0"
+    //   ORDER BY "Price" ASC LIMIT ?
+
+``_where`` / ``_join`` / ``_group_by`` / ``_having`` / set ops /
+additional ``distinct`` between ``_distinct_by(K)`` and the row
+terminator are rejected in v1 (each requires explicit composition
+logic and may have semantic ambiguity).
+
+Reverse + distinct_by (last per group)
+======================================
+
+``reverse() |> _distinct_by(_.K)`` flips the bare-aggregate from
+``MIN(pk)`` to ``MAX(pk)`` — picks the **last** row per K by source/PK
+order (mirrors linq's ``each(arr).reverse()._distinct_by(K)``
+"last per group" splice):
+
+.. code-block:: das
+
+    let lasts <- _sql(db |> select_from(type<Car>)
+                         |> reverse()
+                         |> _distinct_by(_.Name))
+    // SELECT "Id", "Name", "Price"
+    //   FROM (SELECT *, MAX("Id") FROM "Cars" GROUP BY "Name") AS "t0"
+
+``reverse()`` in ``_sql`` is only legal when wrapped by ``_distinct_by`` —
+SQL has no inherent row ordering to reverse. Bare
+``reverse() |> to_array`` rejects with a fixit pointing to
+``_order_by_descending(...)`` for sort reversal.
+
+**Order divergence caveat**: the SQL bare-aggregate returns rows in
+engine-defined order (typically group-key insertion order), while
+linq returns reverse-source-order. Add an explicit
+``_order_by(...)`` for deterministic ordering.
+
+Group-by + first row per group
+==============================
+
+``_group_by(_.K) |> _select((K=_._0, R=_._1 |> first()))`` projects
+each group's key alongside the first row of that group. Lowers via
+the same bare-aggregate subquery; the row entry expands inline to
+all source columns:
+
+.. code-block:: das
+
+    let groups <- _sql(db |> select_from(type<Car>)
+                          |> _group_by(_.Name)
+                          |> _select((Brand    = _._0,
+                                      FirstCar = _._1 |> first())))
+    // SELECT "Name", "Id", "Name", "Price"
+    //   FROM (SELECT *, MIN("Id") FROM "Cars" GROUP BY "Name") AS "t0"
+    // Output type: array<(Brand:string, FirstCar:Car)>
+
+v1 supports single-key groups only. Mixing ``_._1 |> first()`` with
+column aggregates (``length`` / ``sum`` / ``min`` / ``max`` /
+``average``) in the same projection is rejected — use separate
+``_sql`` calls.
+
+For ``UNION`` / ``INTERSECT`` / ``EXCEPT`` see :ref:`tutorial_sql_set_ops`.
+
+.. seealso::
+
+    Full source: :download:`tutorials/sql/12-distinct.das <../../../../tutorials/sql/12-distinct.das>`
+
+    Previous tutorial: :ref:`tutorial_sql_take_skip`
+
+    Next tutorial: :ref:`tutorial_sql_set_ops`

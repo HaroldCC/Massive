@@ -763,7 +763,11 @@ options_declaration
         }
         for ( auto & opt : *$list ) {
             if ( yyextra->g_Access->isOptionAllowed(opt.name, yyextra->g_Program->thisModule->fileName) ) {
-                yyextra->g_Program->options.push_back(opt);
+                if ( yyextra->g_Access->isOptionBlocked(opt.name, yyextra->g_Program->thisModule->fileName) ) {
+                    // blocked: ok to write, silently ignored (not applied)
+                } else {
+                    yyextra->g_Program->options.push_back(opt);
+                }
             } else {
                 das_yyerror(scanner,"option " + opt.name + " is not allowed here",
                     tokAt(scanner,@list), CompilationError::invalid_options);
@@ -2218,10 +2222,12 @@ expr
             if ( $subexpr->rtti_isSequence() ) {
                 auto mkt = new ExprMakeTuple(tokAt(scanner,@subexpr));
                 mkt->values = sequenceToList($subexpr);
+                mkt->shorthandRecordNames = ast_tupleCollectShorthandNames(mkt->values);
                 $$ = mkt;
             } else if ( $comma ) {
                 auto mkt = new ExprMakeTuple(tokAt(scanner,@subexpr));
                 mkt->values.push_back($subexpr);
+                mkt->shorthandRecordNames = ast_tupleCollectShorthandNames(mkt->values);
                 $$ = mkt;
             } else {
                 $$ = $subexpr;
@@ -2664,6 +2670,10 @@ let_variable_name_with_pos_list
         $$ = $list;
         delete $name;
     }
+    |   let_variable_name_with_pos_list[list] ',' MTAG_I '(' expr[subexpr] ')' {
+        $list->push_back(VariableNameAndPosition("``MACRO``TAG``","",tokAt(scanner,@subexpr),$subexpr));
+        $$ = $list;
+    }
     |   let_variable_name_with_pos_list[list] ',' NAME[name] DAS_AKA NAME[akaname] {
         das_checkName(scanner,*$name,tokAt(scanner,@name));
         das_checkName(scanner,*$akaname,tokAt(scanner,@akaname));
@@ -2992,6 +3002,10 @@ variable_name_with_pos_list
         $$ = $list;
         delete $name;
     }
+    |   variable_name_with_pos_list[list] ',' MTAG_I '(' expr[subexpr] ')' {
+        $list->push_back(VariableNameAndPosition("``MACRO``TAG``","",tokAt(scanner,@subexpr),$subexpr));
+        $$ = $list;
+    }
     |   variable_name_with_pos_list[list] ',' NAME[name] DAS_AKA NAME[akaname] {
         das_checkName(scanner,*$name,tokAt(scanner,@name));
         das_checkName(scanner,*$akaname,tokAt(scanner,@akaname));
@@ -3073,7 +3087,7 @@ auto_type_declaration
         $$->isTag = true;
         $$->firstType = new TypeDecl(Type::autoinfer);
         $$->firstType->at = tokAt(scanner, @subexpr);
-        $$->firstType->dimExpr.push_back($subexpr);
+        $$->firstType->typeMacroExpr.push_back($subexpr);
     }
     ;
 
@@ -3174,12 +3188,10 @@ table_type_pair
 
 dim_list
     :  '[' expr[dimExpr] ']' {
-        $$ = new TypeDecl(Type::autoinfer);
-        appendDimExpr($$, $dimExpr);
+        $$ = appendDimExpr(nullptr, $dimExpr, tokAt(scanner,@dimExpr));
     }
     |  dim_list[list] '[' expr[dimExpr] ']' {
-        $$ = $list;
-        appendDimExpr($$, $dimExpr);
+        $$ = appendDimExpr($list, $dimExpr, tokAt(scanner,@dimExpr));
     }
     ;
 
@@ -3196,17 +3208,10 @@ type_declaration_no_options
             das_yyerror(scanner,"macro can`t be used as array base type",tokAt(scanner,@typeDecl),
                 CompilationError::invalid_array_type);
         }
-        $typeDecl->dim.insert($typeDecl->dim.begin(), $dimlist->dim.begin(), $dimlist->dim.end());
-        $typeDecl->dimExpr.insert($typeDecl->dimExpr.begin(), $dimlist->dimExpr.begin(), $dimlist->dimExpr.end());
-        $typeDecl->removeDim = false;
-        $$ = $typeDecl;
-        $dimlist->dimExpr.clear();
+        $$ = attachDimChain($dimlist, $typeDecl);
     }
     |   type_declaration_no_options[typeDecl] '[' ']' {
-        $typeDecl->dim.push_back(TypeDecl::dimAuto);
-        $typeDecl->dimExpr.push_back(nullptr);
-        $typeDecl->removeDim = false;
-        $$ = $typeDecl;
+        $$ = appendAutoDim($typeDecl, tokAt(scanner,@2));
     }
     |   DAS_TYPE '<' { yyextra->das_arrow_depth ++; } type_declaration[typeDecl] '>' { yyextra->das_arrow_depth --; } {
         $typeDecl->autoToAlias = true;
@@ -3215,20 +3220,20 @@ type_declaration_no_options
     |   DAS_TYPEDECL[td] '(' expr[subexpr] ')' {
         $$ = new TypeDecl(Type::typeDecl);
         $$->at = tokRangeAt(scanner,@td,@subexpr);
-        $$->dimExpr.push_back($subexpr);
+        $$->typeMacroExpr.push_back($subexpr);
     }
     |   '$' name_in_namespace[name] optional_expr_list_in_braces[arguments] {
         $$ = new TypeDecl(Type::typeMacro);
         $$->at = tokRangeAt(scanner,@name, @arguments);
-        $$->dimExpr = sequenceToList($arguments);
-        $$->dimExpr.insert($$->dimExpr.begin(), new ExprConstString(tokAt(scanner,@name), *$name));
+        $$->typeMacroExpr = sequenceToList($arguments);
+        $$->typeMacroExpr.insert($$->typeMacroExpr.begin(), new ExprConstString(tokAt(scanner,@name), *$name));
         delete $name;
     }
     |   '$' name_in_namespace[name] '<' { yyextra->das_arrow_depth ++; } type_declaration_no_options_list[declL] '>' optional_expr_list_in_braces[arguments] {
         $$ = new TypeDecl(Type::typeMacro);
         $$->at = tokRangeAt(scanner,@name, @arguments);
-        $$->dimExpr = typesAndSequenceToList($declL,$arguments);
-        $$->dimExpr.insert($$->dimExpr.begin(), new ExprConstString(tokAt(scanner,@name), *$name));
+        $$->typeMacroExpr = typesAndSequenceToList($declL,$arguments);
+        $$->typeMacroExpr.insert($$->typeMacroExpr.begin(), new ExprConstString(tokAt(scanner,@name), *$name));
         delete $name;
     }
     |   type_declaration_no_options[typeDecl] '-' '[' ']' {
@@ -4000,8 +4005,11 @@ make_table_decl
         }
     }
     |   CBRCBRB [loc] make_table[mka] optional_trailing_semicolon_cur_cur {
-        auto mkt = new TypeDecl(Type::autoinfer);
-        mkt->dim.push_back(TypeDecl::dimAuto);
+        auto mkt = new TypeDecl(Type::tFixedArray);
+        mkt->fixedDim = TypeDecl::dimAuto;
+        mkt->at = tokAt(scanner,@loc);
+        mkt->firstType = new TypeDecl(Type::autoinfer);
+        mkt->firstType->at = mkt->at;
         ((ExprMakeArray *)$mka)->makeType = mkt;
         $mka->at = tokAt(scanner,@loc);
         auto ttm = yyextra->g_Program->makeCall(tokAt(scanner,@loc),"to_table_move");
