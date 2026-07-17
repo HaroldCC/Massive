@@ -15,7 +15,8 @@ def Init()
     print("PHASE 3 CPPSYSTEMS TEST\n")
     LogInfo("Phase 3: CPPSystems smoke test")
 
-    testEntityId = CreateEntity(float3(100.0, 0.0, 200.0), 1)
+    // EEntityType::Player = 1, EEntityType::Monster = 3
+    testEntityId = CreateEntity(float3(100.0, 0.0, 200.0), 1)   // Player type
     LogInfo("CreateEntity: OK")
 
     let pos = EntityPosition(testEntityId)

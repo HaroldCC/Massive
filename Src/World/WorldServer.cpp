@@ -9,6 +9,10 @@
 #include "Common/ECS/Scene.h"
 #include "Common/Log/Log.h"
 #include "Common/Network/TCPSocket.h"
+#include "World/Component/EntityType.h"
+#include "World/Component/Health.h"
+#include "World/Component/Position.h"
+#include "World/Component/Tags.h"
 #include "World/System/System.h"
 
 #include <Internal/CenterRPC.pb.h>
@@ -17,6 +21,7 @@
 #include <Login.pb.h>
 #include <Move.pb.h>
 #include <MsgID.pb.h>
+#include <Replicate.pb.h>
 
 #include <chrono>
 #include <ctime>
@@ -290,11 +295,14 @@ namespace MMO
                               das::cast<float>::from(0.02f) };
             _scriptCtx->eval(_fnUpdate, args);
 
-            // 5. CPPSystems — 脚本 Tick 后运行 C++ 物理模拟
+            // 5. CPPSystems — 脚本 Tick 后运行 C++ 物理模拟 + AOI
             auto *scene = _sceneMgr.GetDefaultScene();
             if (scene)
             {
                 RunCPPSystems(*scene, 0.02f);
+
+                // 6. ReplicateSystem — 消费 AOI 结果做网络复制
+                SystemReplicate(*scene, 0.02f);
             }
         }
     }
@@ -701,6 +709,159 @@ namespace MMO
 
         Log::Info("InitScriptEngine: OK");
         return true;
+    }
+
+    void WorldServer::SystemReplicate(ECS::Scene &scene, float dt)
+    {
+        (void)dt;
+        auto &reg = scene.Registry();
+
+        // ── 1. 计算本帧 AOI ──
+        std::unordered_map<uint32_t, VisibleSet> visibleSets;
+        SystemAOI(scene, visibleSets);
+
+        // ── 2. 对每个在线 player 做差量同步 ──
+        for (auto &[sessionID, ws] : _sessions)
+        {
+            if (ws.disconnected || !ws.entity.IsValid())
+            {
+                continue;
+            }
+
+            uint32_t playerEID = ws.entity.entityId;
+
+            auto itVs = visibleSets.find(playerEID);
+            if (itVs == visibleSets.end())
+            {
+                continue;
+            }
+            const auto &vs = itVs->second;
+
+            auto &prevVisible = _aoiStates[playerEID];
+            Proto::EntityReplicateNtf ntf;
+
+            // 2a. 新进入 AOI → Spawn
+            for (uint32_t eid : vs.entityIDs)
+            {
+                if (prevVisible.contains(eid))
+                {
+                    continue;
+                }
+
+                auto *spawn = ntf.add_spawns();
+                spawn->set_entity_id(eid);
+
+                entt::entity ee{static_cast<entt::entity>(eid)};
+
+                if (reg.all_of<Position>(ee))
+                {
+                    auto &pos = reg.get<Position>(ee);
+                    auto *pd  = spawn->mutable_position();
+                    pd->set_x(static_cast<int32_t>(pos.x * 100.0f));
+                    pd->set_y(static_cast<int32_t>(pos.y * 100.0f));
+                    pd->set_z(static_cast<int32_t>(pos.z * 100.0f));
+                }
+
+                if (reg.all_of<Health>(ee))
+                {
+                    auto &hp = reg.get<Health>(ee);
+                    spawn->set_hp_current(hp.current);
+                    spawn->set_hp_max(hp.max);
+                }
+
+                if (reg.all_of<MonsterTag>(ee))
+                {
+                    spawn->set_entity_type(static_cast<uint32_t>(EEntityType::Monster));
+                }
+                else if (reg.all_of<PlayerTag>(ee))
+                {
+                    spawn->set_entity_type(static_cast<uint32_t>(EEntityType::Player));
+                }
+
+                prevVisible.insert(eid);
+            }
+
+            // 2b. 离开 AOI → Despawn
+            {
+                std::unordered_set<uint32_t> currentVisible;
+                for (uint32_t eid : vs.entityIDs)
+                {
+                    currentVisible.insert(eid);
+                }
+
+                std::vector<uint32_t> toRemove;
+                for (uint32_t oldEid : prevVisible)
+                {
+                    if (!currentVisible.contains(oldEid))
+                    {
+                        auto *despawn = ntf.add_despawns();
+                        despawn->set_entity_id(oldEid);
+                        toRemove.push_back(oldEid);
+                    }
+                }
+                for (uint32_t eid : toRemove)
+                {
+                    prevVisible.erase(eid);
+                }
+            }
+
+            // 2c. 脏组件 → Update
+            // Phase 5 MVP: 每帧全量 Update（不做差量）
+            // Phase 6+: DirtyTracker 驱动差量
+            for (uint32_t eid : vs.entityIDs)
+            {
+                if (!prevVisible.contains(eid))
+                {
+                    continue;
+                }
+
+                auto *update = ntf.add_updates();
+                update->set_entity_id(eid);
+
+                entt::entity ee{static_cast<entt::entity>(eid)};
+
+                if (reg.all_of<Position>(ee))
+                {
+                    auto &pos = reg.get<Position>(ee);
+                    auto *pd  = update->mutable_position();
+                    pd->set_x(static_cast<int32_t>(pos.x * 100.0f));
+                    pd->set_y(static_cast<int32_t>(pos.y * 100.0f));
+                    pd->set_z(static_cast<int32_t>(pos.z * 100.0f));
+                }
+
+                if (reg.all_of<Health>(ee))
+                {
+                    auto &hp = reg.get<Health>(ee);
+                    update->set_hp_current(hp.current);
+                }
+
+                if (reg.all_of<DeadTag>(ee))
+                {
+                    update->set_is_dead(true);
+                }
+
+                if (reg.all_of<CombatTag>(ee))
+                {
+                    update->set_is_in_combat(true);
+                }
+            }
+
+            // ── 3. 序列化 + 发送 ──
+            if (ntf.spawns_size() > 0 || ntf.updates_size() > 0 || ntf.despawns_size() > 0)
+            {
+                size_t bodySize = static_cast<size_t>(ntf.ByteSizeLong());
+                if (bodySize > 0)
+                {
+                    auto buf = ByteBuffer::Own(bodySize);
+                    if (ntf.SerializeToArray(buf.WritePtr(), static_cast<int>(bodySize)))
+                    {
+                        buf.SetWritePos(bodySize);
+                        SendRawToClient(sessionID, Proto::MSG_ENTITY_REPLICATE_NTF,
+                                        buf.Data(), buf.Size());
+                    }
+                }
+            }
+        }
     }
 
 } // namespace MMO

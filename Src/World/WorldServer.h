@@ -81,6 +81,9 @@ namespace MMO
         // ── 断线超时 ──
         void OnDisconnectTimeout(uint32 accountID);
 
+        // ── 网络复制（Phase 5）──
+        void SystemReplicate(ECS::Scene &scene, float dt);
+
         // ── Center 通知 ──
         void NotifyCenterPlayerOnline(uint32 accountID);
         void NotifyCenterPlayerOffline(uint32 accountID);
@@ -198,6 +201,9 @@ namespace MMO
         das::SimFunction                 *_fnInit   = nullptr; // 脚本 init() 函数
         das::SimFunction                 *_fnUpdate = nullptr; // 脚本 update() 函数
         std::unique_ptr<MassiveModule>    _massiveModule;   // 桥接模块（持有 WorldServer raw ptr）
+
+        // ── 网络复制（Phase 5）──
+        std::unordered_map<uint32_t, std::unordered_set<uint32_t>> _aoiStates; // playerEID → 上帧可见 entity
     };
 
 } // namespace MMO

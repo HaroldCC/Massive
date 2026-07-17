@@ -13,6 +13,7 @@
 #include "Common/ECS/Scene.h"
 #include "Common/Log/Log.h"
 #include "World/Component/BattleStats.h"
+#include "World/Component/EntityType.h"
 #include "World/Component/Health.h"
 #include "World/Component/Position.h"
 #include "World/Component/Tags.h"
@@ -214,7 +215,7 @@ static uint64_t Bridge_CreateEntity(das::float3 pos, int entityType)
 
     scene->EmplaceComponent<Position>(entity, pos.x, pos.y, pos.z);
 
-    if (entityType == 1)
+    if (entityType == static_cast<int>(EEntityType::Player))
     {
         scene->Registry().emplace<PlayerTag>(e);
     }
