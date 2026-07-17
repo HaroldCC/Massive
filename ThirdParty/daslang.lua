@@ -283,6 +283,13 @@ target("libDaScript")
     add_files("daScript/src/misc/daScriptC.cpp")
     add_files("daScript/src/builtin/modules.cpp")
 
+    -- 补充：编译链路所需但原本未收录的源文件
+    add_files("daScript/src/ast/ast_optimize.cpp")         -- optimizeProgram
+    add_files("daScript/src/ast/ast_gc_report.cpp")        -- gcReportHistogram/gcStageReportDelta
+    add_files("daScript/src/ast/ast_escape_analysis.cpp")  -- escapeAnalysis/scopeFreeOptimization
+    add_files("daScript/src/misc/das_common.cpp")          -- starts_with
+    add_files("daScript/src/simulate/runtime_iterator.cpp") -- PointerDimIterator::first/next/close
+
     -- ── include 路径 ──
     add_sysincludedirs("daScript/include", {public = true})
 
