@@ -1,9 +1,15 @@
 /**
  * @file System.cpp
- * @brief CPPSystems 实现——MovementSystem + CombatTimeoutSystem
+ * @brief CPPSystems 实现——MovementSystem + AOISystem
+ *
+ * 执行顺序（RunCPPSystems）:
+ *   1. MovementSystem: Position += Velocity × dt
+ *   2. AOISystem:      全量 O(N×M) 计算每个 player 的可见 entity 集合
  */
 
 #include "World/System/System.h"
+
+#include <cmath>
 
 #include "Common/ECS/Scene.h"
 #include "Common/Log/Log.h"
@@ -13,6 +19,10 @@
 
 namespace MMO
 {
+
+    // ═══════════════════════════════════════════════════════════════
+    // Phase 3: MovementSystem — Position += Velocity × dt
+    // ═══════════════════════════════════════════════════════════════
 
     void SystemMovement(ECS::Scene &scene, float dt)
     {
@@ -26,25 +36,78 @@ namespace MMO
         }
     }
 
-    void SystemCombatTimeout(ECS::Scene &scene, float now)
+    // ═══════════════════════════════════════════════════════════════
+    // Phase 4: AOISystem — 全量遍历空间索引
+    // ═══════════════════════════════════════════════════════════════
+
+    void SystemAOI(ECS::Scene &scene,
+                   std::unordered_map<uint32_t, VisibleSet> &outVisibleSets)
     {
-        auto view = scene.Registry().view<CombatTag>();
+        auto &reg = scene.Registry();
 
-        // 遍历所有战斗中的 entity，通过 timing 判断超时
-        // Phase 3 简化：无 LastCombatTime 组件 → 直接用系统时间做超时
-        // 实际超时检查由脚本层通过 ScheduleTimer 管理
+        // ── Step 1: 采集所有有 Position 的 entity ──
+        struct EntityEntry
+        {
+            uint32_t id;
+            float    x, y, z;
+        };
+        std::vector<EntityEntry> entities;
+        {
+            auto view = reg.view<const Position>();
+            entities.reserve(view.size());
+            for (auto [e, pos] : view.each())
+            {
+                entities.push_back(
+                    {static_cast<uint32_t>(entt::to_integral(e)), pos.x, pos.y, pos.z});
+            }
+        }
 
-        (void)scene;
-        (void)now;
-        // 超时逻辑由脚本层在 DECS 中驱动（ScheduleTimer 回调）
-        // C++ 侧仅保留 MovementSystem（帧同步硬实时）
+        // ── Step 2: 对每个 player 计算视野 ──
+        {
+            auto players = reg.view<const Position, const PlayerTag>();
+
+            for (auto [e, pos] : players.each())
+            {
+                uint32_t    pid = static_cast<uint32_t>(entt::to_integral(e));
+                VisibleSet &vs  = outVisibleSets[pid];
+                vs.viewRadiusXZ = 100.0f;
+                vs.viewRadiusY  = 15.0f;
+                vs.entityIDs.reserve(entities.size());
+
+                const float rXzSq = vs.viewRadiusXZ * vs.viewRadiusXZ;
+
+                for (auto &entry : entities)
+                {
+                    if (entry.id == pid)
+                    {
+                        continue;
+                    }
+
+                    float dx = entry.x - pos.x;
+                    float dz = entry.z - pos.z;
+                    float dy = entry.y - pos.y;
+
+                    if (dx * dx + dz * dz <= rXzSq && std::abs(dy) <= vs.viewRadiusY)
+                    {
+                        vs.entityIDs.push_back(entry.id);
+                    }
+                }
+            }
+        }
     }
+
+    // ═══════════════════════════════════════════════════════════════
+    // 调度入口
+    // ═══════════════════════════════════════════════════════════════
 
     void RunCPPSystems(ECS::Scene &scene, float dt)
     {
         SystemMovement(scene, dt);
 
-        // CombatTimeout 由脚本层管理——Phase 3 不运行
+        // AOI 结果由 WorldServer 持有（Phase 4+ 供 ReplicateSystem 消费）
+        // Phase 4 MVP: 仅计算并丢弃——验证 AOI 环路
+        std::unordered_map<uint32_t, VisibleSet> visibleSets;
+        SystemAOI(scene, visibleSets);
     }
 
 } // namespace MMO

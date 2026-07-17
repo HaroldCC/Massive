@@ -3,10 +3,15 @@
  * @brief CPPSystems 入口——脚本 Tick 后运行的 C++ EnTT 系统
  *
  * 所有 CPPSystems 在 LogicThread 中顺序执行，操作 EnTT Component。
- * 当前 2 个系统：MovementSystem (Position += Velocity × dt)、
- *            CombatTimeoutSystem (5s 无战斗 → 退出战斗状态)。
+ * Phase 3: MovementSystem
+ * Phase 4: + AOISystem（全量遍历空间索引）
  */
 #pragma once
+
+#include <cstdint>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 namespace MMO::ECS
 {
@@ -16,25 +21,43 @@ namespace MMO::ECS
 namespace MMO
 {
 
-    /**
-     * @brief Position += Velocity × dt
-     *
-     * 遍历所有有 Position + Velocity 同时不含 DeadTag 的 entity。
-     * 最简单的线性位移——Phase 3 MVP。
-     */
+    // ── Phase 3: 物理模拟 ──
+
     void SystemMovement(ECS::Scene &scene, float dt);
 
+    // ── Phase 4: 空间索引 ──
+
     /**
-     * @brief CombatTag 超时自动移除
+     * @brief 每个 player 的可见 entity 集合
      *
-     * 遍历所有有 CombatTag + LastCombatTime 的 entity，
-     * 若距上次战斗 > 5s 则移除 CombatTag。
+     * 由 AOISystem 每帧重新计算，被 ReplicateSystem 消费。
      */
-    void SystemCombatTimeout(ECS::Scene &scene, float now);
+    struct VisibleSet
+    {
+        std::vector<uint32_t> entityIDs;
+        float viewRadiusXZ = 100.0f;
+        float viewRadiusY  = 15.0f;
+    };
+
+    /**
+     * @brief AOI 空间查询——全量遍历 O(N×M)
+     *
+     * 对每个有 Position + PlayerTag 的 entity 计算其视野内的所有实体。
+     * Phase 4 MVP: 100 entity × 10 player 量级 < 0.01ms。
+     * Phase 4+: 替换为网格/十字链表等空间索引。
+     *
+     * @param scene         目标场景
+     * @param outVisibleSets  输出：playerEID → VisibleSet
+     */
+    void SystemAOI(ECS::Scene &scene,
+                   std::unordered_map<uint32_t, VisibleSet> &outVisibleSets);
+
+    // ── 调度入口 ──
 
     /**
      * @brief 对指定场景运行所有 CPPSystems
      *
+     * 执行顺序：MovementSystem → AOISystem
      * 在 OnTick 中脚本 Update() 之后调用。
      */
     void RunCPPSystems(ECS::Scene &scene, float dt);
