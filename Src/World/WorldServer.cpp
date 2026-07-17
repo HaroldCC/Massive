@@ -9,6 +9,7 @@
 #include "Common/ECS/Scene.h"
 #include "Common/Log/Log.h"
 #include "Common/Network/TCPSocket.h"
+#include "World/System/System.h"
 
 #include <Internal/CenterRPC.pb.h>
 #include <Internal/GateRPC.pb.h>
@@ -281,14 +282,20 @@ namespace MMO
         }
         UpdateLoadLevel(_sessions.size(), queueDepth);
 
-        // 4. 脚本 Tick（Phase 1：DECS smoke test）
+        // 4. 脚本 Tick（Phase 3：脚本 → CPPSystems）
         if (_fnUpdate && _scriptCtx)
         {
             _scriptCtx->restart();
-            // Update(sceneID: uint; dt: float)
             vec4f args[] = { das::cast<uint32_t>::from(uint32_t(1)),
                               das::cast<float>::from(0.02f) };
             _scriptCtx->eval(_fnUpdate, args);
+
+            // 5. CPPSystems — 脚本 Tick 后运行 C++ 物理模拟
+            auto *scene = _sceneMgr.GetDefaultScene();
+            if (scene)
+            {
+                RunCPPSystems(*scene, 0.02f);
+            }
         }
     }
 
