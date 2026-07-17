@@ -54,6 +54,9 @@ namespace MMO
             cfg.world.persistentScenes.push_back(std::move(sc));
         }
 
+        // 脚本引擎配置
+        cfg.script.dasRoot = loader.GetString("script.das_root", "Script");
+
         // 日志配置
         auto logLevelInt = loader.GetInt("log.level", 0);
         cfg.log.logDir   = loader.GetString("log.dir", "");

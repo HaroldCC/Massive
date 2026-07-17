@@ -5,6 +5,7 @@
 
 #include "World/WorldServer.h"
 #include "Common/Crypto/SessionToken.h"
+#include "Common/ECS/MassiveModule.h"
 #include "Common/Log/Log.h"
 #include "Common/Network/TCPSocket.h"
 
@@ -19,6 +20,22 @@
 #include <ctime>
 #include <thread>
 
+#include <daScript/simulate/fs_file_info.h>
+#include <daScript/simulate/aot.h>
+#include <daScript/misc/string_writer.h>
+#include <daScript/misc/sysos.h>
+#include <daScript/daScriptModule.h>
+
+// vec4f 和 cast<T> 定义在 simulate.h 中
+//（通过 aot.h、simulate.h 已包含）
+
+// daScript 内建模块声明——必须在命名空间外
+// DECS 依赖 ast_core / rtti_core 等 C++ 原生模块，需要全部注册
+DECLARE_ALL_DEFAULT_MODULES;
+
+// 在 namesapce MMO 外，为全局注册宏提供 DAS_THREAD_LOCAL 环境
+//（daScriptModule.h 需要 ModuleKarma 的 DAS_THREAD_LOCAL 定义）
+
 using namespace std::chrono_literals;
 
 namespace MMO
@@ -29,6 +46,10 @@ namespace MMO
     bool WorldServer::Init(const WorldConfig &cfg)
     {
         _config = cfg;
+
+        // CWD 由 xmake set_rundir / systemd WorkingDirectory 保证为项目根
+        // dasRoot 由 daScript 内部用于 daslib/modules//%/ 路径解析
+        das::setDasRoot(_config.script.dasRoot);
 
         _ioPool = std::make_unique<IOContextPool>(static_cast<size_t>(cfg.network.ioThreads));
 
@@ -53,6 +74,13 @@ namespace MMO
 
         // 注册消息分发
         RegisterHandlers();
+
+        // 初始化脚本引擎（Phase 1：最小 DaLang + DECS 验证）
+        if (!InitScriptEngine())
+        {
+            Log::Error("WorldServer: script engine init failed");
+            return false;
+        }
 
         // 注册 Gate 指向 _sessions
         _gateConnMgr->SetSessionsPtr(&_sessionsMtx, &_sessions);
@@ -224,7 +252,15 @@ namespace MMO
         }
         UpdateLoadLevel(_sessions.size(), queueDepth);
 
-        // 4. 游戏逻辑（后续 ecs_stage）
+        // 4. 脚本 Tick（Phase 1：DECS smoke test）
+        if (_fnUpdate && _scriptCtx)
+        {
+            _scriptCtx->restart();
+            // Update(sceneID: uint; dt: float)
+            vec4f args[] = { das::cast<uint32_t>::from(uint32_t(1)),
+                              das::cast<float>::from(0.02f) };
+            _scriptCtx->eval(_fnUpdate, args);
+        }
     }
 
     void WorldServer::ProcessUnroutedMessages()
@@ -532,6 +568,93 @@ namespace MMO
         {
             Log::Warn("WorldServer: WARNING — sessions={}", _sessions.size());
         }
+    }
+
+    // ── 脚本引擎（Phase 1）──
+
+    das::ProgramPtr WorldServer::CompileDaScript(const std::string &entryFile,
+                                                   das::ModuleGroup &libGroup)
+    {
+        auto fAccess = das::make_smart<das::FsFileAccess>();
+        fAccess->introduceDaslib();
+
+        das::TextWriter logs;
+        auto program = das::compileDaScript(entryFile, fAccess, logs, libGroup);
+        if (!program)
+        {
+            Log::Error("CompileDaScript: program is null");
+            return nullptr;
+        }
+        if (program->failed())
+        {
+            Log::Error("CompileDaScript: compile errors — {}", logs.str());
+            for (auto &err : program->errors)
+            {
+                Log::Error("  {}:{} {}",
+                           err.at.fileInfo ? err.at.fileInfo->name.c_str() : "?",
+                           err.at.line, err.what.c_str());
+            }
+            return nullptr;
+        }
+
+        return program;
+    }
+
+    bool WorldServer::InitScriptEngine()
+    {
+        Log::Info("InitScriptEngine: starting...");
+
+        // 注册全部内建 C++ 模块（DECS 依赖 ast_core/rtti_core 等）
+        PULL_ALL_DEFAULT_MODULES;
+
+        // Initialize 必须在 PULL 之后、compileDaScript 之前调用
+        das::Module::Initialize();
+        Log::Info("InitScriptEngine: modules initialized");
+
+        // 创建 ModuleGroup 并注册 MassiveModule
+        das::ModuleGroup libGroup;
+        MassiveModule massiveMod;
+        massiveMod.BindFunctions();
+        libGroup.addModule(&massiveMod);
+
+        _scriptProgram = CompileDaScript("Script/ServerTick.das", libGroup);
+        if (!_scriptProgram)
+        {
+            Log::Error("InitScriptEngine: compile failed");
+            return false;
+        }
+        Log::Info("InitScriptEngine: compile OK");
+
+        _scriptCtx = std::make_shared<das::Context>(
+            _scriptProgram->getContextStackSize());
+        das::TextWriter simulateLogs;
+        if (!_scriptProgram->simulate(*_scriptCtx, simulateLogs))
+        {
+            Log::Error("InitScriptEngine: simulate failed");
+            return false;
+        }
+        Log::Info("InitScriptEngine: simulate OK");
+
+        auto fnInit = _scriptCtx->findFunction("Init");
+        if (fnInit)
+        {
+            _scriptCtx->eval(fnInit, nullptr);  // Init() 无参
+            _fnInit = fnInit;
+            Log::Info("InitScriptEngine: Init() called");
+        }
+        else
+        {
+            Log::Warn("InitScriptEngine: Init() not found");
+        }
+
+        _fnUpdate = _scriptCtx->findFunction("Update");
+        if (_fnUpdate)
+        {
+            Log::Info("InitScriptEngine: Update() cached");
+        }
+
+        Log::Info("InitScriptEngine: OK");
+        return true;
     }
 
 } // namespace MMO

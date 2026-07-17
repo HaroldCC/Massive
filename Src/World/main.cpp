@@ -20,11 +20,11 @@
 #include "World/WorldServer.h"
 
 #include "Common/Core/Args.h"
-#include "Common/Log/GracefulShutdown.h"
-#include "Common/Core/Dump.h" // SetCrashDumpDirectory
+#include "Common/Core/Dump.h"
 #include "Common/Core/Stacktrace.h"
 #include "Common/DB/DBWorkerPool.h"
 #include "Common/Log/Log.h"
+#include "Common/Log/GracefulShutdown.h"
 
 int main(int argc, char **argv)
 {

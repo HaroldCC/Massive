@@ -44,6 +44,11 @@ namespace MMO
             std::vector<SceneConfig> persistentScenes; // 常驻场景配置
         } world;
 
+        struct Script
+        {
+            std::string dasRoot = "Script"; // das 生态根目录（daslib/Script/System 等）
+        } script;
+
         Log::Config log;
 
         static std::optional<WorldConfig> Load(const std::string &path,

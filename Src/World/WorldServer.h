@@ -16,6 +16,11 @@
 #include <unordered_map>
 
 #include "Common/Core/Types.h"
+
+#include <daScript/ast/ast.h>
+#include <daScript/simulate/simulate.h>
+
+#include "Common/ECS/MassiveModule.h"
 #include "Common/Log/Log.h"
 #include "Common/Network/IOContextPool.h"
 #include "Common/Network/MessageDispatcher.h"
@@ -23,7 +28,6 @@
 #include "Common/Network/TCPAcceptor.h"
 #include "World/CenterClient.h"
 #include "World/GateConnection.h"
-#include "World/SceneManager.h"
 #include "World/Handler/EnterWorldHandler.h"
 #include "World/Handler/MoveHandler.h"
 #include "World/LogicThread.h"
@@ -82,6 +86,24 @@ namespace MMO
 
         // ── 控制消息处理（_ctrlQueue 消费）──
         void ProcessControlMessages();
+
+        // ── 脚本引擎（Phase 1）──
+
+        /**
+         * @brief 初始化 DasLang 脚本引擎
+         *
+         * Phase 1: 创建 Context + 加载 builtin modules + 编译 ServerTick.das
+         * @return 成功返回 true
+         */
+        bool InitScriptEngine();
+
+        /**
+         * @brief 编译 DasLang 入口脚本
+         * @param entryFile  入口 .das 文件路径
+         * @return 编译成功的 Program；失败返回 nullptr
+         */
+        das::ProgramPtr CompileDaScript(const std::string &entryFile,
+                                            das::ModuleGroup &libGroup);
 
         /**
          * @brief 加密 protobuf 消息并发送到客户端
@@ -154,6 +176,12 @@ namespace MMO
         // ── 配置 ──
         WorldConfig       _config;
         std::atomic<bool> _running {false};
+
+        // ── 脚本引擎（Phase 1）──
+        std::shared_ptr<das::Context>     _scriptCtx;       // DasLang 执行上下文
+        das::ProgramPtr                   _scriptProgram;  // 当前编译的脚本 Program
+        das::SimFunction                 *_fnInit   = nullptr; // 脚本 init() 函数
+        das::SimFunction                 *_fnUpdate = nullptr; // 脚本 update() 函数
     };
 
 } // namespace MMO
