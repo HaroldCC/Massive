@@ -20,7 +20,7 @@ add_rules("plugin.compile_commands.autoupdate", {outputdir = "$(projectdir)/buil
 
 set_targetdir(path.join("Bin", "$(plat)-$(arch)-$(mode)"))
 
--- set_rundir(os.projectdir())  -- 去掉 rundir，各 exe 通过 --config-path 参数接收绝对路径
+set_rundir(os.projectdir())
 
 --- 全局编译器标志
 if is_mode("debug") then

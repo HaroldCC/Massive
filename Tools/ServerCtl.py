@@ -214,7 +214,7 @@ def _stop(srv: ServerDef, payload: Payload) -> dict[str, Any]:
 
     if _is_win():
         r = subprocess.run(
-            ["tasklist", "/FI", f'"PID eq {pid}"', "/NH"],
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
             capture_output=True, text=True, timeout=10,
         )
         if r.returncode != 0 or not r.stdout or "No " in r.stdout:
@@ -222,31 +222,16 @@ def _stop(srv: ServerDef, payload: Payload) -> dict[str, Any]:
             pf.unlink(missing_ok=True)
             return ret
 
-        # 尝试优雅关停（前台启动的进程可通过 CTRL_CLOSE_EVENT 接收）
-        # DETACHED_PROCESS 进程对此无响应，2 秒后 force kill 兜底。
+        # DETACHED_PROCESS 启动的进程无控制台窗口，无法接收 WM_CLOSE，
+        # taskkill /PID 不带 /F 对它们无效，所以直接用 /F /PID 精确强杀。
         r = subprocess.run(
-            ["taskkill", "/PID", str(pid)],
+            ["taskkill", "/F", "/PID", str(pid)],
             capture_output=True, timeout=10,
         )
         if r.returncode == 0:
-            # 阶梯等待：快进程秒退，慢进程给满 5 秒
-            for wait_s in [1, 1, 3]:
-                time.sleep(wait_s)
-                alive = subprocess.run(
-                    ["tasklist", "/FI", f'"PID eq {pid}"', "/NH"],
-                    capture_output=True, text=True, timeout=10,
-                )
-                st = alive.stdout or ""
-                if alive.returncode != 0 or not st or "No " in st:
-                    ret["action"] = "graceful"
-                    break
-            else:
-                subprocess.run(
-                    ["taskkill", "/F", "/PID", str(pid)],
-                    capture_output=True, timeout=10,
-                )
-                ret["action"] = "force"
-            ret["action"] = "pid-not-found"
+            ret["action"] = "killed"
+        else:
+            # /F /PID 也失败了：PID 可能已经退出或权限不足，用 IM 兜底
             subprocess.run(
                 ["taskkill", "/F", "/IM", srv.bin],
                 capture_output=True, timeout=10,
@@ -282,10 +267,8 @@ def cmd_down(payload: Payload) -> int:
             nkilled += 1
         pid_str = f"(PID {r['pid']})" if r["pid"] else ""
         a = r["action"]
-        if a == "graceful":
-            print(f"  ok {srv.name} graceful exit {pid_str}")
-        elif a == "force":
-            print(f"  XX {srv.name} force killed {pid_str}")
+        if a == "killed":
+            print(f"  ok {srv.name} killed {pid_str}")
         elif a == "dead":
             print(f"  ?? {srv.name} already dead {pid_str}")
         elif a == "fallback":
