@@ -1,0 +1,50 @@
+options gen2
+options indenting = 4
+options strict_smart_pointers
+
+module assert_once shared private
+
+//! One-shot assertion macro.
+//!
+//! ``assert_once`` works like ``assert`` but fires only on the first failure.
+//! After the first failed check, the assertion is permanently disabled via
+//! an auto-generated global flag variable.
+
+require daslib/ast
+require daslib/rtti
+require daslib/ast_boost
+require daslib/templates_boost
+
+[tag_function(asset_once_tag), unused_argument(expr)]
+def public assert_once(expr : bool; message : string = "") {
+    //! Same as assert, only the check will be not be repeated after the assertion failed the first time.
+    pass
+}
+
+[tag_function_macro(tag="asset_once_tag")]
+class AssertOnceMacro : AstFunctionAnnotation {
+    //! This macro convert assert_once(expr,message) to the following code::
+    //!
+    //!     var __assert_once_I = true  // this is a global variable
+    //!     if __assert_once_I && !expr
+    //!         __assert_once_I = false
+    //!         assert(false,message)
+    def override transform(var call : ExprCallFunc?; var errors : das_string) : ExpressionPtr {
+        let once_name = make_unique_private_name("__assert_once", call.at)
+        if (!compiling_module() |> add_global_private_var(once_name, call.at) <| quote(true)) {
+            errors := "can't add global variable {once_name}"
+            return null
+        }
+        // if ..
+        var qb = qmacro_block() {
+            if ($i(once_name) && !$e(call.arguments[0])) {
+                $i(once_name) = false
+                assert(false, $e(call.arguments[1]))
+            }
+        }
+        qb |> force_at(call.at)
+        return <- qb
+    }
+}
+
+

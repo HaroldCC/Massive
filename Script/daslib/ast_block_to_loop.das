@@ -1,0 +1,116 @@
+options gen2
+options indenting = 4
+options strict_smart_pointers = true
+
+module ast_block_to_loop shared private
+
+//! Block-to-loop transformation utilities.
+//!
+//! Provides AST visitors that convert inline-block patterns into
+//! equivalent loop constructs for macro code generation.
+
+require daslib/ast_boost
+
+class B2LVisitor : AstVisitor {
+    //! AST visitor that converts block expressions to loop form.
+    inClosure : int
+    inArchetype : int
+    failOnReturn : bool
+    replaceReturnWithContinue : bool
+    requireContinueCond : bool
+    loop_depth : array<int>
+    def B2LVisitor(fOnR, rRetWC, rCC : bool) {
+        failOnReturn = fOnR
+        replaceReturnWithContinue = rRetWC
+        requireContinueCond = rCC
+        loop_depth |> push(0)
+    }
+    def override visitExprReturn(var expr : ExprReturn?) : ExpressionPtr {
+        if (inClosure == 0 && inArchetype == 0) {
+            if (failOnReturn) {
+                return <- make_static_assert_false("return is not allowed inside this macros's block", expr.at)
+            } elif (replaceReturnWithContinue) {
+                if (expr.subexpr != null) {
+                    return <- new ExprIfThenElse(at = expr.at,
+                        cond = clone_expression(expr.subexpr),
+                        if_true = new ExprReturn(at = expr.at,
+                                subexpr = new ExprConstBool(at = expr.at, value := true)
+                            ),
+                        if_false = new ExprContinue(at = expr.at)
+                    )
+                } else {
+                    if (requireContinueCond) {
+                        macro_error(compiling_program(), expr.at, "expecting return boolean (continue or stop)")
+                    } else {
+                        return new ExprContinue(at = expr.at)
+                    }
+                }
+            }
+        }
+        return <- expr
+    }
+    def override preVisitExprFor(expr : ExprFor?) : void {
+        loop_depth |> back ++
+    }
+    def override visitExprFor(var expr : ExprFor?) : ExpressionPtr {
+        loop_depth |> back --
+        return <- expr
+    }
+    def override preVisitExprWhile(expr : ExprWhile?) : void {
+        loop_depth |> back ++
+    }
+    def override visitExprWhile(var expr : ExprWhile?) : ExpressionPtr {
+        loop_depth |> back --
+        return <- expr
+    }
+    def override preVisitExprBlock(blk : ExprBlock?) : void {
+        if (blk.blockFlags.isClosure) {
+            inClosure ++
+            loop_depth |> push(0)
+        }
+    }
+    def override visitExprBlock(var blk : ExprBlock?) : ExpressionPtr {
+        if (blk.blockFlags.isClosure) {
+            inClosure --
+            loop_depth |> pop()
+        }
+        return <- blk
+    }
+    def override preVisitExprCall(expr : ExprCall?) : void {
+        if (expr.name == "for_each_archetype") {
+            inArchetype ++
+            loop_depth |> push(0)
+        }
+    }
+    def override visitExprCall(var expr : ExprCall?) : ExpressionPtr {
+        if (expr.name == "for_each_archetype") {
+            loop_depth |> pop()
+            inArchetype --
+        }
+        return <- expr
+    }
+    def override visitExprBreak(var expr : ExprBreak?) : ExpressionPtr {
+        if (inClosure != 0 || inArchetype != 0 || loop_depth |> back != 0) return <- expr
+        return <- make_static_assert_false("break is not allowed inside this macros's block {loop_depth}", expr.at)
+    }
+    def override visitExprContinue(var expr : ExprContinue?) : ExpressionPtr {
+        if (inClosure != 0 || inArchetype != 0 || loop_depth |> back != 0) return <- expr
+        return <- make_static_assert_false("continue is not allowed inside this macros's block {loop_depth}", expr.at)
+    }
+}
+
+[macro_function]
+def public convert_block_to_loop(var blk : Expression?; failOnReturn, replaceReturnWithContinue, requireContinueCond : bool) {
+    //! Converts closure block to loop.
+    //! If `failOnReturn` is true, then returns are not allowed inside the block.
+    //! If `replaceReturnWithContinue` is true, then `return cond;` are replaced with `if cond; continue;`.
+    //! If `requireContinueCond` is false, then `return;` is replaced with `continue;`, otherwise it is an error.
+    var astVisitor = new B2LVisitor(failOnReturn, replaceReturnWithContinue, requireContinueCond)
+    make_visitor(*astVisitor) $(astVisitorAdapter) {
+        visit(blk, astVisitorAdapter)
+    }
+    unsafe {
+        delete astVisitor
+    }
+}
+

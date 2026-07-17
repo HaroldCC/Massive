@@ -1,0 +1,74 @@
+options gen2
+options indenting = 4
+options strict_smart_pointers = true
+
+module unroll shared private
+
+//! Compile-time loop unrolling macro.
+//!
+//! ``unroll`` replaces a ``for`` loop with a fixed ``range`` by inlining
+//! each iteration at compile time. The loop variable is substituted with
+//! the constant index in each unrolled copy.
+
+require daslib/ast
+require daslib/rtti
+require daslib/ast_boost
+require daslib/templates_boost
+
+[tag_function(unroll_tag)]
+def public unroll(blk : block) {
+    //! Unrolls the for loop (with fixed range)
+    invoke(blk)
+}
+
+[tag_function_macro(tag="unroll_tag")]
+class UnrollMacro : AstFunctionAnnotation {
+    //! This macro implements loop unrolling in the form of `unroll` function.
+    //! Unroll function expects block with the single for loop in it.
+    //! Moveover only range for is supported, and only with the fixed range.
+    //! For example:::
+    //!
+    //!     var n : float4[9]
+    //!     unroll <|   // contents of the loop will be replaced with 9 image load instructions.
+    //!         for i in range(9)
+    //!             n[i] = imageLoad(c_bloom_htex, xy + int2(0,i-4))
+    def override transform(var call : ExprCallFunc?; var errors : das_string) : ExpressionPtr {
+        if (is_in_lint_check()) {
+            // In lint mode, skip unrolling — return the inner for loop as-is
+            var mblk = unsafe(reinterpret<ExprMakeBlock?>(call.arguments[0]))
+            var blk = unsafe(reinterpret<ExprBlock?>(mblk._block))
+            if (blk.list |> length == 1 && blk.list[0] is ExprFor) return <- clone_expression(blk.list[0])
+        }
+        assert(call.arguments[0] is ExprMakeBlock)
+        var mblk = unsafe(reinterpret<ExprMakeBlock?>(call.arguments[0]))
+        var blk = unsafe(reinterpret<ExprBlock?>(mblk._block))
+        if (!empty(blk.finalList)) {
+            errors := "not expecting finally section in the unroll"
+            return null
+        }
+        if (blk.list |> length != 1 || !(blk.list[0] is ExprFor)) {
+            errors := "expecting unroll <| for ..."
+            return null
+        }
+        let efor = unsafe(reinterpret<ExprFor?>(blk.list[0]))
+        if (!(efor.sources[0] is ExprConstRange)) {
+            errors := "can only unroll for loop with range"
+            return null
+        }
+        let euc = efor.sources[0] as ExprConstRange
+        let van = "{efor.iterators[0]}"
+        var nblk = new ExprBlock(at = call.at)
+        for (i in euc.value) {
+            {
+                var iblk = clone_expression(efor.body)
+                remove_deref(van, iblk)
+                var rules : Template
+                rules |> replaceVariable(van) <| new ExprConstInt(at = call.at, value = i)
+                rules |> apply_template(call.at, iblk, false)
+                nblk.list |> emplace(iblk)
+            }
+        }
+        return <- nblk
+    }
+}
+

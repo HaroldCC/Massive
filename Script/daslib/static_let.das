@@ -1,0 +1,135 @@
+options gen2
+options indenting = 4
+options strict_smart_pointers = true
+
+module static_let shared private
+
+//! Static variable declarations.
+//!
+//! ``static_let`` promotes local variable declarations to global scope, so they are
+//! initialized once and persist across function calls (like C ``static``). The variable
+//! is renamed under the hood to avoid collisions. ``static_let_finalize`` additionally
+//! deletes the variable on context shutdown.
+
+require daslib/ast
+require daslib/rtti
+require daslib/ast_boost
+require daslib/templates_boost
+
+[tag_function(static_let_tag), unused_argument(blk)]
+def public static_let(blk : block) {
+    //! Given a scope with the variable declarations, this function will make those variables global.
+    //! Variable will be renamed under the hood, and all local access to it will be renamed as well.
+    pass
+}
+
+[tag_function(static_let_tag), unused_argument(name, blk)]
+def public static_let(name : string; blk : block) {
+    //! Given a scope with the variable declarations, this function will make those variables global.
+    //! Variable will be renamed under the hood, and all local access to it will be renamed as well.
+    pass
+}
+
+[tag_function(static_let_tag), unused_argument(blk)]
+def public static_let_finalize(blk : block) {
+    //! This is very similar to regular static_let, but additionally the variable will be deleted on the context shutdown.
+    pass
+}
+
+def private make_shutdown_function(varname : string; at : LineInfo) {
+    var fn = new Function(at = at, atDecl = at, name := "shutdown`{varname}")
+    fn.flags.generated = true
+    fn.flags.shutdown = true
+    fn.result = new TypeDecl(baseType = Type.tVoid, at = at)
+    var blk = new ExprBlock(at = at)
+    var delv = new ExprDelete(at = at,
+        subexpr <- new ExprVar(at = at, name := varname)
+    )
+    delv.genFlags.alwaysSafe = true
+    emplace(blk.list, delv)
+    fn.body = blk
+    return compiling_module() |> add_function(fn)
+}
+
+[tag_function_macro(tag="static_let_tag")]
+class StaticLetMacro : AstFunctionAnnotation {
+    //! This macro implements the `static_let` and `static_let_finalize` functions.
+    def override transform(var call : ExprCallFunc?; var errors : das_string) : ExpressionPtr {
+        var mblk : ExprMakeBlock?
+        var prefix = "`static`at_line_{int(call.at.line)}`"
+        if (length(call.arguments) == 1) {
+            if (!(call.arguments[0] is ExprMakeBlock)) {
+                errors := "expecting block as argument"
+                return null
+            }
+            mblk = call.arguments[0] as ExprMakeBlock
+        } elif (length(call.arguments) == 2) {
+            if (!(call.arguments[0] is ExprConstString)) {
+                errors := "expecting string as first argument"
+                return null
+            }
+            if (!(call.arguments[1] is ExprMakeBlock)) {
+                errors := "expecting block as second argument"
+                return null
+            }
+            mblk = call.arguments[1] as ExprMakeBlock
+            let pname = call.arguments[0] as ExprConstString
+            prefix = "{pname.value}{prefix}"
+        } else {
+            errors := "expecting static_let(block) or static_let(name, block)"
+            return null
+        }
+        var blk = mblk._block as ExprBlock
+        if (!empty(blk.finalList)) {
+            errors := "not expecting finally section in the static_let"
+            return null
+        }
+        var inscope renames : array<tuple<old_name : string; new_name : string>>
+        for (ex in blk.list) {
+            if (!(ex is ExprLet)) {
+                errors := "expecting let ... expressions in the static_let"
+                return null
+            }
+            var lexpr = ex as ExprLet
+            for (vvar in lexpr.variables) {
+                {
+                    var vclone <- clone_variable(vvar)
+                    vclone.flags.private_variable = true
+                    vclone.flags.generated = true
+                    let old_name = "{vclone.name}"
+                    let new_name = "{prefix}{vclone.name}"
+                    vclone.name := new_name
+                    renames |> push((old_name = old_name, new_name = new_name))
+                    if (!(compiling_module() |> add_variable(vclone))) {
+                        errors := "can't add global variable {new_name}"
+                        return null
+                    }
+                    if ("{call.name}" == "static_let_finalize") {
+                        if (!make_shutdown_function(new_name, vvar.at)) {
+                            errors := "can't add shutdown function {new_name}"
+                            return null
+                        }
+                    }
+                }
+            }
+        }
+        var success = true
+        compiling_program() |> get_ast_context(call) $(valid, astc) {
+            if (!valid) {
+                errors := "can't get valid program context"
+                success = false
+            } else {
+                apply_template(astc.scopes[astc.scopes |> length - 1]) $(rules) {
+                    for (r in renames) {
+                        rules |> renameVariable(r.old_name) <| "_::{r.new_name}"
+                    }
+                }
+            }
+        }
+        if (!success) return null
+        return <- quote() {
+            pass
+        }
+    }
+}
+

@@ -1,0 +1,48 @@
+options gen2
+options indenting = 4
+options strict_smart_pointers = true
+
+module generic_return shared private
+
+//! Generic return-type instantiation macro.
+//!
+//! ``generic_return(func_id)`` replaces a call with the default-constructed
+//! value of the matching generic function's return type.
+
+require daslib/ast_boost
+require daslib/templates_boost
+require daslib/macro_boost
+
+[call_macro(name="generic_return")]
+class GenericReturn : AstCallMacro {
+    //! Replaces generic_return(expr) with a block that calls expr and returns its result, handling void, copyable, and movable return types.
+    def override visit(prog : ProgramPtr; mod : Module?; var expr : ExprCallMacro?) : ExpressionPtr {
+        if (expr.arguments |> length != 1) {
+            macro_error(prog, expr.at, "generic_return expecting 1 argument")
+            return null
+        }
+        assume ret_expr = expr.arguments[0]
+        if (ret_expr._type == null || ret_expr._type.isAutoOrAlias) {
+            macro_error(prog, expr.at, "generic_return requires fully inferred type")
+            return null
+        }
+        if (ret_expr._type.isVoid) {
+            return <- qmacro_block() {
+                $e(ret_expr)
+                return
+            }
+        } elif (ret_expr._type.canCopy) {
+            return <- qmacro_block() {
+                return $e(ret_expr)
+            }
+        } elif (ret_expr._type.canMove) {
+            return <- qmacro_block() {
+                return <- $e(ret_expr)
+            }
+        } else {
+            macro_error(prog, expr.at, "generic_return for the type {describe(ret_expr._type)}, which can't be copied or moved")
+            return null
+        }
+    }
+}
+
