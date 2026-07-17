@@ -1,33 +1,38 @@
 // ServerTick.das — 顶层 Tick 调度入口
 // 所属: WorldServer
-// Phase 1.4: DECS smoke test
+// Phase 2: MassiveModule 桥接函数验证
 
 options gen2
 options indenting = 4
 
-require daslib/decs_boost
 require massive
+
+var testEntityId : uint64
 
 [export]
 def Init()
 {
-    print("▌▌▌ DECS SMOKE TEST ▐▐▐\n")
-    LogInfo("DECS smoke test: init OK")
+    print("PHASE 2 BRIDGE TEST\n")
+    LogInfo("Phase 2: bridge test start")
 
-    // 最小 DECS 验证：create_entity 是 deferred 的，必须 commit()
-    let eid = create_entity() <| @(eid, cmp)
-    {
-        LogInfo("DECS: entity created id={eid.id} gen={eid.generation}")
-    }
-    LogInfo("DECS: eid reserved, id={eid.id}")
+    testEntityId = CreateEntity(float3(100.0, 0.0, 200.0), 1)
+    LogInfo("CreateEntity: OK")
 
-    // commit() 才真正执行所有 deferred action（create/delete/set）
-    commit()
-    LogInfo("DECS: commit done, entity is now alive")
+    let pos = EntityPosition(testEntityId)
+    LogInfo("EntityPosition: OK")
+
+    var isPlayer = EntityIsPlayer(testEntityId)
+    var isMonster = EntityIsMonster(testEntityId)
+    var isDead = EntityIsDead(testEntityId)
+    LogInfo("IsPlayer={isPlayer} IsMonster={isMonster} IsDead={isDead}")
+
+    LogInfo("GetDeltaTime: {GetDeltaTime()}s")
+    LogInfo("Phase 2 bridge test done")
 }
 
 [export]
 def Update(sceneID: uint, dt: float)
 {
-    LogInfo("tick: {sceneID}  {dt}")
+    var pos = EntityPosition(testEntityId)
+    LogInfo("Update OK")
 }

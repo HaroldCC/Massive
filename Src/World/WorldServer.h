@@ -44,6 +44,21 @@ namespace MMO
         void Run();
         void Stop();
 
+        /**
+         * @brief 发送已序列化的 protobuf body 到客户端（供脚本桥接调用）
+         *
+         * 与 SendToClient<TMsg> 不同，数据已经序列化为 protobuf bytes，
+         * 跳过 SerializeToArray 步骤，直接加密 + 组帧出站。
+         *
+         * @warning 必须在 LogicThread 中调用（独占 _sessions 读写权限）
+         * @param sessionID  目标 Session
+         * @param msgID      消息 ID（EMsgID）
+         * @param data       protobuf 序列化后的字节数组
+         * @param len        字节长度
+         */
+        void SendRawToClient(uint32 sessionID, uint32 msgID,
+                            const uint8 *data, size_t len);
+
     private:
         // ── Init 阶段 ──
         bool InitCenterClient(const WorldConfig &cfg);
@@ -87,12 +102,12 @@ namespace MMO
         // ── 控制消息处理（_ctrlQueue 消费）──
         void ProcessControlMessages();
 
-        // ── 脚本引擎（Phase 1）──
+        // ── 脚本引擎（Phase 2）──
 
         /**
          * @brief 初始化 DasLang 脚本引擎
          *
-         * Phase 1: 创建 Context + 加载 builtin modules + 编译 ServerTick.das
+         * Phase 2: 创建 Context + MassiveModule(15 函数) + 编译 ServerTick.das
          * @return 成功返回 true
          */
         bool InitScriptEngine();
@@ -177,11 +192,12 @@ namespace MMO
         WorldConfig       _config;
         std::atomic<bool> _running {false};
 
-        // ── 脚本引擎（Phase 1）──
+        // ── 脚本引擎（Phase 2）──
         std::shared_ptr<das::Context>     _scriptCtx;       // DasLang 执行上下文
         das::ProgramPtr                   _scriptProgram;  // 当前编译的脚本 Program
         das::SimFunction                 *_fnInit   = nullptr; // 脚本 init() 函数
         das::SimFunction                 *_fnUpdate = nullptr; // 脚本 update() 函数
+        std::unique_ptr<MassiveModule>    _massiveModule;   // 桥接模块（持有 WorldServer raw ptr）
     };
 
 } // namespace MMO

@@ -6,6 +6,7 @@
 #include "World/WorldServer.h"
 #include "Common/Crypto/SessionToken.h"
 #include "Common/ECS/MassiveModule.h"
+#include "Common/ECS/Scene.h"
 #include "Common/Log/Log.h"
 #include "Common/Network/TCPSocket.h"
 
@@ -184,6 +185,34 @@ namespace MMO
         }
 
         Log::Info("WorldServer: stopped");
+    }
+
+    void WorldServer::SendRawToClient(uint32 sessionID, uint32 msgID,
+                                      const uint8 *data, size_t len)
+    {
+        auto it = _sessions.find(sessionID);
+        if (it == _sessions.end())
+        {
+            Log::Warn("SendRawToClient: session {} not found", sessionID);
+            return;
+        }
+
+        // 加密
+        auto encrypted = it->second.crypto.Encrypt(data, len);
+        if (encrypted.Size() == 0)
+        {
+            return;
+        }
+
+        // 构建完整包: [PacketHeader:12B][encrypted]
+        uint32 totalLen = static_cast<uint32>(sizeof(PacketHeader) + encrypted.Size());
+        auto   frame    = ByteBuffer::Own(totalLen);
+        frame.WriteUint32(totalLen);
+        frame.WriteUint32(msgID);
+        frame.WriteUint32(sessionID);
+        frame.WriteBytes(encrypted.Data(), encrypted.Size());
+
+        _gateConnMgr->SendToGate(it->second.gateServerID, sessionID, std::move(frame));
     }
 
     // ── 消息分发注册 ──
@@ -570,7 +599,7 @@ namespace MMO
         }
     }
 
-    // ── 脚本引擎（Phase 1）──
+    // ── 脚本引擎（Phase 2）──
 
     das::ProgramPtr WorldServer::CompileDaScript(const std::string &entryFile,
                                                    das::ModuleGroup &libGroup)
@@ -611,11 +640,17 @@ namespace MMO
         das::Module::Initialize();
         Log::Info("InitScriptEngine: modules initialized");
 
+        // 创建 MassiveModule — 注入 4 个上下文指针
+        _massiveModule = std::make_unique<MassiveModule>(
+            this,
+            &_sceneMgr,
+            &_logicThread.GetTimingWheel(),
+            &_sessions);
+        _massiveModule->BindFunctions();
+
         // 创建 ModuleGroup 并注册 MassiveModule
         das::ModuleGroup libGroup;
-        MassiveModule massiveMod;
-        massiveMod.BindFunctions();
-        libGroup.addModule(&massiveMod);
+        libGroup.addModule(_massiveModule.get());
 
         _scriptProgram = CompileDaScript("Script/ServerTick.das", libGroup);
         if (!_scriptProgram)
@@ -627,6 +662,10 @@ namespace MMO
 
         _scriptCtx = std::make_shared<das::Context>(
             _scriptProgram->getContextStackSize());
+
+        // MassiveModule 需要 _ctx 来分配 TArray / alocate（供桥接函数）
+        _massiveModule->_ctx = _scriptCtx;
+
         das::TextWriter simulateLogs;
         if (!_scriptProgram->simulate(*_scriptCtx, simulateLogs))
         {
