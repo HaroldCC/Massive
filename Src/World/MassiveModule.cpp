@@ -10,6 +10,10 @@
 
 #include <chrono>
 
+#include <daScript/simulate/aot.h>
+#include <daScript/simulate/simulate.h>
+#include <daScript/ast/ast_handle.h>
+
 #include "Common/ECS/Scene.h"
 #include "Common/Log/Log.h"
 #include "World/Component/BattleStats.h"
@@ -21,10 +25,6 @@
 #include "World/SceneManager.h"
 #include "World/WorldServer.h"
 #include "World/WorldSession.h"
-
-#include <daScript/simulate/aot.h>
-#include <daScript/simulate/simulate.h>
-#include <daScript/ast/ast_handle.h>
 
 // ── 全局指针：BindFunctions 时设定，所有静态桥接函数通过它访问上下文 ──
 namespace
@@ -49,10 +49,10 @@ namespace
         entt::entity e     = entt::null;
     };
 
-    ResolvedEntity ResolveEntity(uint64_t fullEntityId)
+    ResolvedEntity ResolveEntity(uint64 fullEntityId)
     {
-        uint32_t entityID = static_cast<uint32_t>(fullEntityId & 0xFFFFFFFF);
-        uint32_t sceneID  = static_cast<uint32_t>(fullEntityId >> 32);
+        uint32 entityID = static_cast<uint32>(fullEntityId & 0xFFFFFFFF);
+        uint32 sceneID  = static_cast<uint32>(fullEntityId >> 32);
 
         auto *sceneMgr = g_massiveMod ? g_massiveMod->_sceneMgr : nullptr;
         auto *scene    = sceneMgr ? sceneMgr->GetScene(sceneID) : nullptr;
@@ -66,11 +66,10 @@ namespace
 
 } // anonymous namespace
 
-// ═══════════════════════════════════════════════════════════════
-// 3.1 空间查询
-// ═══════════════════════════════════════════════════════════════
+/** @name 空间查询 */
+/** @{ */
 
-static das::float3 Bridge_EntityPosition(uint64_t fullEntityId)
+static das::float3 Bridge_EntityPosition(uint64 fullEntityId)
 {
     auto [scene, valid, e] = ResolveEntity(fullEntityId);
     if (!valid)
@@ -78,7 +77,7 @@ static das::float3 Bridge_EntityPosition(uint64_t fullEntityId)
         return das::float3();
     }
 
-    Entity ent{scene->SceneID(), static_cast<uint32_t>(e)};
+    Entity ent{scene->SceneID(), static_cast<uint32>(e)};
     if (!scene->HasComponent<Position>(ent))
     {
         return das::float3();
@@ -88,10 +87,11 @@ static das::float3 Bridge_EntityPosition(uint64_t fullEntityId)
     return das::float3(pos.x, pos.y, pos.z);
 }
 
-static das::TArray<uint64_t> Bridge_EntitiesInRadius(const das::float3 &center,
+static das::TArray<uint64> Bridge_EntitiesInRadius(const das::float3 &center,
                                                      float               radius)
 {
-    das::TArray<uint64_t> result;
+    // Phase 5+: TArray 需要 das::Context 分配——当前函数未注册，待 Phase 6 类型工厂实现时一起启用
+    das::TArray<uint64> result;
 
     auto *sceneMgr = g_massiveMod ? g_massiveMod->_sceneMgr : nullptr;
     auto *scene    = sceneMgr ? sceneMgr->GetDefaultScene() : nullptr;
@@ -107,9 +107,9 @@ static das::TArray<uint64_t> Bridge_EntitiesInRadius(const das::float3 &center,
         float dz = pos.z - center.z;
         if (dx * dx + dz * dz <= radius * radius)
         {
-            uint32_t eid    = static_cast<uint32_t>(entt::to_integral(e));
-            uint64_t fullID = (static_cast<uint64_t>(scene->SceneID()) << 32) | eid;
-            reinterpret_cast<uint64_t *>(result.data)[result.size] = fullID;
+            uint32 eid    = static_cast<uint32>(entt::to_integral(e));
+            uint64 fullID = (static_cast<uint64>(scene->SceneID()) << 32) | eid;
+            reinterpret_cast<uint64 *>(result.data)[result.size] = fullID;
             result.size++;
         }
     }
@@ -117,11 +117,12 @@ static das::TArray<uint64_t> Bridge_EntitiesInRadius(const das::float3 &center,
     return result;
 }
 
-// ═══════════════════════════════════════════════════════════════
-// 3.2 属性查询
-// ═══════════════════════════════════════════════════════════════
+/** @} */
 
-static BattleStats *Bridge_EntityGetBattleStats(uint64_t fullEntityId)
+/** @name 属性查询 */
+/** @{ */
+
+static BattleStats *Bridge_EntityGetBattleStats(uint64 fullEntityId)
 {
     auto [scene, valid, e] = ResolveEntity(fullEntityId);
     if (!valid)
@@ -129,7 +130,7 @@ static BattleStats *Bridge_EntityGetBattleStats(uint64_t fullEntityId)
         return nullptr;
     }
 
-    Entity ent{scene->SceneID(), static_cast<uint32_t>(e)};
+    Entity ent{scene->SceneID(), static_cast<uint32>(e)};
 
     if (!scene->HasComponent<BattleStats>(ent) && !scene->HasComponent<Health>(ent))
     {
@@ -161,45 +162,47 @@ static BattleStats *Bridge_EntityGetBattleStats(uint64_t fullEntityId)
     return stats;
 }
 
-// ═══════════════════════════════════════════════════════════════
-// 3.3 Tag 判断
-// ═══════════════════════════════════════════════════════════════
+/** @} */
 
-static bool Bridge_EntityIsDead(uint64_t fullEntityId)
+/** @name Tag 判断 */
+/** @{ */
+
+static bool Bridge_EntityIsDead(uint64 fullEntityId)
 {
     auto [scene, valid, e] = ResolveEntity(fullEntityId);
     return valid && scene->Registry().all_of<DeadTag>(e);
 }
 
-static bool Bridge_EntityIsInCombat(uint64_t fullEntityId)
+static bool Bridge_EntityIsInCombat(uint64 fullEntityId)
 {
     auto [scene, valid, e] = ResolveEntity(fullEntityId);
     return valid && scene->Registry().all_of<CombatTag>(e);
 }
 
-static bool Bridge_EntityIsStunned(uint64_t fullEntityId)
+static bool Bridge_EntityIsStunned(uint64 fullEntityId)
 {
     auto [scene, valid, e] = ResolveEntity(fullEntityId);
     return valid && scene->Registry().all_of<StunnedTag>(e);
 }
 
-static bool Bridge_EntityIsPlayer(uint64_t fullEntityId)
+static bool Bridge_EntityIsPlayer(uint64 fullEntityId)
 {
     auto [scene, valid, e] = ResolveEntity(fullEntityId);
     return valid && scene->Registry().all_of<PlayerTag>(e);
 }
 
-static bool Bridge_EntityIsMonster(uint64_t fullEntityId)
+static bool Bridge_EntityIsMonster(uint64 fullEntityId)
 {
     auto [scene, valid, e] = ResolveEntity(fullEntityId);
     return valid && scene->Registry().all_of<MonsterTag>(e);
 }
 
-// ═══════════════════════════════════════════════════════════════
-// 3.4 世界交互
-// ═══════════════════════════════════════════════════════════════
+/** @} */
 
-static uint64_t Bridge_CreateEntity(das::float3 pos, int entityType)
+/** @name 世界交互 */
+/** @{ */
+
+static uint64 Bridge_CreateEntity(das::float3 pos, int32 entityType)
 {
     auto *sceneMgr = g_massiveMod ? g_massiveMod->_sceneMgr : nullptr;
     auto *scene    = sceneMgr ? sceneMgr->GetDefaultScene() : nullptr;
@@ -215,7 +218,7 @@ static uint64_t Bridge_CreateEntity(das::float3 pos, int entityType)
 
     scene->EmplaceComponent<Position>(entity, pos.x, pos.y, pos.z);
 
-    if (entityType == static_cast<int>(EEntityType::Player))
+    if (entityType == static_cast<int>(EEntityType::ENTITY_PLAYER))
     {
         scene->Registry().emplace<PlayerTag>(e);
     }
@@ -232,10 +235,10 @@ static uint64_t Bridge_CreateEntity(das::float3 pos, int entityType)
     return (static_cast<uint64_t>(scene->SceneID()) << 32) | entityID;
 }
 
-static void Bridge_DestroyEntity(uint64_t fullEntityId)
+static void Bridge_DestroyEntity(uint64 fullEntityId)
 {
-    uint32_t entityID = static_cast<uint32_t>(fullEntityId & 0xFFFFFFFF);
-    uint32_t sceneID  = static_cast<uint32_t>(fullEntityId >> 32);
+    uint32 entityID = static_cast<uint32>(fullEntityId & 0xFFFFFFFF);
+    uint32 sceneID  = static_cast<uint32>(fullEntityId >> 32);
 
     auto *sceneMgr = g_massiveMod ? g_massiveMod->_sceneMgr : nullptr;
     auto *scene    = sceneMgr ? sceneMgr->GetScene(sceneID) : nullptr;
@@ -248,8 +251,13 @@ static void Bridge_DestroyEntity(uint64_t fullEntityId)
     Log::Debug("MassiveModule::DestroyEntity: eid={}", entityID);
 }
 
-static void Bridge_SendToClient(uint32_t sessionID, uint32_t msgID,
-                                const das::TArray<uint8_t> &data)
+/** @} */
+
+/** @name 定时器 */
+/** @{ */
+
+static void Bridge_SendToClient(uint32 sessionID, uint32 msgID,
+                                const das::TArray<uint8> &data)
 {
     auto *worldServer = g_massiveMod ? g_massiveMod->_worldServer : nullptr;
     if (!worldServer)
@@ -263,12 +271,10 @@ static void Bridge_SendToClient(uint32_t sessionID, uint32_t msgID,
                                  static_cast<size_t>(data.size));
 }
 
-// ═══════════════════════════════════════════════════════════════
-// 3.5 定时器
-// ═══════════════════════════════════════════════════════════════
+/** @} */
 
-static uint32_t Bridge_ScheduleTimer(int delayMs,
-                                     const das::TBlock<void, uint32_t> &block)
+static uint32 Bridge_ScheduleTimer(int32 delayMs,
+                                     const das::TBlock<void, uint32> &block)
 {
     if (!g_massiveMod || !g_massiveMod->_timingWheel)
     {
@@ -277,7 +283,7 @@ static uint32_t Bridge_ScheduleTimer(int delayMs,
     }
 
     auto    &mod     = *g_massiveMod;
-    uint32_t timerID = mod._nextTimerID.fetch_add(1, std::memory_order_relaxed);
+    uint32 timerID = mod._nextTimerID.fetch_add(1, std::memory_order_relaxed);
 
     auto ctx = mod._ctx;
     mod._timerCallbacks[timerID] = {block, ctx};
@@ -297,7 +303,7 @@ static uint32_t Bridge_ScheduleTimer(int delayMs,
     return timerID;
 }
 
-static void Bridge_CancelTimer(uint32_t timerID)
+static void Bridge_CancelTimer(uint32 timerID)
 {
     if (!g_massiveMod)
     {
@@ -314,16 +320,17 @@ static void Bridge_CancelTimer(uint32_t timerID)
     Log::Debug("MassiveModule::CancelTimer: id={}", timerID);
 }
 
-// ═══════════════════════════════════════════════════════════════
-// 3.6 工具函数
-// ═══════════════════════════════════════════════════════════════
+/** @} */
+
+/** @name 工具函数 */
+/** @{ */
 
 static float Bridge_GetDeltaTime()
 {
     return 0.02f;
 }
 
-static uint64_t Bridge_FindEntityBySession(uint32_t sessionID)
+static uint64 Bridge_FindEntityBySession(uint32 sessionID)
 {
     auto *sessions = g_massiveMod ? g_massiveMod->_sessions : nullptr;
     if (!sessions)
@@ -338,8 +345,10 @@ static uint64_t Bridge_FindEntityBySession(uint32_t sessionID)
     }
 
     auto &entity = it->second.entity;
-    return (static_cast<uint64_t>(entity.sceneId) << 32) | entity.entityId;
+    return (static_cast<uint64>(entity.sceneId) << 32) | entity.entityId;
 }
+
+/** @} */
 
 // ── 日志函数 ──
 

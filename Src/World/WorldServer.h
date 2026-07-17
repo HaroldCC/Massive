@@ -31,6 +31,7 @@
 #include "World/Handler/EnterWorldHandler.h"
 #include "World/Handler/MoveHandler.h"
 #include "World/LogicThread.h"
+#include "World/System/System.h"
 #include "World/WorldConfig.h"
 #include "World/WorldSession.h"
 
@@ -81,8 +82,14 @@ namespace MMO
         // ── 断线超时 ──
         void OnDisconnectTimeout(uint32 accountID);
 
-        // ── 网络复制（Phase 5）──
-        void SystemReplicate(ECS::Scene &scene, float dt);
+        /**
+         * @brief 网络复制：消费 AOI 可见集 → 差量同步 → SendToClient
+         * @param scene      目标场景
+         * @param dt         帧间隔
+         * @param visibleSets  AOI 计算结果（playerEID → VisibleSet）
+         */
+        void SystemReplicate(ECS::Scene &scene, float dt,
+                             const std::unordered_map<uint32_t, VisibleSet> &visibleSets);
 
         // ── Center 通知 ──
         void NotifyCenterPlayerOnline(uint32 accountID);

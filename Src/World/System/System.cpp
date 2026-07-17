@@ -100,14 +100,11 @@ namespace MMO
     // 调度入口
     // ═══════════════════════════════════════════════════════════════
 
-    void RunCPPSystems(ECS::Scene &scene, float dt)
+    void RunCPPSystems(ECS::Scene &scene, float dt,
+                       std::unordered_map<uint32_t, VisibleSet> &outVisibleSets)
     {
         SystemMovement(scene, dt);
-
-        // AOI 结果由 WorldServer 持有（Phase 4+ 供 ReplicateSystem 消费）
-        // Phase 4 MVP: 仅计算并丢弃——验证 AOI 环路
-        std::unordered_map<uint32_t, VisibleSet> visibleSets;
-        SystemAOI(scene, visibleSets);
+        SystemAOI(scene, outVisibleSets);
     }
 
 } // namespace MMO

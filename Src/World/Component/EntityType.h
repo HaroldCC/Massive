@@ -7,7 +7,7 @@
  */
 #pragma once
 
-#include <cstdint>
+#include "Common/Core/Types.h"
 
 namespace MMO
 {
@@ -15,11 +15,11 @@ namespace MMO
     /**
      * @brief 实体类型——EnTT + Protobuf 共用
      */
-    enum class EEntityType : int32_t
+    enum class EEntityType : int32
     {
-        Player  = 1,
-        NPC     = 2,
-        Monster = 3,
+        ENTITY_PLAYER  = 1,
+        ENTITY_NPC     = 2,
+        ENTITY_MONSTER = 3,
     };
 
 } // namespace MMO

@@ -5,6 +5,7 @@
  * 所有 CPPSystems 在 LogicThread 中顺序执行，操作 EnTT Component。
  * Phase 3: MovementSystem
  * Phase 4: + AOISystem（全量遍历空间索引）
+ * Phase 5: + ReplicateSystem（网络复制，在 WorldServer 中实现）
  */
 #pragma once
 
@@ -23,6 +24,11 @@ namespace MMO
 
     // ── Phase 3: 物理模拟 ──
 
+    /**
+     * @brief Position += Velocity × dt
+     * @param scene 目标场景
+     * @param dt    帧间隔（固定 0.02f）
+     */
     void SystemMovement(ECS::Scene &scene, float dt);
 
     // ── Phase 4: 空间索引 ──
@@ -59,7 +65,12 @@ namespace MMO
      *
      * 执行顺序：MovementSystem → AOISystem
      * 在 OnTick 中脚本 Update() 之后调用。
+     *
+     * @param scene         目标场景
+     * @param dt            帧间隔
+     * @param outVisibleSets  [输出] AOI 计算结果，供 ReplicateSystem 复用
      */
-    void RunCPPSystems(ECS::Scene &scene, float dt);
+    void RunCPPSystems(ECS::Scene &scene, float dt,
+                       std::unordered_map<uint32_t, VisibleSet> &outVisibleSets);
 
 } // namespace MMO

@@ -299,10 +299,11 @@ namespace MMO
             auto *scene = _sceneMgr.GetDefaultScene();
             if (scene)
             {
-                RunCPPSystems(*scene, 0.02f);
+                std::unordered_map<uint32_t, VisibleSet> visibleSets;
+                RunCPPSystems(*scene, 0.02f, visibleSets);
 
                 // 6. ReplicateSystem — 消费 AOI 结果做网络复制
-                SystemReplicate(*scene, 0.02f);
+                SystemReplicate(*scene, 0.02f, visibleSets);
             }
         }
     }
@@ -711,16 +712,12 @@ namespace MMO
         return true;
     }
 
-    void WorldServer::SystemReplicate(ECS::Scene &scene, float dt)
+    void WorldServer::SystemReplicate(ECS::Scene &scene, float dt,
+                                       const std::unordered_map<uint32, VisibleSet> &visibleSets)
     {
         (void)dt;
         auto &reg = scene.Registry();
 
-        // ── 1. 计算本帧 AOI ──
-        std::unordered_map<uint32_t, VisibleSet> visibleSets;
-        SystemAOI(scene, visibleSets);
-
-        // ── 2. 对每个在线 player 做差量同步 ──
         for (auto &[sessionID, ws] : _sessions)
         {
             if (ws.disconnected || !ws.entity.IsValid())
@@ -728,7 +725,7 @@ namespace MMO
                 continue;
             }
 
-            uint32_t playerEID = ws.entity.entityId;
+            uint32 playerEID = ws.entity.entityId;
 
             auto itVs = visibleSets.find(playerEID);
             if (itVs == visibleSets.end())
@@ -741,7 +738,7 @@ namespace MMO
             Proto::EntityReplicateNtf ntf;
 
             // 2a. 新进入 AOI → Spawn
-            for (uint32_t eid : vs.entityIDs)
+            for (uint32 eid : vs.entityIDs)
             {
                 if (prevVisible.contains(eid))
                 {
@@ -757,9 +754,9 @@ namespace MMO
                 {
                     auto &pos = reg.get<Position>(ee);
                     auto *pd  = spawn->mutable_position();
-                    pd->set_x(static_cast<int32_t>(pos.x * 100.0f));
-                    pd->set_y(static_cast<int32_t>(pos.y * 100.0f));
-                    pd->set_z(static_cast<int32_t>(pos.z * 100.0f));
+                    pd->set_x(static_cast<int32>(pos.x * 100.0f));
+                    pd->set_y(static_cast<int32>(pos.y * 100.0f));
+                    pd->set_z(static_cast<int32>(pos.z * 100.0f));
                 }
 
                 if (reg.all_of<Health>(ee))
@@ -771,11 +768,11 @@ namespace MMO
 
                 if (reg.all_of<MonsterTag>(ee))
                 {
-                    spawn->set_entity_type(static_cast<uint32_t>(EEntityType::Monster));
+                    spawn->set_entity_type(static_cast<uint32>(EEntityType::ENTITY_MONSTER));
                 }
                 else if (reg.all_of<PlayerTag>(ee))
                 {
-                    spawn->set_entity_type(static_cast<uint32_t>(EEntityType::Player));
+                    spawn->set_entity_type(static_cast<uint32>(EEntityType::ENTITY_PLAYER));
                 }
 
                 prevVisible.insert(eid);
@@ -783,14 +780,14 @@ namespace MMO
 
             // 2b. 离开 AOI → Despawn
             {
-                std::unordered_set<uint32_t> currentVisible;
-                for (uint32_t eid : vs.entityIDs)
+                std::unordered_set<uint32> currentVisible;
+                for (uint32 eid : vs.entityIDs)
                 {
                     currentVisible.insert(eid);
                 }
 
-                std::vector<uint32_t> toRemove;
-                for (uint32_t oldEid : prevVisible)
+                std::vector<uint32> toRemove;
+                for (uint32 oldEid : prevVisible)
                 {
                     if (!currentVisible.contains(oldEid))
                     {
@@ -799,16 +796,14 @@ namespace MMO
                         toRemove.push_back(oldEid);
                     }
                 }
-                for (uint32_t eid : toRemove)
+                for (uint32 eid : toRemove)
                 {
                     prevVisible.erase(eid);
                 }
             }
 
             // 2c. 脏组件 → Update
-            // Phase 5 MVP: 每帧全量 Update（不做差量）
-            // Phase 6+: DirtyTracker 驱动差量
-            for (uint32_t eid : vs.entityIDs)
+            for (uint32 eid : vs.entityIDs)
             {
                 if (!prevVisible.contains(eid))
                 {
@@ -824,9 +819,9 @@ namespace MMO
                 {
                     auto &pos = reg.get<Position>(ee);
                     auto *pd  = update->mutable_position();
-                    pd->set_x(static_cast<int32_t>(pos.x * 100.0f));
-                    pd->set_y(static_cast<int32_t>(pos.y * 100.0f));
-                    pd->set_z(static_cast<int32_t>(pos.z * 100.0f));
+                    pd->set_x(static_cast<int32>(pos.x * 100.0f));
+                    pd->set_y(static_cast<int32>(pos.y * 100.0f));
+                    pd->set_z(static_cast<int32>(pos.z * 100.0f));
                 }
 
                 if (reg.all_of<Health>(ee))
