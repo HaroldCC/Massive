@@ -1,9 +1,13 @@
 /**
  * @file MassiveModule.cpp
- * @brief MassiveModule 实现 — Phase 2 完整桥接层
+ * @brief MassiveModule 实现 — Phase 2 完整桥接层（安全修复）
  *
- * 15 个函数分 5 组：空间查询、属性查询、Tag 判断、世界交互、定时器。
- * 所有桥接函数通过全局 g_massiveMod 指针访问 C++ 世界。
+ * 本次改动目的：修复脚本桥接层中的不安全内存操作与裸指针返回。
+ * - 使用 DasHelpers::CreateDasArrayFromVector 在 das::Context 中安全分配并构造 das::TArray
+ * - 将 EntityGetBattleStats 改为按值返回 MMO::BattleStats（避免 ctx->allocate 裸指针）
+ * - 定时器回调继续使用共享的 das::ContextPtr 保证生命周期（类型定义已在头文件中）
+ *
+ * 说明：本文件保留原有分组与注册逻辑，仅替换不安全实现为受控实现，注册部分暂不变。
  */
 
 #include "Common/ECS/MassiveModule.h"
@@ -25,6 +29,8 @@
 #include "World/SceneManager.h"
 #include "World/WorldServer.h"
 #include "World/WorldSession.h"
+
+#include "Engine/DasHelpers.h"
 
 // ── 全局指针：BindFunctions 时设定，所有静态桥接函数通过它访问上下文 ──
 namespace
@@ -87,17 +93,28 @@ static das::float3 Bridge_EntityPosition(uint64 fullEntityId)
     return das::float3(pos.x, pos.y, pos.z);
 }
 
+/**
+ * @brief 在给定半径内查询实体
+ *
+ * 注意：该实现改为先在 C++ 侧收集结果到 std::vector，再通过 DasHelpers
+ * 在 das::Context 中分配并构造 das::TArray 返回，避免直接写入 TArray 内部内存。
+ *
+ * @param center 查询中心
+ * @param radius 半径
+ * @param ctx    调用时传入的 das::Context（由绑定注册时传入）
+ * @return das::TArray<uint64> 返回的实体 fullID 列表（sceneID<<32 | entityID）
+ */
 static das::TArray<uint64> Bridge_EntitiesInRadius(const das::float3 &center,
-                                                     float               radius)
+                                                   float               radius,
+                                                   das::Context       *ctx)
 {
-    // Phase 5+: TArray 需要 das::Context 分配——当前函数未注册，待 Phase 6 类型工厂实现时一起启用
-    das::TArray<uint64> result;
+    std::vector<uint64_t> tmp;
 
     auto *sceneMgr = g_massiveMod ? g_massiveMod->_sceneMgr : nullptr;
     auto *scene    = sceneMgr ? sceneMgr->GetDefaultScene() : nullptr;
-    if (!scene)
+    if (!scene || !ctx)
     {
-        return result;
+        return das::TArray<uint64>();
     }
 
     auto view = scene->Registry().view<const Position>();
@@ -109,12 +126,11 @@ static das::TArray<uint64> Bridge_EntitiesInRadius(const das::float3 &center,
         {
             uint32 eid    = static_cast<uint32>(entt::to_integral(e));
             uint64 fullID = (static_cast<uint64>(scene->SceneID()) << 32) | eid;
-            reinterpret_cast<uint64 *>(result.data)[result.size] = fullID;
-            result.size++;
+            tmp.push_back(fullID);
         }
     }
 
-    return result;
+    return DasHelpers::CreateDasArrayFromVector<uint64>(ctx, tmp);
 }
 
 /** @} */
@@ -122,41 +138,36 @@ static das::TArray<uint64> Bridge_EntitiesInRadius(const das::float3 &center,
 /** @name 属性查询 */
 /** @{ */
 
-static BattleStats *Bridge_EntityGetBattleStats(uint64 fullEntityId)
+/**
+ * @brief 获取实体战斗属性
+ *
+ * 为避免在宿主堆上分配裸指针并将其返回给脚本（所有权不明确），函数改为按值返回
+ * MMO::BattleStats（POD 结构体，拷贝开销极小）。
+ *
+ * @param fullEntityId 场景与实体组合 ID
+ * @return MMO::BattleStats 按值返回的战斗属性快照
+ */
+static MMO::BattleStats Bridge_EntityGetBattleStats(uint64 fullEntityId)
 {
+    MMO::BattleStats stats{}; // default 初始化
     auto [scene, valid, e] = ResolveEntity(fullEntityId);
     if (!valid)
     {
-        return nullptr;
+        return stats;
     }
 
     Entity ent{scene->SceneID(), static_cast<uint32>(e)};
 
-    if (!scene->HasComponent<BattleStats>(ent) && !scene->HasComponent<Health>(ent))
-    {
-        return nullptr;
-    }
-
-    auto *ctx   = g_massiveMod ? g_massiveMod->GetContext() : nullptr;
-    auto *stats = ctx ? reinterpret_cast<BattleStats *>(
-                            ctx->allocate(sizeof(BattleStats)))
-                      : nullptr;
-    if (!stats)
-    {
-        return nullptr;
-    }
-    *stats = {};
-
     if (scene->HasComponent<BattleStats>(ent))
     {
-        *stats = scene->GetComponent<BattleStats>(ent);
+        stats = scene->GetComponent<BattleStats>(ent);
     }
 
     if (scene->HasComponent<Health>(ent))
     {
         auto &hp       = scene->GetComponent<Health>(ent);
-        stats->currentHp = hp.current;
-        stats->maxHp     = hp.max;
+        stats.currentHp = hp.current;
+        stats.maxHp     = hp.max;
     }
 
     return stats;
@@ -271,10 +282,15 @@ static void Bridge_SendToClient(uint32 sessionID, uint32 msgID,
                                  static_cast<size_t>(data.size));
 }
 
-/** @} */
-
+/**
+ * @brief ScheduleTimer：在 Module 的 TimingWheel 上注册回调。
+ *
+ * 注意：_timerCallbacks 中保存的是 das::Context 的 shared_ptr（见头文件定义），
+ *       回调触发时直接在 TimingWheel 的执行上下文（LogicThread）中调用 das_invoke，
+ *       因此只需保证 ctx 不被提前销毁。
+ */
 static uint32 Bridge_ScheduleTimer(int32 delayMs,
-                                     const das::TBlock<void, uint32> &block)
+                                   const das::TBlock<void, uint32> &block)
 {
     if (!g_massiveMod || !g_massiveMod->_timingWheel)
     {
@@ -285,14 +301,18 @@ static uint32 Bridge_ScheduleTimer(int32 delayMs,
     auto    &mod     = *g_massiveMod;
     uint32 timerID = mod._nextTimerID.fetch_add(1, std::memory_order_relaxed);
 
-    auto ctx = mod._ctx;
+    // 使用 shared_ptr 保证 Context 在回调前不会被释放
+    auto ctx = mod._ctx; // das::ContextPtr
     mod._timerCallbacks[timerID] = {block, ctx};
 
+    // TimingWheel 的回调在 LogicThread 的上下文中执行（见 LogicThread 实现），
+    // 因此可以安全调用 das_invoke。触发后清理回调条目。
     mod._timingWheel->Schedule(std::chrono::milliseconds(delayMs),
-                               [timerID, ctx, &mod]() {
+                               [timerID, &mod]() {
                                    auto it = mod._timerCallbacks.find(timerID);
                                    if (it != mod._timerCallbacks.end())
                                    {
+                                       // it->second.ctx 是 shared_ptr<das::Context>
                                        das_invoke<void>::invoke(it->second.ctx.get(), nullptr,
                                                                 it->second.block, timerID);
                                        mod._timerCallbacks.erase(it);
