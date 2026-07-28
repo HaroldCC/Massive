@@ -16,7 +16,6 @@
 
 #include "Common/Core/Types.h"
 #include "Common/ECS/Entity.h"
-#include "Common/ECS/ScriptComponentStorage.h"
 
 namespace MMO::ECS
 {
@@ -135,22 +134,9 @@ namespace MMO::ECS
          */
         void RegisterScriptComponent(const std::string &name, size_t componentSize);
 
-        /**
-         * @brief 获取脚本组件存储
-         * @param name  组件名
-         * @return ScriptComponentStorage*，未注册返回 nullptr
-         */
-        ScriptComponentStorage *GetScriptStorage(const std::string &name);
-
-        const std::unordered_map<std::string, std::unique_ptr<ScriptComponentStorage>> &ScriptStorages() const
-        {
-            return _scriptStorages;
-        }
-
     private:
         uint32                                                                   _sceneId;
         entt::registry                                                           _registry;
-        std::unordered_map<std::string, std::unique_ptr<ScriptComponentStorage>> _scriptStorages;
     };
 
 } // namespace MMO::ECS
