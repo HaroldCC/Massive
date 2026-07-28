@@ -14,6 +14,7 @@
 #include "World/Component/Position.h"
 #include "World/Component/Tags.h"
 #include "World/System/System.h"
+#include "World/AutoGen/ProtoBindIndex.gen.h"
 
 #include <Internal/CenterRPC.pb.h>
 #include <Internal/GateRPC.pb.h>
@@ -34,14 +35,14 @@
 #include <daScript/daScriptModule.h>
 
 // vec4f 和 cast<T> 定义在 simulate.h 中
-//（通过 aot.h、simulate.h 已包含）
+// （通过 aot.h、simulate.h 已包含）
 
 // daScript 内建模块声明——必须在命名空间外
 // DECS 依赖 ast_core / rtti_core 等 C++ 原生模块，需要全部注册
 DECLARE_ALL_DEFAULT_MODULES;
 
 // 在 namesapce MMO 外，为全局注册宏提供 DAS_THREAD_LOCAL 环境
-//（daScriptModule.h 需要 ModuleKarma 的 DAS_THREAD_LOCAL 定义）
+// （daScriptModule.h 需要 ModuleKarma 的 DAS_THREAD_LOCAL 定义）
 
 using namespace std::chrono_literals;
 
@@ -181,6 +182,19 @@ namespace MMO
         _running.store(false, std::memory_order_release);
         _logicThread.Stop();
 
+        // 排空脚本定时器回调，避免 Context 析构后触发（CodeReview #5）
+        if (_massiveModule)
+        {
+            _massiveModule->_timerCallbacks.clear();
+        }
+
+        // 先销毁 Context/Program（它们依赖模块数据），再 Shutdown 模块
+        _scriptCtx.reset();
+        _scriptProgram.reset();
+        _massiveModule.reset();
+
+        das::Module::Shutdown(); // CodeReview #2: 官方 Quick Start 5.1.2 要求
+
         if (_gateAcceptor)
         {
             _gateAcceptor->Stop();
@@ -193,8 +207,7 @@ namespace MMO
         Log::Info("WorldServer: stopped");
     }
 
-    void WorldServer::SendRawToClient(uint32 sessionID, uint32 msgID,
-                                      const uint8 *data, size_t len)
+    void WorldServer::SendRawToClient(uint32 sessionID, uint32 msgID, const uint8 *data, size_t len)
     {
         auto it = _sessions.find(sessionID);
         if (it == _sessions.end())
@@ -291,19 +304,39 @@ namespace MMO
         if (_fnUpdate && _scriptCtx)
         {
             _scriptCtx->restart();
-            vec4f args[] = { das::cast<uint32_t>::from(uint32_t(1)),
-                              das::cast<float>::from(0.02f) };
-            _scriptCtx->eval(_fnUpdate, args);
+
+            float dt     = static_cast<float>(elapsed.count()) / 1000.0f;
+            vec4f args[] = {das::cast<uint32_t>::from(uint32_t(1)), das::cast<float>::from(dt)};
+
+            // CodeReview #4: 同步 dt 给 Bridge_GetDeltaTime
+            _massiveModule->_scriptDt.store(dt, std::memory_order_relaxed);
+
+            // CodeReview #6: 使用 evalWithCatch 捕获脚本异常，避免进程崩溃
+            _scriptCtx->evalWithCatch(_fnUpdate, args);
+            if (auto ex = _scriptCtx->getException())
+            {
+                Log::Error("Script Update exception: {}", ex);
+            }
+
+            // CodeReview #3: 基于堆实际增长量自适应触发 GC（优于固定帧计数）
+            // bump allocator 的 restart() 只回卷栈/string heap，不回卷 general heap。
+            // 监控 heap->getTotalBytesAllocated() 增长，超过阈值才触发。
+            uint64_t heapNow = _scriptCtx->heap->getTotalBytesAllocated();
+            if (heapNow - _lastGCHeapSize > 4 * 1024 * 1024) // 堆增长 > 4MB → GC
+            {
+                _scriptCtx->collectHeap(nullptr, true, true);
+                _lastGCHeapSize = _scriptCtx->heap->getTotalBytesAllocated();
+            }
 
             // 5. CPPSystems — 脚本 Tick 后运行 C++ 物理模拟 + AOI
             auto *scene = _sceneMgr.GetDefaultScene();
             if (scene)
             {
                 std::unordered_map<uint32_t, VisibleSet> visibleSets;
-                RunCPPSystems(*scene, 0.02f, visibleSets);
+                RunCPPSystems(*scene, dt, visibleSets);
 
                 // 6. ReplicateSystem — 消费 AOI 结果做网络复制
-                SystemReplicate(*scene, 0.02f, visibleSets);
+                SystemReplicate(*scene, dt, visibleSets);
             }
         }
     }
@@ -404,7 +437,14 @@ namespace MMO
     void WorldServer::OnMessage(uint32 sessionID, WorldSession &ws, const LogicMessage &msg)
     {
         (void)ws;
-        // LogicThread 独占，按 msgID 查表分发
+
+        // Phase 3（23_ProtoScriptBinding.md）：优先尝试脚本分发
+        if (ScriptDispatchRegistry::Dispatch(*this, sessionID, msg.msgID, msg.body.Data(), msg.body.Size()))
+        {
+            return;
+        }
+
+        // 未注册进 ScriptDispatchRegistry 的消息（控制消息、尚未迁移的消息）→ C++ 分发
         auto dispatched = _dispatcher.Dispatch(sessionID, msg.msgID, msg.body.Data(), msg.body.Size());
         if (!dispatched)
         {
@@ -617,14 +657,13 @@ namespace MMO
 
     // ── 脚本引擎（Phase 2）──
 
-    das::ProgramPtr WorldServer::CompileDaScript(const std::string &entryFile,
-                                                   das::ModuleGroup &libGroup)
+    das::ProgramPtr WorldServer::CompileDaScript(const std::string &entryFile, das::ModuleGroup &libGroup)
     {
         auto fAccess = das::make_smart<das::FsFileAccess>();
         fAccess->introduceDaslib();
 
         das::TextWriter logs;
-        auto program = das::compileDaScript(entryFile, fAccess, logs, libGroup);
+        auto            program = das::compileDaScript(entryFile, fAccess, logs, libGroup);
         if (!program)
         {
             Log::Error("CompileDaScript: program is null");
@@ -637,7 +676,8 @@ namespace MMO
             {
                 Log::Error("  {}:{} {}",
                            err.at.fileInfo ? err.at.fileInfo->name.c_str() : "?",
-                           err.at.line, err.what.c_str());
+                           err.at.line,
+                           err.what.c_str());
             }
             return nullptr;
         }
@@ -657,11 +697,8 @@ namespace MMO
         Log::Info("InitScriptEngine: modules initialized");
 
         // 创建 MassiveModule — 注入 4 个上下文指针
-        _massiveModule = std::make_unique<MassiveModule>(
-            this,
-            &_sceneMgr,
-            &_logicThread.GetTimingWheel(),
-            &_sessions);
+        _massiveModule =
+            std::make_unique<MassiveModule>(this, &_sceneMgr, &_logicThread.GetTimingWheel(), &_sessions);
         _massiveModule->BindFunctions();
 
         // 创建 ModuleGroup 并注册 MassiveModule
@@ -676,8 +713,7 @@ namespace MMO
         }
         Log::Info("InitScriptEngine: compile OK");
 
-        _scriptCtx = std::make_shared<das::Context>(
-            _scriptProgram->getContextStackSize());
+        _scriptCtx = std::make_shared<das::Context>(_scriptProgram->getContextStackSize());
 
         // MassiveModule 需要 _ctx 来分配 TArray / alocate（供桥接函数）
         _massiveModule->_ctx = _scriptCtx;
@@ -693,7 +729,12 @@ namespace MMO
         auto fnInit = _scriptCtx->findFunction("Init");
         if (fnInit)
         {
-            _scriptCtx->eval(fnInit, nullptr);  // Init() 无参
+            // CodeReview #6: 使用 evalWithCatch 捕获脚本异常
+            _scriptCtx->evalWithCatch(fnInit, nullptr);
+            if (auto ex = _scriptCtx->getException())
+            {
+                Log::Error("InitScriptEngine: Init() exception: {}", ex);
+            }
             _fnInit = fnInit;
             Log::Info("InitScriptEngine: Init() called");
         }
@@ -708,12 +749,21 @@ namespace MMO
             Log::Info("InitScriptEngine: Update() cached");
         }
 
+        // Phase 3（23_ProtoScriptBinding.md）：缓存 dispatch_msg() 并注册消息分发
+        _fnDispatchMsg = _scriptCtx->findFunction("dispatch_msg");
+        if (_fnDispatchMsg)
+        {
+            Log::Info("InitScriptEngine: dispatch_msg() cached");
+            RegisterAllMsgDispatch();
+        }
+
         Log::Info("InitScriptEngine: OK");
         return true;
     }
 
-    void WorldServer::SystemReplicate(ECS::Scene &scene, float dt,
-                                       const std::unordered_map<uint32, VisibleSet> &visibleSets)
+    void WorldServer::SystemReplicate(ECS::Scene                                   &scene,
+                                      float                                         dt,
+                                      const std::unordered_map<uint32, VisibleSet> &visibleSets)
     {
         (void)dt;
         auto &reg = scene.Registry();
@@ -734,7 +784,7 @@ namespace MMO
             }
             const auto &vs = itVs->second;
 
-            auto &prevVisible = _aoiStates[playerEID];
+            auto                     &prevVisible = _aoiStates[playerEID];
             Proto::EntityReplicateNtf ntf;
 
             // 2a. 新进入 AOI → Spawn
@@ -748,7 +798,7 @@ namespace MMO
                 auto *spawn = ntf.add_spawns();
                 spawn->set_entity_id(eid);
 
-                entt::entity ee{static_cast<entt::entity>(eid)};
+                entt::entity ee {static_cast<entt::entity>(eid)};
 
                 if (reg.all_of<Position>(ee))
                 {
@@ -813,7 +863,7 @@ namespace MMO
                 auto *update = ntf.add_updates();
                 update->set_entity_id(eid);
 
-                entt::entity ee{static_cast<entt::entity>(eid)};
+                entt::entity ee {static_cast<entt::entity>(eid)};
 
                 if (reg.all_of<Position>(ee))
                 {
@@ -851,8 +901,7 @@ namespace MMO
                     if (ntf.SerializeToArray(buf.WritePtr(), static_cast<int>(bodySize)))
                     {
                         buf.SetWritePos(bodySize);
-                        SendRawToClient(sessionID, Proto::MSG_ENTITY_REPLICATE_NTF,
-                                        buf.Data(), buf.Size());
+                        SendRawToClient(sessionID, Proto::MSG_ENTITY_REPLICATE_NTF, buf.Data(), buf.Size());
                     }
                 }
             }

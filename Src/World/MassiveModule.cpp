@@ -4,9 +4,13 @@
  *
  * 15 个函数分 5 组：空间查询、属性查询、Tag 判断、世界交互、定时器。
  * 所有桥接函数通过全局 g_massiveMod 指针访问 C++ 世界。
+ *
+ * Phase 3（本文档 #23）：引入 RegisterAllProtoMessageTypes 注册 protobuf
+ * 消息的 ManagedStructureAnnotation。
  */
 
 #include "Common/ECS/MassiveModule.h"
+#include "World/AutoGen/ProtoBindIndex.gen.h"
 
 #include <chrono>
 
@@ -293,7 +297,9 @@ static uint32 Bridge_ScheduleTimer(int32 delayMs,
                                    auto it = mod._timerCallbacks.find(timerID);
                                    if (it != mod._timerCallbacks.end())
                                    {
-                                       das_invoke<void>::invoke(it->second.ctx.get(), nullptr,
+                                       // CodeReview #5: 使用 lambda 内按值捕获的 ctx，
+                                       // 避免 it->second.ctx 在 Stop() 后被重置
+                                       das_invoke<void>::invoke(ctx.get(), nullptr,
                                                                 it->second.block, timerID);
                                        mod._timerCallbacks.erase(it);
                                    }
@@ -327,7 +333,9 @@ static void Bridge_CancelTimer(uint32 timerID)
 
 static float Bridge_GetDeltaTime()
 {
-    return 0.02f;
+    // CodeReview #4: 通过 Bridge 全局指针读取最新 dt（由 OnTick 每帧更新）
+    // 默认 0.02f 用于 Init() 阶段（早于第一个 OnTick）
+    return g_massiveMod ? g_massiveMod->_scriptDt.load(std::memory_order_relaxed) : 0.02f;
 }
 
 static uint64 Bridge_FindEntityBySession(uint32 sessionID)
@@ -483,6 +491,15 @@ namespace MMO
         addExtern<DAS_BIND_FUN(Bridge_LogError)>(*this, lib, "LogError",
                                                  SideEffects::modifyExternal)
             ->args({"text", "context", "at"});
+
+        // ── Phase 3: Protobuf 消息类型注册（23_ProtoScriptBinding.md）──
+        RegisterAllProtoMessageTypes(*this, lib);
     }
 
+// ── 双注册宏（官方 External Modules 5.4.5.1 要求）──
+// REGISTER_DYN_MODULE: 动态二进制入口（daslang）；REGISTER_MODULE: 静态二进制兼容（daslang_static）
+REGISTER_DYN_MODULE(MassiveModule, MassiveModule);
+REGISTER_MODULE(MassiveModule);
+
 } // namespace MMO
+

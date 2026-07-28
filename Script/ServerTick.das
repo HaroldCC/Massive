@@ -1,11 +1,12 @@
 // ServerTick.das — 顶层 Tick 调度入口
 // 所属: WorldServer
-// Phase 3: 脚本 Tick + CPPSystems (MovementSystem)
+// Phase 3 (23_ProtoScriptBinding.md): 引入 Handlers.das 以注册 [msg_handler]
 
 options gen2
 options indenting = 4
 
 require massive
+require Handlers
 
 var testEntityId : uint64
 
@@ -25,6 +26,9 @@ def Init()
     LogInfo("IsPlayer={EntityIsPlayer(testEntityId)}")
     LogInfo("IsDead={EntityIsDead(testEntityId)}")
     LogInfo("Phase 3 init done")
+
+    // Phase 3: 校验 handler 注册完整性
+    validate_handler_registry()
 }
 
 [export]

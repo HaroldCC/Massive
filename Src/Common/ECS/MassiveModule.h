@@ -42,6 +42,8 @@ namespace MMO
     class MassiveModule : public das::Module
     {
     public:
+        MassiveModule() = default;
+
         /**
          * @brief 构造并注册全部桥接函数
          * @param worldServer   WorldServer 实例（供 SendRawToClient）
@@ -80,6 +82,9 @@ namespace MMO
         std::unordered_map<uint32, WorldSession> *_sessions    = nullptr;
 
         std::shared_ptr<das::Context> _ctx;
+
+        /// CodeReview #4: 每帧由 OnTick 更新，Bridge_GetDeltaTime 读取
+        std::atomic<float> _scriptDt{0.02f};
 
         struct TimerCallback
         {
