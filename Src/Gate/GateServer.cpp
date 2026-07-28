@@ -303,7 +303,7 @@ namespace MMO
         // 零分配序列化
         size_t bodySize = static_cast<size_t>(rsp.ByteSizeLong());
         auto   bodyBuf  = ByteBuffer::Own(bodySize);
-        std::ignore = rsp.SerializeToArray(bodyBuf.WritePtr(), static_cast<int>(bodySize));
+        std::ignore     = rsp.SerializeToArray(bodyBuf.WritePtr(), static_cast<int>(bodySize));
         bodyBuf.SetWritePos(bodySize);
 
         // 构建 PacketHeader + Body
@@ -330,7 +330,7 @@ namespace MMO
                                     [[maybe_unused]] const Proto::HeartbeatReq &req)
     {
         Proto::HeartbeatRsp rsp;
-        auto nowMs = static_cast<uint64>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        auto                nowMs = static_cast<uint64>(std::chrono::duration_cast<std::chrono::milliseconds>(
                                              std::chrono::system_clock::now().time_since_epoch())
                                              .count());
         rsp.set_server_time(nowMs);
@@ -338,7 +338,7 @@ namespace MMO
         // 零分配序列化
         size_t bodySize = static_cast<size_t>(rsp.ByteSizeLong());
         auto   bodyBuf  = ByteBuffer::Own(bodySize);
-        std::ignore = rsp.SerializeToArray(bodyBuf.WritePtr(), static_cast<int>(bodySize));
+        std::ignore     = rsp.SerializeToArray(bodyBuf.WritePtr(), static_cast<int>(bodySize));
         bodyBuf.SetWritePos(bodySize);
 
         // 构建 PacketHeader + Body

@@ -51,10 +51,10 @@ namespace MMO
          * @param timingWheel   LogicThread 独占定时器（供 ScheduleTimer）
          * @param sessions      WorldServer::_sessions 引用（供 FindEntityBySession）
          */
-        MassiveModule(WorldServer                               *worldServer,
-                      SceneManager                              *sceneMgr,
-                      TimingWheel                               *timingWheel,
-                      std::unordered_map<uint32, WorldSession>  *sessions);
+        MassiveModule(WorldServer                              *worldServer,
+                      SceneManager                             *sceneMgr,
+                      TimingWheel                              *timingWheel,
+                      std::unordered_map<uint32, WorldSession> *sessions);
 
         ~MassiveModule() override;
 
@@ -84,15 +84,16 @@ namespace MMO
         std::shared_ptr<das::Context> _ctx;
 
         /// CodeReview #4: 每帧由 OnTick 更新，Bridge_GetDeltaTime 读取
-        std::atomic<float> _scriptDt{0.02f};
+        std::atomic<float> _scriptDt {0.02f};
 
         struct TimerCallback
         {
-            das::TBlock<void, uint32_t>     block;
-            std::shared_ptr<das::Context>   ctx;
+            das::TBlock<void, uint32_t>   block;
+            std::shared_ptr<das::Context> ctx;
         };
+
         std::unordered_map<uint32_t, TimerCallback> _timerCallbacks;
-        std::atomic<uint32_t>                        _nextTimerID {1};
+        std::atomic<uint32_t>                       _nextTimerID {1};
     };
 
 } // namespace MMO

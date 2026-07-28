@@ -58,18 +58,23 @@ namespace MMO
          * @param data       protobuf 序列化后的字节数组
          * @param len        字节长度
          */
-        void SendRawToClient(uint32 sessionID, uint32 msgID,
-                            const uint8 *data, size_t len);
+        void SendRawToClient(uint32 sessionID, uint32 msgID, const uint8 *data, size_t len);
 
         /**
          * @brief 获取脚本 Context（供 *.gen.cpp 中的 Dispatch 函数使用）
          */
-        das::Context *GetScriptContext() const { return _scriptCtx.get(); }
+        das::Context *GetScriptContext() const
+        {
+            return _scriptCtx.get();
+        }
 
         /**
          * @brief 获取 dispatch_msg 函数缓存（供 *.gen.cpp 中的 Dispatch 函数使用）
          */
-        das::SimFunction *GetDispatchMsgFunction() const { return _fnDispatchMsg; }
+        das::SimFunction *GetDispatchMsgFunction() const
+        {
+            return _fnDispatchMsg;
+        }
 
     private:
         // ── Init 阶段 ──
@@ -99,7 +104,8 @@ namespace MMO
          * @param dt         帧间隔
          * @param visibleSets  AOI 计算结果（playerEID → VisibleSet）
          */
-        void SystemReplicate(ECS::Scene &scene, float dt,
+        void SystemReplicate(ECS::Scene                                     &scene,
+                             float                                           dt,
                              const std::unordered_map<uint32_t, VisibleSet> &visibleSets);
 
         // ── Center 通知 ──
@@ -138,8 +144,7 @@ namespace MMO
          * @param entryFile  入口 .das 文件路径
          * @return 编译成功的 Program；失败返回 nullptr
          */
-        das::ProgramPtr CompileDaScript(const std::string &entryFile,
-                                            das::ModuleGroup &libGroup);
+        das::ProgramPtr CompileDaScript(const std::string &entryFile, das::ModuleGroup &libGroup);
 
         /**
          * @brief 加密 protobuf 消息并发送到客户端
@@ -214,12 +219,12 @@ namespace MMO
         std::atomic<bool> _running {false};
 
         // ── 脚本引擎（Phase 2）──
-        std::shared_ptr<das::Context>     _scriptCtx;       // DasLang 执行上下文
-        das::ProgramPtr                   _scriptProgram;  // 当前编译的脚本 Program
-        das::SimFunction                 *_fnInit   = nullptr; // 脚本 init() 函数
-        das::SimFunction                 *_fnUpdate = nullptr; // 脚本 update() 函数
-        das::SimFunction                 *_fnDispatchMsg = nullptr; // 脚本 dispatch_msg() 函数
-        std::unique_ptr<MassiveModule>    _massiveModule;   // 桥接模块（持有 WorldServer raw ptr）
+        std::shared_ptr<das::Context>  _scriptCtx;               // DasLang 执行上下文
+        das::ProgramPtr                _scriptProgram;           // 当前编译的脚本 Program
+        das::SimFunction              *_fnInit        = nullptr; // 脚本 init() 函数
+        das::SimFunction              *_fnUpdate      = nullptr; // 脚本 update() 函数
+        das::SimFunction              *_fnDispatchMsg = nullptr; // 脚本 dispatch_msg() 函数
+        std::unique_ptr<MassiveModule> _massiveModule;           // 桥接模块（持有 WorldServer raw ptr）
 
         /// CodeReview #3: 自适应 GC 的堆大小基线（GC 后更新）
         uint64_t _lastGCHeapSize = 0;

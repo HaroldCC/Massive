@@ -225,13 +225,13 @@ namespace MMO
              */
             std::array<char, 4096> stackBuf;
             auto                   result = fmt::format_to_n(stackBuf.data(),
-                                                             stackBuf.size() - 1, /**< 预留 '\0' */
-                                                             "[{:#010X}] [{}:{} {}] {}",
-                                                             Log::GetTraceID(),
-                                                             file,
-                                                             line,
-                                                             func,
-                                                             message);
+                                           stackBuf.size() - 1, /**< 预留 '\0' */
+                                           "[{:#010X}] [{}:{} {}] {}",
+                                           Log::GetTraceID(),
+                                           file,
+                                           line,
+                                           func,
+                                           message);
 
             if (result.size < stackBuf.size() - 1)
             {
@@ -245,13 +245,13 @@ namespace MMO
                 // 超长消息（罕见）：fallback 更大的栈 buffer
                 std::array<char, 8192> largeBuf;
                 auto                   largeResult              = fmt::format_to_n(largeBuf.data(),
-                                                                                   largeBuf.size() - 1,
-                                                                                   "[{:#010X}] [{}:{} {}] {}",
-                                                                                   Log::GetTraceID(),
-                                                                                   file,
-                                                                                   line,
-                                                                                   func,
-                                                                                   message);
+                                                    largeBuf.size() - 1,
+                                                    "[{:#010X}] [{}:{} {}] {}",
+                                                    Log::GetTraceID(),
+                                                    file,
+                                                    line,
+                                                    func,
+                                                    message);
                 largeBuf[static_cast<size_t>(largeResult.size)] = '\0';
                 spdlog::string_view_t payload(largeBuf.data(), largeResult.size);
                 logger->log(spdLevel, payload);

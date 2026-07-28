@@ -26,8 +26,7 @@ namespace MMO
      * @brief 脚本分发函数签名——解析 protobuf + 转发到 daScript
      * @return 解析成功且已转发返回 true；解析失败返回 false
      */
-    using ScriptDispatchFn = bool (*)(WorldServer &server, uint32 sessionID,
-                                      const uint8 *body, size_t len);
+    using ScriptDispatchFn = bool (*)(WorldServer &server, uint32 sessionID, const uint8 *body, size_t len);
 
     /**
      * @brief msgID → ScriptDispatchFn 定长表，O(1) 查表
@@ -44,8 +43,8 @@ namespace MMO
          * @brief 按 msgID 查表并分发
          * @return 找到对应分发函数且分发成功返回 true；未注册该 msgID 返回 false
          */
-        static bool Dispatch(WorldServer &server, uint32 sessionID, uint32 msgID,
-                              const uint8 *body, size_t len);
+        static bool
+        Dispatch(WorldServer &server, uint32 sessionID, uint32 msgID, const uint8 *body, size_t len);
 
     private:
         static std::array<ScriptDispatchFn, kMaxHandlers> &Table();

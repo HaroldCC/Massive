@@ -41,8 +41,8 @@ namespace MMO
     struct VisibleSet
     {
         std::vector<uint32_t> entityIDs;
-        float viewRadiusXZ = 100.0f;
-        float viewRadiusY  = 15.0f;
+        float                 viewRadiusXZ = 100.0f;
+        float                 viewRadiusY  = 15.0f;
     };
 
     /**
@@ -55,8 +55,7 @@ namespace MMO
      * @param scene         目标场景
      * @param outVisibleSets  输出：playerEID → VisibleSet
      */
-    void SystemAOI(ECS::Scene &scene,
-                   std::unordered_map<uint32_t, VisibleSet> &outVisibleSets);
+    void SystemAOI(ECS::Scene &scene, std::unordered_map<uint32_t, VisibleSet> &outVisibleSets);
 
     // ── 调度入口 ──
 
@@ -70,7 +69,6 @@ namespace MMO
      * @param dt            帧间隔
      * @param outVisibleSets  [输出] AOI 计算结果，供 ReplicateSystem 复用
      */
-    void RunCPPSystems(ECS::Scene &scene, float dt,
-                       std::unordered_map<uint32_t, VisibleSet> &outVisibleSets);
+    void RunCPPSystems(ECS::Scene &scene, float dt, std::unordered_map<uint32_t, VisibleSet> &outVisibleSets);
 
 } // namespace MMO

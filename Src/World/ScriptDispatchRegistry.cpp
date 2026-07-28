@@ -11,7 +11,7 @@ namespace MMO
 
     std::array<ScriptDispatchFn, kMaxHandlers> &ScriptDispatchRegistry::Table()
     {
-        static std::array<ScriptDispatchFn, kMaxHandlers> table{};
+        static std::array<ScriptDispatchFn, kMaxHandlers> table {};
         return table;
     }
 
@@ -25,8 +25,11 @@ namespace MMO
         Table()[msgID] = fn;
     }
 
-    bool ScriptDispatchRegistry::Dispatch(WorldServer &server, uint32 sessionID, uint32 msgID,
-                                            const uint8 *body, size_t len)
+    bool ScriptDispatchRegistry::Dispatch(WorldServer &server,
+                                          uint32       sessionID,
+                                          uint32       msgID,
+                                          const uint8 *body,
+                                          size_t       len)
     {
         if (msgID >= kMaxHandlers || !Table()[msgID])
         {

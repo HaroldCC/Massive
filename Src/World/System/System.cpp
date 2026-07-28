@@ -40,8 +40,7 @@ namespace MMO
     // Phase 4: AOISystem — 全量遍历空间索引
     // ═══════════════════════════════════════════════════════════════
 
-    void SystemAOI(ECS::Scene &scene,
-                   std::unordered_map<uint32_t, VisibleSet> &outVisibleSets)
+    void SystemAOI(ECS::Scene &scene, std::unordered_map<uint32_t, VisibleSet> &outVisibleSets)
     {
         auto &reg = scene.Registry();
 
@@ -51,14 +50,14 @@ namespace MMO
             uint32_t id;
             float    x, y, z;
         };
+
         std::vector<EntityEntry> entities;
         {
             auto view = reg.view<const Position>();
             entities.reserve(view.size());
             for (auto [e, pos] : view.each())
             {
-                entities.push_back(
-                    {static_cast<uint32_t>(entt::to_integral(e)), pos.x, pos.y, pos.z});
+                entities.push_back({static_cast<uint32_t>(entt::to_integral(e)), pos.x, pos.y, pos.z});
             }
         }
 
@@ -100,8 +99,7 @@ namespace MMO
     // 调度入口
     // ═══════════════════════════════════════════════════════════════
 
-    void RunCPPSystems(ECS::Scene &scene, float dt,
-                       std::unordered_map<uint32_t, VisibleSet> &outVisibleSets)
+    void RunCPPSystems(ECS::Scene &scene, float dt, std::unordered_map<uint32_t, VisibleSet> &outVisibleSets)
     {
         SystemMovement(scene, dt);
         SystemAOI(scene, outVisibleSets);
