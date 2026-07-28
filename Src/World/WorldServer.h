@@ -31,6 +31,7 @@
 #include "World/Handler/EnterWorldHandler.h"
 #include "World/Handler/MoveHandler.h"
 #include "World/LogicThread.h"
+#include "World/ScriptDispatchRegistry.h"
 #include "World/System/System.h"
 #include "World/WorldConfig.h"
 #include "World/WorldSession.h"
@@ -59,6 +60,16 @@ namespace MMO
          */
         void SendRawToClient(uint32 sessionID, uint32 msgID,
                             const uint8 *data, size_t len);
+
+        /**
+         * @brief 获取脚本 Context（供 *.gen.cpp 中的 Dispatch 函数使用）
+         */
+        das::Context *GetScriptContext() const { return _scriptCtx.get(); }
+
+        /**
+         * @brief 获取 dispatch_msg 函数缓存（供 *.gen.cpp 中的 Dispatch 函数使用）
+         */
+        das::SimFunction *GetDispatchMsgFunction() const { return _fnDispatchMsg; }
 
     private:
         // ── Init 阶段 ──
@@ -207,7 +218,11 @@ namespace MMO
         das::ProgramPtr                   _scriptProgram;  // 当前编译的脚本 Program
         das::SimFunction                 *_fnInit   = nullptr; // 脚本 init() 函数
         das::SimFunction                 *_fnUpdate = nullptr; // 脚本 update() 函数
+        das::SimFunction                 *_fnDispatchMsg = nullptr; // 脚本 dispatch_msg() 函数
         std::unique_ptr<MassiveModule>    _massiveModule;   // 桥接模块（持有 WorldServer raw ptr）
+
+        /// CodeReview #3: 自适应 GC 的堆大小基线（GC 后更新）
+        uint64_t _lastGCHeapSize = 0;
 
         // ── 网络复制（Phase 5）──
         std::unordered_map<uint32_t, std::unordered_set<uint32_t>> _aoiStates; // playerEID → 上帧可见 entity
