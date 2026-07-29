@@ -72,11 +72,11 @@ namespace MMO
         lib.addBuiltInModule();
 
         // Log
-        das::addExtern<DAS_BIND_FUN(LogInfo)>(*this, lib, "LogInfo", das::SideEffects::modifyExternal)
+        das::addExtern<DAS_BIND_FUN(LogInfo)>(*this, lib, "LogInfo", das::SideEffects::modifyExternal, "LogInfo")
             ->args({"text", "ctx", "at"});
-        das::addExtern<DAS_BIND_FUN(LogWarn)>(*this, lib, "LogWarn", das::SideEffects::modifyExternal)
+        das::addExtern<DAS_BIND_FUN(LogWarn)>(*this, lib, "LogWarn", das::SideEffects::modifyExternal, "LogWarn")
             ->args({"text", "ctx", "at"});
-        das::addExtern<DAS_BIND_FUN(LogError)>(*this, lib, "LogError", das::SideEffects::modifyExternal)
+        das::addExtern<DAS_BIND_FUN(LogError)>(*this, lib, "LogError", das::SideEffects::modifyExternal, "LogError")
             ->args({"text", "ctx", "at"});
     }
 

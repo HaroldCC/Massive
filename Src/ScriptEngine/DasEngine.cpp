@@ -34,6 +34,8 @@ namespace MMO
 
         // PULL_ALL_DEFAULT_MODULES;
         NEED_ALL_DEFAULT_MODULES;
+
+        NEED_MODULE(DasCommonModule);
         das::Module::Initialize();
 
         _initialized = true;
