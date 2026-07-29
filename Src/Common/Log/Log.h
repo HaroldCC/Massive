@@ -172,7 +172,7 @@ namespace MMO
         struct SourceLoc
         {
             std::string_view file;
-            int              line;
+            uint32           line;
             std::string_view func;
         };
 
@@ -183,7 +183,7 @@ namespace MMO
          */
         constexpr SourceLoc FromStd(const std::source_location &loc)
         {
-            return {loc.file_name(), static_cast<int>(loc.line()), loc.function_name()};
+            return {loc.file_name(), loc.line(), loc.function_name()};
         }
 
         /**
@@ -255,7 +255,7 @@ namespace MMO
          */
         template <typename... Args>
         void
-        LogDispatchAt(ELogLevel level, const char *file, int line, std::string_view fmtStr, Args &&...args)
+        LogDispatchAt(ELogLevel level, const char *file, uint32 line, std::string_view fmtStr, Args &&...args)
         {
             if (!ShouldLog(level))
             {
@@ -403,7 +403,7 @@ namespace MMO
          * @param args   格式化参数
          */
         template <typename... Args>
-        static void At(ELogLevel level, const char *file, int line, std::string_view fmt, Args &&...args)
+        static void At(ELogLevel level, const char *file, uint32 line, std::string_view fmt, Args &&...args)
         {
             LogDetail::LogDispatchAt(level, file, line, fmt, std::forward<Args>(args)...);
         }

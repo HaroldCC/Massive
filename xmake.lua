@@ -38,14 +38,14 @@ end
 add_includedirs("Src")
 
 includes("ThirdParty/xmake.lua")
-includes("Src/Common/xmake.lua")
-includes("Src/Login/xmake.lua")
-includes("Src/Gate/xmake.lua")
-includes("Src/World/xmake.lua")
-includes("Src/Center/xmake.lua")
-includes("Src/Social/xmake.lua")
-includes("Src/TestClient/xmake.lua")
-includes("Src/Proto/xmake.lua")
+includes("Src/**/xmake.lua")
+-- includes("Src/Login/xmake.lua")
+-- includes("Src/Gate/xmake.lua")
+-- includes("Src/World/xmake.lua")
+-- includes("Src/Center/xmake.lua")
+-- includes("Src/Social/xmake.lua")
+-- includes("Src/TestClient/xmake.lua")
+-- includes("Src/Proto/xmake.lua")
 
 --
 -- 自定义 format task：格式化项目源码，排除 ThirdParty 和 AutoGen 目录

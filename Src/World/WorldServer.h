@@ -20,7 +20,6 @@
 #include <daScript/ast/ast.h>
 #include <daScript/simulate/simulate.h>
 
-#include "Common/ECS/MassiveModule.h"
 #include "Common/Log/Log.h"
 #include "Common/Network/IOContextPool.h"
 #include "Common/Network/MessageDispatcher.h"
@@ -35,46 +34,23 @@
 #include "World/System/System.h"
 #include "World/WorldConfig.h"
 #include "World/WorldSession.h"
+#include "ScriptEngine/IDasHost.h"
 
 namespace MMO
 {
 
-    class WorldServer
+    class WorldServer : public IDasLangtHost
     {
     public:
         bool Init(const WorldConfig &cfg);
         void Run();
         void Stop();
 
-        /**
-         * @brief 发送已序列化的 protobuf body 到客户端（供脚本桥接调用）
-         *
-         * 与 SendToClient<TMsg> 不同，数据已经序列化为 protobuf bytes，
-         * 跳过 SerializeToArray 步骤，直接加密 + 组帧出站。
-         *
-         * @warning 必须在 LogicThread 中调用（独占 _sessions 读写权限）
-         * @param sessionID  目标 Session
-         * @param msgID      消息 ID（EMsgID）
-         * @param data       protobuf 序列化后的字节数组
-         * @param len        字节长度
-         */
-        void SendRawToClient(uint32 sessionID, uint32 msgID, const uint8 *data, size_t len);
+        das::Context *GetScriptContext() const override;
 
-        /**
-         * @brief 获取脚本 Context（供 *.gen.cpp 中的 Dispatch 函数使用）
-         */
-        das::Context *GetScriptContext() const
-        {
-            return _scriptCtx.get();
-        }
+        das::SimFunction *GetDispatchFunc() const override;
 
-        /**
-         * @brief 获取 dispatch_msg 函数缓存（供 *.gen.cpp 中的 Dispatch 函数使用）
-         */
-        das::SimFunction *GetDispatchMsgFunction() const
-        {
-            return _fnDispatchMsg;
-        }
+        void SendRawToClient(uint32 sessionID, uint32 msgID, const uint8 *data, size_t len) override;
 
     private:
         // ── Init 阶段 ──
@@ -218,13 +194,16 @@ namespace MMO
         WorldConfig       _config;
         std::atomic<bool> _running {false};
 
-        // ── 脚本引擎（Phase 2）──
-        std::shared_ptr<das::Context>  _scriptCtx;               // DasLang 执行上下文
-        das::ProgramPtr                _scriptProgram;           // 当前编译的脚本 Program
-        das::SimFunction              *_fnInit        = nullptr; // 脚本 init() 函数
-        das::SimFunction              *_fnUpdate      = nullptr; // 脚本 update() 函数
-        das::SimFunction              *_fnDispatchMsg = nullptr; // 脚本 dispatch_msg() 函数
-        std::unique_ptr<MassiveModule> _massiveModule;           // 桥接模块（持有 WorldServer raw ptr）
+        struct DasLangHost
+        {
+            std::shared_ptr<das::Context> _scriptCtx;               // DasLang 执行上下文
+            das::ProgramPtr               _scriptProgram;           // 当前编译的脚本 Program
+            das::SimFunction             *_fnInit        = nullptr; // 脚本 init() 函数
+            das::SimFunction             *_fnUpdate      = nullptr; // 脚本 update() 函数
+            das::SimFunction             *_fnDispatchMsg = nullptr; // 脚本 dispatch_msg() 函数
+        } _dasHost;
+
+        // std::unique_ptr<MassiveModule> _massiveModule; // 桥接模块（持有 WorldServer raw ptr）
 
         /// CodeReview #3: 自适应 GC 的堆大小基线（GC 后更新）
         uint64_t _lastGCHeapSize = 0;

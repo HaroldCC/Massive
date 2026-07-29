@@ -1,0 +1,35 @@
+options gen2
+
+require strings
+require daslib.strings_boost
+
+// 模块名称，文件路径，导入名称（别名）
+typedef TModuleInfo = tuple<string, string, string> const;
+
+// var DAS_PAK_ROOT = "../";
+
+[export]
+def module_get(req, from : string) : TModuleInfo
+{
+    let rs <- split_by_chars(req, "./")
+    let modName = rs[length(rs) - 1]
+
+    // daslib modules
+    if (length(rs) == 2 && rs[0] == "daslib") {
+        return (modName, "{get_das_root()}/daslib/{modName}.das", "")
+    }
+
+    // relative modules
+    var fr <- split_by_chars(from, "/")
+    if (length(fr) > 0) {
+        pop(fr)
+    }
+
+    for (se in rs) {
+        push(fr, se)
+    }
+
+    let pathName = join(fr, "/") + ".das"
+
+    return (modName, pathName, "")
+}

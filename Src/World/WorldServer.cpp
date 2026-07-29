@@ -9,6 +9,7 @@
 #include "Common/ECS/Scene.h"
 #include "Common/Log/Log.h"
 #include "Common/Network/TCPSocket.h"
+#include "ScriptEngine/DasEngine.h"
 #include "World/Component/EntityType.h"
 #include "World/Component/Health.h"
 #include "World/Component/Position.h"
@@ -33,16 +34,7 @@
 #include <daScript/misc/string_writer.h>
 #include <daScript/misc/sysos.h>
 #include <daScript/daScriptModule.h>
-
-// vec4f 和 cast<T> 定义在 simulate.h 中
-// （通过 aot.h、simulate.h 已包含）
-
-// daScript 内建模块声明——必须在命名空间外
-// DECS 依赖 ast_core / rtti_core 等 C++ 原生模块，需要全部注册
-DECLARE_ALL_DEFAULT_MODULES;
-
-// 在 namesapce MMO 外，为全局注册宏提供 DAS_THREAD_LOCAL 环境
-// （daScriptModule.h 需要 ModuleKarma 的 DAS_THREAD_LOCAL 定义）
+#include "ScriptEngine/DasEngine.h"
 
 using namespace std::chrono_literals;
 
@@ -207,31 +199,16 @@ namespace MMO
         Log::Info("WorldServer: stopped");
     }
 
+    das::Context *WorldServer::GetScriptContext() const
+    {
+    }
+
+    das::SimFunction *WorldServer::GetDispatchFunc() const
+    {
+    }
+
     void WorldServer::SendRawToClient(uint32 sessionID, uint32 msgID, const uint8 *data, size_t len)
     {
-        auto it = _sessions.find(sessionID);
-        if (it == _sessions.end())
-        {
-            Log::Warn("SendRawToClient: session {} not found", sessionID);
-            return;
-        }
-
-        // 加密
-        auto encrypted = it->second.crypto.Encrypt(data, len);
-        if (encrypted.Size() == 0)
-        {
-            return;
-        }
-
-        // 构建完整包: [PacketHeader:12B][encrypted]
-        uint32 totalLen = static_cast<uint32>(sizeof(PacketHeader) + encrypted.Size());
-        auto   frame    = ByteBuffer::Own(totalLen);
-        frame.WriteUint32(totalLen);
-        frame.WriteUint32(msgID);
-        frame.WriteUint32(sessionID);
-        frame.WriteBytes(encrypted.Data(), encrypted.Size());
-
-        _gateConnMgr->SendToGate(it->second.gateServerID, sessionID, std::move(frame));
     }
 
     // ── 消息分发注册 ──
@@ -689,8 +666,8 @@ namespace MMO
     {
         Log::Info("InitScriptEngine: starting...");
 
-        // 注册全部内建 C++ 模块（DECS 依赖 ast_core/rtti_core 等）
-        PULL_ALL_DEFAULT_MODULES;
+        auto &dasEngine = DasLangEngine::GetIns();
+
 
         // Initialize 必须在 PULL 之后、compileDaScript 之前调用
         das::Module::Initialize();

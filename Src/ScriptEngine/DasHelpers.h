@@ -2,6 +2,7 @@
 
 #include <vector>
 #include <cstdint>
+#include "daScript/simulate/aot.h"
 #include "daScript/simulate/simulate.h"
 
 namespace DasHelpers

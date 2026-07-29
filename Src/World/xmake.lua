@@ -51,6 +51,6 @@ target("WorldServer")
         "CommonConfig",
         "CommonLog",
         "Proto",
-        "libDaScript"
+        "ScriptEngine"
     )
     add_deps("asio", {public = true})
