@@ -6,14 +6,10 @@
 namespace MMO
 {
 
-    class IDasLangtHost
+    class IDasLangHost
     {
     public:
-        virtual ~IDasLangtHost() = default;
-
-        virtual das::Context *GetScriptContext() const = 0;
-
-        virtual das::SimFunction *GetDispatchFunc() const = 0;
+        virtual ~IDasLangHost() = default;
 
         virtual void SendRawToClient(uint32 sessionID, uint32 msgID, const uint8 *data, size_t len) = 0;
     };

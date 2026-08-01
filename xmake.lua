@@ -24,7 +24,7 @@ set_rundir(os.projectdir())
 
 --- 全局编译器标志
 if is_mode("debug") then
-    add_defines("MASSIVE_ENABLE_TRACY")
+    add_defines("MASSIVE_ENABLE_TRACY", "DEBUG")
 elseif is_mode("releasedbg") then
     add_defines("MASSIVE_ENABLE_TRACY")
     if is_plat("linux") then
@@ -34,6 +34,20 @@ elseif is_mode("releasedbg") then
     end
 elseif is_mode("release") then
 end
+
+rule("Rules.das_aot")
+    add_deps("c++", "daslang")
+
+    before_build(function(target)
+        local daslangTarget = target:dep("daslang")
+        local daslangExe = path.join(daslangTarget:targetdir(), daslangTarget:name())
+        local dasRoot = path.join(os.projectdir(), "Script")
+        local aotDir = path.join(target:autogendir(), "aot")
+        os.mkdir(aotDir)
+
+        local scripts
+    end)
+rule_end()
 
 add_includedirs("Src")
 

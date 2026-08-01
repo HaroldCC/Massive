@@ -1,16 +1,29 @@
 #!/usr/bin/env python3
 """
-GenMsgBindings.py — Protobuf → daScript 消息绑定代码生成器
+GenMsgBindings.py — Protobuf → C++ 脚本绑定代码生成器
 
-按文档 23_ProtoScriptBinding.md 实现：
+职责（v2，2026-07 重构后）:
   - 扫描 Src/Proto/*.proto，识别 *Req 消息
   - 计算依赖闭包（*Req 所在文件 + 被引用的类型所在文件）
   - 每个闭包内的 .proto → <ProtoFileName>.gen.cpp
-  - 产出 ProtoBindIndex.gen.{h,cpp}（汇总）
-  - 产出 Script/AutoGen/HandlerRegistry.das
+      · MAKE_TYPE_FACTORY + ManagedStructureAnnotation（消息类型绑定）
+      · string/bytes/repeated 字段访问器
+      · Dispatch<Msg>Req()——解析 protobuf + 转发进脚本
+  - 产出 ProtoBindIndex.gen.{h,cpp}（汇总 + EMsgID 枚举绑定）
+
+v2 相对 v1 的变化:
+  1. 不再生成 Script/AutoGen/HandlerRegistry.das。
+     [msg_handler] 注解改为手写在 Script/Handlers.das 里（见 Docs/ScriptLayer_01_MsgBinding.md）。
+     msgID 由手写宏在编译期从已绑定的 EMsgID 枚举按命名约定推导，不再依赖生成的 das 查表。
+  2. Dispatch 函数不再耦合 WorldServer——改走 DasLangEngine::GetIns()，
+     使 .gen.cpp 成为“解析 protobuf + 转发进脚本”的服务无关代码。
+  3. 解析到不支持的 proto 构造（oneof / 消息内嵌 message|enum）时报错退出，
+     而非静默跳过（避免漏绑定字段）。
+  4. 修复 v1 的重复 #include。
 
 用法:
-  python GenMsgBindings.py --proto-dir Src/Proto --cpp-out Src/World/AutoGen --das-out Script/AutoGen
+  python GenMsgBindings.py --proto-dir Src/Proto --cpp-out Src/World/AutoGen
+  （--das-out 已废弃：仍可传入但被忽略，仅为兼容旧 xmake 调用；建议从 xmake 移除。）
 """
 
 import argparse
@@ -20,21 +33,23 @@ import sys
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
-# ── 修复 Windows 编码 ──
+# ── 修复 Windows 控制台编码 ──
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+PROTO_NS = "MMO::Proto"  # 项目统一 package = MMO.Proto
+
+
 # ═══════════════════════════════════════════════════════════════
-# Proto 解析（轻量——仅提取本生成器所需的信息）
+# 数据结构
 # ═══════════════════════════════════════════════════════════════
 
 @dataclass
 class FieldInfo:
     """protobuf 字段描述"""
     name: str            # 字段名（snake_case）
-    type_name: str       # 类型名（Proto 类型名或标量）
+    type_name: str       # 类型名（去包前缀后的 Proto 类型名或标量）
     number: int
     label: str           # "", "repeated", "optional"
     is_scalar: bool = False
@@ -42,25 +57,28 @@ class FieldInfo:
     is_bytes: bool = False
     is_map: bool = False
 
+
 @dataclass
 class MessageInfo:
     """protobuf message 描述"""
     name: str            # 消息名（PascalCase）
     fields: list[FieldInfo] = field(default_factory=list)
 
+
 @dataclass
 class ProtoFileInfo:
     """.proto 文件解析结果"""
     name: str            # 文件名（不含 .proto，如 "Move"）
     filename: str        # 完整文件名（Move.proto）
-    package: str         # package 名
-    imports: list[str]   # import 的文件名列表
+    package: str
+    imports: list[str]
     messages: list[MessageInfo] = field(default_factory=list)
     has_req: bool = False   # 是否包含 *Req 消息
 
+
 # ── Regex 集合 ──
 _RE_PACKAGE = re.compile(r"^\s*package\s+([\w.]+)\s*;", re.MULTILINE)
-_RE_IMPORT  = re.compile(r'^\s*import\s+"([^"]+)"\s*;', re.MULTILINE)
+_RE_IMPORT = re.compile(r'^\s*import\s+"([^"]+)"\s*;', re.MULTILINE)
 _RE_MESSAGE_START = re.compile(r"^\s*message\s+(\w+)\s*\{", re.MULTILINE)
 _RE_FIELD = re.compile(
     r"^\s*(repeated|optional)\s+([\w.]+)\s+(\w+)\s*=\s*(\d+)",
@@ -75,7 +93,9 @@ _RE_MAP_FIELD = re.compile(
     re.MULTILINE,
 )
 
-# 标量类型集合
+# 消息体内不支持的构造——命中即报错退出（避免静默漏字段）
+_RE_UNSUPPORTED = re.compile(r"^\s*(oneof|message|enum)\s+\w+", re.MULTILINE)
+
 SCALAR_TYPES = {
     "double", "float", "int32", "int64", "uint32", "uint64",
     "sint32", "sint64", "fixed32", "fixed64", "sfixed32", "sfixed64",
@@ -84,13 +104,40 @@ SCALAR_TYPES = {
 STRING_TYPES = {"string"}
 BYTES_TYPES = {"bytes"}
 
+_CPP_SCALAR_MAP = {
+    "double": "double", "float": "float",
+    "int32": "int32_t", "int64": "int64_t",
+    "uint32": "uint32_t", "uint64": "uint64_t",
+    "sint32": "int32_t", "sint64": "int64_t",
+    "fixed32": "uint32_t", "fixed64": "uint64_t",
+    "sfixed32": "int32_t", "sfixed64": "int64_t",
+    "bool": "bool",
+}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 命名约定（唯一真相源——宏侧同规则实现，见 Docs/ScriptLayer_01）
+# ═══════════════════════════════════════════════════════════════
+
+def camel_to_msg_id(msg_name: str) -> str:
+    """MoveReq → MSG_MOVE_REQ；LoginEnterWorldReq → MSG_LOGIN_ENTER_WORLD_REQ"""
+    snake = re.sub(r"(?<![A-Z])([A-Z])", r"_\1", msg_name)
+    snake = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", snake)
+    return "MSG" + snake.upper()
+
+
+def cap_first(s: str) -> str:
+    """username → Username（仅首字母大写，其余保持——用于函数名拼接）"""
+    return s[0].upper() + s[1:] if s else s
+
+
+# ═══════════════════════════════════════════════════════════════
+# Proto 解析
+# ═══════════════════════════════════════════════════════════════
+
 def parse_msg_id_proto(filepath: Path) -> list[tuple[str, int]]:
-    """
-    解析 MsgID.proto，提取 EMsgID 枚举值。
-    返回 [(name, value), ...] 列表，过滤掉名字含 SENTINEL / _MIN_ / _MAX_ 的项。
-    """
+    """解析 MsgID.proto，提取 EMsgID 枚举 [(name, value), ...]（过滤哨兵）"""
     text = filepath.read_text(encoding="utf-8")
-    # 匹配 MSG_XXX = N; 格式
     pattern = re.compile(r"^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(\d+)\s*;", re.MULTILINE)
     entries: list[tuple[str, int]] = []
     for m in pattern.finditer(text):
@@ -102,38 +149,49 @@ def parse_msg_id_proto(filepath: Path) -> list[tuple[str, int]]:
     return entries
 
 
+def _extract_message_body(text: str, start: int) -> tuple[str, int]:
+    """从 message 体起始位置扫描配对大括号，返回 (body, 结束位置)"""
+    brace_depth = 1
+    pos = start
+    while pos < len(text) and brace_depth > 0:
+        if text[pos] == "{":
+            brace_depth += 1
+        elif text[pos] == "}":
+            brace_depth -= 1
+        pos += 1
+    return text[start:pos], pos
+
+
 def parse_proto_file(filepath: Path) -> ProtoFileInfo:
-    """解析一个 .proto 文件，返回结构化信息"""
+    """解析一个 .proto 文件；遇到不支持的构造报错退出"""
     text = filepath.read_text(encoding="utf-8")
     basename = filepath.name
-    name = filepath.stem  # 不带扩展名
+    name = filepath.stem
 
-    # Package
     pkg_match = _RE_PACKAGE.search(text)
     package = pkg_match.group(1) if pkg_match else ""
-
-    # Imports
     imports = _RE_IMPORT.findall(text)
 
-    # Messages
-    messages = []
+    messages: list[MessageInfo] = []
     for msg_match in _RE_MESSAGE_START.finditer(text):
         msg_name = msg_match.group(1)
-        fields = []
+        body, _ = _extract_message_body(text, msg_match.end())
 
-        # 找到消息体的结束位置——简单方案：扫描大括号
-        start = msg_match.end()
-        brace_depth = 1
-        pos = start
-        while pos < len(text) and brace_depth > 0:
-            if text[pos] == '{':
-                brace_depth += 1
-            elif text[pos] == '}':
-                brace_depth -= 1
-            pos += 1
-        body = text[start:pos]
+        # ── 健壮性：不支持的构造直接报错，绝不静默跳过 ──
+        bad = _RE_UNSUPPORTED.search(body)
+        if bad is not None:
+            print(
+                f"错误：{basename} 的 message {msg_name} 含暂不支持的构造 "
+                f"'{bad.group(1)}'。GenMsgBindings.py 目前仅支持标量/string/bytes/"
+                f"message 类型字段、repeated、proto3 optional。\n"
+                f"→ 请拆分该构造，或扩展生成器（含 oneof/嵌套类型）后重跑。",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
-        # 解析 map 字段
+        fields: list[FieldInfo] = []
+
+        # map 字段
         for m in _RE_MAP_FIELD.finditer(body):
             fields.append(FieldInfo(
                 name=m.group(3),
@@ -143,10 +201,10 @@ def parse_proto_file(filepath: Path) -> ProtoFileInfo:
                 is_map=True,
             ))
 
-        # 解析 repeated/optional 字段
+        # repeated / optional
         for m in _RE_FIELD.finditer(body):
             raw_type = m.group(2)
-            type_name = raw_type.split(".")[-1]  # 去掉包前缀
+            type_name = raw_type.split(".")[-1]
             fields.append(FieldInfo(
                 name=m.group(3),
                 type_name=type_name,
@@ -157,10 +215,9 @@ def parse_proto_file(filepath: Path) -> ProtoFileInfo:
                 is_bytes=(raw_type in BYTES_TYPES),
             ))
 
-        # 解析普通（非 repeated/optional）字段
+        # 普通字段
         for m in _RE_FIELD_SCALAR.finditer(body):
             raw_type = m.group(1)
-            # 跳过 map（已处理）、跳过 enum 内联定义、跳过 oneof
             if raw_type in ("option", "reserved", "oneof", "enum", "message"):
                 continue
             type_name = raw_type.split(".")[-1]
@@ -177,432 +234,434 @@ def parse_proto_file(filepath: Path) -> ProtoFileInfo:
         messages.append(MessageInfo(name=msg_name, fields=fields))
 
     has_req = any(m.name.endswith("Req") for m in messages)
-
     return ProtoFileInfo(
-        name=name,
-        filename=basename,
-        package=package,
-        imports=imports,
-        messages=messages,
-        has_req=has_req,
+        name=name, filename=basename, package=package,
+        imports=imports, messages=messages, has_req=has_req,
     )
 
 
 # ═══════════════════════════════════════════════════════════════
-# 依赖闭包计算
+# 依赖闭包
 # ═══════════════════════════════════════════════════════════════
 
-def compute_closure(
-    proto_files: dict[str, ProtoFileInfo],
-) -> list[ProtoFileInfo]:
-    """
-    计算依赖闭包：
-      1. 所有含 *Req 的 .proto 文件
-      2. 这些 *Req 消息（递归）引用的其它 message 所在的 .proto 文件
-    返回按依赖顺序排列的列表（被引用类型所在文件在前）。
-    """
-    # 首先收集所有含 *Req 的文件
-    req_files: set[str] = set()
-    for fname, info in proto_files.items():
-        if info.has_req:
-            req_files.add(fname)
+def compute_closure(proto_files: dict[str, ProtoFileInfo]) -> list[ProtoFileInfo]:
+    """含 *Req 的文件 + 其（递归）引用的类型所在文件；被引用多的排前"""
+    req_files: set[str] = {f for f, i in proto_files.items() if i.has_req}
 
-    # 构建类型→文件映射
     type_to_file: dict[str, str] = {}
     for fname, info in proto_files.items():
         for msg in info.messages:
             type_to_file[msg.name] = fname
 
-    # BFS 计算闭包
     closure: set[str] = set(req_files)
     queue = deque(req_files)
-
     while queue:
         cur = queue.popleft()
-        info = proto_files[cur]
-        for msg in info.messages:
-            for field in msg.fields:
-                if field.is_scalar or field.is_string or field.is_bytes or field.is_map:
+        for msg in proto_files[cur].messages:
+            for fld in msg.fields:
+                if fld.is_scalar or fld.is_string or fld.is_bytes or fld.is_map:
                     continue
-                # 嵌套 message 类型
-                ref_file = type_to_file.get(field.type_name)
+                ref_file = type_to_file.get(fld.type_name)
                 if ref_file and ref_file not in closure:
                     closure.add(ref_file)
                     queue.append(ref_file)
 
-    # 按依赖关系排序（被引用多的在前）
-    # 简单实现：按被引用次数降序
     ref_count: dict[str, int] = defaultdict(int)
     for fname in closure:
-        info = proto_files[fname]
-        for msg in info.messages:
-            for field in msg.fields:
-                if not (field.is_scalar or field.is_string or field.is_bytes or field.is_map):
-                    ref_file = type_to_file.get(field.type_name)
-                    if ref_file and ref_file in closure:
-                        ref_count[ref_file] += 1
+        for msg in proto_files[fname].messages:
+            for fld in msg.fields:
+                if fld.is_scalar or fld.is_string or fld.is_bytes or fld.is_map:
+                    continue
+                ref_file = type_to_file.get(fld.type_name)
+                if ref_file and ref_file in closure:
+                    ref_count[ref_file] += 1
 
-    # 排序：被引用多的在前；同引用数按文件名排
     sorted_files = sorted(closure, key=lambda f: (-ref_count.get(f, 0), f))
-
     return [proto_files[f] for f in sorted_files]
 
 
 # ═══════════════════════════════════════════════════════════════
-# C++ 生成：单个 .gen.cpp
+# 字段分类辅助
 # ═══════════════════════════════════════════════════════════════
 
-def cpp_field_type(raw_type: str) -> str:
-    """protobuf 类型 → C++ 函数签名中的返回类型"""
-    type_map = {
-        "double": "double", "float": "float",
-        "int32": "int32_t", "int64": "int64_t",
-        "uint32": "uint32_t", "uint64": "uint64_t",
-        "sint32": "int32_t", "sint64": "int64_t",
-        "fixed32": "uint32_t", "fixed64": "uint64_t",
-        "sfixed32": "int32_t", "sfixed64": "int64_t",
-        "bool": "bool",
-    }
-    return type_map.get(raw_type, raw_type)
+def _string_accessor_name(msg: str, fld: FieldInfo) -> str:
+    return f"{msg}_Get{cap_first(fld.name)}"
 
 
-def camel_to_msg_id(msg_name: str) -> str:
-    """MoveReq → MSG_MOVE_REQ"""
-    snake = re.sub(r"(?<![A-Z])([A-Z])", r"_\1", msg_name)
-    snake = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", snake)
-    return "MSG" + snake.upper()
+def _repeated_size_name(msg: str, fld: FieldInfo) -> str:
+    return f"{msg}_{cap_first(fld.name)}_Size"
 
 
-def generate_proto_gen_cpp(info: ProtoFileInfo, proto_files: dict[str, ProtoFileInfo]) -> str:
-    """为单个 .proto 文件生成 .gen.cpp"""
-    lines = []
-    ns = "MMO::Proto"  # 项目使用 MMO.Proto 包
+def _repeated_index_name(msg: str, fld: FieldInfo) -> str:
+    return f"{msg}_{cap_first(fld.name)}"
 
-    # ── 文件头 ──
-    has_dispatch = info.has_req
-    brief = f"消息类型注册 + 消息分发" if has_dispatch else f"被业务消息引用的辅助类型注册"
-    lines.append(f"/**")
-    lines.append(f" * @file {info.name}.gen.cpp")
-    lines.append(f" * @brief 自动生成文件——{info.filename} {brief}")
-    lines.append(f" *")
-    lines.append(f" * 生成工具: Tools/Script/GenMsgBindings.py")
-    lines.append(f" * 来源: Src/Proto/{info.filename}")
-    lines.append(f" * @warning 不要手动编辑")
-    if has_dispatch:
-        req_names = [m.name for m in info.messages if m.name.endswith("Req")]
-        lines.append(f" * @note {', '.join(req_names)} 覆写了 canCopy/canClone 为 false——脚本不能把 req 存进")
-        lines.append(f" *       全局变量或结构体字段，只能在本次调用内读取字段/按引用传递。")
-    lines.append(f" */")
-    # ── Include：自己的 .pb.h 加上依赖类型所在的 .pb.h ──
-    lines.append(f"#include \"Proto/AutoGen/{info.name}.pb.h\"")
-    # 收集本文件引用到的所有嵌套类型（跨文件依赖）
+
+def _iter_string_fields(msg: MessageInfo):
+    """非 repeated 的 string/bytes 字段"""
+    for fld in msg.fields:
+        if fld.is_map:
+            continue
+        if fld.label != "repeated" and (fld.is_string or fld.is_bytes):
+            yield fld
+
+
+def _iter_repeated_fields(msg: MessageInfo):
+    for fld in msg.fields:
+        if fld.label == "repeated" and not fld.is_map:
+            yield fld
+
+
+# ═══════════════════════════════════════════════════════════════
+# C++ 发射器（Emitter）——每个只负责一小段，主函数编排
+# ═══════════════════════════════════════════════════════════════
+
+def emit_file_header(info: ProtoFileInfo) -> list[str]:
+    req_names = [m.name for m in info.messages if m.name.endswith("Req")]
+    brief = "消息类型注册 + 消息分发" if info.has_req else "被业务消息引用的辅助类型注册"
+    out = [
+        "/**",
+        f" * @file {info.name}.gen.cpp",
+        f" * @brief 自动生成文件——{info.filename} {brief}",
+        " *",
+        " * 生成工具: Tools/Script/GenMsgBindings.py",
+        f" * 来源: Src/Proto/{info.filename}",
+        " * @warning 不要手动编辑",
+    ]
+    if req_names:
+        out.append(f" * @note {', '.join(req_names)} 覆写 canCopy/canClone = false——")
+        out.append(" *       脚本不能把 req 存进全局变量或结构体字段，只能本次调用内读取/按引用传递。")
+    out.append(" */")
+    return out
+
+
+def emit_includes(info: ProtoFileInfo, proto_files: dict[str, ProtoFileInfo],
+                  referenced_types: set[str]) -> list[str]:
+    """去重后的 include 列表"""
+    pb_headers: list[str] = []           # 保持顺序 + 去重
+    seen: set[str] = set()
+
+    def add_pb(header_name: str):
+        line = f'#include "Proto/AutoGen/{header_name}.pb.h"'
+        if line not in seen:
+            seen.add(line)
+            pb_headers.append(line)
+
+    add_pb(info.name)
+    # 被引用类型所在文件的 .pb.h
+    name_to_file = {}
+    for other in proto_files.values():
+        for msg in other.messages:
+            name_to_file[msg.name] = other.name
+    for ref in sorted(referenced_types):
+        f = name_to_file.get(ref)
+        if f and f != info.name:
+            add_pb(f)
+
+    out = list(pb_headers)
+    if info.has_req:
+        out.append("#include <MsgID.pb.h>")
+    # dispatch 相关：引擎（服务无关，不再 include WorldServer.h）。
+    # 注册表由 DasLangEngine 持有并经 DasEngine.h 传递可见，无需单独 include。
+    if info.has_req:
+        out.append('#include "ScriptEngine/DasEngine.h"')
+        out.append('#include "Common/Log/Log.h"')
+    out.append("")
+    out.append("#include <daScript/simulate/simulate.h>")
+    out.append("#include <daScript/ast/ast_interop.h>")
+    out.append("#include <daScript/ast/ast_handle.h>")
+    out.append("#include <daScript/daScriptModule.h>")
+    out.append("#include <daScript/ast/ast_typefactory.h>")
+    out.append("")
+    return out
+
+
+def emit_type_factories(info: ProtoFileInfo, referenced_types: set[str]) -> list[str]:
+    out: list[str] = []
+    own_names = {m.name for m in info.messages}
+    for msg in info.messages:
+        out.append(f"MAKE_TYPE_FACTORY({msg.name}, {PROTO_NS}::{msg.name})")
+    for ref in sorted(referenced_types):
+        if ref not in own_names:
+            out.append(f"MAKE_TYPE_FACTORY({ref}, {PROTO_NS}::{ref})")
+    return out
+
+
+def emit_string_accessor(msg: MessageInfo, fld: FieldInfo) -> list[str]:
+    func = _string_accessor_name(msg.name, fld)
+    body = (f"return msg.{fld.name}().c_str();" if fld.is_string
+            else f"return reinterpret_cast<const char *>(msg.{fld.name}().data());")
+    return [
+        f"    // ── string/bytes 字段：addExternProperty 注册，脚本写 req.{fld.name}（无括号）──",
+        f"    const char *{func}(const {PROTO_NS}::{msg.name} &msg)",
+        "    {",
+        f"        {body}",
+        "    }",
+        "",
+    ]
+
+
+def emit_repeated_accessors(msg: MessageInfo, fld: FieldInfo) -> list[str]:
+    size_func = _repeated_size_name(msg.name, fld)
+    index_func = _repeated_index_name(msg.name, fld)
+    if fld.is_string:
+        ret_type, access = "const char *", f"msg.{fld.name}(index).c_str()"
+    elif fld.is_bytes:
+        ret_type, access = "const char *", f"reinterpret_cast<const char *>(msg.{fld.name}(index).data())"
+    elif fld.is_scalar:
+        ret_type = _CPP_SCALAR_MAP.get(fld.type_name, fld.type_name)
+        access = f"msg.{fld.name}(index)"
+    else:
+        ret_type, access = f"const {PROTO_NS}::{fld.type_name} &", f"msg.{fld.name}(index)"
+    return [
+        "    // ── repeated _size：addExternProperty，无括号 ──",
+        f"    int {size_func}(const {PROTO_NS}::{msg.name} &msg)",
+        "    {",
+        f"        return msg.{fld.name}_size();",
+        "    }",
+        "",
+        "    // ── repeated 索引访问：需要 index 参数，必须带括号 ──",
+        f"    {ret_type}{index_func}(const {PROTO_NS}::{msg.name} &msg, int index)",
+        "    {",
+        f"        return {access};",
+        "    }",
+        "",
+    ]
+
+
+def emit_annotation(msg: MessageInfo, is_req: bool) -> list[str]:
+    out = [
+        "    /**",
+        f"     * @brief {msg.name} 的 daScript 类型注解",
+    ]
+    if is_req:
+        out.append("     * @note 引用类型（网络消息）——canCopy/canClone = false")
+    else:
+        out.append("     * @note 值类型——脚本可安全复制/克隆保存")
+    out += [
+        "     */",
+        f"    struct {msg.name}Annotation : ManagedStructureAnnotation<{PROTO_NS}::{msg.name}, false, false>",
+        "    {",
+        f"        {msg.name}Annotation(ModuleLibrary &ml)",
+        f'            : ManagedStructureAnnotation("{msg.name}", ml, "{PROTO_NS}::{msg.name}")',
+        "        {",
+    ]
+    # 标量 / 嵌套 message 直接 addProperty；string/bytes/repeated 走 Register 里的 addExternProperty
+    for fld in msg.fields:
+        if fld.is_map:
+            out.append(f"            // TODO(GenMsgBindings): {msg.name}.{fld.name} (map) 需手写绑定，暂未生成")
+            continue
+        if fld.is_string or fld.is_bytes:
+            continue
+        if fld.label == "repeated":
+            continue
+        out.append(f'            addProperty<DAS_BIND_MANAGED_PROP({fld.name})>("{fld.name}");')
+    out.append("        }")
+    if is_req:
+        out += [
+            "",
+            "        // §2.4 生命周期防护——阻断脚本把 req 赋值/克隆进任何逃逸本次调用的存储位置",
+            "        virtual bool canCopy() const override { return false; }",
+            "        virtual bool canClone() const override { return false; }",
+        ]
+    out += ["    };", ""]
+    return out
+
+
+def emit_dispatch_fn(info: ProtoFileInfo, msg: MessageInfo) -> list[str]:
+    """解析 protobuf + 转发进脚本。服务无关：走 DasLangEngine::GetIns()。"""
+    func = f"Dispatch{msg.name}"
+    msg_id = f"{PROTO_NS}::{camel_to_msg_id(msg.name)}"
+    return [
+        f"    bool {func}(uint32 sessionID, const uint8 *body, size_t len)",
+        "    {",
+        f"        {PROTO_NS}::{msg.name} req;",
+        "        if (!req.ParseFromArray(body, static_cast<int>(len)))",
+        "        {",
+        f'            MMO::Log::Error("{info.name}.gen: {msg.name} parse failed, session={{}}", sessionID);',
+        "            return false;",
+        "        }",
+        "",
+        "        das::Context     *ctx        = MMO::DasLangEngine::GetIns().GetScriptContext();",
+        "        das::SimFunction *fnDispatch = MMO::DasLangEngine::GetIns().GetDispatchFunc();",
+        "        if (nullptr == ctx || nullptr == fnDispatch)",
+        "        {",
+        "            return false;",
+        "        }",
+        "",
+        "        vec4f callArgs[3] = {",
+        f"            das::cast<uint32_t>::from(static_cast<uint32_t>({msg_id})),",
+        "            das::cast<uint32_t>::from(sessionID),",
+        f"            das::cast<const {PROTO_NS}::{msg.name} *>::from(&req),",
+        "        };",
+        "        ctx->evalWithCatch(fnDispatch, callArgs);",
+        "        return true;",
+        "    }",
+        "",
+    ]
+
+
+def emit_register_bindings(info: ProtoFileInfo) -> list[str]:
+    out = [
+        f"    void Register{info.name}ProtoBindings(das::Module &mod, das::ModuleLibrary &lib)",
+        "    {",
+        "        (void)mod;",
+    ]
+    has_any = False
+    for msg in info.messages:
+        out.append(f"        mod.addAnnotation(new {msg.name}Annotation(lib));")
+        has_any = True
+        for fld in _iter_string_fields(msg):
+            func = _string_accessor_name(msg.name, fld)
+            out.append(f'        das::addExternProperty<DAS_BIND_FUN({func})>(mod, lib, ".`{fld.name}", "{func}")')
+            out.append('            ->args({"msg"});')
+        for fld in _iter_repeated_fields(msg):
+            size_func = _repeated_size_name(msg.name, fld)
+            index_func = _repeated_index_name(msg.name, fld)
+            out.append(f'        das::addExternProperty<DAS_BIND_FUN({size_func})>(mod, lib, ".`{fld.name}_size", "{size_func}")')
+            out.append('            ->args({"msg"});')
+            out.append(f'        das::addExtern<DAS_BIND_FUN({index_func})>(mod, lib, "{fld.name}", das::SideEffects::none)')
+            out.append('            ->args({"msg", "index"});')
+    if not has_any:
+        out.append("        // 本文件仅含被引用类型，无消息")
+    out.append("    }")
+    out.append("")
+    return out
+
+
+def emit_register_dispatch(info: ProtoFileInfo, req_msgs: list[MessageInfo]) -> list[str]:
+    # 注册表由 DasLangEngine 持有（脚本层组件，World/Social 共用）。
+    # 经引擎单例取实例注册——不再假设 ScriptDispatchRegistry 是静态类。
+    out = [
+        f"    void Register{info.name}MsgDispatch()",
+        "    {",
+        "        auto &registry = DasLangEngine::GetIns().DispatchRegistry();",
+    ]
+    for msg in req_msgs:
+        msg_id = f"{PROTO_NS}::{camel_to_msg_id(msg.name)}"
+        out.append(f"        registry.Register(static_cast<uint32_t>({msg_id}), &Dispatch{msg.name});")
+    out.append("    }")
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════
+# 组装：单个 .gen.cpp
+# ═══════════════════════════════════════════════════════════════
+
+def generate_proto_gen_cpp(info: ProtoFileInfo,
+                           proto_files: dict[str, ProtoFileInfo]) -> str:
+    # 收集跨文件引用类型（非 repeated 的 message 类型字段）
     referenced_types: set[str] = set()
     for msg in info.messages:
-        for field in msg.fields:
-            if not (field.is_scalar or field.is_string or field.is_bytes or field.is_map) and field.label != "repeated":
-                referenced_types.add(field.type_name)
-    # 对每个引用类型，include 其所在 .proto 的 .pb.h
-    for ref_type in referenced_types:
-        for other_info in proto_files.values():
-            if other_info.name == info.name:
-                continue
-            for other_msg in other_info.messages:
-                if other_msg.name == ref_type:
-                    lines.append(f"#include \"Proto/AutoGen/{other_info.name}.pb.h\"")
+        for fld in msg.fields:
+            if (not (fld.is_scalar or fld.is_string or fld.is_bytes or fld.is_map)
+                    and fld.label != "repeated"):
+                referenced_types.add(fld.type_name)
 
-    if info.has_req:
-        lines.append(f"#include <MsgID.pb.h>")
-    lines.append(f"#include \"World/ScriptDispatchRegistry.h\"")
-    lines.append(f"#include \"World/WorldServer.h\"")
-    lines.append(f"")
-    lines.append(f"#include <daScript/simulate/simulate.h>")
-    lines.append(f"#include <daScript/ast/ast_interop.h>")
-    lines.append(f"#include <daScript/ast/ast_handle.h>")
-    lines.append(f"#include <daScript/daScriptModule.h>")
-    lines.append(f"#include <daScript/ast/ast_typefactory.h>")
-    lines.append(f"")
-
-    # MAKE_TYPE_FACTORY：为本文件定义的消息类型 + 所有被引用的跨文件类型提供 typeName
-    for msg in info.messages:
-        lines.append(f"MAKE_TYPE_FACTORY({msg.name}, {ns}::{msg.name})")
-    for ref_type in referenced_types:
-        # 找出引用类型的完整命名空间路径
-        for proto_file in proto_files.values():
-            for other_msg in proto_file.messages:
-                if other_msg.name == ref_type and other_msg.name not in {m.name for m in info.messages}:
-                    lines.append(f"MAKE_TYPE_FACTORY({ref_type}, {ns}::{ref_type})")
-
-    # ── 匿名命名空间 ──
-    lines.append(f"namespace")
-    lines.append(f"{{")
-    lines.append(f"    using namespace das;")
-    lines.append(f"")
-
-    # ── 为每个 message 生成 Annotation ──
     req_names = {m.name for m in info.messages if m.name.endswith("Req")}
-    value_type_names = set()
-    # 确定值类型：被 *Req 引用但不是 *Req 本身的类型
-    for msg in info.messages:
-        if msg.name not in req_names:
-            value_type_names.add(msg.name)
+    req_msgs = [m for m in info.messages if m.name in req_names]
 
-    # 辅助函数生成——排除 repeated 字段（repeated 单独处理）
-    string_field_funcs = []
-    repeated_size_funcs = []
-    repeated_index_funcs = []
-    for msg in info.messages:
-        for field in msg.fields:
-            if field.is_map:
-                continue
-            if field.label == "repeated":
-                # repeated 字段：生成 _size + 索引访问
-                size_func = f"{msg.name}_{field.name[0].upper()}{field.name[1:]}_Size"
-                repeated_size_funcs.append((size_func, msg.name, field))
-                index_func = f"{msg.name}_{field.name[0].upper()}{field.name[1:]}"
-                repeated_index_funcs.append((index_func, msg.name, field))
-            elif field.is_string or field.is_bytes:
-                # 非 repeated 的 string/bytes：生成 getter 辅助函数
-                func_name = f"{msg.name}_Get{field.name[0].upper()}{field.name[1:]}"
-                string_field_funcs.append((func_name, msg.name, field))
+    lines: list[str] = []
+    lines += emit_file_header(info)
+    lines += emit_includes(info, proto_files, referenced_types)
+    lines += emit_type_factories(info, referenced_types)
 
-    # 产出 string/bytes 辅助函数
-    for func_name, msg_name, field in string_field_funcs:
-        lines.append(f"    // ── string/bytes 字段：用 addExternProperty 注册，脚本侧写 req.{field.name}（无括号）──")
-        lines.append(f"    const char *{func_name}(const {ns}::{msg_name} &msg)")
-        lines.append(f"    {{")
-        if field.is_string:
-            lines.append(f"        return msg.{field.name}().c_str();")
-        else:
-            lines.append(f"        return reinterpret_cast<const char *>(msg.{field.name}().data());")
-        lines.append(f"    }}")
-        lines.append(f"")
-
-    # 产出 repeated _size 函数
-    for func_name, msg_name, field in repeated_size_funcs:
-        lines.append(f"    // ── repeated _size：用 addExternProperty，无括号 ──")
-        lines.append(f"    int {func_name}(const {ns}::{msg_name} &msg)")
-        lines.append(f"    {{")
-        lines.append(f"        return msg.{field.name}_size();")
-        lines.append(f"    }}")
-        lines.append(f"")
-
-    # 产出 repeated 索引访问函数
-    for func_name, msg_name, field in repeated_index_funcs:
-        if field.is_string:
-            ret_type = "const char *"
-            access_expr = f"msg.{field.name}(index).c_str()"
-        elif field.is_bytes:
-            ret_type = "const char *"
-            access_expr = f"reinterpret_cast<const char *>(msg.{field.name}(index).data())"
-        elif field.is_scalar:
-            ret_type = cpp_field_type(field.type_name)
-            access_expr = f"msg.{field.name}(index)"
-        else:
-            ret_type = f"const {ns}::{field.type_name} &"
-            access_expr = f"msg.{field.name}(index)"
-        lines.append(f"    // ── repeated 索引访问：需要 index 参数，必须带括号 ──")
-        lines.append(f"    {ret_type}{func_name}(const {ns}::{msg_name} &msg, int index)")
-        lines.append(f"    {{")
-        lines.append(f"        return {access_expr};")
-        lines.append(f"    }}")
-        lines.append(f"")
-
-    # ── Annotation 类 ──
-    for msg in info.messages:
-        is_req = msg.name in req_names
-        is_value = msg.name in value_type_names
-        can_copy_str = "" if is_value else """
-        // §2.4 生命周期防护——阻断脚本把 req 赋值/克隆进任何逃逸本次调用的存储位置
-        virtual bool canCopy() const override { return false; }
-        virtual bool canClone() const override { return false; }"""
-
-        lines.append(f"    /**")
-        lines.append(f"     * @brief {msg.name} 的 daScript 类型注解")
-        if is_value:
-            lines.append(f"     * @note 值类型——脚本可安全复制/克隆保存")
-        else:
-            lines.append(f"     * @note 引用类型（网络消息）——canCopy/canClone = false")
-        lines.append(f"     */")
-        lines.append(f"    struct {msg.name}Annotation : ManagedStructureAnnotation<{ns}::{msg.name}, false, false>")
-        lines.append(f"    {{")
-        lines.append(f"        {msg.name}Annotation(ModuleLibrary &ml)")
-        lines.append(f"            : ManagedStructureAnnotation(\"{msg.name}\", ml, \"{ns}::{msg.name}\")")
-        lines.append(f"        {{")
-
-        # addProperty 绑定（标量、嵌套 message 直接用 addProperty）
-        for field in msg.fields:
-            if field.is_map:
-                lines.append(f"            // TODO(GenMsgBindings): {msg.name}.{field.name} (map) 需手写绑定，暂未生成")
-                continue
-            if field.is_string or field.is_bytes:
-                continue  # 用 addExternProperty，在 Register 函数里
-            if field.label == "repeated" and not field.is_map:
-                continue  # 用 addExtern/addExternProperty，在 Register 函数里
-            # 标量、嵌套 message 直接用 addProperty 绑定
-            lines.append(f"            addProperty<DAS_BIND_MANAGED_PROP({field.name})>(\"{field.name}\");")
-
-        lines.append(f"        }}")
-        lines.append(f"{can_copy_str}")
-        lines.append(f"    }};")
-        lines.append(f"")
-
-    # ── Dispatch 函数（仅 *Req 消息）──
-    dispatch_funcs = []
-    for msg in info.messages:
-        if msg.name not in req_names:
-            continue
-        msg_id_const = f"MMO::Proto::{camel_to_msg_id(msg.name)}"
-
-        func_name = f"Dispatch{msg.name}"
-        dispatch_funcs.append((func_name, msg, msg_id_const))
-
-        lines.append(f"    bool {func_name}(MMO::WorldServer &server, uint32 sessionID, const uint8 *body, size_t len)")
-        lines.append(f"    {{")
-        lines.append(f"        {ns}::{msg.name} req;")
-        lines.append(f"        if (!req.ParseFromArray(body, static_cast<int>(len)))")
-        lines.append(f"        {{")
-        lines.append(f"            MMO::Log::Error(\"{info.name}.gen: {msg.name} parse failed, session={{}}\", sessionID);")
-        lines.append(f"            return false;")
-        lines.append(f"        }}")
-        lines.append(f"")
-        lines.append(f"        das::Context *ctx        = server.GetScriptContext();")
-        lines.append(f"        auto          fnDispatch = server.GetDispatchMsgFunction();")
-        lines.append(f"        if (!ctx || !fnDispatch)")
-        lines.append(f"        {{")
-        lines.append(f"            return false;")
-        lines.append(f"        }}")
-        lines.append(f"")
-        lines.append(f"        vec4f callArgs[3] = {{")
-        lines.append(f"            das::cast<uint32_t>::from(static_cast<uint32_t>({msg_id_const})),")
-        lines.append(f"            das::cast<uint32_t>::from(sessionID),")
-        lines.append(f"            das::cast<const {ns}::{msg.name} *>::from(&req),")
-        lines.append(f"        }};")
-        lines.append(f"        ctx->eval(fnDispatch, callArgs);")
-        lines.append(f"        return true;")
-        lines.append(f"    }}")
-        lines.append(f"")
-
-    lines.append(f"}} // namespace")
-    lines.append(f"")
-
-    # ── namespace MMO ──
-    lines.append(f"namespace MMO")
-    lines.append(f"{{")
-    lines.append(f"")
-
-    # RegisterXxxProtoBindings
-    lines.append(f"    void Register{info.name}ProtoBindings(das::Module &mod, das::ModuleLibrary &lib)")
-    lines.append(f"    {{")
-    lines.append(f"        (void)mod;")
-    has_annotation = False
-    for msg in info.messages:
-        lines.append(f"        mod.addAnnotation(new {msg.name}Annotation(lib));")
-        has_annotation = True
-        # string/bytes addExternProperty（仅对非 repeated 的 string/bytes 字段）
-        # 注意：属性名必须是 ".`字段名"——daScript 的 expr.field 语法在推断阶段
-        # 精确查找 ".`" + 字段名 这个函数名（见 ast_infer_type.cpp 的字段解析），
-        # ManagedStructureAnnotation::addProperty 内部就是这样拼接的；直接调用
-        # 底层 addExternProperty 时必须手动拼上这个前缀，否则只能以自由函数调用
-        # （从 addExtern 的角度看是一样的，但脚本侧不能写 req.username 这种字段语法）。
-        for field in msg.fields:
-            if (field.is_string or field.is_bytes) and field.label != "repeated":
-                func_name = f"{msg.name}_Get{field.name[0].upper()}{field.name[1:]}"
-                lines.append(f"        das::addExternProperty<DAS_BIND_FUN({func_name})>(mod, lib, \".`{field.name}\", \"{func_name}\")")
-                lines.append(f"            ->args({{\"msg\"}});")
-            if field.label == "repeated" and not field.is_map:
-                size_func = f"{msg.name}_{field.name[0].upper()}{field.name[1:]}_Size"
-                index_func = f"{msg.name}_{field.name[0].upper()}{field.name[1:]}"
-                lines.append(f"        das::addExternProperty<DAS_BIND_FUN({size_func})>(mod, lib, \".`{field.name}_size\", \"{size_func}\")")
-                lines.append(f"            ->args({{\"msg\"}});")
-                lines.append(f"        das::addExtern<DAS_BIND_FUN({index_func})>(mod, lib, \"{field.name}\", das::SideEffects::none)")
-                lines.append(f"            ->args({{\"msg\", \"index\"}});")
-    if not has_annotation:
-        lines.append(f"        // 本文件仅含被引用类型，无 *Req 消息")
-    lines.append(f"    }}")
-    lines.append(f"")
-
-    # RegisterXxxMsgDispatch（仅当有 *Req 消息）
-    if dispatch_funcs:
-        lines.append(f"    void Register{info.name}MsgDispatch()")
-        lines.append(f"    {{")
-        for func_name, msg, msg_id_const in dispatch_funcs:
-            lines.append(f"        ScriptDispatchRegistry::Register(static_cast<uint32_t>({msg_id_const}), &{func_name});")
-        lines.append(f"    }}")
-
-    lines.append(f"}} // namespace MMO")
-    lines.append(f"")
-
-    return "\n".join(lines)
-
-
-# ═══════════════════════════════════════════════════════════════
-# 生成 ProtoBindIndex.gen.h
-# ═══════════════════════════════════════════════════════════════
-
-def generate_index_h(closure: list[ProtoFileInfo]) -> str:
-    lines = []
-    lines.append("/**")
-    lines.append(" * @file ProtoBindIndex.gen.h")
-    lines.append(" * @brief 自动生成文件——汇总声明，供 MassiveModule.cpp / WorldServer.cpp 手写代码 include")
-    lines.append(" *")
-    lines.append(" * 生成工具: Tools/Script/GenMsgBindings.py")
-    lines.append(" * @warning 不要手动编辑")
-    lines.append(" */")
-    lines.append("#pragma once")
-    lines.append("")
-    lines.append("namespace das")
+    # ── 匿名命名空间：访问器 + 注解 + dispatch ──
+    lines.append("namespace")
     lines.append("{")
-    lines.append("    class Module;")
-    lines.append("    class ModuleLibrary;")
-    lines.append("} // namespace das")
+    lines.append("    using namespace das;")
     lines.append("")
+
+    for msg in info.messages:
+        for fld in _iter_string_fields(msg):
+            lines += emit_string_accessor(msg, fld)
+        for fld in _iter_repeated_fields(msg):
+            lines += emit_repeated_accessors(msg, fld)
+
+    for msg in info.messages:
+        lines += emit_annotation(msg, msg.name in req_names)
+
+    for msg in req_msgs:
+        lines += emit_dispatch_fn(info, msg)
+
+    lines.append("} // namespace")
+    lines.append("")
+
+    # ── namespace MMO：注册函数 ──
     lines.append("namespace MMO")
     lines.append("{")
     lines.append("")
-    lines.append("    /**")
-    lines.append("     * @brief 注册当前依赖闭包内全部 .proto 文件对应的 daScript 类型")
-    lines.append("     * @note 在 MassiveModule::BindFunctions() 内调用一次")
-    lines.append("     */")
-    lines.append("    void RegisterAllProtoMessageTypes(das::Module &mod, das::ModuleLibrary &lib);")
-    lines.append("")
-    lines.append("    /**")
-    lines.append("     * @brief 注册当前依赖闭包内全部 .proto 文件对应的消息分发函数")
-    lines.append("     * @note 在 WorldServer::InitScriptEngine() 缓存 dispatch_msg 之后调用一次")
-    lines.append("     */")
-    lines.append("    void RegisterAllMsgDispatch();")
-    lines.append("")
+    lines += emit_register_bindings(info)
+    if req_msgs:
+        lines += emit_register_dispatch(info, req_msgs)
     lines.append("} // namespace MMO")
     lines.append("")
     return "\n".join(lines)
 
 
 # ═══════════════════════════════════════════════════════════════
-# 生成 ProtoBindIndex.gen.cpp
+# ProtoBindIndex.gen.h / .cpp
 # ═══════════════════════════════════════════════════════════════
 
+def generate_index_h(closure: list[ProtoFileInfo]) -> str:
+    lines = [
+        "/**",
+        " * @file ProtoBindIndex.gen.h",
+        " * @brief 自动生成文件——汇总声明，供宿主（WorldServer 等）手写代码 include",
+        " *",
+        " * 生成工具: Tools/Script/GenMsgBindings.py",
+        " * @warning 不要手动编辑",
+        " */",
+        "#pragma once",
+        "",
+        "namespace das",
+        "{",
+        "    class Module;",
+        "    class ModuleLibrary;",
+        "} // namespace das",
+        "",
+        "namespace MMO",
+        "{",
+        "",
+        "    /**",
+        "     * @brief 注册当前依赖闭包内全部消息的 daScript 类型（含 EMsgID 枚举）",
+        "     * @note 在服务专用 Module 的 BindFunctions() 内调用一次",
+        "     */",
+        "    void RegisterAllProtoMessageTypes(das::Module &mod, das::ModuleLibrary &lib);",
+        "",
+        "    /**",
+        "     * @brief 注册当前依赖闭包内全部 *Req 的消息分发函数到 ScriptDispatchRegistry",
+        "     * @note 在脚本 Load 成功、dispatch_msg 就绪之后调用一次",
+        "     */",
+        "    void RegisterAllMsgDispatch();",
+        "",
+        "} // namespace MMO",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def generate_index_cpp(closure: list[ProtoFileInfo],
-                        msg_id_entries: list[tuple[str, int]]) -> str:
-    lines = []
-    lines.append("/**")
-    lines.append(" * @file ProtoBindIndex.gen.cpp")
-    lines.append(" * @brief 自动生成文件——汇总调用各 <ProtoFileName>.gen.cpp 里定义的注册函数")
-    lines.append(" *")
-    lines.append(" * 生成工具: Tools/Script/GenMsgBindings.py")
-    lines.append(" * 来源: Src/Proto/ 下依赖闭包内的全部 .proto 文件")
-    lines.append(" * @warning 不要手动编辑——新增/删除 .proto 文件后重新生成本文件")
-    lines.append(" * @note 调用顺序已按依赖关系排好（被引用类型所在文件先注册）。")
-    lines.append(" */")
-    lines.append("#include \"World/AutoGen/ProtoBindIndex.gen.h\"")
-    lines.append("")
-    lines.append("#include <daScript/daScriptModule.h>")
-    lines.append("#include <daScript/ast/ast.h>")
-    lines.append("#include <daScript/simulate/simulate.h>")
-    lines.append("#include <daScript/simulate/bind_enum.h>")
-    lines.append("#include <MsgID.pb.h>")
-    lines.append("")
-    lines.append("namespace MMO")
-    lines.append("{")
-    # 前置声明——使用 extern，与定义处的 `namespace MMO { }` 一致
+                       msg_id_entries: list[tuple[str, int]]) -> str:
+    lines = [
+        "/**",
+        " * @file ProtoBindIndex.gen.cpp",
+        " * @brief 自动生成文件——汇总各 <ProtoFileName>.gen.cpp 的注册函数 + EMsgID 枚举绑定",
+        " *",
+        " * 生成工具: Tools/Script/GenMsgBindings.py",
+        " * @warning 不要手动编辑——新增/删除 .proto 后重新生成",
+        " * @note 调用顺序已按依赖关系排好（被引用类型所在文件先注册）。",
+        " */",
+        '#include "World/AutoGen/ProtoBindIndex.gen.h"',
+        "",
+        "#include <daScript/daScriptModule.h>",
+        "#include <daScript/ast/ast.h>",
+        "#include <daScript/simulate/simulate.h>",
+        "#include <daScript/simulate/bind_enum.h>",
+        "#include <MsgID.pb.h>",
+        "",
+        "namespace MMO",
+        "{",
+    ]
     for info in closure:
         lines.append(f"    extern void Register{info.name}ProtoBindings(das::Module &mod, das::ModuleLibrary &lib);")
     lines.append("")
@@ -611,197 +670,55 @@ def generate_index_cpp(closure: list[ProtoFileInfo],
             lines.append(f"    extern void Register{info.name}MsgDispatch();")
     lines.append("} // namespace MMO")
     lines.append("")
-    # 匿名命名空间——EMsgID 枚举绑定
-    lines.append("namespace")
-    lines.append("{")
-    lines.append("    using namespace das;")
-    lines.append("")
-    lines.append("    // EMsgID 枚举绑定——替代手写的 MsgIDConstants.das")
-    lines.append("    struct EnumerationEMsgID : das::Enumeration")
-    lines.append("    {")
-    lines.append("        EnumerationEMsgID() : das::Enumeration(\"EMsgID\")")
-    lines.append("        {")
-    lines.append("            external = true;")
-    lines.append("            cppName = \"MMO::Proto::EMsgID\";")
-    lines.append("            baseType = das::Type::tInt;")
+    # EMsgID 枚举绑定
+    lines += [
+        "namespace",
+        "{",
+        "    using namespace das;",
+        "",
+        "    // EMsgID 枚举绑定——脚本侧写 EMsgID.MSG_XXX，宏侧编译期查值",
+        "    struct EnumerationEMsgID : das::Enumeration",
+        "    {",
+        '        EnumerationEMsgID() : das::Enumeration("EMsgID")',
+        "        {",
+        "            external = true;",
+        '            cppName  = "MMO::Proto::EMsgID";',
+        "            baseType = das::Type::tInt;",
+    ]
     for name, value in msg_id_entries:
-        lines.append(f"            addI(\"{name}\", {value}, das::LineInfo());")
-    lines.append("        }")
-    lines.append("    };")
-    lines.append("")
-    lines.append("} // namespace")
-    lines.append("")
-    lines.append("namespace MMO")
-    lines.append("{")
-    lines.append("")
-    lines.append("    void RegisterAllProtoMessageTypes(das::Module &mod, das::ModuleLibrary &lib)")
-    lines.append("    {")
+        lines.append(f'            addI("{name}", {value}, das::LineInfo());')
+    lines += [
+        "        }",
+        "    };",
+        "",
+        "} // namespace",
+        "",
+        "namespace MMO",
+        "{",
+        "",
+        "    void RegisterAllProtoMessageTypes(das::Module &mod, das::ModuleLibrary &lib)",
+        "    {",
+    ]
     for info in closure:
         lines.append(f"        Register{info.name}ProtoBindings(mod, lib);")
-    lines.append("        mod.addEnumeration(new EnumerationEMsgID());")
-    lines.append("    }")
-    lines.append("")
-    lines.append("    void RegisterAllMsgDispatch()")
-    lines.append("    {")
+    lines += [
+        "        mod.addEnumeration(new EnumerationEMsgID());",
+        "    }",
+        "",
+        "    void RegisterAllMsgDispatch()",
+        "    {",
+    ]
     for info in closure:
         if info.has_req:
             lines.append(f"        Register{info.name}MsgDispatch();")
-    lines.append("    }")
-    lines.append("")
-    lines.append("} // namespace MMO")
-    lines.append("")
-    lines.append("DAS_BIND_ENUM_CAST(MMO::Proto::EMsgID)")
-    lines.append("")
-    return "\n".join(lines)
-
-
-# ═══════════════════════════════════════════════════════════════
-# 生成 HandlerRegistry.das
-# ═══════════════════════════════════════════════════════════════
-
-def generate_handler_registry_das(proto_files: dict[str, ProtoFileInfo],
-                                    closure: list[ProtoFileInfo]) -> str:
-    """生成 Script/AutoGen/HandlerRegistry.das"""
-
-    # 收集所有 *Req 消息
-    req_entries: list[tuple[str, str]] = []  # (MsgName, MsgIDConstant)
-    for info in closure:
-        for msg in info.messages:
-            if msg.name.endswith("Req"):
-                msg_id_const = camel_to_msg_id(msg.name)
-                req_entries.append((msg.name, msg_id_const))
-
-    lines = []
-    lines.append("// ════════════════════════════════════════════════════")
-    lines.append("// 自动生成 — GenMsgBindings.py")
-    lines.append("//   生成时间: 2026-07-28")
-    lines.append("//   来源: Src/Proto/*.proto 中的 *Req 消息 + MsgID.proto")
-    lines.append("// ════════════════════════════════════════════════════")
-    lines.append("")
-    lines.append("options gen2")
-    lines.append("options indenting = 4")
-    lines.append("")
-    lines.append("module HandlerRegistry")
-    lines.append("")
-    lines.append("require daslib/ast")
-    lines.append("require daslib/ast_boost")
-    lines.append("require daslib/templates_boost")
-    lines.append("")
-    lines.append("require massive")
-
-    # 消息名 → msgID 表（EMsgID 是 C++ 侧绑定的枚举，需显式转 uint）
-    lines.append("// ── 消息名 → msgID 编译期映射（apply() 内查表用）──")
-    lines.append("let g_msg_name_to_id : table<string; uint> <- {")
-    for msg_name, msg_id_const in req_entries:
-        lines.append(f"    \"{msg_name}\" => uint(EMsgID.{msg_id_const}),")
-    lines.append("}")
-    lines.append("")
-
-    # 期望数量
-    lines.append(f"// ── 期望注册的 handler 数量（等于上表条目数）──")
-    lines.append(f"let g_expected_handler_count = {len(req_entries)}")
-    lines.append("")
-
-    # 运行期分发表
-    # @@(...) { ... } 在这里没有捕获任何外部变量（$c/$v 都是编译期展开），
-    # 推断出的类型是 function<...>，不是 lambda<...>——两者不能混用赋值。
-    lines.append("// ── 运行期分发表：msgID → handler function ──")
-    lines.append("var g_handler_registry : table<uint; function<(sessionID : uint; msgPtr : void?) : void>>")
-    lines.append("var g_registered_count : int = 0")
-    lines.append("")
-
-    # [msg_handler] 注解
-    lines.append("// ── [msg_handler] 注解 ──")
-    lines.append("[function_macro(name=\"msg_handler\")]")
-    lines.append("class MsgHandlerAnnotation : AstFunctionAnnotation {")
-    lines.append("    def override apply(var func : FunctionPtr; var group : ModuleGroup;")
-    lines.append("                       args : AnnotationArgumentList; var errors : das_string) : bool {")
-    lines.append("        // 步骤 1: msg 参数必须是字符串（消息名，如 \"MoveReq\"）——")
-    lines.append("        //         daScript 语法上 msg=Xxx 的裸标识符会被解析成字符串本身，")
-    lines.append("        //         此处显式要求写成 msg=\"Xxx\"，与语法行为保持一致。")
-    lines.append("        let msgArg = find_arg(args, \"msg\")")
-    lines.append("        if (!(msgArg is tString)) {")
-    lines.append('            errors := "[msg_handler] 需要 msg=\\"<MessageName>\\" 参数（如 msg=\\"MoveReq\\"）"')
-    lines.append("            return false")
-    lines.append("        }")
-    lines.append("        let msgName = msgArg as tString")
-    lines.append("")
-    lines.append("        // 步骤 2: 消息名必须在生成器扫描出的表里——防止拼错")
-    lines.append("        var msgID : uint")
-    lines.append("        var found = false")
-    lines.append("        g_msg_name_to_id |> get(msgName) $(id) {")
-    lines.append("            msgID = id")
-    lines.append("            found = true")
-    lines.append("        }")
-    lines.append("        if (!found) {")
-    lines.append('            errors := "[msg_handler] 未知消息名 \\"{msgName}\\"——检查 .proto 是否存在对应 *Req 消息，或重跑 xmake 触发生成"')
-    lines.append("            return false")
-    lines.append("        }")
-    lines.append("")
-    lines.append("        // 步骤 3: 函数签名至少两个参数 (sessionID: uint; req: <MessageName>[; 额外 string/repeated 参数...])")
-    lines.append("        if (length(func.arguments) < 2) {")
-    lines.append('            errors := "[msg_handler(msg=\\"{msgName}\\")] 函数至少需要两个参数: (sessionID : uint; req : {msgName})"')
-    lines.append("            return false")
-    lines.append("        }")
-    lines.append("        if (func.arguments[0]._type.baseType != Type.tUInt || func.arguments[0]._type.fixedDim != 0) {")
-    lines.append('            errors := "[msg_handler(msg=\\"{msgName}\\")] 第一个参数必须是 sessionID : uint"')
-    lines.append("            return false")
-    lines.append("        }")
-    lines.append("")
-    lines.append("        // 步骤 4: 第二个参数类型名必须严格等于消息名——按约定推导，无需额外注解")
-    lines.append("        // MoveReq 等消息类型通过 ManagedStructureAnnotation 绑定，是 handled type")
-    lines.append("        // （baseType == Type.tHandle），类型名要从 annotation.name 取，不是 structType")
-    lines.append("        let msgType = func.arguments[1]._type")
-    lines.append("        if (msgType.baseType != Type.tHandle || msgType.annotation == null) {")
-    lines.append('            errors := "[msg_handler(msg=\\"{msgName}\\")] 第二个参数类型应为 {msgName}，实际不是消息类型"')
-    lines.append("            return false")
-    lines.append("        }")
-    lines.append("        if (msgType.annotation.name != msgName) {")
-    lines.append('            errors := "[msg_handler(msg=\\"{msgName}\\")] 第二个参数类型应为 {msgName}，实际是 {msgType.annotation.name}"')
-    lines.append("            return false")
-    lines.append("        }")
-    lines.append("")
-    lines.append("        // 步骤 5: 注入注册代码——把 (msgID → 转发 block) 写进全局表")
-    lines.append("        // apply() 本身运行在编译期的宏 context 里（Program::makeMacroModule 为")
-    lines.append("        // thisModule 单独开了一个 macroContext），这里直接写 g_registered_count")
-    lines.append("        // += 1 只会改到宏 context 里的那份全局变量，运行时 _scriptCtx 是另一个")
-    lines.append("        // 独立 context，看到的仍是初值 0——所以必须和 g_handler_registry 一样，")
-    lines.append("        // 用 qmacro_expr 生成语句、塞进 [init] 函数体，才会在运行时 context 里")
-    lines.append("        // 真正执行。setup_call_list(isInit=true) 拿到（或创建）该 [init] 函数。")
-    lines.append('        var initBlk <- setup_call_list("msg_handler`init", func.at, true, true)')
-    lines.append("        initBlk.list |> push(qmacro_expr(${")
-    lines.append("            g_handler_registry[$v(msgID)] = @@(sessionID : uint; msgPtr : void?) {")
-    lines.append("                let typedMsg = unsafe(reinterpret<$t(msgType)?> msgPtr)")
-    lines.append('                $c("_::{func.name}")(sessionID, *typedMsg)')
-    lines.append("            }")
-    lines.append("        }))")
-    lines.append('        initBlk.list |> push(qmacro_expr(${ g_registered_count += 1 }))')
-    lines.append("        func.flags.privateFunction = true")
-    lines.append("        return true")
-    lines.append("    }")
-    lines.append("}")
-    lines.append("")
-
-    # dispatch_msg 入口
-    lines.append("// ── C++ 唯一调用入口 ──")
-    lines.append("[export]")
-    lines.append("def dispatch_msg(msgID : uint; sessionID : uint; msgPtr : void?) {")
-    lines.append("    g_handler_registry |> get(msgID) $(handler) {")
-    lines.append("        invoke(handler, sessionID, msgPtr)")
-    lines.append("    }")
-    lines.append("}")
-    lines.append("")
-
-    # 完整性校验
-    lines.append("// ── 完整性校验：handler 数量必须等于生成器扫描出的期望数量 ──")
-    lines.append("[export]")
-    lines.append("def validate_handler_registry {")
-    lines.append("    if (g_registered_count != g_expected_handler_count) {")
-    lines.append('        panic("handler 完整性校验失败: 期望 {g_expected_handler_count} 个 [msg_handler]，实际注册 {g_registered_count} 个——检查 Handlers.das 是否有消息漏写或漏加注解")')
-    lines.append("    }")
-    lines.append("}")
-    lines.append("")
-
+    lines += [
+        "    }",
+        "",
+        "} // namespace MMO",
+        "",
+        "DAS_BIND_ENUM_CAST(MMO::Proto::EMsgID)",
+        "",
+    ]
     return "\n".join(lines)
 
 
@@ -810,25 +727,29 @@ def generate_handler_registry_das(proto_files: dict[str, ProtoFileInfo],
 # ═══════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="Protobuf → daScript 消息绑定代码生成器")
+    parser = argparse.ArgumentParser(description="Protobuf → C++ 脚本绑定代码生成器")
     parser.add_argument("--proto-dir", required=True, help="Src/Proto 目录路径")
     parser.add_argument("--cpp-out", required=True, help="C++ 生成文件输出路径（如 Src/World/AutoGen）")
-    parser.add_argument("--das-out", required=True, help="daScript 生成文件输出路径（如 Script/AutoGen）")
+    parser.add_argument("--das-out", required=False, default=None,
+                        help="[已废弃] 旧 das 输出路径——保留以兼容旧 xmake 调用，本生成器忽略之")
+    parser.add_argument("--purge-legacy-das", action="store_true",
+                        help="迁移到手写 [msg_handler] 后，删除旧生成产物 "
+                             "Script/AutoGen/HandlerRegistry.das 与 MsgIDConstants.das。"
+                             "默认不删——避免尚未迁移的构建丢失依赖文件。")
     args = parser.parse_args()
 
     proto_dir = Path(args.proto_dir)
     cpp_out = Path(args.cpp_out)
-    das_out = Path(args.das_out)
-
-    # 确保输出目录存在
     cpp_out.mkdir(parents=True, exist_ok=True)
-    das_out.mkdir(parents=True, exist_ok=True)
 
-    # 1. 解析所有 .proto 文件
+    if args.das_out:
+        print(f"⚠️  --das-out 已废弃并被忽略（{args.das_out}）——请从 xmake 调用中移除该参数")
+
+    # 1. 解析 .proto（排除 MsgID.proto，单独处理）
     proto_files: dict[str, ProtoFileInfo] = {}
-    exclude_names = {"MsgID.proto"}
+    exclude = {"MsgID.proto"}
     for proto_path in sorted(proto_dir.glob("*.proto")):
-        if proto_path.name in exclude_names:
+        if proto_path.name in exclude:
             continue
         info = parse_proto_file(proto_path)
         proto_files[info.filename] = info
@@ -841,49 +762,46 @@ def main():
         status = "有 *Req" if info.has_req else "仅辅助类型"
         print(f"  解析: {info.filename} ({status}, {len(info.messages)} 个消息)")
 
-    # 2. 计算依赖闭包
+    # 2. 依赖闭包
     closure = compute_closure(proto_files)
     print(f"\n依赖闭包 ({len(closure)} 个文件):")
     for info in closure:
         print(f"  - {info.filename}")
 
-    # 2.5 解析 MsgID.proto——生成 EMsgID 枚举绑定用
-    msg_id_proto_path = proto_dir / "MsgID.proto"
-    msg_id_entries = parse_msg_id_proto(msg_id_proto_path)
-    print(f"\n解析: {msg_id_proto_path.name} ({len(msg_id_entries)} 个枚举值)")
+    # 2.5 MsgID.proto → EMsgID 枚举
+    msg_id_path = proto_dir / "MsgID.proto"
+    if not msg_id_path.is_file():
+        print(f"错误：缺少 {msg_id_path}", file=sys.stderr)
+        sys.exit(1)
+    msg_id_entries = parse_msg_id_proto(msg_id_path)
+    print(f"\n解析: {msg_id_path.name} ({len(msg_id_entries)} 个枚举值)")
 
-    # 3. 生成每个文件的 .gen.cpp
+    # 3. 每文件 .gen.cpp
     for info in closure:
         content = generate_proto_gen_cpp(info, proto_files)
         out_path = cpp_out / f"{info.name}.gen.cpp"
         out_path.write_text(content, encoding="utf-8")
         print(f"  生成: {out_path}")
 
-    # 4. 生成汇总文件
-    index_h = generate_index_h(closure)
-    index_h_path = cpp_out / "ProtoBindIndex.gen.h"
-    index_h_path.write_text(index_h, encoding="utf-8")
-    print(f"  生成: {index_h_path}")
+    # 4. 汇总
+    (cpp_out / "ProtoBindIndex.gen.h").write_text(generate_index_h(closure), encoding="utf-8")
+    print(f"  生成: {cpp_out / 'ProtoBindIndex.gen.h'}")
+    (cpp_out / "ProtoBindIndex.gen.cpp").write_text(
+        generate_index_cpp(closure, msg_id_entries), encoding="utf-8")
+    print(f"  生成: {cpp_out / 'ProtoBindIndex.gen.cpp'}")
 
-    index_cpp = generate_index_cpp(closure, msg_id_entries)
-    index_cpp_path = cpp_out / "ProtoBindIndex.gen.cpp"
-    index_cpp_path.write_text(index_cpp, encoding="utf-8")
-    print(f"  生成: {index_cpp_path}")
+    # 5. 清理旧 das 产物——仅当显式传 --purge-legacy-das（已完成手写迁移）时执行。
+    #    默认不删：否则一次普通构建/测试就会删掉尚在使用的 HandlerRegistry.das。
+    if args.purge_legacy_das:
+        das_autogen = proto_dir.parent.parent / "Script" / "AutoGen"
+        for stale in ("HandlerRegistry.das", "MsgIDConstants.das"):
+            p = das_autogen / stale
+            if p.exists():
+                p.unlink()
+                print(f"  删除旧产物: {p}（--purge-legacy-das）")
 
-    # 5. 生成 HandlerRegistry.das
-    das_content = generate_handler_registry_das(proto_files, closure)
-    das_path = das_out / "HandlerRegistry.das"
-    das_path.write_text(das_content, encoding="utf-8")
-    print(f"  生成: {das_path}")
-
-    # 6. 删除旧的 MsgIDConstants.das（已由 C++ EMsgID 绑定替代）
-    old_constants = das_out / "MsgIDConstants.das"
-    if old_constants.exists():
-        old_constants.unlink()
-        print(f"  删除: {old_constants}（已由 C++ EMsgID 绑定替代）")
-
-    print(f"\n✅ 全部生成完成")
-    print(f"⚠️  新增/删除含 *Req 的 .proto 文件后，需执行一次 xmake f -c 让 xmake 通配符重新扫描")
+    print("\n✅ 全部生成完成")
+    print("⚠️  新增/删除含 *Req 的 .proto 后，需执行一次 xmake f -c 让通配符重新扫描")
 
 
 if __name__ == "__main__":

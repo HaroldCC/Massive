@@ -5,11 +5,11 @@
 
 #include "World/WorldServer.h"
 #include "Common/Crypto/SessionToken.h"
-#include "Common/ECS/MassiveModule.h"
 #include "Common/ECS/Scene.h"
 #include "Common/Log/Log.h"
 #include "Common/Network/TCPSocket.h"
 #include "ScriptEngine/DasEngine.h"
+#include "ScriptEngine/DasEngineConfig.h"
 #include "World/Component/EntityType.h"
 #include "World/Component/Health.h"
 #include "World/Component/Position.h"
@@ -174,19 +174,6 @@ namespace MMO
         _running.store(false, std::memory_order_release);
         _logicThread.Stop();
 
-        // 排空脚本定时器回调，避免 Context 析构后触发（CodeReview #5）
-        if (_massiveModule)
-        {
-            _massiveModule->_timerCallbacks.clear();
-        }
-
-        // 先销毁 Context/Program（它们依赖模块数据），再 Shutdown 模块
-        _scriptCtx.reset();
-        _scriptProgram.reset();
-        _massiveModule.reset();
-
-        das::Module::Shutdown(); // CodeReview #2: 官方 Quick Start 5.1.2 要求
-
         if (_gateAcceptor)
         {
             _gateAcceptor->Stop();
@@ -197,14 +184,6 @@ namespace MMO
         }
 
         Log::Info("WorldServer: stopped");
-    }
-
-    das::Context *WorldServer::GetScriptContext() const
-    {
-    }
-
-    das::SimFunction *WorldServer::GetDispatchFunc() const
-    {
     }
 
     void WorldServer::SendRawToClient(uint32 sessionID, uint32 msgID, const uint8 *data, size_t len)
@@ -276,46 +255,6 @@ namespace MMO
             }
         }
         UpdateLoadLevel(_sessions.size(), queueDepth);
-
-        // 4. 脚本 Tick（Phase 3：脚本 → CPPSystems）
-        if (_fnUpdate && _scriptCtx)
-        {
-            _scriptCtx->restart();
-
-            float dt     = static_cast<float>(elapsed.count()) / 1000.0f;
-            vec4f args[] = {das::cast<uint32_t>::from(uint32_t(1)), das::cast<float>::from(dt)};
-
-            // CodeReview #4: 同步 dt 给 Bridge_GetDeltaTime
-            _massiveModule->_scriptDt.store(dt, std::memory_order_relaxed);
-
-            // CodeReview #6: 使用 evalWithCatch 捕获脚本异常，避免进程崩溃
-            _scriptCtx->evalWithCatch(_fnUpdate, args);
-            if (auto ex = _scriptCtx->getException())
-            {
-                Log::Error("Script Update exception: {}", ex);
-            }
-
-            // CodeReview #3: 基于堆实际增长量自适应触发 GC（优于固定帧计数）
-            // bump allocator 的 restart() 只回卷栈/string heap，不回卷 general heap。
-            // 监控 heap->getTotalBytesAllocated() 增长，超过阈值才触发。
-            uint64_t heapNow = _scriptCtx->heap->getTotalBytesAllocated();
-            if (heapNow - _lastGCHeapSize > 4 * 1024 * 1024) // 堆增长 > 4MB → GC
-            {
-                _scriptCtx->collectHeap(nullptr, true, true);
-                _lastGCHeapSize = _scriptCtx->heap->getTotalBytesAllocated();
-            }
-
-            // 5. CPPSystems — 脚本 Tick 后运行 C++ 物理模拟 + AOI
-            auto *scene = _sceneMgr.GetDefaultScene();
-            if (scene)
-            {
-                std::unordered_map<uint32_t, VisibleSet> visibleSets;
-                RunCPPSystems(*scene, dt, visibleSets);
-
-                // 6. ReplicateSystem — 消费 AOI 结果做网络复制
-                SystemReplicate(*scene, dt, visibleSets);
-            }
-        }
     }
 
     void WorldServer::ProcessUnroutedMessages()
@@ -413,10 +352,11 @@ namespace MMO
 
     void WorldServer::OnMessage(uint32 sessionID, WorldSession &ws, const LogicMessage &msg)
     {
-        (void)ws;
-
-        // Phase 3（23_ProtoScriptBinding.md）：优先尝试脚本分发
-        if (ScriptDispatchRegistry::Dispatch(*this, sessionID, msg.msgID, msg.body.Data(), msg.body.Size()))
+        // 优先尝试脚本分发
+        if (DasLangEngine::GetIns().DispatchRegistry().Dispatch(sessionID,
+                                                                msg.msgID,
+                                                                msg.body.Data(),
+                                                                msg.body.Size()))
         {
             return;
         }
@@ -668,71 +608,27 @@ namespace MMO
 
         auto &dasEngine = DasLangEngine::GetIns();
 
+        DasLangEngineConfig cfg;
+        cfg.dasLangRoot = _config.script.dasRoot;
 
-        // Initialize 必须在 PULL 之后、compileDaScript 之前调用
-        das::Module::Initialize();
-        Log::Info("InitScriptEngine: modules initialized");
+#ifdef DEBUG
+        cfg.mode = EScriptMode::Develop;
+#else
+        cfg.mode = EScriptMode::Release;
+#endif
 
-        // 创建 MassiveModule — 注入 4 个上下文指针
-        _massiveModule =
-            std::make_unique<MassiveModule>(this, &_sceneMgr, &_logicThread.GetTimingWheel(), &_sessions);
-        _massiveModule->BindFunctions();
-
-        // 创建 ModuleGroup 并注册 MassiveModule
-        das::ModuleGroup libGroup;
-        libGroup.addModule(_massiveModule.get());
-
-        _scriptProgram = CompileDaScript("Script/ServerTick.das", libGroup);
-        if (!_scriptProgram)
+        if (!dasEngine.Initialize(cfg, this, _moduleProvider.get()))
         {
-            Log::Error("InitScriptEngine: compile failed");
             return false;
         }
-        Log::Info("InitScriptEngine: compile OK");
 
-        _scriptCtx = std::make_shared<das::Context>(_scriptProgram->getContextStackSize());
-
-        // MassiveModule 需要 _ctx 来分配 TArray / alocate（供桥接函数）
-        _massiveModule->_ctx = _scriptCtx;
-
-        das::TextWriter simulateLogs;
-        if (!_scriptProgram->simulate(*_scriptCtx, simulateLogs))
+        if (!dasEngine.Load("main.das"))
         {
-            Log::Error("InitScriptEngine: simulate failed");
+            Log::Error("Load main.das fail:{}", dasEngine.GetLastErrors());
             return false;
         }
-        Log::Info("InitScriptEngine: simulate OK");
 
-        auto fnInit = _scriptCtx->findFunction("Init");
-        if (fnInit)
-        {
-            // CodeReview #6: 使用 evalWithCatch 捕获脚本异常
-            _scriptCtx->evalWithCatch(fnInit, nullptr);
-            if (auto ex = _scriptCtx->getException())
-            {
-                Log::Error("InitScriptEngine: Init() exception: {}", ex);
-            }
-            _fnInit = fnInit;
-            Log::Info("InitScriptEngine: Init() called");
-        }
-        else
-        {
-            Log::Warn("InitScriptEngine: Init() not found");
-        }
-
-        _fnUpdate = _scriptCtx->findFunction("Update");
-        if (_fnUpdate)
-        {
-            Log::Info("InitScriptEngine: Update() cached");
-        }
-
-        // Phase 3（23_ProtoScriptBinding.md）：缓存 dispatch_msg() 并注册消息分发
-        _fnDispatchMsg = _scriptCtx->findFunction("dispatch_msg");
-        if (_fnDispatchMsg)
-        {
-            Log::Info("InitScriptEngine: dispatch_msg() cached");
-            RegisterAllMsgDispatch();
-        }
+        RegisterAllMsgDispatch();
 
         Log::Info("InitScriptEngine: OK");
         return true;

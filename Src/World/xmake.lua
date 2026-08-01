@@ -24,9 +24,7 @@ rule("gen_msg_bindings")
             end
         end
         if dirty then
-            os.vrunv("python", {genScript, "--proto-dir", protoDir,
-                                "--cpp-out", autogenDir,
-                                "--das-out", path.join(os.projectdir(), "Script/AutoGen")})
+            os.vrunv("python", {genScript, "--proto-dir", protoDir, "--cpp-out", autogenDir})
             cprint("${color.success}[msgbind] handler bindings 已更新")
         end
 

@@ -20,13 +20,11 @@
 namespace MMO
 {
 
-    class WorldServer;
-
     /**
      * @brief 脚本分发函数签名——解析 protobuf + 转发到 daScript
      * @return 解析成功且已转发返回 true；解析失败返回 false
      */
-    using ScriptDispatchFn = bool (*)(WorldServer &server, uint32 sessionID, const uint8 *body, size_t len);
+    using ScriptDispatchFn = bool (*)(uint32 sessionID, const uint8 *body, size_t len);
 
     /**
      * @brief msgID → ScriptDispatchFn 定长表，O(1) 查表
@@ -37,17 +35,16 @@ namespace MMO
         /**
          * @brief 注册一个 msgID 的分发函数——由各 *.gen.cpp 在启动期调用
          */
-        static void Register(uint32 msgID, ScriptDispatchFn fn);
+        void Register(uint32 msgID, ScriptDispatchFn fn);
 
         /**
          * @brief 按 msgID 查表并分发
          * @return 找到对应分发函数且分发成功返回 true；未注册该 msgID 返回 false
          */
-        static bool
-        Dispatch(WorldServer &server, uint32 sessionID, uint32 msgID, const uint8 *body, size_t len);
+        bool Dispatch(uint32 sessionID, uint32 msgID, const uint8 *body, size_t len);
 
     private:
-        static std::array<ScriptDispatchFn, kMaxHandlers> &Table();
+        std::array<ScriptDispatchFn, kMaxHandlers> _msgFuncs {};
     };
 
 } // namespace MMO

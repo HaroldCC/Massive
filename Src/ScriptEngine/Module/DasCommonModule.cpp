@@ -8,7 +8,7 @@
 namespace MMO
 {
 
-    static void LogInfo(const char *text, das::Context *ctx, das::LineInfoArg *at)
+    void LogInfo(const char *text, das::Context *ctx, das::LineInfoArg *at)
     {
         if (nullptr != at && nullptr != at->fileInfo)
         {
@@ -24,7 +24,7 @@ namespace MMO
         }
     }
 
-    static void LogWarn(const char *text, das::Context *ctx, das::LineInfoArg *at)
+    void LogWarn(const char *text, das::Context *ctx, das::LineInfoArg *at)
     {
         if (nullptr != at && nullptr != at->fileInfo)
         {
@@ -40,7 +40,7 @@ namespace MMO
         }
     }
 
-    static void LogError(const char *text, das::Context *ctx, das::LineInfoArg *at)
+    void LogError(const char *text, das::Context *ctx, das::LineInfoArg *at)
     {
         if (nullptr != at && nullptr != at->fileInfo)
         {
@@ -60,31 +60,35 @@ namespace MMO
     {
     }
 
-    void DasCommonModule::SetHost(IDasLangtHost *host, TimingWheel *timingWheel)
-    {
-        _host        = host;
-        _timingWheel = timingWheel;
-    }
-
-    void DasCommonModule::BindFunctions()
+    void DasCommonModule::Build()
     {
         das::ModuleLibrary lib(this);
         lib.addBuiltInModule();
 
         // Log
-        das::addExtern<DAS_BIND_FUN(LogInfo)>(*this, lib, "LogInfo", das::SideEffects::modifyExternal, "LogInfo")
+        das::addExtern<DAS_BIND_FUN(LogInfo)>(*this,
+                                              lib,
+                                              "MMO::LogInfo",
+                                              das::SideEffects::modifyExternal,
+                                              "MMO::LogInfo")
             ->args({"text", "ctx", "at"});
-        das::addExtern<DAS_BIND_FUN(LogWarn)>(*this, lib, "LogWarn", das::SideEffects::modifyExternal, "LogWarn")
+        das::addExtern<DAS_BIND_FUN(LogWarn)>(*this,
+                                              lib,
+                                              "LogWarn",
+                                              das::SideEffects::modifyExternal,
+                                              "MMO::LogWarn")
             ->args({"text", "ctx", "at"});
-        das::addExtern<DAS_BIND_FUN(LogError)>(*this, lib, "LogError", das::SideEffects::modifyExternal, "LogError")
+        das::addExtern<DAS_BIND_FUN(LogError)>(*this,
+                                               lib,
+                                               "LogError",
+                                               das::SideEffects::modifyExternal,
+                                               "MMO::LogError")
             ->args({"text", "ctx", "at"});
     }
 
-    das::Context *DasCommonModule::GetContext() const
+    das::ModuleAotType DasCommonModule::aotRequire(das::TextWriter &tw) const
     {
-        return _host->GetScriptContext();
+        tw << "#include \"ScriptEngine/Module/DasCommonModule.h\"\n";
+        return das::ModuleAotType::cpp;
     }
-
-    REGISTER_DYN_MODULE(DasCommonModule, DasCommonModule)
-    REGISTER_MODULE(DasCommonModule)
 } // namespace MMO
