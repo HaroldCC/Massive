@@ -328,3 +328,44 @@ target("libDaScript")
     on_config(function(target)
         target:add("sysincludedirs", modulesIncDir)
     end)
+
+target("daslang")
+    set_kind("binary")
+    add_rules("Rules.ThirdParty")
+    add_deps("libDaScript")
+    set_warnings("none")
+
+    add_files("daScript/utils/daScript/main.cpp")
+
+    add_sysincludedirs("daScript/include")
+    add_defines(commonDefines)
+    add_defines("DAS_ENABLE_DYN_INCLUDES=1")
+    add_defines(string.format("DAS_FUSION=%s", dasFusionMode))
+    if is_mode("release") then
+        add_defines("DAS_NO_ASSERTIONS")
+    end
+
+    if is_plat("windows") then
+        add_syslinks("dbghelp", "ws2_32")
+    elseif is_plat("linux") then
+        add_syslinks("dl", "pthread")
+    elseif is_plat("macosx") then
+        add_syslinks("pthread")
+    end
+    if is_plat("mingw") then
+        add_defines("_GNU_SOURCE")
+    end
+    setupPlatformFlags()
+
+    on_config(function(target)
+        target:add("sysincludedirs", modulesIncDir)
+    end)
+
+    before_build(function(target)
+        import("core.project.depend")
+        local incFile = path.join(modulesIncDir, "modules", "external_need.inc")
+        if not os.isfile(incFile) then
+            os.mkdir(path.join(modulesIncDir, "modules"))
+            io.open(incFile, "w"):close()
+        end
+    end)
