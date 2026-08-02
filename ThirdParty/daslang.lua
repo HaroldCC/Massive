@@ -278,6 +278,7 @@ target("libDaScript")
     add_files("daScript/src/simulate/simulate_fusion_call1.cpp")
     add_files("daScript/src/simulate/simulate_fusion_call2.cpp")
     add_files("daScript/src/simulate/simulate_fusion_if.cpp")
+    add_files("daScript/src/simulate/simulate_fusion_tablewithhash.cpp")
 
     -- C API 和模块注册
     add_files("daScript/src/misc/daScriptC.cpp")
