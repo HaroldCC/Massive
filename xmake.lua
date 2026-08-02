@@ -36,22 +36,57 @@ elseif is_mode("release") then
 end
 
 rule("Rules.das_aot")
-    add_deps("c++", "daslang")
+    add_deps("c++", "AotGen")
+
+    -- xmake 构建时序（源码核实）：
+    --   build jobgraph 是"先建图后执行"。add_filejobs 在 get_targetjobs 建图阶段
+    --   调用 sourcebatches() 固化文件编译 job；before_build 闭包在执行阶段才跑。
+    --   → before_build 里 target:add("files", ...) 永远进不了本次构建（obj 缺失）。
+    --
+    -- 正确做法（生成与注册解耦）：
+    --   on_config（早于建图）：add_files(outcpp, {always_added = true}) 注册进 sourcebatch。
+    --     always_added = 文件此刻可能不存在也加入（xmake issues/1634 支持的机制）。
+    --   before_build（执行阶段，AotGen.exe 已由 build.fence + add_deps 保证构建完）：
+    --     运行 AotGen 生成 outcpp。编译 job 在 on_build 时执行，此刻文件已存在。
+    on_config(function (target)
+        local service = target:extraconf("rules", "Rules.das_aot", "service") or "world"
+        local entry = target:extraconf("rules", "Rules.das_aot", "entry") or (service .. "/main.das")
+        local aotDir = path.join(target:autogendir(), "aot")
+        local outcpp = path.join(aotDir, entry:gsub("[/\\]", "_"):gsub("%.das$", "") .. ".das.cpp")
+        -- 注册进 sourcebatch（文件此刻可能尚未生成，always_added 允许）
+        target:add("files", outcpp, {always_added = true})
+    end)
 
     before_build(function(target)
-        local daslangTarget = target:dep("daslang")
-        local daslangExe = path.join(daslangTarget:targetdir(), daslangTarget:name())
+        import("core.project.depend")
+        local aotgenTarget = target:dep("AotGen")
+        local aotgenExe = path.join(aotgenTarget:targetdir(), aotgenTarget:name())
         local dasRoot = path.join(os.projectdir(), "Script")
         local aotDir = path.join(target:autogendir(), "aot")
         os.mkdir(aotDir)
 
-        local scripts
+        -- AOT 入口清单：只列各服务【入口脚本】，其 require 闭包由 aot() 自动覆盖。
+        -- 单一真相源：与 IDasLangModuleProvider::MainScriptFile() 一致（如 World/main.das）。
+        local service = target:extraconf("rules", "Rules.das_aot", "service") or "world"
+        local entry = target:extraconf("rules", "Rules.das_aot", "entry") or (service .. "/main.das")
+        local dasfile = path.join(dasRoot, entry)
+        local outcpp = path.join(aotDir, entry:gsub("[/\\]", "_"):gsub("%.das$", "") .. ".das.cpp")
+
+        -- 依赖：入口脚本 + 整个 Script 目录（Handlers/MsgHandlerRegistry 等 require 闭包）
+        local deps = os.files(path.join(dasRoot, "**.das"))
+        table.insert(deps, dasfile)
+        table.insert(deps, aotgenExe)
+        depend.on_changed(function ()
+            os.vrunv(aotgenExe, { dasRoot, dasfile, outcpp })
+            cprint("${color.success}[aot] %s (+require 闭包)", entry)
+        end, {files = deps, dependfile = outcpp .. ".d"})
     end)
 rule_end()
 
 add_includedirs("Src")
 
 includes("ThirdParty/xmake.lua")
+includes("Tools/AotGen/xmake.lua")
 includes("Src/**/xmake.lua")
 -- includes("Src/Login/xmake.lua")
 -- includes("Src/Gate/xmake.lua")

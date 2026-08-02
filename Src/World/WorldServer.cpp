@@ -10,6 +10,7 @@
 #include "Common/Network/TCPSocket.h"
 #include "ScriptEngine/DasEngine.h"
 #include "ScriptEngine/DasEngineConfig.h"
+#include "World/DasModule/WorldDasModule.h"
 #include "World/Component/EntityType.h"
 #include "World/Component/Health.h"
 #include "World/Component/Position.h"
@@ -74,6 +75,9 @@ namespace MMO
 
         // 注册消息分发
         RegisterHandlers();
+
+        // 实例化脚本模块提供者（World 专用 das 模块：消息类型 + EMsgID 绑定）
+        _moduleProvider = std::make_unique<WorldDasModule>();
 
         // 初始化脚本引擎（Phase 1：最小 DaLang + DECS 验证）
         if (!InitScriptEngine())
@@ -622,9 +626,9 @@ namespace MMO
             return false;
         }
 
-        if (!dasEngine.Load("main.das"))
+        if (!dasEngine.Load("Script/World/main.das"))
         {
-            Log::Error("Load main.das fail:{}", dasEngine.GetLastErrors());
+            Log::Error("Load Script/World/main.das fail:{}", dasEngine.GetLastErrors());
             return false;
         }
 
