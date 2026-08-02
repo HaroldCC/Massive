@@ -74,6 +74,7 @@ class ProtoFileInfo:
     imports: list[str]
     messages: list[MessageInfo] = field(default_factory=list)
     has_req: bool = False   # 是否包含 *Req 消息
+    service: str = ""       # 归属服务（"world"/"social"/""=公共）
 
 
 # ── Regex 集合 ──
@@ -162,7 +163,7 @@ def _extract_message_body(text: str, start: int) -> tuple[str, int]:
     return text[start:pos], pos
 
 
-def parse_proto_file(filepath: Path) -> ProtoFileInfo:
+def parse_proto_file(filepath: Path, service: str = "") -> ProtoFileInfo:
     """解析一个 .proto 文件；遇到不支持的构造报错退出"""
     text = filepath.read_text(encoding="utf-8")
     basename = filepath.name
@@ -237,15 +238,64 @@ def parse_proto_file(filepath: Path) -> ProtoFileInfo:
     return ProtoFileInfo(
         name=name, filename=basename, package=package,
         imports=imports, messages=messages, has_req=has_req,
+        service=service,
     )
 
 
 # ═══════════════════════════════════════════════════════════════
-# 依赖闭包
+# 依赖闭包 + topo 排序
 # ═══════════════════════════════════════════════════════════════
 
+def _is_message_ref(fld: FieldInfo) -> bool:
+    """字段是否为消息类型引用（非标量/string/bytes/map）"""
+    return not (fld.is_scalar or fld.is_string or fld.is_bytes or fld.is_map)
+
+
+def _topo_sort_messages(messages: list[MessageInfo],
+                        by_name: dict[str, MessageInfo]) -> list[MessageInfo]:
+    """按消息间字段依赖 topo 排序：被依赖者在前。
+
+    依赖 = 某消息的字段（singular 或 repeated）类型是同文件内另一消息。
+    循环依赖无法用 ctor 内 addProperty 满足任何顺序，检测到环时告警并退回原序
+    （调用方需将环上字段改为注解外后置绑定）。
+    """
+    visited: dict[str, int] = {}   # 0=访问中, 1=完成
+    ordered: list[MessageInfo] = []
+    has_cycle = [False]
+
+    def visit(m: MessageInfo) -> None:
+        state = visited.get(m.name)
+        if state == 1:
+            return
+        if state == 0:
+            has_cycle[0] = True
+            return
+        visited[m.name] = 0
+        for fld in m.fields:
+            if not _is_message_ref(fld):
+                continue
+            dep = by_name.get(fld.type_name)
+            if dep is not None and dep is not m:
+                visit(dep)
+        visited[m.name] = 1
+        ordered.append(m)
+
+    for m in messages:
+        visit(m)
+
+    if has_cycle[0]:
+        print("警告：检测到消息循环引用，注解注册顺序可能触发 DAS_FATAL_ERROR；"
+              "如确有循环字段，请改为注解外后置 addExternProperty 绑定该字段",
+              file=sys.stderr)
+        return messages
+    return ordered
+
+
 def compute_closure(proto_files: dict[str, ProtoFileInfo]) -> list[ProtoFileInfo]:
-    """含 *Req 的文件 + 其（递归）引用的类型所在文件；被引用多的排前"""
+    """含 *Req 的文件 + 其（递归）引用的类型所在文件；按文件间依赖 topo 排序（被依赖者在前）。
+
+    返回顺序即注册顺序：被依赖文件先注册其消息注解，保证 makeHandleType 前向解析成功。
+    """
     req_files: set[str] = {f for f, i in proto_files.items() if i.has_req}
 
     type_to_file: dict[str, str] = {}
@@ -253,31 +303,51 @@ def compute_closure(proto_files: dict[str, ProtoFileInfo]) -> list[ProtoFileInfo
         for msg in info.messages:
             type_to_file[msg.name] = fname
 
+    # 收集闭包（BFS 沿消息字段引用）
     closure: set[str] = set(req_files)
     queue = deque(req_files)
     while queue:
         cur = queue.popleft()
         for msg in proto_files[cur].messages:
             for fld in msg.fields:
-                if fld.is_scalar or fld.is_string or fld.is_bytes or fld.is_map:
+                if not _is_message_ref(fld):
                     continue
                 ref_file = type_to_file.get(fld.type_name)
                 if ref_file and ref_file not in closure:
                     closure.add(ref_file)
                     queue.append(ref_file)
 
-    ref_count: dict[str, int] = defaultdict(int)
-    for fname in closure:
+    # 文件间依赖边：file X 依赖 file Y（X 的某消息字段类型定义在 Y，且 Y != X）
+    def file_deps(fname: str) -> set[str]:
+        deps: set[str] = set()
         for msg in proto_files[fname].messages:
             for fld in msg.fields:
-                if fld.is_scalar or fld.is_string or fld.is_bytes or fld.is_map:
+                if not _is_message_ref(fld):
                     continue
-                ref_file = type_to_file.get(fld.type_name)
-                if ref_file and ref_file in closure:
-                    ref_count[ref_file] += 1
+                ref = type_to_file.get(fld.type_name)
+                if ref and ref in closure and ref != fname:
+                    deps.add(ref)
+        return deps
 
-    sorted_files = sorted(closure, key=lambda f: (-ref_count.get(f, 0), f))
-    return [proto_files[f] for f in sorted_files]
+    # DFS topo：被依赖文件先入 ordered（append 在递归返回后 → 依赖者后出）
+    visited: dict[str, int] = {}   # 0=访问中, 1=完成
+    ordered: list[str] = []
+
+    def visit(fname: str) -> None:
+        st = visited.get(fname)
+        if st == 1:
+            return
+        if st == 0:
+            return  # 文件级环：忽略（消息级 topo 已处理大部分）
+        visited[fname] = 0
+        for dep in sorted(file_deps(fname)):  # sorted 保证确定性
+            visit(dep)
+        visited[fname] = 1
+        ordered.append(fname)
+
+    for fname in sorted(closure):
+        visit(fname)
+    return [proto_files[f] for f in ordered]
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -288,6 +358,14 @@ def _string_accessor_name(msg: str, fld: FieldInfo) -> str:
     return f"{msg}_Get{cap_first(fld.name)}"
 
 
+def _bytes_size_name(msg: str, fld: FieldInfo) -> str:
+    return f"{msg}_{cap_first(fld.name)}_Size"
+
+
+def _bytes_at_name(msg: str, fld: FieldInfo) -> str:
+    return f"{msg}_{cap_first(fld.name)}_At"
+
+
 def _repeated_size_name(msg: str, fld: FieldInfo) -> str:
     return f"{msg}_{cap_first(fld.name)}_Size"
 
@@ -296,12 +374,21 @@ def _repeated_index_name(msg: str, fld: FieldInfo) -> str:
     return f"{msg}_{cap_first(fld.name)}"
 
 
-def _iter_string_fields(msg: MessageInfo):
-    """非 repeated 的 string/bytes 字段"""
+def _iter_plain_string_fields(msg: MessageInfo):
+    """非 repeated 的 string 字段（真文本，可安全 c_str）"""
     for fld in msg.fields:
         if fld.is_map:
             continue
-        if fld.label != "repeated" and (fld.is_string or fld.is_bytes):
+        if fld.label != "repeated" and fld.is_string:
+            yield fld
+
+
+def _iter_bytes_fields(msg: MessageInfo):
+    """非 repeated 的 bytes 字段（二进制，须按长度逐字节暴露）"""
+    for fld in msg.fields:
+        if fld.is_map:
+            continue
+        if fld.label != "repeated" and fld.is_bytes:
             yield fld
 
 
@@ -328,8 +415,10 @@ def emit_file_header(info: ProtoFileInfo) -> list[str]:
         " * @warning 不要手动编辑",
     ]
     if req_names:
-        out.append(f" * @note {', '.join(req_names)} 覆写 canCopy/canClone = false——")
-        out.append(" *       脚本不能把 req 存进全局变量或结构体字段，只能本次调用内读取/按引用传递。")
+        out.append(f" * @note {', '.join(req_names)} 覆写 canClone=false——req 句柄不能存进全局/结构体。")
+        out.append(" *       ⚠ 但【从 req 抽出的 string】是指向 req 内部的临时指针，")
+        out.append(" *       仅本次 dispatch 调用内有效；脚本如需保留必须 := 克隆，不能 = 存储。")
+        out.append(" *       bytes 字段已按长度暴露（`xx_size + xx(index)`），无 NUL 截断问题。")
     out.append(" */")
     return out
 
@@ -388,13 +477,34 @@ def emit_type_factories(info: ProtoFileInfo, referenced_types: set[str]) -> list
 
 def emit_string_accessor(msg: MessageInfo, fld: FieldInfo) -> list[str]:
     func = _string_accessor_name(msg.name, fld)
-    body = (f"return msg.{fld.name}().c_str();" if fld.is_string
-            else f"return reinterpret_cast<const char *>(msg.{fld.name}().data());")
     return [
-        f"    // ── string/bytes 字段：addExternProperty 注册，脚本写 req.{fld.name}（无括号）──",
+        "    // ── string 字段：addExternProperty 注册，脚本写 req.`fieldname（无括号）──",
+        "    //    ⚠ 返回的是指向 req 内部的 const char*，仅本次 dispatch 调用内有效；",
+        "    //    脚本如需保留必须 := 克隆，不能 = 存储（见 emit_file_header 注释）。",
         f"    const char *{func}(const {PROTO_NS}::{msg.name} &msg)",
         "    {",
-        f"        {body}",
+        f"        return msg.{fld.name}().c_str();",
+        "    }",
+        "",
+    ]
+
+
+def emit_bytes_accessors(msg: MessageInfo, fld: FieldInfo) -> list[str]:
+    """bytes 字段：_size 长度属性 + (msg,index)->uint8 逐字节访问，避免 NUL 截断。"""
+    size_func = _bytes_size_name(msg.name, fld)
+    at_func = _bytes_at_name(msg.name, fld)
+    return [
+        "    // ── bytes 字段：长度 + 逐字节 uint8，避免 NUL 截断（0x00 不丢）──",
+        f"    int {size_func}(const {PROTO_NS}::{msg.name} &msg)",
+        "    {",
+        f"        return static_cast<int>(msg.{fld.name}().size());",
+        "    }",
+        "",
+        f"    uint8_t {at_func}(const {PROTO_NS}::{msg.name} &msg, int index)",
+        "    {",
+        f"        const auto &b = msg.{fld.name}();",
+        "        if (index < 0 || index >= static_cast<int>(b.size())) { return 0u; }",
+        f"        return static_cast<uint8_t>(b[static_cast<size_t>(index)]);",
         "    }",
         "",
     ]
@@ -404,14 +514,17 @@ def emit_repeated_accessors(msg: MessageInfo, fld: FieldInfo) -> list[str]:
     size_func = _repeated_size_name(msg.name, fld)
     index_func = _repeated_index_name(msg.name, fld)
     if fld.is_string:
-        ret_type, access = "const char *", f"msg.{fld.name}(index).c_str()"
+        ret_type, access, default = "const char *", f"msg.{fld.name}(index).c_str()", '""'
     elif fld.is_bytes:
-        ret_type, access = "const char *", f"reinterpret_cast<const char *>(msg.{fld.name}(index).data())"
+        ret_type, access, default = "const char *", f"reinterpret_cast<const char *>(msg.{fld.name}(index).data())", "nullptr"
     elif fld.is_scalar:
         ret_type = _CPP_SCALAR_MAP.get(fld.type_name, fld.type_name)
-        access = f"msg.{fld.name}(index)"
+        access, default = f"msg.{fld.name}(index)", f"static_cast<{ret_type}>(0)"
     else:
-        ret_type, access = f"const {PROTO_NS}::{fld.type_name} &", f"msg.{fld.name}(index)"
+        # message 元素：越界返回该类型的静态默认实例（const& 安全）
+        ret_type = f"const {PROTO_NS}::{fld.type_name} &"
+        access = f"msg.{fld.name}(index)"
+        default = f"{PROTO_NS}::{fld.type_name}::default_instance()"
     return [
         "    // ── repeated _size：addExternProperty，无括号 ──",
         f"    int {size_func}(const {PROTO_NS}::{msg.name} &msg)",
@@ -419,9 +532,10 @@ def emit_repeated_accessors(msg: MessageInfo, fld: FieldInfo) -> list[str]:
         f"        return msg.{fld.name}_size();",
         "    }",
         "",
-        "    // ── repeated 索引访问：需要 index 参数，必须带括号 ──",
+        "    // ── repeated 索引访问：带边界检查（本 build protobuf BoundsCheckMode=kNoEnforcement）──",
         f"    {ret_type}{index_func}(const {PROTO_NS}::{msg.name} &msg, int index)",
         "    {",
+        f"        if (index < 0 || index >= msg.{fld.name}_size()) {{ return {default}; }}",
         f"        return {access};",
         "    }",
         "",
@@ -434,9 +548,9 @@ def emit_annotation(msg: MessageInfo, is_req: bool) -> list[str]:
         f"     * @brief {msg.name} 的 daScript 类型注解",
     ]
     if is_req:
-        out.append("     * @note 引用类型（网络消息）——canCopy/canClone = false")
+        out.append("     * @note 引用类型（网络消息）——句柄不可 clone，防止逃逸本次调用")
     else:
-        out.append("     * @note 值类型——脚本可安全复制/克隆保存")
+        out.append("     * @note 值类型——可 clone(:=)/存储，不可 = 复制（protobuf 非平凡拷贝）")
     out += [
         "     */",
         f"    struct {msg.name}Annotation : ManagedStructureAnnotation<{PROTO_NS}::{msg.name}, false, false>",
@@ -459,8 +573,8 @@ def emit_annotation(msg: MessageInfo, is_req: bool) -> list[str]:
     if is_req:
         out += [
             "",
-            "        // §2.4 生命周期防护——阻断脚本把 req 赋值/克隆进任何逃逸本次调用的存储位置",
-            "        virtual bool canCopy() const override { return false; }",
+            "        // §2.4 生命周期防护——阻断脚本 clone req 存进逃逸本次调用的存储位置",
+            "        // （canCopy/canMove 因 protobuf 非平凡拷贝已默认 false，无需 override）",
             "        virtual bool canClone() const override { return false; }",
         ]
     out += ["    };", ""]
@@ -510,10 +624,17 @@ def emit_register_bindings(info: ProtoFileInfo) -> list[str]:
     for msg in info.messages:
         out.append(f"        mod.addAnnotation(new {msg.name}Annotation(lib));")
         has_any = True
-        for fld in _iter_string_fields(msg):
+        for fld in _iter_plain_string_fields(msg):
             func = _string_accessor_name(msg.name, fld)
             out.append(f'        das::addExternProperty<DAS_BIND_FUN({func})>(mod, lib, ".`{fld.name}", "{func}")')
             out.append('            ->args({"msg"});')
+        for fld in _iter_bytes_fields(msg):
+            size_func = _bytes_size_name(msg.name, fld)
+            at_func = _bytes_at_name(msg.name, fld)
+            out.append(f'        das::addExternProperty<DAS_BIND_FUN({size_func})>(mod, lib, ".`{fld.name}_size", "{size_func}")')
+            out.append('            ->args({"msg"});')
+            out.append(f'        das::addExtern<DAS_BIND_FUN({at_func})>(mod, lib, "{fld.name}", das::SideEffects::none)')
+            out.append('            ->args({"msg", "index"});')
         for fld in _iter_repeated_fields(msg):
             size_func = _repeated_size_name(msg.name, fld)
             index_func = _repeated_index_name(msg.name, fld)
@@ -549,6 +670,11 @@ def emit_register_dispatch(info: ProtoFileInfo, req_msgs: list[MessageInfo]) -> 
 
 def generate_proto_gen_cpp(info: ProtoFileInfo,
                            proto_files: dict[str, ProtoFileInfo]) -> str:
+    # ★ A1: 文件内按字段依赖 topo 排序，保证被依赖的消息注解先注册
+    #   （注解 ctor 内 addProperty 即时解析 message 字段类型，前向引用会 DAS_FATAL_ERROR）
+    by_name = {m.name: m for m in info.messages}
+    info.messages = _topo_sort_messages(info.messages, by_name)
+
     # 收集跨文件引用类型（非 repeated 的 message 类型字段）
     referenced_types: set[str] = set()
     for msg in info.messages:
@@ -572,8 +698,10 @@ def generate_proto_gen_cpp(info: ProtoFileInfo,
     lines.append("")
 
     for msg in info.messages:
-        for fld in _iter_string_fields(msg):
+        for fld in _iter_plain_string_fields(msg):
             lines += emit_string_accessor(msg, fld)
+        for fld in _iter_bytes_fields(msg):
+            lines += emit_bytes_accessors(msg, fld)
         for fld in _iter_repeated_fields(msg):
             lines += emit_repeated_accessors(msg, fld)
 
@@ -602,6 +730,98 @@ def generate_proto_gen_cpp(info: ProtoFileInfo,
 # ProtoBindIndex.gen.h / .cpp
 # ═══════════════════════════════════════════════════════════════
 
+def generate_emsgid_bind_h() -> str:
+    """EMsgIDBind.gen.h —— EMsgID 枚举绑定声明（公共层，DasCommonModule 调用）"""
+    return "\n".join([
+        "/**",
+        " * @file EMsgIDBind.gen.h",
+        " * @brief 自动生成文件——EMsgID 枚举绑定声明（全局共享 ID 值空间）",
+        " *",
+        " * 生成工具: Tools/Script/GenMsgBindings.py",
+        " * @warning 不要手动编辑",
+        " */",
+        "#pragma once",
+        "",
+        "namespace das",
+        "{",
+        "    class Module;",
+        "} // namespace das",
+        "",
+        "namespace MMO",
+        "{",
+        "",
+        "    /**",
+        "     * @brief 注册 EMsgID 枚举到指定模块",
+        "     * @note 由 DasCommonModule::Build 调用（绑定到 Common 模块），",
+        "     *       使所有服务的脚本侧都能引用 EMsgID.MSG_XXX，宏侧查 Common 即可。",
+        "     */",
+        "    void RegisterEMsgIDEnumeration(das::Module &mod);",
+        "",
+        "} // namespace MMO",
+        "",
+    ])
+
+
+def generate_emsgid_bind_cpp(msg_id_entries: list[tuple[str, int]]) -> str:
+    """EMsgIDBind.gen.cpp —— EMsgID 枚举绑定实现"""
+    lines = [
+        "/**",
+        " * @file EMsgIDBind.gen.cpp",
+        " * @brief 自动生成文件——EMsgID 枚举绑定（全局共享 ID 值空间）",
+        " *",
+        " * 生成工具: Tools/Script/GenMsgBindings.py",
+        " * @warning 不要手动编辑——新增/删除消息后重新生成",
+        " */",
+        '#include "Proto/AutoGen/EMsgIDBind.gen.h"',
+        "",
+        "#include <daScript/daScriptModule.h>",
+        "#include <daScript/ast/ast.h>",
+        "#include <daScript/simulate/simulate.h>",
+        "#include <daScript/simulate/bind_enum.h>",
+        "#include <MsgID.pb.h>",
+        "",
+        "namespace",
+        "{",
+        "    using namespace das;",
+        "",
+        "    // EMsgID 枚举绑定——脚本侧写 EMsgID.MSG_XXX，宏侧编译期查值",
+        "    // 注：仅 addEnumeration + DAS_BIND_ENUM_CAST，未 emit typeFactory<EMsgID>。",
+        "    // 因为 msgID 始终以 uint32 跨 C++/脚本边界（见 Dispatch），从不以 EMsgID 类型传参。",
+        "    // 若将来有 addExtern 的参数/返回类型是 MMO::Proto::EMsgID，需改用 DAS_BASE_BIND_ENUM_FACTORY。",
+        "    struct EnumerationEMsgID : das::Enumeration",
+        "    {",
+        '        EnumerationEMsgID() : das::Enumeration("EMsgID")',
+        "        {",
+        "            external = true;",
+        '            cppName  = "MMO::Proto::EMsgID";',
+        "            baseType = das::Type::tInt;",
+    ]
+    for name, value in msg_id_entries:
+        lines.append(f'            addI("{name}", {value}, das::LineInfo());')
+    lines += [
+        "        }",
+        "    };",
+        "",
+        "} // namespace",
+        "",
+        "namespace MMO",
+        "{",
+        "",
+        "    void RegisterEMsgIDEnumeration(das::Module &mod)",
+        "    {",
+        "        // EMsgID 是全局共享 ID 值空间，绑定到 Common 模块（DasCommonModule::Build 调用），",
+        "        // 使所有服务（World/Social）都能在脚本侧引用 EMsgID.MSG_XXX，宏侧查 Common 即可。",
+        "        mod.addEnumeration(new EnumerationEMsgID());",
+        "    }",
+        "",
+        "} // namespace MMO",
+        "",
+        "DAS_BIND_ENUM_CAST(MMO::Proto::EMsgID)",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def generate_index_h(closure: list[ProtoFileInfo]) -> str:
     lines = [
         "/**",
@@ -612,6 +832,17 @@ def generate_index_h(closure: list[ProtoFileInfo]) -> str:
         " * @warning 不要手动编辑",
         " */",
         "#pragma once",
+        "",
+        "#include <MsgID.pb.h>",
+    ]
+    # include 闭包内所有消息的 .pb.h——AOT 生成的 .das.cpp 会引用 MMO::Proto::Xxx 类型，
+    # 经 aotRequire 只 include 本头，故本头必须提供全部消息类型定义。
+    seen_pb: set[str] = set()
+    for info in closure:
+        if info.name not in seen_pb:
+            seen_pb.add(info.name)
+            lines.append(f'#include "Proto/AutoGen/{info.name}.pb.h"')
+    lines += [
         "",
         "namespace das",
         "{",
@@ -641,22 +872,25 @@ def generate_index_h(closure: list[ProtoFileInfo]) -> str:
 
 
 def generate_index_cpp(closure: list[ProtoFileInfo],
-                       msg_id_entries: list[tuple[str, int]]) -> str:
+                       msg_id_entries: list[tuple[str, int]],
+                       cpp_out_rel: str = "World/AutoGen") -> str:
+    # 注意：EMsgID 枚举绑定已拆到 EMsgIDBind.gen.{h,cpp}（公共层，DasCommonModule 调用），
+    # 这里只保留服务侧的消息类型注册 + 分发注册。
     lines = [
         "/**",
         " * @file ProtoBindIndex.gen.cpp",
-        " * @brief 自动生成文件——汇总各 <ProtoFileName>.gen.cpp 的注册函数 + EMsgID 枚举绑定",
+        " * @brief 自动生成文件——汇总各 <ProtoFileName>.gen.cpp 的注册函数 + 消息分发注册",
         " *",
         " * 生成工具: Tools/Script/GenMsgBindings.py",
         " * @warning 不要手动编辑——新增/删除 .proto 后重新生成",
         " * @note 调用顺序已按依赖关系排好（被引用类型所在文件先注册）。",
+        " * @note EMsgID 枚举绑定见 EMsgIDBind.gen.cpp（绑定到 Common 模块）。",
         " */",
-        '#include "World/AutoGen/ProtoBindIndex.gen.h"',
+        f'#include "{cpp_out_rel}/ProtoBindIndex.gen.h"',
         "",
         "#include <daScript/daScriptModule.h>",
         "#include <daScript/ast/ast.h>",
         "#include <daScript/simulate/simulate.h>",
-        "#include <daScript/simulate/bind_enum.h>",
         "#include <MsgID.pb.h>",
         "",
         "namespace MMO",
@@ -670,29 +904,7 @@ def generate_index_cpp(closure: list[ProtoFileInfo],
             lines.append(f"    extern void Register{info.name}MsgDispatch();")
     lines.append("} // namespace MMO")
     lines.append("")
-    # EMsgID 枚举绑定
     lines += [
-        "namespace",
-        "{",
-        "    using namespace das;",
-        "",
-        "    // EMsgID 枚举绑定——脚本侧写 EMsgID.MSG_XXX，宏侧编译期查值",
-        "    struct EnumerationEMsgID : das::Enumeration",
-        "    {",
-        '        EnumerationEMsgID() : das::Enumeration("EMsgID")',
-        "        {",
-        "            external = true;",
-        '            cppName  = "MMO::Proto::EMsgID";',
-        "            baseType = das::Type::tInt;",
-    ]
-    for name, value in msg_id_entries:
-        lines.append(f'            addI("{name}", {value}, das::LineInfo());')
-    lines += [
-        "        }",
-        "    };",
-        "",
-        "} // namespace",
-        "",
         "namespace MMO",
         "{",
         "",
@@ -702,7 +914,6 @@ def generate_index_cpp(closure: list[ProtoFileInfo],
     for info in closure:
         lines.append(f"        Register{info.name}ProtoBindings(mod, lib);")
     lines += [
-        "        mod.addEnumeration(new EnumerationEMsgID());",
         "    }",
         "",
         "    void RegisterAllMsgDispatch()",
@@ -716,8 +927,6 @@ def generate_index_cpp(closure: list[ProtoFileInfo],
         "",
         "} // namespace MMO",
         "",
-        "DAS_BIND_ENUM_CAST(MMO::Proto::EMsgID)",
-        "",
     ]
     return "\n".join(lines)
 
@@ -726,10 +935,44 @@ def generate_index_cpp(closure: list[ProtoFileInfo],
 # 主入口
 # ═══════════════════════════════════════════════════════════════
 
+def collect_service_protos(proto_dir: Path, service: str) -> dict[str, ProtoFileInfo]:
+    """扫描 公共（顶层）+ <Service>/ 子目录 的 .proto，返回 {filename: ProtoFileInfo}。
+
+    - 顶层 *.proto 视为公共（Common.proto 等），所有服务共享；
+    - <Service>/ 子目录（如 World/、Social/）为该服务专用；
+    - 若同名文件同时出现在公共与服务子目录，服务子目录优先（覆盖）。
+    """
+    proto_files: dict[str, ProtoFileInfo] = {}
+    exclude = {"MsgID.proto"}
+    # 公共
+    for p in sorted(proto_dir.glob("*.proto")):
+        if p.name in exclude:
+            continue
+        info = parse_proto_file(p)
+        proto_files[info.filename] = info
+    # 服务专用
+    svc_dir = proto_dir / service.capitalize()
+    if svc_dir.is_dir():
+        for p in sorted(svc_dir.glob("*.proto")):
+            if p.name in exclude:
+                continue
+            info = parse_proto_file(p, service=service)
+            proto_files[info.filename] = info
+    return proto_files
+
+
 def main():
     parser = argparse.ArgumentParser(description="Protobuf → C++ 脚本绑定代码生成器")
+    parser.add_argument("--service", required=True,
+                        help="服务名（world / social），决定扫描的 proto 子目录")
     parser.add_argument("--proto-dir", required=True, help="Src/Proto 目录路径")
     parser.add_argument("--cpp-out", required=True, help="C++ 生成文件输出路径（如 Src/World/AutoGen）")
+    parser.add_argument("--emsgid-out", required=False, default=None,
+                        help="EMsgID 枚举绑定输出路径（默认 Src/Proto/AutoGen——公共层，"
+                             "由 DasCommonModule 依赖）")
+    parser.add_argument("--only-emsgid", action="store_true",
+                        help="仅生成 EMsgID 枚举绑定（公共层），不生成服务消息绑定。"
+                             "供 Proto target 的 proto_msgid rule 调用")
     parser.add_argument("--das-out", required=False, default=None,
                         help="[已废弃] 旧 das 输出路径——保留以兼容旧 xmake 调用，本生成器忽略之")
     parser.add_argument("--purge-legacy-das", action="store_true",
@@ -745,14 +988,23 @@ def main():
     if args.das_out:
         print(f"⚠️  --das-out 已废弃并被忽略（{args.das_out}）——请从 xmake 调用中移除该参数")
 
-    # 1. 解析 .proto（排除 MsgID.proto，单独处理）
-    proto_files: dict[str, ProtoFileInfo] = {}
-    exclude = {"MsgID.proto"}
-    for proto_path in sorted(proto_dir.glob("*.proto")):
-        if proto_path.name in exclude:
-            continue
-        info = parse_proto_file(proto_path)
-        proto_files[info.filename] = info
+    # 0. EMsgID 枚举绑定（公共层，DasCommonModule 依赖）——先于消息绑定生成
+    msg_id_path0 = proto_dir / "MsgID.proto"
+    if msg_id_path0.is_file():
+        msg_id_entries0 = parse_msg_id_proto(msg_id_path0)
+        emsgid_out = Path(args.emsgid_out) if args.emsgid_out else proto_dir / "AutoGen"
+        emsgid_out.mkdir(parents=True, exist_ok=True)
+        (emsgid_out / "EMsgIDBind.gen.h").write_text(generate_emsgid_bind_h(), encoding="utf-8")
+        print(f"  生成: {emsgid_out / 'EMsgIDBind.gen.h'}")
+        (emsgid_out / "EMsgIDBind.gen.cpp").write_text(
+            generate_emsgid_bind_cpp(msg_id_entries0), encoding="utf-8")
+        print(f"  生成: {emsgid_out / 'EMsgIDBind.gen.cpp'}")
+    if args.only_emsgid:
+        print("\n✅ EMsgID 绑定生成完成（--only-emsgid）")
+        return
+
+    # 1. 解析 .proto（公共 + <Service>/ 子目录；排除 MsgID.proto 单独处理）
+    proto_files = collect_service_protos(proto_dir, args.service)
 
     if not proto_files:
         print("错误：未找到 .proto 文件", file=sys.stderr)
@@ -786,8 +1038,17 @@ def main():
     # 4. 汇总
     (cpp_out / "ProtoBindIndex.gen.h").write_text(generate_index_h(closure), encoding="utf-8")
     print(f"  生成: {cpp_out / 'ProtoBindIndex.gen.h'}")
+    # include 路径：从 project root 到 cpp_out 的相对路径（如 World/AutoGen）。
+    # 约定 cpp_out 位于 <project>/Src/<Service>/AutoGen，取 "Src" 之后的片段。
+    cpp_out_rel = "World/AutoGen"
+    try:
+        src_idx = str(cpp_out).replace("\\", "/").find("Src/")
+        if src_idx >= 0:
+            cpp_out_rel = str(cpp_out).replace("\\", "/")[src_idx + len("Src/"):]
+    except Exception:
+        pass
     (cpp_out / "ProtoBindIndex.gen.cpp").write_text(
-        generate_index_cpp(closure, msg_id_entries), encoding="utf-8")
+        generate_index_cpp(closure, msg_id_entries, cpp_out_rel), encoding="utf-8")
     print(f"  生成: {cpp_out / 'ProtoBindIndex.gen.cpp'}")
 
     # 5. 清理旧 das 产物——仅当显式传 --purge-legacy-das（已完成手写迁移）时执行。

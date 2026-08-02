@@ -91,11 +91,18 @@ namespace MMO
     {
         _entryFile = entryFile;
 
-        // Release 优先尝试 .dasbin Develop直接源码编译
+        // Release 优先尝试 .dasbin Develop直接源码编译。
+        // dabin 文件名用入口 basename（去目录）：Script/World/main.das → main.dasbin
         std::string dasbinPath = "";
         if (_cfg.mode == EScriptMode::Release && !_cfg.dasbinDir.empty())
         {
-            dasbinPath = std::format("{}/{}.dasbin", _cfg.dasbinDir, entryFile);
+            std::string base  = entryFile;
+            auto        slash = base.find_last_of("/\\");
+            if (slash != std::string::npos)
+            {
+                base = base.substr(slash + 1);
+            }
+            dasbinPath = std::format("{}/{}.dasbin", _cfg.dasbinDir, base);
         }
 
         DasLangImage img = Compile(_entryFile, dasbinPath);
@@ -111,7 +118,7 @@ namespace MMO
             return false;
         }
 
-        // save dasbin
+        // save dasbin —— 仅当本次是从源码全量编译（未命中 dabin）时生成缓存
         if (_cfg.mode == EScriptMode::Release && !_cfg.dasbinDir.empty() && dasbinPath.empty())
         {
             std::vector<std::pair<std::string, int64>> depFiles;
@@ -123,7 +130,13 @@ namespace MMO
                 }
             }
 
-            std::string outPath = std::format("{}/{}.dasbin", _cfg.dasbinDir, entryFile);
+            std::string base  = entryFile;
+            auto        slash = base.find_last_of("/\\");
+            if (slash != std::string::npos)
+            {
+                base = base.substr(slash + 1);
+            }
+            std::string outPath = std::format("{}/{}.dasbin", _cfg.dasbinDir, base);
             DasLangSerializer::Save(outPath, img.program, *img.moduleGroup, depFiles, _cfg.dasbinKeyHex);
         }
 
@@ -225,10 +238,10 @@ namespace MMO
         {
             std::string err;
             auto        program = DasLangSerializer::Load(dasbinPath,
-                                                          *img.moduleGroup,
-                                                          img.fileAccess.get(),
-                                                          _cfg.dasbinKeyHex,
-                                                          err);
+                                                   *img.moduleGroup,
+                                                   img.fileAccess.get(),
+                                                   _cfg.dasbinKeyHex,
+                                                   err);
             if (program)
             {
                 img.program = program;
@@ -279,6 +292,12 @@ namespace MMO
         img.funcInit        = img.ctx->findFunction("Init");
         img.funcUpdate      = img.ctx->findFunction("Update");
         img.funcDispatchMsg = img.ctx->findFunction("DispatchMsg");
+
+        // 诊断：确认脚本侧入口函数都绑定成功（DispatchMsg 由 MsgHandlerRegistry 模块导出）
+        Log::Info("DasEngine: RebindFunctions Init={} Update={} DispatchMsg={}",
+                  (nullptr != img.funcInit) ? "ok" : "MISS",
+                  (nullptr != img.funcUpdate) ? "ok" : "MISS",
+                  (nullptr != img.funcDispatchMsg) ? "ok" : "MISS");
     }
 
     void DasLangEngine::DoSwap(DasLangImage &&img)
@@ -357,6 +376,7 @@ namespace MMO
         p.threadlock_context = true;
         p.persistent_heap    = true;
         p.rtti               = true;
+        p.version_2_syntax   = true; // 项目脚本统一 v2 语法（main.das / daslib 均 gen2）
         if (forAotGen)
         {
             p.aot                        = false;
@@ -379,6 +399,9 @@ namespace MMO
     void DasLangEngine::BuildModuleGroup(DasLangImage &img)
     {
         img.moduleGroup = std::make_unique<das::ModuleGroup>();
+        // 公共模块：Common（日志等全服务通用绑定）由引擎统一注册
+        img.moduleGroup->addModule(_commonModule.get());
+        // 服务专用模块（world/social 等）：消息类型 + EMsgID + 业务绑定
         _moduleProvider->CreateModules(*img.moduleGroup);
     }
 

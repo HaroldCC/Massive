@@ -57,6 +57,25 @@ rule("proto_msgid")
                                 "--output", "Internal/InternalMsgID.proto"})
             cprint("${color.success}[proto] InternalMsgID.proto 已更新")
         end
+
+        -- EMsgID 枚举绑定（公共层，DasCommonModule 依赖）——MsgID.proto 就绪后立即生成，
+        -- 保证 ScriptEngine 编译时文件已存在（ScriptEngine 的 gen_emsgid_bind 只负责 add_files）
+        local bindScript   = path.join(os.projectdir(), "Tools/Script/GenMsgBindings.py")
+        local emsgidCpp    = path.join(protoDir, "AutoGen", "EMsgIDBind.gen.cpp")
+        local emsgidDirty  = not os.isfile(emsgidCpp)
+        if not emsgidDirty then
+            local bindMtime = os.mtime(emsgidCpp)
+            if os.mtime(msgidProto) > bindMtime then
+                emsgidDirty = true
+            end
+        end
+        if emsgidDirty then
+            os.vrunv("python", {bindScript, "--only-emsgid", "--service", "world",
+                                "--proto-dir", protoDir,
+                                "--cpp-out", path.join(protoDir, "AutoGen"),
+                                "--emsgid-out", path.join(protoDir, "AutoGen")})
+            cprint("${color.success}[proto] EMsgIDBind.gen 已更新")
+        end
     end)
 
 --- rule: protoc 生成 .pb.{h,cc} + 编译
