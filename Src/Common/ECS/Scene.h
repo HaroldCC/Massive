@@ -135,8 +135,8 @@ namespace MMO::ECS
         void RegisterScriptComponent(const std::string &name, size_t componentSize);
 
     private:
-        uint32                                                                   _sceneId;
-        entt::registry                                                           _registry;
+        uint32         _sceneId;
+        entt::registry _registry;
     };
 
 } // namespace MMO::ECS
