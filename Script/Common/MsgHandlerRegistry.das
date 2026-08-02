@@ -7,6 +7,7 @@ require daslib.ast
 require daslib.ast_boost
 require daslib.macro_boost
 require daslib.strings_boost
+require daslib.templates_boost // $c 模板名解析需要
 
 require Common
 
@@ -88,12 +89,13 @@ class MsgHandlerAnnotation : AstFunctionAnnotation
         let msgIdName   = MsgNameToMsgID(msgTypeName)       // "MSG_MOVE_REQ"
 
         // 步骤 3: 定位 C++ 绑定的 EMsgID 枚举
+        //   EMsgID 是全局共享 ID 值空间，绑定在 Common 模块（DasCommonModule），
+        //   所有服务都 require Common。宏侧按约定从 Common 取。
         let cmod = find_compiling_module("Common")
         if (cmod == null) {
             errors := "[msg_handler] 未找到 Common 模块——handler 文件需 require Common"
             return false
         }
-
         let enu = module_find_enumeration(cmod, "EMsgID")
         if (enu == null) {
             errors := "[msg_handler] Common 模块未绑定 EMsgID 枚举"
