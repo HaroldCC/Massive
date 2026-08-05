@@ -133,10 +133,13 @@ class MsgHandlerAnnotation : AstFunctionAnnotation
 }
 
 [export]
-def DispatchMsg(msgID : uint, sessionID : uint, msgPtr : void?)
+def DispatchMsg(msgID : uint, sessionID : uint, msgPtr : void?) : bool
 {
+    var handled = false
     g_HandlerRegistry |> get(msgID)$(handler)
     {
-        invoke(handler, sessionID, msgPtr);
+        invoke(handler, sessionID, msgPtr)
+        handled = true
     }
+    return handled
 }

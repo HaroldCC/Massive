@@ -14,6 +14,8 @@
 //   编译 daslib/aot_cpp.das → 找 aot 函数 → evalWithCatch 驱动它，
 //   daslib 自己拼完整 .cpp（含 prologue/各模块 aotRequire 发射的 include）。
 
+#include "ScriptEngine/DasEngine.h"
+#include "ScriptEngine/DasEngineConfig.h"
 #include "ScriptEngine/Module/DasCommonModule.h"
 #include "World/DasModule/WorldScriptModule.h"
 
@@ -32,6 +34,12 @@
 #include <vector>
 
 DECLARE_ALL_DEFAULT_MODULES;
+
+// 文件作用域声明 register_*()（PULL_MODULE 需要）。
+// 注意：REGISTER_MODULE_IN_NAMESPACE 生成的是全局 register_DasCommonModule，
+// 故 DECLARE/PULL 用不带 namespace 的类名（宏按标识符拼接）。
+DECLARE_MODULE(DasCommonModule);
+DECLARE_MODULE(WorldScriptModule);
 
 namespace
 {
@@ -75,6 +83,27 @@ namespace
 #endif
             std::system(mkdir.c_str()); // NOLINT: 构建期工具，目录创建
         }
+        // 内容幂等：若输出已存在且内容相同，跳过写入（避免每次构建 bump mtime 触发下游重编）。
+        // 官方 aot 驱动（daslib/aot_cpp.das write_result）同样去重。
+        {
+            FILE *oldFp = std::fopen(output.c_str(), "rb");
+            if (oldFp)
+            {
+                std::string oldContent;
+                char        buf[4096];
+                size_t      n;
+                while ((n = std::fread(buf, 1, sizeof(buf), oldFp)) > 0)
+                {
+                    oldContent.append(buf, n);
+                }
+                std::fclose(oldFp);
+                if (oldContent == resultStr)
+                {
+                    return true; // 内容未变，不重写
+                }
+            }
+        }
+
         FILE *fp = std::fopen(output.c_str(), "wb");
         if (!fp)
         {
@@ -103,10 +132,10 @@ namespace
     int RunAot(int argc, char **argv, const std::string &dasRoot)
     {
         // ── 与运行端相同的模块集（DasLangEngine::BuildModuleGroup 的同源路径）──
-        auto commonModule = std::make_unique<MMO::DasCommonModule>();
-        commonModule->Build();
-        auto worldModule = std::make_unique<MMO::WorldScriptModule>();
-        worldModule->Build();
+        // 官方范式：PULL_MODULE 拉取（模块经 REGISTER_MODULE 自注册进全局链表，构造注册绑定），
+        // 模块生命周期归 das::Module::Shutdown 统一管理——不再 unique_ptr 持有。
+        PULL_MODULE(DasCommonModule);
+        PULL_MODULE(WorldScriptModule);
         das::Module::Initialize();
 
         // daslib aot() 驱动
@@ -138,13 +167,12 @@ namespace
             return -1;
         }
 
-        // policy：与运行端一致（除 aot 标志），aotHash 才能命中
-        das::CodeOfPolicies cop;
-        cop.aot          = false;
-        cop.aot_module   = true;
-        cop.aot_lib      = false;
-        cop.ignore_shared_modules = false;
-        cop.version_2_syntax      = true;
+        // policy：与运行端一致（除 aot 标志），aotHash 才能命中。
+        // 复用 DasEngine::MakePolicies(mode, forAotGen=true)——单一真相源，
+        // 消除两端 policy 漂移风险（AotGen 不再手搓 cop）。
+        das::CodeOfPolicies cop = MMO::DasLangEngine::MakePolicies(MMO::EScriptMode::Release, true);
+        // MakePolicies 的 forAotGen 分支已设 aot=false, aot_module=true,
+        // fail_on_lack_of_aot_export=true——与官方 aot 工具一致。
 
         bool crossPlatform = false;
         for (int i = 3; i < argc; ++i)

@@ -52,9 +52,15 @@ rule("Rules.das_aot")
         local service = target:extraconf("rules", "Rules.das_aot", "service") or "world"
         local entry = target:extraconf("rules", "Rules.das_aot", "entry") or (service .. "/main.das")
         local aotDir = path.join(target:autogendir(), "aot")
-        local outcpp = path.join(aotDir, entry:gsub("[/\\]", "_"):gsub("%.das$", "") .. ".das.cpp")
-        -- 注册进 sourcebatch（文件此刻可能尚未生成，always_added 允许）
-        target:add("files", outcpp, {always_added = true})
+        -- 多入口：服务入口 + 各分发/注册模块（其 [export] 分发函数跨模块，需单独 AOT）。
+        local dasRoot = path.join(os.projectdir(), "Script")
+        local entries = { entry }
+        table.join2(entries, target:extraconf("rules", "Rules.das_aot", "extra_aot") or {})
+        for _, e in ipairs(entries) do
+            local outcpp = path.join(aotDir, e:gsub("[/\\]", "_"):gsub("%.das$", "") .. ".das.cpp")
+            -- 注册进 sourcebatch（文件此刻可能尚未生成，always_added 允许）
+            target:add("files", outcpp, {always_added = true})
+        end
     end)
 
     before_build(function(target)
@@ -65,21 +71,46 @@ rule("Rules.das_aot")
         local aotDir = path.join(target:autogendir(), "aot")
         os.mkdir(aotDir)
 
-        -- AOT 入口清单：只列各服务【入口脚本】，其 require 闭包由 aot() 自动覆盖。
-        -- 单一真相源：与 IDasLangModuleProvider::MainScriptFile() 一致（如 World/main.das）。
+        -- AOT 入口清单：服务入口 + 分发/注册模块（其 [export] 分发函数跨模块需单独 AOT）。
+        -- 入口脚本的 require 闭包由 aot() 自动覆盖；但 DispatchMsg/DispatchGameEvent/
+        -- TickGameSystems 等 [export] 定义在 require 的 module X 文件里，aot() 只 AOT
+        -- 本模块函数（aot_cpp.das collectUsedFunctions: func._module != getThisModule 跳过），
+        -- 必须单独 AOT 这些模块文件。
         local service = target:extraconf("rules", "Rules.das_aot", "service") or "world"
         local entry = target:extraconf("rules", "Rules.das_aot", "entry") or (service .. "/main.das")
         local dasfile = path.join(dasRoot, entry)
-        local outcpp = path.join(aotDir, entry:gsub("[/\\]", "_"):gsub("%.das$", "") .. ".das.cpp")
+        local extra = target:extraconf("rules", "Rules.das_aot", "extra_aot") or {}
+        local entries = { entry }
+        table.join2(entries, extra)
 
         -- 依赖：入口脚本 + 整个 Script 目录（Handlers/MsgHandlerRegistry 等 require 闭包）
+        --   + 绑定/proto 头（ProtoBindIndex.gen.h 等变化 → aotHash 漂移 → 必须重生成 .das.cpp，
+        --     否则 Release AOT 静默回退解释器）
+        --   + 生成器脚本（GenMsgBindings.py 变化 → 绑定头可能变）
         local deps = os.files(path.join(dasRoot, "**.das"))
+        table.join2(deps, os.files(path.join(os.projectdir(), "Src/World/AutoGen/**.gen.h")))
+        table.join2(deps, os.files(path.join(os.projectdir(), "Src/Proto/AutoGen/*.pb.h")))
+        table.join2(deps, os.files(path.join(os.projectdir(), "Tools/Script/GenMsgBindings.py")))
         table.insert(deps, dasfile)
+        for _, e in ipairs(extra) do
+            table.insert(deps, path.join(dasRoot, e))
+        end
         table.insert(deps, aotgenExe)
         depend.on_changed(function ()
-            os.vrunv(aotgenExe, { dasRoot, dasfile, outcpp })
-            cprint("${color.success}[aot] %s (+require 闭包)", entry)
-        end, {files = deps, dependfile = outcpp .. ".d"})
+            -- batch 模式：生成 list.txt，逐入口 AOT。
+            -- entry 相对【项目根】（AotGen aot() 用默认 file access，相对 CWD=项目根解析），
+            -- 即 "Script/World/main.das" 而非 "World/main.das"。
+            local listFile = path.join(aotDir, "aot_file_list.txt")
+            local lines = {}
+            for _, e in ipairs(entries) do
+                local absEntry = path.join("Script", e)   -- 相对项目根
+                local outrel = e:gsub("[/\\]", "_"):gsub("%.das$", "") .. ".das.cpp"
+                table.insert(lines, absEntry .. "\t" .. outrel)
+            end
+            io.writefile(listFile, table.concat(lines, "\n") .. "\n")
+            os.vrunv(aotgenExe, { dasRoot, "-aot-file-list", listFile, aotDir })
+            cprint("${color.success}[aot] %d entry files AOT'd (%s +extra)", #entries, entry)
+        end, {files = deps, dependfile = path.join(aotDir, "aot_all.d")})
     end)
 rule_end()
 

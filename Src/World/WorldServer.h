@@ -9,33 +9,30 @@
  */
 #pragma once
 
-#include <chrono>
-#include <memory>
-#include <shared_mutex>
-#include <string>
-#include <unordered_map>
-
 #include "Common/Core/Types.h"
+#include "Common/Log/Log.h"
+#include "Common/Network/IOContextPool.h"
+#include "Common/Network/MessageDispatcher.h"
+#include "Common/Network/TCPAcceptor.h"
+#include "World.h"
+#include "World/CenterClient.h"
+#include "World/GateConnection.h"
+#include "World/LogicThread.h"
+#include "World/WorldConfig.h"
+#include "World/WorldSession.h"
+#include "ScriptEngine/DasEngine.h"
+#include "ScriptEngine/GameEventBus.h"
+#include "ScriptEngine/IDasHost.h"
+#include "ScriptEngine/IDasModuleProvider.h"
+#include "World/System/SystemReplicate.h"
 
 #include <daScript/ast/ast.h>
 #include <daScript/simulate/simulate.h>
 
-#include "Common/Log/Log.h"
-#include "Common/Network/IOContextPool.h"
-#include "Common/Network/MessageDispatcher.h"
-#include "Common/Network/PacketHeader.h"
-#include "Common/Network/TCPAcceptor.h"
-#include "World/CenterClient.h"
-#include "World/GateConnection.h"
-#include "World/Handler/EnterWorldHandler.h"
-#include "World/Handler/MoveHandler.h"
-#include "World/LogicThread.h"
-#include "ScriptEngine/ScriptDispatchRegistry.h"
-#include "World/System/System.h"
-#include "World/WorldConfig.h"
-#include "World/WorldSession.h"
-#include "ScriptEngine/IDasHost.h"
-#include "ScriptEngine/IDasModuleProvider.h"
+#include <memory>
+#include <shared_mutex>
+#include <unordered_map>
+#include <vector>
 
 namespace MMO
 {
@@ -47,18 +44,22 @@ namespace MMO
         void Run();
         void Stop();
 
-        void SendRawToClient(uint32 sessionID, uint32 msgID, const uint8 *data, size_t len) override;
+        void          SendRawToClient(uint32 sessionID, uint32 msgID, const uint8 *data, size_t len) override;
+        GameEventBus *GetGameEventBus() override;
+        ECS::Scene   *GetDefaultScene() override;
+        ECS::Scene   *GetSceneByEntityID(uint64 entityID) override;
 
     private:
         // ── Init 阶段 ──
         bool InitCenterClient(const WorldConfig &cfg);
         bool InitGateAcceptor(const WorldConfig &cfg);
+        void InitWorlds();
 
         // ── 消息分发注册 ──
         void RegisterHandlers();
 
         // ── LogicThread 回调 ──
-        void OnTick(std::chrono::milliseconds elapsed);
+        void OnTick(float dt);
         void OnMessage(uint32 sessionID, WorldSession &ws, const LogicMessage &msg);
         void OnPreProcess();
         void OnPostFlush();
@@ -70,16 +71,6 @@ namespace MMO
 
         // ── 断线超时 ──
         void OnDisconnectTimeout(uint32 accountID);
-
-        /**
-         * @brief 网络复制：消费 AOI 可见集 → 差量同步 → SendToClient
-         * @param scene      目标场景
-         * @param dt         帧间隔
-         * @param visibleSets  AOI 计算结果（playerEID → VisibleSet）
-         */
-        void SystemReplicate(ECS::Scene                                     &scene,
-                             float                                           dt,
-                             const std::unordered_map<uint32_t, VisibleSet> &visibleSets);
 
         // ── Center 通知 ──
         void NotifyCenterPlayerOnline(uint32 accountID);
@@ -102,22 +93,36 @@ namespace MMO
         // ── 控制消息处理（_ctrlQueue 消费）──
         void ProcessControlMessages();
 
-        // ── 脚本引擎（Phase 2）──
+        // ── 脚本引擎 ──
 
         /**
          * @brief 初始化 DasLang 脚本引擎
          *
-         * Phase 2: 创建 Context + MassiveModule(15 函数) + 编译 ServerTick.das
+         * 编译 Script/World/main.das（含消息分发注册）
          * @return 成功返回 true
          */
         bool InitScriptEngine();
 
         /**
-         * @brief 编译 DasLang 入口脚本
-         * @param entryFile  入口 .das 文件路径
-         * @return 编译成功的 Program；失败返回 nullptr
+         * @brief 加密已序列化字节并发送到客户端（复制系统用）
+         * @warning 必须在 LogicThread 中调用（独占 _sessions 读写权限）
+         * @param sessionID 目标 Session
+         * @param msgID     消息 ID（EMsgID）
+         * @param data      已序列化的消息字节（protobuf body）
+         * @param len       字节数
          */
-        das::ProgramPtr CompileDaScript(const std::string &entryFile, das::ModuleGroup &libGroup);
+        void SendEncrypted(uint32 sessionID, uint32 msgID, const uint8 *data, size_t len);
+
+        /**
+         * @brief 把事件总线内容派发给脚本 [game_event] handler（每帧）
+         */
+        void DispatchGameEventsToScript();
+
+        /**
+         * @brief 每帧调用脚本 [game_system] 低频决策（错峰调度）
+         * @param dt 固定步长
+         */
+        void TickGameSystems(float dt);
 
         /**
          * @brief 加密 protobuf 消息并发送到客户端
@@ -141,30 +146,7 @@ namespace MMO
             }
             buf.SetWritePos(bodySize);
 
-            auto it = _sessions.find(sessionID);
-            if (it == _sessions.end())
-            {
-                Log::Warn("SendToClient: session {} not found", sessionID);
-                return;
-            }
-
-            // 加密 = [Seq:4B][Ciphertext+Tag]
-            auto encrypted = it->second.crypto.Encrypt(buf.Data(), buf.Size());
-            if (encrypted.Size() == 0)
-            {
-                return;
-            }
-
-            // 构建完整包: [PacketHeader:12B][encrypted]
-            // PacketHeader = {length, msgID, sessionID}，全大端
-            uint32 totalLen = static_cast<uint32>(sizeof(PacketHeader) + encrypted.Size());
-            auto   frame    = ByteBuffer::Own(totalLen);
-            frame.WriteUint32(totalLen); // PacketHeader.length
-            frame.WriteUint32(msgID);
-            frame.WriteUint32(sessionID);
-            frame.WriteBytes(encrypted.Data(), encrypted.Size());
-
-            _gateConnMgr->SendToGate(it->second.gateServerID, sessionID, std::move(frame));
+            SendEncrypted(sessionID, msgID, buf.Data(), buf.Size());
         }
 
         // ── 消息分发（按 msgID 查表）──
@@ -181,8 +163,14 @@ namespace MMO
         std::shared_mutex                        _sessionsMtx;
         std::unordered_map<uint32, WorldSession> _sessions;
 
-        // ── 场景 ──
-        SceneManager _sceneMgr;
+        std::vector<std::unique_ptr<World>> _worlds;
+
+        // 每 World 一个复制调度器（多场景各自独立打包发送）
+        std::vector<std::unique_ptr<ReplicateScheduler>> _replicateSystems;
+
+        // ── 游戏事件（ECS_06）──
+        std::unique_ptr<GameEventBus> _gameEventBus;     // C++ 写，脚本读（每帧派发）
+        float                         _accumTime = 0.0f; // 引擎累计时间（TickGameSystems 用）
 
         // ── 过载统计 ──
         size_t _prevQueueDepth = 0;
@@ -192,8 +180,9 @@ namespace MMO
         std::atomic<bool> _running {false};
 
         std::unique_ptr<IDasLangModuleProvider> _moduleProvider;
-
-        std::unordered_map<uint32_t, std::unordered_set<uint32_t>> _aoiStates; // playerEID → 上帧可见 entity
+        // 脚本引擎实例（WorldServer 持有，显式注册进 DasLangEngine::SetInstance——
+        // 替代 Meyers 单例的隐式全局状态）
+        std::unique_ptr<DasLangEngine> _dasEngine;
     };
 
 } // namespace MMO

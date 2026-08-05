@@ -51,12 +51,12 @@ rule("gen_msg_bindings")
 target("ProtoScriptModule")
     set_kind("static")
     add_headerfiles("*.h")
-    add_files("WorldScriptModule.cpp")
+    add_files("WorldScriptModule.cpp", "WorldBridge.cpp")
     add_includedirs(
         "$(projectdir)/Src",
         "$(projectdir)/Src/Proto/AutoGen"
     )
-    add_deps("ScriptEngine", "Proto", {public = true})
+    add_deps("ScriptEngine", "Proto", "CommonECS", "CommonLog", {public = true})
     -- 生成 World 服务的消息绑定（ProtoBindIndex.gen.* 等）并纳入编译
     add_rules("gen_msg_bindings", {service = "world"})
 

@@ -4,38 +4,26 @@
  */
 
 #include "World/WorldServer.h"
-#include "Common/Crypto/SessionToken.h"
-#include "Common/ECS/Scene.h"
 #include "Common/Log/Log.h"
 #include "Common/Network/TCPSocket.h"
 #include "ScriptEngine/DasEngine.h"
 #include "ScriptEngine/DasEngineConfig.h"
 #include "World/DasModule/WorldDasModule.h"
-#include "World/Component/EntityType.h"
-#include "World/Component/Health.h"
-#include "World/Component/Position.h"
-#include "World/Component/Tags.h"
-#include "World/System/System.h"
 #include "World/AutoGen/ProtoBindIndex.gen.h"
+#include "World/Handler/EnterWorldHandler.h"
 
-#include <Internal/CenterRPC.pb.h>
-#include <Internal/GateRPC.pb.h>
-#include <Internal/InternalMsgID.pb.h>
-#include <Login.pb.h>
-#include <Move.pb.h>
-#include <MsgID.pb.h>
-#include <Replicate.pb.h>
+#include "Internal/CenterRPC.pb.h"
+#include "Internal/GateRPC.pb.h"
+#include "Internal/InternalMsgID.pb.h"
+#include "Move.pb.h"
+#include "MsgID.pb.h"
+#include "daScript/misc/sysos.h"
 
 #include <chrono>
 #include <ctime>
+#include <memory>
+#include <mutex>
 #include <thread>
-
-#include <daScript/simulate/fs_file_info.h>
-#include <daScript/simulate/aot.h>
-#include <daScript/misc/string_writer.h>
-#include <daScript/misc/sysos.h>
-#include <daScript/daScriptModule.h>
-#include "ScriptEngine/DasEngine.h"
 
 using namespace std::chrono_literals;
 
@@ -66,11 +54,22 @@ namespace MMO
             return false;
         }
 
-        // 加载常驻场景
-        if (!_sceneMgr.LoadPersistentScenes(cfg.world.persistentScenes))
+        // 创建常驻场景对应的 World
+        InitWorlds();
+
+        // 游戏事件总线（C++ 写 → 脚本 [game_event] 读）
+        _gameEventBus = std::make_unique<GameEventBus>();
+
+        // 每个 World 一个复制调度器（多场景各自独立打包，不再钉死 _worlds[0]）
+        _replicateSystems.clear();
+        _replicateSystems.reserve(_worlds.size());
+        for (auto &world : _worlds)
         {
-            Log::Error("WorldServer: no scenes loaded");
-            return false;
+            _replicateSystems.emplace_back(std::make_unique<ReplicateScheduler>(
+                world->GetScene(),
+                [this](uint32 sessionID, const uint8 *data, size_t len) {
+                    SendEncrypted(sessionID, Proto::MSG_ENTITY_REPLICATE_NTF, data, len);
+                }));
         }
 
         // 注册消息分发
@@ -137,6 +136,19 @@ namespace MMO
                                       _ioPool.get());
     }
 
+    void WorldServer::InitWorlds()
+    {
+        _worlds.clear();
+        for (uint32 sceneID : _config.world.persistentScenes)
+        {
+            auto world = std::make_unique<World>(static_cast<uint16>(sceneID));
+            world->Init();
+            _worlds.push_back(std::move(world));
+            Log::Info("WorldServer: world scene={} initialized", sceneID);
+        }
+        Log::Info("WorldServer: {} worlds initialized", _worlds.size());
+    }
+
     bool WorldServer::InitGateAcceptor(const WorldConfig &cfg)
     {
         _gateConnMgr = std::make_unique<GateConnectionMgr>();
@@ -187,11 +199,144 @@ namespace MMO
             _ioPool->Stop();
         }
 
+        // 关闭脚本引擎（模块归 daScript 环境管理，Shutdown 统一释放）
+        if (_dasEngine)
+        {
+            _dasEngine->Shutdown();
+        }
+        _dasEngine.reset();
+
         Log::Info("WorldServer: stopped");
     }
 
     void WorldServer::SendRawToClient(uint32 sessionID, uint32 msgID, const uint8 *data, size_t len)
     {
+        // IDasLangHost 接口：脚本侧原始发送（暂未用，走 SendEncrypted）
+        SendEncrypted(sessionID, msgID, data, len);
+    }
+
+    void WorldServer::SendEncrypted(uint32 sessionID, uint32 msgID, const uint8 *data, size_t len)
+    {
+        // 复制系统/脚本侧产出的已序列化字节 → 加密 + PacketHeader 包装 → Gate
+        auto it = _sessions.find(sessionID);
+        if (it == _sessions.end())
+        {
+            Log::Warn("SendEncrypted: session {} not found", sessionID);
+            return;
+        }
+
+        // 加密 = [Seq:4B][Ciphertext+Tag]
+        auto encrypted = it->second.crypto.Encrypt(data, len);
+        if (encrypted.Size() == 0)
+        {
+            Log::Warn("SendEncrypted: encrypt failed session={}", sessionID);
+            return;
+        }
+
+        // 构建完整包: [PacketHeader:12B][encrypted]
+        uint32 totalLen = static_cast<uint32>(sizeof(PacketHeader) + encrypted.Size());
+        auto   frame    = ByteBuffer::Own(totalLen);
+        frame.WriteUint32(totalLen); // PacketHeader.length
+        frame.WriteUint32(msgID);
+        frame.WriteUint32(sessionID);
+        frame.WriteBytes(encrypted.Data(), encrypted.Size());
+
+        _gateConnMgr->SendToGate(it->second.gateServerID, sessionID, std::move(frame));
+    }
+
+    GameEventBus *WorldServer::GetGameEventBus()
+    {
+        return _gameEventBus.get();
+    }
+
+    ECS::Scene *WorldServer::GetDefaultScene()
+    {
+        return _worlds.empty() ? nullptr : &_worlds[0]->GetScene();
+    }
+
+    ECS::Scene *WorldServer::GetSceneByEntityID(uint64 entityID)
+    {
+        // 单场景 MVP：scene 位匹配才返回
+        const uint16 sceneID = ECS::SceneOf(ECS::EntityID(entityID));
+        for (auto &world : _worlds)
+        {
+            if (world->GetSceneID() == sceneID)
+            {
+                return &world->GetScene();
+            }
+        }
+        return nullptr;
+    }
+
+    /**
+     * @brief 把事件总线内容派发给脚本 [game_event] handler
+     *
+     * 流程：GameEventBus::Drain() → 逐事件 eval DispatchGameEvent(type, payload)
+     * 每个事件一次脚本调用（铁律 2：事件数有限）
+     */
+    void WorldServer::DispatchGameEventsToScript()
+    {
+        if (!_gameEventBus)
+        {
+            return;
+        }
+
+        auto &dasEngine = DasLangEngine::GetIns();
+        auto *ctx       = dasEngine.GetScriptContext();
+        if (!ctx)
+        {
+            return;
+        }
+        auto *fnDispatch = ctx->findFunction("DispatchGameEvent");
+        if (!fnDispatch)
+        {
+            return;
+        }
+
+        auto events = _gameEventBus->Drain();
+        if (events.empty())
+        {
+            return;
+        }
+
+        // 逐事件派发：DispatchGameEvent(evType, payloadPtr)
+        // CallScriptFunctionIn 校验 arity（脚本 expects 2 参）——签名漂移立即报错
+        for (auto &env : events)
+        {
+            if (!DasLangEngine::CallScriptFunctionIn(ctx,
+                                                     fnDispatch,
+                                                     "DispatchGameEvent",
+                                                     env.event_type,
+                                                     const_cast<uint8_t *>(env.data)))
+            {
+                break; // 脚本异常：停止本帧剩余事件（避免级联）
+            }
+        }
+    }
+
+    /**
+     * @brief 每帧调用脚本 [game_system] 低频决策（错峰调度）
+     */
+    void WorldServer::TickGameSystems(float dt)
+    {
+        auto &dasEngine = DasLangEngine::GetIns();
+        auto *ctx       = dasEngine.GetScriptContext();
+        if (!ctx)
+        {
+            return;
+        }
+        auto *fnTick = ctx->findFunction("TickGameSystems");
+        if (!fnTick)
+        {
+            Log::Warn("TickGameSystems: function not found (script may lack GameSystemRegistry require)");
+            return;
+        }
+
+        _accumTime += dt;
+        if (!DasLangEngine::CallScriptFunctionIn(ctx, fnTick, "TickGameSystems", dt, _accumTime))
+        {
+            Log::Warn("TickGameSystems: script call failed (arity mismatch or exception)");
+        }
     }
 
     // ── 消息分发注册 ──
@@ -239,13 +384,40 @@ namespace MMO
 
     // ── LogicThread 回调 ──
 
-    void WorldServer::OnTick([[maybe_unused]] std::chrono::milliseconds elapsed)
+    void WorldServer::OnTick(float dt)
     {
         // 1. 处理未路由的 EnterWorldReq（内部持 unique_lock 写 _sessions）
         ProcessUnroutedMessages();
 
         // 2. 控制消息（DisconnectNtf / SessionRebindReq）
         ProcessControlMessages();
+
+        for (auto &&world : _worlds)
+        {
+            world->Tick(dt);
+        }
+
+        // 3. 脚本引擎驱动：热重载轮询（PollReload）+ 脚本 Update + GC
+        //    这是 DasLangEngine::Tick 的唯一调用点——不调用则热重载标志永不消费、
+        //    funcUpdate 永不执行、collectHeap GC 永不触发（曾长期断链，见 ECS 审查）。
+        DasLangEngine::GetIns().Tick(dt);
+
+        // 脚本低频决策（[game_system] 错峰调度）
+        TickGameSystems(dt);
+
+        // 游戏事件派发（[game_event] 类型化分发）
+        DispatchGameEventsToScript();
+
+        // 复制阶段：每个 World 消费自身 AOI 状态 → 打包 → 加密发送
+        for (size_t i = 0; i < _worlds.size() && i < _replicateSystems.size(); ++i)
+        {
+            auto &world = *_worlds[i];
+            auto &repl  = *_replicateSystems[i];
+            repl.Update(world.GetAoiState(), world.GetAoiEnters(), world.GetAoiLeaves());
+            // 事件消费后清空（AOI 阶段已填充，复制阶段清掉）
+            world.GetAoiEnters().clear();
+            world.GetAoiLeaves().clear();
+        }
 
         // 3. 过载保护（读遍历 _sessions，与 IO 线程 shared_lock 并发读不冲突）
         //    但此处 LogicThread 刚写完 _sessions（ProcessUnroutedMessages），
@@ -272,19 +444,18 @@ namespace MMO
         {
             if (msg.msgID != Proto::MSG_LOGIN_ENTER_WORLD_REQ)
             {
-                Log::Warn("WorldServer: unexpected unrouted msgID={}", msg.msgID);
+                Log::Warn("WorldServer: unrouted msgID={} from session={} ignored", msg.msgID, msg.sessionID);
                 continue;
             }
 
-            auto *scene = _sceneMgr.GetDefaultScene();
-            if (!scene)
+            auto *scene = _worlds.empty() ? nullptr : &_worlds[0]->GetScene();
+            if (nullptr == scene)
             {
-                Log::Warn("WorldServer: no default scene for EnterWorld");
+                Log::Warn("WorldServer: default scene not found, cannot process EnterWorldReq for session={}",
+                          msg.sessionID);
                 continue;
             }
 
-            // ProcessUnroutedMessages 会写 _sessions（insert），
-            // 与 IO 线程的 shared_lock 读互斥，需持 unique_lock
             std::unique_lock lock(_sessionsMtx);
             EnterWorldHandler::Handle(
                 msg.sessionID,
@@ -292,65 +463,22 @@ namespace MMO
                 msg.body.Size(),
                 _sessions,
                 _config.security.loginServerSecret,
-                1, // gateID（MVP：固定 1）
+                1,
                 *scene,
-                [this](uint32 sessionID, uint32 msgID, ByteBuffer rawBody) {
-                    // 出站：完成加密 + PacketHeader 包装后通过 GateConnectionMgr 发回客户端
-                    auto it         = _sessions.find(sessionID);
-                    bool hasSession = (it != _sessions.end());
-
-                    // EnterWorldRsp 不走加密（客户端尚未初始化 CryptoSession）
+                [this](uint32 sessionID, uint32 msgID, ByteBuffer body) {
+                    auto it = _sessions.find(sessionID);
                     if (msgID == Proto::MSG_LOGIN_ENTER_WORLD_RSP)
                     {
-                        uint32     totalLen = static_cast<uint32>(sizeof(PacketHeader) + rawBody.Size());
-                        ByteBuffer frame    = ByteBuffer::Own(totalLen);
-                        frame.WriteUint32(totalLen);
+                        uint32 totalLen = static_cast<uint32>(sizeof(PacketHeader) + body.Size());
+                        auto   frame    = ByteBuffer::Own(totalLen);
+                        frame.WriteUint32(totalLen); // PacketHeader.length
                         frame.WriteUint32(msgID);
                         frame.WriteUint32(sessionID);
-                        frame.WriteBytes(rawBody.Data(), rawBody.Size());
-                        _gateConnMgr->SendToGate(1, sessionID, std::move(frame));
+                        frame.WriteBytes(body.Data(), body.Size());
+                        _gateConnMgr->SendToGate(it->second.gateServerID, sessionID, std::move(frame));
                         return;
                     }
-
-                    if (hasSession)
-                    {
-                        auto encrypted = it->second.crypto.Encrypt(rawBody.Data(), rawBody.Size());
-                        if (encrypted.Size() == 0)
-                        {
-                            Log::Warn("WorldServer: encrypt failed for session={}", sessionID);
-                            return;
-                        }
-
-                        uint32     totalLen = static_cast<uint32>(sizeof(PacketHeader) + encrypted.Size());
-                        ByteBuffer frame    = ByteBuffer::Own(totalLen);
-                        frame.WriteUint32(totalLen);
-                        frame.WriteUint32(msgID);
-                        frame.WriteUint32(sessionID);
-                        frame.WriteBytes(encrypted.Data(), encrypted.Size());
-
-                        _gateConnMgr->SendToGate(it->second.gateServerID, sessionID, std::move(frame));
-                    }
-                    else
-                    {
-                        uint32     totalLen = static_cast<uint32>(sizeof(PacketHeader) + rawBody.Size());
-                        ByteBuffer frame    = ByteBuffer::Own(totalLen);
-                        frame.WriteUint32(totalLen);
-                        frame.WriteUint32(msgID);
-                        frame.WriteUint32(sessionID);
-                        frame.WriteBytes(rawBody.Data(), rawBody.Size());
-                        _gateConnMgr->SendToGate(1, sessionID, std::move(frame));
-                    }
                 });
-
-            // 如果 Handle 执行后创建了新 session，通知 Center
-            if (!_sessions.empty())
-            {
-                auto it = _sessions.find(msg.sessionID);
-                if (it != _sessions.end() && !it->second.disconnected)
-                {
-                    NotifyCenterPlayerOnline(it->second.accountID);
-                }
-            }
         }
     }
 
@@ -462,13 +590,7 @@ namespace MMO
         {
             if (it->second.accountID == accountID && it->second.disconnected)
             {
-                Log::Info("WorldServer: disconnect timeout for account={}, destroying entity", accountID);
-
-                ECS::Scene *scene = _sceneMgr.GetScene(it->second.entity.sceneId);
-                if (scene)
-                {
-                    scene->DestroyEntity(it->second.entity);
-                }
+                Log::Info("WorldServer: disconnect timeout for account={}, removing session", accountID);
 
                 // 通知 Center 玩家离线
                 NotifyCenterPlayerOffline(accountID);
@@ -576,44 +698,22 @@ namespace MMO
         }
     }
 
-    // ── 脚本引擎（Phase 2）──
-
-    das::ProgramPtr WorldServer::CompileDaScript(const std::string &entryFile, das::ModuleGroup &libGroup)
-    {
-        auto fAccess = das::make_smart<das::FsFileAccess>();
-        fAccess->introduceDaslib();
-
-        das::TextWriter logs;
-        auto            program = das::compileDaScript(entryFile, fAccess, logs, libGroup);
-        if (!program)
-        {
-            Log::Error("CompileDaScript: program is null");
-            return nullptr;
-        }
-        if (program->failed())
-        {
-            Log::Error("CompileDaScript: compile errors — {}", logs.str());
-            for (auto &err : program->errors)
-            {
-                Log::Error("  {}:{} {}",
-                           err.at.fileInfo ? err.at.fileInfo->name.c_str() : "?",
-                           err.at.line,
-                           err.what.c_str());
-            }
-            return nullptr;
-        }
-
-        return program;
-    }
+    // ── 脚本引擎 ──
 
     bool WorldServer::InitScriptEngine()
     {
         Log::Info("InitScriptEngine: starting...");
 
-        auto &dasEngine = DasLangEngine::GetIns();
+        // 引擎实例由 WorldServer 持有并显式注册（替代 Meyers 单例的隐式全局状态）
+        _dasEngine = std::make_unique<DasLangEngine>();
+        DasLangEngine::SetInstance(*_dasEngine);
+        auto &dasEngine = *_dasEngine;
 
         DasLangEngineConfig cfg;
         cfg.dasLangRoot = _config.script.dasRoot;
+        // .das_project 项目文件——get_file_access 编译它并启用 module_get 等回调（模块解析/沙箱）。
+        // 相对项目根（CWD）。World 服务入口所在目录 Script/World/。
+        cfg.projectFile = "Script/World/.das_project";
 
 #ifdef DEBUG
         cfg.mode = EScriptMode::Develop;
@@ -636,153 +736,6 @@ namespace MMO
 
         Log::Info("InitScriptEngine: OK");
         return true;
-    }
-
-    void WorldServer::SystemReplicate(ECS::Scene                                   &scene,
-                                      float                                         dt,
-                                      const std::unordered_map<uint32, VisibleSet> &visibleSets)
-    {
-        (void)dt;
-        auto &reg = scene.Registry();
-
-        for (auto &[sessionID, ws] : _sessions)
-        {
-            if (ws.disconnected || !ws.entity.IsValid())
-            {
-                continue;
-            }
-
-            uint32 playerEID = ws.entity.entityId;
-
-            auto itVs = visibleSets.find(playerEID);
-            if (itVs == visibleSets.end())
-            {
-                continue;
-            }
-            const auto &vs = itVs->second;
-
-            auto                     &prevVisible = _aoiStates[playerEID];
-            Proto::EntityReplicateNtf ntf;
-
-            // 2a. 新进入 AOI → Spawn
-            for (uint32 eid : vs.entityIDs)
-            {
-                if (prevVisible.contains(eid))
-                {
-                    continue;
-                }
-
-                auto *spawn = ntf.add_spawns();
-                spawn->set_entity_id(eid);
-
-                entt::entity ee {static_cast<entt::entity>(eid)};
-
-                if (reg.all_of<Position>(ee))
-                {
-                    auto &pos = reg.get<Position>(ee);
-                    auto *pd  = spawn->mutable_position();
-                    pd->set_x(static_cast<int32>(pos.x * 100.0f));
-                    pd->set_y(static_cast<int32>(pos.y * 100.0f));
-                    pd->set_z(static_cast<int32>(pos.z * 100.0f));
-                }
-
-                if (reg.all_of<Health>(ee))
-                {
-                    auto &hp = reg.get<Health>(ee);
-                    spawn->set_hp_current(hp.current);
-                    spawn->set_hp_max(hp.max);
-                }
-
-                if (reg.all_of<MonsterTag>(ee))
-                {
-                    spawn->set_entity_type(static_cast<uint32>(EEntityType::ENTITY_MONSTER));
-                }
-                else if (reg.all_of<PlayerTag>(ee))
-                {
-                    spawn->set_entity_type(static_cast<uint32>(EEntityType::ENTITY_PLAYER));
-                }
-
-                prevVisible.insert(eid);
-            }
-
-            // 2b. 离开 AOI → Despawn
-            {
-                std::unordered_set<uint32> currentVisible;
-                for (uint32 eid : vs.entityIDs)
-                {
-                    currentVisible.insert(eid);
-                }
-
-                std::vector<uint32> toRemove;
-                for (uint32 oldEid : prevVisible)
-                {
-                    if (!currentVisible.contains(oldEid))
-                    {
-                        auto *despawn = ntf.add_despawns();
-                        despawn->set_entity_id(oldEid);
-                        toRemove.push_back(oldEid);
-                    }
-                }
-                for (uint32 eid : toRemove)
-                {
-                    prevVisible.erase(eid);
-                }
-            }
-
-            // 2c. 脏组件 → Update
-            for (uint32 eid : vs.entityIDs)
-            {
-                if (!prevVisible.contains(eid))
-                {
-                    continue;
-                }
-
-                auto *update = ntf.add_updates();
-                update->set_entity_id(eid);
-
-                entt::entity ee {static_cast<entt::entity>(eid)};
-
-                if (reg.all_of<Position>(ee))
-                {
-                    auto &pos = reg.get<Position>(ee);
-                    auto *pd  = update->mutable_position();
-                    pd->set_x(static_cast<int32>(pos.x * 100.0f));
-                    pd->set_y(static_cast<int32>(pos.y * 100.0f));
-                    pd->set_z(static_cast<int32>(pos.z * 100.0f));
-                }
-
-                if (reg.all_of<Health>(ee))
-                {
-                    auto &hp = reg.get<Health>(ee);
-                    update->set_hp_current(hp.current);
-                }
-
-                if (reg.all_of<DeadTag>(ee))
-                {
-                    update->set_is_dead(true);
-                }
-
-                if (reg.all_of<CombatTag>(ee))
-                {
-                    update->set_is_in_combat(true);
-                }
-            }
-
-            // ── 3. 序列化 + 发送 ──
-            if (ntf.spawns_size() > 0 || ntf.updates_size() > 0 || ntf.despawns_size() > 0)
-            {
-                size_t bodySize = static_cast<size_t>(ntf.ByteSizeLong());
-                if (bodySize > 0)
-                {
-                    auto buf = ByteBuffer::Own(bodySize);
-                    if (ntf.SerializeToArray(buf.WritePtr(), static_cast<int>(bodySize)))
-                    {
-                        buf.SetWritePos(bodySize);
-                        SendRawToClient(sessionID, Proto::MSG_ENTITY_REPLICATE_NTF, buf.Data(), buf.Size());
-                    }
-                }
-            }
-        }
     }
 
 } // namespace MMO

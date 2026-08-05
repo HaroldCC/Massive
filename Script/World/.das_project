@@ -11,6 +11,44 @@ typedef TModuleInfo = tuple<string, string, string> const;
 [export]
 def module_get(req, from : string) : TModuleInfo
 {
+    // native 模块（C++ 侧 REGISTER_MODULE 注册，如 Common/world）——
+    // 返回空 fileName，编译器走 Module::requireEx 的 native 查找（requireEx 对 promoted
+    // 模块检查 fileName 匹配，非空 fileName 会导致 native 模块被跳过而解析失败）。
+    if (req == "Common" || req == "world") {
+        return (req, "", "")
+    }
+
+    // 相对路径 require（./x.das / ../x.das / %/x.das）——基于 from 目录解析出绝对路径，
+    // 使 project 模式能找到文件（FsFileAccess 的 file-path 模式只在非 project 模式生效）。
+    if (starts_with(req, "./") || starts_with(req, "../") || starts_with(req, "%/")) {
+        var fr <- split_by_chars(from, "/")
+        if (length(fr) > 0) {
+            pop(fr)   // 去掉文件名，剩目录
+        }
+        let reqParts <- split_by_chars(req, "/")
+        for (se in reqParts) {
+            push(fr, se)
+        }
+        // 归一化 .. 段
+        var out : array<string>
+        for (seg in fr) {
+            if (seg == "..") {
+                if (length(out) > 0) {
+                    pop(out)
+                }
+            } else {
+                push(out, seg)
+            }
+        }
+        let absPath = join(out, "/")
+        // 取末段作模块名（去 .das 后缀）
+        var lastSeg = out[length(out) - 1]
+        if (ends_with(lastSeg, ".das")) {
+            lastSeg = lastSeg |> slice(0, length(lastSeg) - 4)
+        }
+        return (lastSeg, absPath, "")
+    }
+
     let rs <- split_by_chars(req, "./")
     let modName = rs[length(rs) - 1]
 
@@ -19,7 +57,7 @@ def module_get(req, from : string) : TModuleInfo
         return (modName, "{get_das_root()}/daslib/{modName}.das", "")
     }
 
-    // relative modules
+    // 普通模块名（daslib 已处理，其余按相对路径解析到 from 同目录）
     var fr <- split_by_chars(from, "/")
     if (length(fr) > 0) {
         pop(fr)

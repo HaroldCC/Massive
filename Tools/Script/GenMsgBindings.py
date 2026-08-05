@@ -73,6 +73,7 @@ class ProtoFileInfo:
     package: str
     imports: list[str]
     messages: list[MessageInfo] = field(default_factory=list)
+    enums: dict[str, list[tuple[str, int]]] = field(default_factory=dict)  # 顶层 enum 名 → [(值名, 值)]
     has_req: bool = False   # 是否包含 *Req 消息
     service: str = ""       # 归属服务（"world"/"social"/""=公共）
 
@@ -93,6 +94,10 @@ _RE_MAP_FIELD = re.compile(
     r"^\s*map<([^,]+),\s*([^>]+)>\s+(\w+)\s*=\s*(\d+)",
     re.MULTILINE,
 )
+
+# 顶层 enum 解析（GameEvent.proto 的 EGameEventType 等——值须从 proto 解析而非消息顺序硬编码）
+_RE_ENUM_START = re.compile(r"^\s*enum\s+(\w+)\s*\{", re.MULTILINE)
+_RE_ENUM_VALUE = re.compile(r"^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(-?\d+)", re.MULTILINE)
 
 # 消息体内不支持的构造——命中即报错退出（避免静默漏字段）
 _RE_UNSUPPORTED = re.compile(r"^\s*(oneof|message|enum)\s+\w+", re.MULTILINE)
@@ -235,9 +240,21 @@ def parse_proto_file(filepath: Path, service: str = "") -> ProtoFileInfo:
         messages.append(MessageInfo(name=msg_name, fields=fields))
 
     has_req = any(m.name.endswith("Req") for m in messages)
+
+    # 解析顶层 enum（值从 proto 文本解析——事件枚举值不得按消息顺序硬编码）
+    enums: dict[str, list[tuple[str, int]]] = {}
+    for enum_match in _RE_ENUM_START.finditer(text):
+        enum_name = enum_match.group(1)
+        enum_body, _ = _extract_message_body(text, enum_match.end())
+        values = [
+            (m.group(1), int(m.group(2)))
+            for m in _RE_ENUM_VALUE.finditer(enum_body)
+        ]
+        enums[enum_name] = values
+
     return ProtoFileInfo(
         name=name, filename=basename, package=package,
-        imports=imports, messages=messages, has_req=has_req,
+        imports=imports, messages=messages, enums=enums, has_req=has_req,
         service=service,
     )
 
@@ -478,7 +495,7 @@ def emit_type_factories(info: ProtoFileInfo, referenced_types: set[str]) -> list
 def emit_string_accessor(msg: MessageInfo, fld: FieldInfo) -> list[str]:
     func = _string_accessor_name(msg.name, fld)
     return [
-        "    // ── string 字段：addExternProperty 注册，脚本写 req.`fieldname（无括号）──",
+        "    // ── string 字段访问器（普通 addExtern 函数，脚本 req |> GetXxx()）──",
         "    //    ⚠ 返回的是指向 req 内部的 const char*，仅本次 dispatch 调用内有效；",
         "    //    脚本如需保留必须 := 克隆，不能 = 存储（见 emit_file_header 注释）。",
         f"    const char *{func}(const {PROTO_NS}::{msg.name} &msg)",
@@ -526,7 +543,7 @@ def emit_repeated_accessors(msg: MessageInfo, fld: FieldInfo) -> list[str]:
         access = f"msg.{fld.name}(index)"
         default = f"{PROTO_NS}::{fld.type_name}::default_instance()"
     return [
-        "    // ── repeated _size：addExternProperty，无括号 ──",
+        "    // ── repeated 大小访问器（普通 addExtern 函数）──",
         f"    int {size_func}(const {PROTO_NS}::{msg.name} &msg)",
         "    {",
         f"        return msg.{fld.name}_size();",
@@ -559,7 +576,7 @@ def emit_annotation(msg: MessageInfo, is_req: bool) -> list[str]:
         f'            : ManagedStructureAnnotation("{msg.name}", ml, "{PROTO_NS}::{msg.name}")',
         "        {",
     ]
-    # 标量 / 嵌套 message 直接 addProperty；string/bytes/repeated 走 Register 里的 addExternProperty
+    # 标量 / 嵌套 message 直接 addProperty；string/bytes/repeated 走 Register 里的 addExtern（非属性）
     for fld in msg.fields:
         if fld.is_map:
             out.append(f"            // TODO(GenMsgBindings): {msg.name}.{fld.name} (map) 需手写绑定，暂未生成")
@@ -574,7 +591,8 @@ def emit_annotation(msg: MessageInfo, is_req: bool) -> list[str]:
         out += [
             "",
             "        // §2.4 生命周期防护——阻断脚本 clone req 存进逃逸本次调用的存储位置",
-            "        // （canCopy/canMove 因 protobuf 非平凡拷贝已默认 false，无需 override）",
+            "        // 模板参数 <Msg, false, false>：canNew=false（脚本不能 new 请求句柄），",
+            "        // canDelete=false（脚本不能 delete）。canCopy/canMove 由基类按 protobuf 非平凡拷贝推导为 false。",
             "        virtual bool canClone() const override { return false; }",
         ]
     out += ["    };", ""]
@@ -602,13 +620,17 @@ def emit_dispatch_fn(info: ProtoFileInfo, msg: MessageInfo) -> list[str]:
         "            return false;",
         "        }",
         "",
-        "        vec4f callArgs[3] = {",
-        f"            das::cast<uint32_t>::from(static_cast<uint32_t>({msg_id})),",
-        "            das::cast<uint32_t>::from(sessionID),",
-        f"            das::cast<const {PROTO_NS}::{msg.name} *>::from(&req),",
-        "        };",
-        "        ctx->evalWithCatch(fnDispatch, callArgs);",
-        "        return true;",
+        "        // 脚本 DispatchMsg 返回 bool（handler 是否命中）——未命中返回 false，",
+        "        // 让 OnMessage 的脚本优先路径落到 C++ handler（消除双 handler 遮蔽）。",
+        "        // CallScriptFunctionInR 校验 arity（DispatchMsg 脚本 expects 3 参）——签名漂移立即报错。",
+        f"        const uint32_t msgID = static_cast<uint32_t>({msg_id});",
+        "        auto [handled, ok] = MMO::DasLangEngine::CallScriptFunctionInR<bool>(ctx, fnDispatch, \"Dispatch\", msgID, sessionID, &req);",
+        "        if (!ok)",
+        "        {",
+        f'            MMO::Log::Error("{info.name}.gen: {msg.name} dispatch exception, session={{}}", sessionID);',
+        "            return false;",
+        "        }",
+        "        return handled;",
         "    }",
         "",
     ]
@@ -626,19 +648,25 @@ def emit_register_bindings(info: ProtoFileInfo) -> list[str]:
         has_any = True
         for fld in _iter_plain_string_fields(msg):
             func = _string_accessor_name(msg.name, fld)
-            out.append(f'        das::addExternProperty<DAS_BIND_FUN({func})>(mod, lib, ".`{fld.name}", "{func}")')
+            # ⚠ string 字段不能注册为 `.`xx 属性（addExternProperty）：AOT 发射器对
+            # propertyFunction 生成 ((obj).cppName()) 成员调用形式，自由函数无法成员调用，
+            # 脚本读 string 字段时 AOT 编译失败（error 见 aot_cpp.das propertyFunction 分支）。
+            # 改为普通 addExtern 函数，脚本用 req |> GetUsername() 或 GetUsername(req) 访问。
+            out.append(f'        das::addExtern<DAS_BIND_FUN({func})>(mod, lib, "{func}", das::SideEffects::none)')
             out.append('            ->args({"msg"});')
         for fld in _iter_bytes_fields(msg):
             size_func = _bytes_size_name(msg.name, fld)
             at_func = _bytes_at_name(msg.name, fld)
-            out.append(f'        das::addExternProperty<DAS_BIND_FUN({size_func})>(mod, lib, ".`{fld.name}_size", "{size_func}")')
+            # bytes 字段同 string——size 也注册为普通函数（非 `.`xx_size 属性），规避 AOT 成员展开。
+            out.append(f'        das::addExtern<DAS_BIND_FUN({size_func})>(mod, lib, "{size_func}", das::SideEffects::none)')
             out.append('            ->args({"msg"});')
             out.append(f'        das::addExtern<DAS_BIND_FUN({at_func})>(mod, lib, "{fld.name}", das::SideEffects::none)')
             out.append('            ->args({"msg", "index"});')
         for fld in _iter_repeated_fields(msg):
             size_func = _repeated_size_name(msg.name, fld)
             index_func = _repeated_index_name(msg.name, fld)
-            out.append(f'        das::addExternProperty<DAS_BIND_FUN({size_func})>(mod, lib, ".`{fld.name}_size", "{size_func}")')
+            # repeated 字段同 string/bytes——size/索引都注册为普通函数，规避 AOT 成员展开。
+            out.append(f'        das::addExtern<DAS_BIND_FUN({size_func})>(mod, lib, "{size_func}", das::SideEffects::none)')
             out.append('            ->args({"msg"});')
             out.append(f'        das::addExtern<DAS_BIND_FUN({index_func})>(mod, lib, "{fld.name}", das::SideEffects::none)')
             out.append('            ->args({"msg", "index"});')
@@ -764,6 +792,10 @@ def generate_emsgid_bind_h() -> str:
 
 def generate_emsgid_bind_cpp(msg_id_entries: list[tuple[str, int]]) -> str:
     """EMsgIDBind.gen.cpp —— EMsgID 枚举绑定实现"""
+    # 官方宏 DAS_BASE_BIND_ENUM(enum_name, das_enum_name, ...) 生成：
+    #   EnumerationEMsgID 类（当前命名空间，文件作用域）+ typeFactory<MMO::Proto::EMsgID>
+    # 消除了手工 Enumeration 无 typeFactory 的缺陷（addExtern 参数/返回值用 EMsgID 类型时能解析）。
+    enum_members = ", ".join(name for name, _ in msg_id_entries)
     lines = [
         "/**",
         " * @file EMsgIDBind.gen.cpp",
@@ -780,43 +812,23 @@ def generate_emsgid_bind_cpp(msg_id_entries: list[tuple[str, int]]) -> str:
         "#include <daScript/simulate/bind_enum.h>",
         "#include <MsgID.pb.h>",
         "",
-        "namespace",
-        "{",
-        "    using namespace das;",
+        "// 官方范式（cpp_api.rst 枚举节）：DAS_BASE_BIND_ENUM 须放在 using namespace das 之前。",
+        "// 生成 EnumerationEMsgID 类 + typeFactory<MMO::Proto::EMsgID>（addExtern 类型解析用）。",
+        f"DAS_BASE_BIND_ENUM(MMO::Proto::EMsgID, EMsgID, {enum_members})",
         "",
-        "    // EMsgID 枚举绑定——脚本侧写 EMsgID.MSG_XXX，宏侧编译期查值",
-        "    // 注：仅 addEnumeration + DAS_BIND_ENUM_CAST，未 emit typeFactory<EMsgID>。",
-        "    // 因为 msgID 始终以 uint32 跨 C++/脚本边界（见 Dispatch），从不以 EMsgID 类型传参。",
-        "    // 若将来有 addExtern 的参数/返回类型是 MMO::Proto::EMsgID，需改用 DAS_BASE_BIND_ENUM_FACTORY。",
-        "    struct EnumerationEMsgID : das::Enumeration",
-        "    {",
-        '        EnumerationEMsgID() : das::Enumeration("EMsgID")',
-        "        {",
-        "            external = true;",
-        '            cppName  = "MMO::Proto::EMsgID";',
-        "            baseType = das::Type::tInt;",
-    ]
-    for name, value in msg_id_entries:
-        lines.append(f'            addI("{name}", {value}, das::LineInfo());')
-    lines += [
-        "        }",
-        "    };",
-        "",
-        "} // namespace",
+        "DAS_BIND_ENUM_CAST(MMO::Proto::EMsgID)",
         "",
         "namespace MMO",
         "{",
         "",
         "    void RegisterEMsgIDEnumeration(das::Module &mod)",
         "    {",
-        "        // EMsgID 是全局共享 ID 值空间，绑定到 Common 模块（DasCommonModule::Build 调用），",
+        "        // EMsgID 是全局共享 ID 值空间，绑定到 Common 模块（DasCommonModule 构造注册），",
         "        // 使所有服务（World/Social）都能在脚本侧引用 EMsgID.MSG_XXX，宏侧查 Common 即可。",
         "        mod.addEnumeration(new EnumerationEMsgID());",
         "    }",
         "",
         "} // namespace MMO",
-        "",
-        "DAS_BIND_ENUM_CAST(MMO::Proto::EMsgID)",
         "",
     ]
     return "\n".join(lines)
@@ -929,6 +941,221 @@ def generate_index_cpp(closure: list[ProtoFileInfo],
         "",
     ]
     return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════
+# GameEvent 绑定生成器（ECS_06 决策 3：类型化事件 + 自动绑定）
+# ═══════════════════════════════════════════════════════════════
+
+def event_msg_to_enum(event_msg_name: str) -> str:
+    """EntityDamagedEvent → GAME_EVENT_ENTITY_DAMAGED"""
+    # 去 Event 后缀 → EntityDamaged → 驼峰转下划线大写 → 加前缀
+    if event_msg_name.endswith("Event"):
+        event_msg_name = event_msg_name[: -len("Event")]
+    snake = re.sub(r"(?<![A-Z])([A-Z])", r"_\1", event_msg_name)
+    snake = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", snake)
+    return "GAME_EVENT" + snake.upper()
+
+
+def generate_game_event_bindings_h(event_msgs: list[MessageInfo]) -> str:
+    lines = [
+        "/**",
+        " * @file GameEventBindings.gen.h",
+        " * @brief 自动生成文件——游戏事件绑定声明（类型化事件，ECS_06 决策 3）",
+        " *",
+        " * 生成工具: Tools/Script/GenMsgBindings.py",
+        " * @warning 不要手动编辑——新增/删除 GameEvent.proto 事件后重新生成",
+        " */",
+        "#pragma once",
+        "",
+        "#include <cstdint>",
+        "",
+        "// 事件消息类型（EntityDamagedEvent 等）——AOT 生成的 .das.cpp 引用这些类型",
+        '#include "Proto/AutoGen/GameEvent.pb.h"',
+        "",
+        "namespace das",
+        "{",
+        "    class Module;",
+        "    class ModuleLibrary;",
+        "} // namespace das",
+        "",
+        "namespace MMO",
+        "{",
+        "",
+        "    /**",
+        "     * @brief 注册全部游戏事件类型 + EGameEventType 枚举到模块",
+        "     * @note 由 WorldScriptModule::Build 调用（绑定到 world 模块），",
+        "     *       脚本侧 require world 后可用 EGameEventType 枚举 + 各 *Event 类型",
+        "     */",
+        "    void RegisterAllGameEventBindings(das::Module &mod, das::ModuleLibrary &lib);",
+        "",
+        "} // namespace MMO",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def generate_game_event_bindings_cpp(event_msgs: list[MessageInfo],
+                                     event_enum_values: list[tuple[str, int]] = None) -> str:
+    lines = [
+        "/**",
+        " * @file GameEventBindings.gen.cpp",
+        " * @brief 自动生成文件——游戏事件类型绑定 + Emit 工厂（类型化事件）",
+        " *",
+        " * 生成工具: Tools/Script/GenMsgBindings.py",
+        " * @warning 不要手动编辑",
+        " */",
+        '#include "GameEventBindings.gen.h"',
+        "",
+        "#include <GameEvent.pb.h>",
+        "",
+        '#include "ScriptEngine/GameEventBus.h"',
+        "",
+        "#include <daScript/simulate/simulate.h>",
+        "#include <daScript/ast/ast_interop.h>",
+        "#include <daScript/ast/ast_handle.h>",
+        "#include <daScript/daScriptModule.h>",
+        "#include <daScript/ast/ast_typefactory.h>",
+        "#include <daScript/simulate/bind_enum.h>",
+        "",
+    ]
+
+    # MAKE_TYPE_FACTORY——每个事件类型必须（ManagedStructureAnnotation 需要 typeName 特化）
+    for ev in event_msgs:
+        lines.append(f"MAKE_TYPE_FACTORY({ev.name}, {PROTO_NS}::{ev.name})")
+    # GameEventEnvelope 也需 typeName 特化（文件作用域，不能在 namespace 内）
+    lines.append("MAKE_TYPE_FACTORY(GameEventEnvelope, MMO::GameEventEnvelope)")
+    lines.append("")
+
+    lines.append("namespace")
+    lines.append("{")
+    lines.append("    using namespace das;")
+    lines.append("")
+
+    # 每个事件的 ManagedStructureAnnotation（字段访问器）
+    for ev in event_msgs:
+        lines += [
+            f"    // {ev.name} 类型注解（自动生成）",
+            f"    struct {ev.name}Annotation : ManagedStructureAnnotation<{PROTO_NS}::{ev.name}, false, false>",
+            "    {",
+            f'        {ev.name}Annotation(ModuleLibrary &ml)',
+            f'            : ManagedStructureAnnotation("{ev.name}", ml, "{PROTO_NS}::{ev.name}")',
+            "        {",
+        ]
+        for fld in ev.fields:
+            if fld.is_map or fld.is_string or fld.is_bytes or fld.label == "repeated":
+                continue  # 事件字段均为标量（GameEvent.proto 约束）
+            lines.append(f'            addProperty<DAS_BIND_MANAGED_PROP({fld.name})>("{fld.name}");')
+        lines += [
+            "        }",
+            "        // 事件类型是 protobuf 消息——canNew/canDelete 均 false（模板参），",
+            "        // canCopy/canMove 由基类按非平凡拷贝推导为 false；阻断脚本 clone 逃逸。",
+            "        virtual bool canClone() const override { return false; }",
+            "    };",
+            "",
+        ]
+
+    # GameEventEnvelope 类型注解（脚本侧声明 array<GameEventEnvelope> 用）
+    # 注意：字段名 event_type（type 是 das 保留字）
+    # ⚠ event_type/data 不注册为 `.`xx 属性：AOT 发射器对 propertyFunction 生成
+    #   ((obj).cppName()) 成员调用，自由函数无法成员调用 → AOT 编译失败。
+    #   改为普通 addExtern 函数（脚本侧实际不访问这些字段，经 DispatchGameEvent 函数接收事件）。
+    lines += [
+        "    // GameEventEnvelope 类型注解——事件总线负载（脚本侧遍历用）",
+        "    struct GameEventEnvelopeAnnotation : ManagedStructureAnnotation<MMO::GameEventEnvelope>",
+        "    {",
+        '        GameEventEnvelopeAnnotation(ModuleLibrary &ml)',
+        '            : ManagedStructureAnnotation("GameEventEnvelope", ml, "MMO::GameEventEnvelope")',
+        "        {",
+        "            // 事件经 DispatchGameEvent(evType, payload) 接收，此处无需绑定字段属性",
+        "        }",
+        "    };",
+        "",
+        "    // event_type 值访问器（普通 addExtern 函数，非属性——规避 AOT 成员展开）",
+        "    uint16_t GameEventEnvelope_GetEventType(const MMO::GameEventEnvelope &env)",
+        "    {",
+        "        return env.event_type;",
+        "    }",
+        "",
+        "    // data 指针访问器（普通 addExtern 函数，非属性）。",
+        "    // 返回 const uint8_t*——脚本侧只读 payload（铁律：脚本不得写总线内部缓冲）。",
+        "    const uint8_t *GameEventEnvelope_GetData(const MMO::GameEventEnvelope &env)",
+        "    {",
+        "        return env.data;",
+        "    }",
+        "",
+    ]
+
+    # EGameEventType 枚举绑定
+    lines += [
+        "    // EGameEventType 枚举绑定——脚本侧写 EGameEventType.GAME_EVENT_XXX",
+        "    struct EnumerationEGameEventType : das::Enumeration",
+        "    {",
+        '        EnumerationEGameEventType() : das::Enumeration("EGameEventType")',
+        "        {",
+        "            external = true;",
+        '            cppName  = "MMO::Proto::EGameEventType";',
+        "            baseType = das::Type::tInt;",
+    ]
+    if event_enum_values:
+        # 从 GameEvent.proto 的 enum EGameEventType 解析真实值（含 GAME_EVENT_NONE=0）——
+        # 不再按消息声明顺序硬编码 1..N（中间插入事件会错位导致分派错乱）。
+        for name, value in event_enum_values:
+            lines.append(f'            addI("{name}", {value}, das::LineInfo());')
+    else:
+        # 兜底：proto enum 未解析到时退化为消息顺序（不应发生）
+        for i, ev in enumerate(event_msgs, start=1):
+            enum_name = event_msg_to_enum(ev.name)
+            lines.append(f'            addI("{enum_name}", {i}, das::LineInfo());')
+    lines += [
+        "        }",
+        "    };",
+        "",
+        "} // namespace",
+        "",
+        "namespace MMO",
+        "{",
+        "",
+        "    void RegisterAllGameEventBindings(das::Module &mod, das::ModuleLibrary &lib)",
+        "    {",
+    ]
+    for ev in event_msgs:
+        lines.append(f"        mod.addAnnotation(new {ev.name}Annotation(lib));")
+    lines.append("        mod.addAnnotation(new GameEventEnvelopeAnnotation(lib));")
+    lines.append("        mod.addEnumeration(new EnumerationEGameEventType());")
+    # GameEventEnvelope 访问器注册为普通 addExtern 函数（非 `.`xx 属性——规避 AOT 成员展开）。
+    # 脚本侧实际不直接访问这些字段，事件经 DispatchGameEvent(evType, payload) 接收。
+    lines.append(
+        '        das::addExtern<DAS_BIND_FUN(GameEventEnvelope_GetEventType)>'
+        '(mod, lib, "GameEventEnvelope_GetEventType", das::SideEffects::none)'
+    )
+    lines.append('            ->args({"env"});')
+    lines.append(
+        '        das::addExtern<DAS_BIND_FUN(GameEventEnvelope_GetData)>'
+        '(mod, lib, "GameEventEnvelope_GetData", das::SideEffects::none)'
+    )
+    lines.append('            ->args({"env"});')
+    lines += [
+        "    }",
+        "",
+    ]
+
+    lines += [
+        "} // namespace MMO",
+        "",
+        f"DAS_BIND_ENUM_CAST({PROTO_NS}::EGameEventType)",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def collect_game_events(proto_files: dict[str, ProtoFileInfo]) -> list[MessageInfo]:
+    """从 GameEvent.proto 收集 *Event 消息（按枚举顺序）"""
+    info = proto_files.get("GameEvent.proto")
+    if not info:
+        return []
+    # 按消息声明顺序（枚举值即顺序，见 generate_game_event_bindings_cpp）
+    return [m for m in info.messages if m.name.endswith("Event")]
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1050,6 +1277,24 @@ def main():
     (cpp_out / "ProtoBindIndex.gen.cpp").write_text(
         generate_index_cpp(closure, msg_id_entries, cpp_out_rel), encoding="utf-8")
     print(f"  生成: {cpp_out / 'ProtoBindIndex.gen.cpp'}")
+
+    # 4.5 GameEvent 绑定（ECS_06 决策 3：类型化事件自动绑定）
+    #     生成 GameEventBindings.gen.{h,cpp} 到 cpp_out（World/AutoGen）
+    event_msgs = collect_game_events(proto_files)
+    if event_msgs:
+        # 从 GameEvent.proto 的 enum EGameEventType 解析真实值（含 GAME_EVENT_NONE=0），
+        # 传给生成器——避免按消息顺序硬编码导致中间插值错位。
+        game_event_proto = proto_files.get("GameEvent.proto")
+        event_enum_values = (game_event_proto.enums.get("EGameEventType")
+                             if game_event_proto else None) or []
+        (cpp_out / "GameEventBindings.gen.h").write_text(
+            generate_game_event_bindings_h(event_msgs), encoding="utf-8")
+        print(f"  生成: {cpp_out / 'GameEventBindings.gen.h'} ({len(event_msgs)} 个事件)")
+        (cpp_out / "GameEventBindings.gen.cpp").write_text(
+            generate_game_event_bindings_cpp(event_msgs, event_enum_values), encoding="utf-8")
+        print(f"  生成: {cpp_out / 'GameEventBindings.gen.cpp'}")
+    else:
+        print("  ⚠️  未找到 GameEvent.proto 的 *Event 消息，跳过事件绑定生成")
 
     # 5. 清理旧 das 产物——仅当显式传 --purge-legacy-das（已完成手写迁移）时执行。
     #    默认不删：否则一次普通构建/测试就会删掉尚在使用的 HandlerRegistry.das。
