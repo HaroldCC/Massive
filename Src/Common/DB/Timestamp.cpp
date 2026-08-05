@@ -41,13 +41,13 @@ namespace MMO::DB
         // 解析 "YYYY-MM-DD HH:MM:SS"
         const char *p = pgText.c_str();
         auto        n = std::sscanf(p,
-                             "%d-%d-%d %d:%d:%d",
-                             &tmBuf.tm_year,
-                             &tmBuf.tm_mon,
-                             &tmBuf.tm_mday,
-                             &tmBuf.tm_hour,
-                             &tmBuf.tm_min,
-                             &tmBuf.tm_sec);
+                                    "%d-%d-%d %d:%d:%d",
+                                    &tmBuf.tm_year,
+                                    &tmBuf.tm_mon,
+                                    &tmBuf.tm_mday,
+                                    &tmBuf.tm_hour,
+                                    &tmBuf.tm_min,
+                                    &tmBuf.tm_sec);
         if (n < 6)
         {
             return {};

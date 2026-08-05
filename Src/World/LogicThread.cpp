@@ -85,23 +85,28 @@ namespace MMO
             DB::DBWorkerPool::Instance().ProcessCallbacks();
 
             // ── Phase 4: 游戏逻辑（传剩余预算给业务层） ──
-            auto now     = std::chrono::steady_clock::now();
-            auto elapsed = now - lastTime;
-            if (elapsed > kMaxElapsed)
+            auto now         = std::chrono::steady_clock::now();
+            auto realElapsed = now - lastTime;
+            lastTime         = now;
+            if (realElapsed > kMaxElapsed)
             {
-                elapsed = kMaxElapsed;
+                realElapsed = kMaxElapsed;
             }
-            lastTime = now;
+            _accumulator += std::chrono::duration<float>(realElapsed).count();
 
-            // 计算剩余预算：离 20ms 还有多少时间，给业务层自己决定做多少事
-            auto usedInTick = std::chrono::steady_clock::now() - tickStart;
-            auto budget     = kTickInterval - usedInTick;
-            if (budget < std::chrono::milliseconds(5))
+            uint32 steps = 0;
+            while (_accumulator >= kFixedDeltaTime && steps < kMaxCatchupSteps)
             {
-                budget = std::chrono::milliseconds(5); // 最少给 5ms
+                onTick(kFixedDeltaTime);
+                _accumulator -= kFixedDeltaTime;
+                ++steps;
             }
-
-            onTick(std::chrono::duration_cast<std::chrono::milliseconds>(budget));
+            if (_accumulator >= kFixedDeltaTime)
+            {
+                // 追帧上限达成仍欠账——丢弃时间（防死亡螺旋）
+                _accumulator = 0.0f;
+                Log::Warn("LogicThread: catch-up limit hit, dropping accumulated time");
+            }
 
             // ── Phase 6: 出站刷新 ──
             if (postFlush)

@@ -1,142 +1,145 @@
-/**
- * @file Scene.h
- * @brief 场景——EnTT registry + 脚本组件存储的容器
- *
- * 每个 Scene 持有独立 EnTT registry（C++ 高频组件）
- * 和 ScriptComponentStorage 集合（脚本层组件）。
- */
 #pragma once
 
-#include <memory>
-#include <string>
-#include <unordered_map>
-#include <vector>
-
-#include <entt/entt.hpp>
-
 #include "Common/Core/Types.h"
-#include "Common/ECS/Entity.h"
+#include "Common/ECS/ActiveSet.h"
+#include "Common/ECS/EntityID.h"
+#include "Common/ECS/EntityRegistry.h"
+#include "Common/ECS/DirtyIndex.h"
+#include "Common/ECS/Grid.h"
+#include "entt/entity/fwd.hpp"
 
 namespace MMO::ECS
 {
-
-    /**
-     * @brief 场景——EnTT registry + 脚本组件存储的容器
-     *
-     * 每个场景独立一个 Scene 实例。
-     * C++ 高频组件（Position/Velocity/Health）走 EnTT registry 的 SoA 存储。
-     * 脚本组件走 ScriptComponentStorage 的 SoA Blob 列。
-     */
     class Scene
     {
     public:
-        explicit Scene(uint32 sceneId);
+        explicit Scene(uint16 sceneID);
 
         Scene(const Scene &)            = delete;
         Scene &operator=(const Scene &) = delete;
         Scene(Scene &&)                 = delete;
         Scene &operator=(Scene &&)      = delete;
 
-        ~Scene() = default;
-
-        uint32 SceneID() const
+        uint16 SceneID() const
         {
-            return _sceneId;
+            return _sceneID;
         }
 
-        // ── Entity 生命周期 ──
+        EntityID     CreateEntity();
+        bool         DestroyEntity(EntityID eid);
+        bool         IsValidEntity(EntityID eid) const;
+        entt::entity ResolveEntity(EntityID eid) const;
+        EntityID     ToEntityID(entt::entity e) const;
+
+        template <typename TCommponent>
+        TCommponent &GetComponent(EntityID eid)
+        {
+            return _entt.get<TCommponent>(ResolveEntity(eid));
+        }
+
+        template <typename TCommponent>
+        const TCommponent &GetComponent(EntityID eid) const
+        {
+            return _entt.get<TCommponent>(ResolveEntity(eid));
+        }
+
+        template <typename TCommponent>
+        bool HasComponent(EntityID eid) const
+        {
+            return _entt.all_of<TCommponent>(ResolveEntity(eid));
+        }
+
+        template <typename TCommponent, typename... Args>
+        TCommponent &EmplaceComponent(EntityID eid, Args &&...args)
+        {
+            return _entt.emplace<TCommponent>(ResolveEntity(eid), std::forward<Args>(args)...);
+        }
+
+        template <typename TCommponent>
+        void RemoveComponent(EntityID eid)
+        {
+            _entt.remove<TCommponent>(ResolveEntity(eid));
+        }
+
+        template <typename TComponent>
+        void MarkComponentDirty(EntityID eid)
+        {
+            auto e = ResolveEntity(eid);
+            if (e == entt::null)
+            {
+                return;
+            }
+            GetDirtyIndex<TComponent>().Mark(EntityIndex(static_cast<uint32>(entt::to_integral(e))));
+        }
 
         /**
-         * @brief 创建实体
-         * @return Entity{sceneId, entityId}
+         * @brief 获取组件脏索引（每组件类型一份，函数内 static）
+         *
+         * C++ 模板成员不能直接存容器——用函数模板内 static 局部变量，
+         * 每 TComponent 特化独立一份。生命周期随程序，Scene 销毁时自动复用。
          */
-        Entity CreateEntity();
-
-        /**
-         * @brief 销毁实体（同时清理脚本组件）
-         * @param entity  Entity
-         */
-        void DestroyEntity(const Entity &entity);
-
-        /**
-         * @brief 实体是否有效
-         * @param entity  Entity
-         */
-        bool IsValid(const Entity &entity) const;
-
-        // ── C++ 组件（EnTT 存储）──
-
-        /**
-         * @brief 获取 entity 的组件引用
-         * @tparam T  组件类型
-         * @return T&
-         */
-        template <typename T>
-        T &GetComponent(const Entity &entity)
+        template <typename TComponent>
+        DirtyIndex<TComponent> &GetDirtyIndex()
         {
-            return _registry.get<T>(entt::entity(entity.entityId));
+            static DirtyIndex<TComponent> index;
+            return index;
         }
 
-        template <typename T>
-        const T &GetComponent(const Entity &entity) const
+        entt::registry &GetEnttRegistry()
         {
-            return _registry.get<T>(entt::entity(entity.entityId));
+            return _entt;
         }
 
-        template <typename T>
-        bool HasComponent(const Entity &entity) const
+        const entt::registry &GetEnttRegistry() const
         {
-            return _registry.all_of<T>(entt::entity(entity.entityId));
+            return _entt;
         }
 
-        template <typename T, typename... Args>
-        T &EmplaceComponent(const Entity &entity, Args &&...args)
-        {
-            return _registry.emplace<T>(entt::entity(entity.entityId), std::forward<Args>(args)...);
-        }
-
-        template <typename T>
-        void RemoveComponent(const Entity &entity)
-        {
-            _registry.remove<T>(entt::entity(entity.entityId));
-        }
-
-        // ── 批量操作（ecs_query 底层）──
-
-        template <typename... Components>
-        auto CreateView()
-        {
-            return _registry.view<Components...>();
-        }
-
-        template <typename... Owned>
-        auto CreateGroup()
-        {
-            return _registry.group<entt::owned_t<Owned...>>();
-        }
-
-        entt::registry &Registry()
+        EntityRegistry &GetEntityRegistry()
         {
             return _registry;
         }
 
-        const entt::registry &Registry() const
+        const EntityRegistry &GetEntityRegistry() const
         {
             return _registry;
         }
 
-        // ── 脚本组件存储 ──
+        // ── 空间索引（per-scene）──
 
         /**
-         * @brief 注册一个脚本组件类型
-         * @param name            组件名
-         * @param componentSize   单组件字节数
+         * @brief 获取格子空间索引
+         *
+         * Grid 是 per-scene 的（场景内实体归属同一格子集）。
+         * AOI 系统每帧更新它，空间查询（EntitiesInRadius 等）读它。
          */
-        void RegisterScriptComponent(const std::string &name, size_t componentSize);
+        ECS::Grid &GetGrid()
+        {
+            return _grid;
+        }
+
+        const ECS::Grid &GetGrid() const
+        {
+            return _grid;
+        }
+
+        // ── 活跃集（AOI 内实体）──
+
+        ActiveSet &GetActiveSet()
+        {
+            return _activeSet;
+        }
+
+        const ActiveSet &GetActiveSet() const
+        {
+            return _activeSet;
+        }
 
     private:
-        uint32         _sceneId;
-        entt::registry _registry;
+        uint16         _sceneID {0};
+        EntityRegistry _registry;
+        entt::registry _entt;
+        ECS::Grid      _grid;      // 格子空间索引（默认 10 世界单位/格）
+        ActiveSet      _activeSet; // 活跃实体集
     };
-
 } // namespace MMO::ECS

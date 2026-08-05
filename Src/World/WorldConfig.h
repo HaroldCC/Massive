@@ -4,7 +4,12 @@
  */
 #pragma once
 
-#include "World/SceneManager.h" // SceneConfig
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "Common/Core/Types.h"
+#include "Common/Log/Log.h"
 
 namespace MMO
 {
@@ -41,7 +46,7 @@ namespace MMO
             uint16                   worldServerID = 1;
             uint16                   maxPlayers    = 10000;
             std::vector<std::string> gateAddresses;    // Gate 内网地址列表
-            std::vector<SceneConfig> persistentScenes; // 常驻场景配置
+            std::vector<uint32>      persistentScenes; // 常驻场景 ID 列表
         } world;
 
         struct Script

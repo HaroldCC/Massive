@@ -1,23 +1,28 @@
-/**
- * @file EnterWorldHandler.cpp
- * @brief EnterWorldHandler 实现
- */
-
-#include "World/Handler/EnterWorldHandler.h"
-
+#include "EnterWorldHandler.h"
 #include "Common/Crypto/SessionToken.h"
-#include "Common/ECS/Scene.h"
 #include "Common/Log/Log.h"
 
-#include <Login.pb.h>
-#include <MsgID.pb.h>
-
-#include <chrono>
-#include <ctime>
+#include "Login.pb.h"
+#include "MsgID.pb.h"
+#include "World/Component/Health.h"
+#include "World/Component/PlayerConnection.h"
+#include "World/Component/Position.h"
+#include "World/Component/Tags.h"
+#include "World/WorldSession.h"
 
 namespace MMO
 {
-
+    /**
+     * @brief 处理 EnterWorldReq
+     * @param sessionID    Gate sessionId
+     * @param body         protobuf 请求体
+     * @param len          长度
+     * @param sessions     会话表（IO 线程读锁外，此处由 LogicThread 独占）
+     * @param lss          LoginServerSecret（SessionToken 验证）
+     * @param gateServerID Gate 实例 ID
+     * @param defaultScene 默认场景（实体创建目标）
+     * @param gateSendFn   出站回调
+     */
     void EnterWorldHandler::Handle(uint32                                    sessionID,
                                    const uint8                              *body,
                                    size_t                                    len,
@@ -25,209 +30,88 @@ namespace MMO
                                    const uint8                              *lss,
                                    uint16                                    gateServerID,
                                    ECS::Scene                               &defaultScene,
-                                   GateSendFn                                gateSendFn)
+                                   GateSendFunc                              gateSendFunc)
     {
         Proto::LoginEnterWorldReq req;
         if (!req.ParseFromArray(body, static_cast<int>(len)))
         {
-            Log::Warn("EnterWorld: protobuf parse failed ({} bytes)", len);
-            SendError(sessionID, 2001, "Invalid request", gateSendFn);
+            Log::Warn("EnterWorldHandler: failed to parse EnterWorldReq for session {}", sessionID);
             return;
         }
 
-        // 解析 SessionToken
         if (static_cast<size_t>(req.session_token().size()) != Crypto::SessionToken::kTotalSize)
         {
-            Log::Warn("EnterWorld: invalid session token size={}", req.session_token().size());
-            SendError(sessionID, 2002, "Invalid session token", gateSendFn);
+            Log::Warn("EnterWorldHandler: invalid session token size for session {}", sessionID);
             return;
         }
 
         auto tokenOpt =
             Crypto::SessionToken::FromBuffer(reinterpret_cast<const uint8 *>(req.session_token().data()),
-                                             static_cast<size_t>(req.session_token().size()));
+                                             req.session_token().size());
         if (!tokenOpt)
         {
-            SendError(sessionID, 2002, "Invalid session token", gateSendFn);
             return;
         }
 
         auto payloadOpt = Crypto::SessionTokenBuilder::Verify(lss, *tokenOpt);
         if (!payloadOpt)
         {
-            Log::Debug("EnterWorld: token verify failed (expired or tampered)");
-            SendError(sessionID, 2003, "Token expired or invalid", gateSendFn);
+            Log::Warn("EnterWorldHandler: session token verification failed for session {}", sessionID);
             return;
         }
 
-        uint32 accountID    = payloadOpt->accountId;
-        uint8 *sessionKey   = payloadOpt->sessionKey.Data();
-        auto   clientRandom = req.nonce();
+        const uint32 accountID    = payloadOpt->accountID;
+        const uint64 clientRandom = req.nonce();
 
-        // 检查是否重连
-        for (auto &[sid, ws] : sessions)
-        {
-            if (ws.accountID == accountID)
-            {
-                Log::Info("EnterWorld: reconnect detected for accountID={}", accountID);
-                HandleReconnect(sessionID,
-                                gateServerID,
-                                sessions,
-                                accountID,
-                                reinterpret_cast<const uint8 *>(req.reconnect_seed().data()),
-                                static_cast<size_t>(req.reconnect_seed().size()),
-                                clientRandom,
-                                gateSendFn);
-                return;
-            }
-        }
+        // 创建实体
+        const ECS::EntityID entityID = defaultScene.CreateEntity();
 
-        // 首次登录
-        HandleFirstLogin(sessionID,
-                         gateServerID,
-                         sessions,
-                         accountID,
-                         sessionKey,
-                         clientRandom,
-                         defaultScene,
-                         gateSendFn);
-    }
+        // 玩家实体组件：连接归属 + 出生位置 + 玩家标记
+        //  （AOI/复制/断线处理都依赖这些——没有它们玩家不可见）
+        defaultScene.EmplaceComponent<PlayerConnection>(
+            entityID,
+            PlayerConnection {.sessionID = sessionID, .gateServerID = gateServerID});
+        defaultScene.EmplaceComponent<Position>(entityID, Position {0.0f, 0.0f, 0.0f});
+        defaultScene.EmplaceComponent<Health>(entityID, Health {100, 100});
+        defaultScene.GetEnttRegistry().emplace<PlayerTag>(defaultScene.ResolveEntity(entityID));
 
-    void EnterWorldHandler::HandleFirstLogin(uint32                                    sessionID,
-                                             uint16                                    gateServerID,
-                                             std::unordered_map<uint32, WorldSession> &sessions,
-                                             uint32                                    accountID,
-                                             const uint8                              *sessionKey,
-                                             uint64                                    clientRandom,
-                                             ECS::Scene                               &defaultScene,
-                                             GateSendFn                                gateSendFn)
-    {
-        auto entity = defaultScene.CreateEntity();
+        // 玩家进格子（AOI 空间索引）
+        defaultScene.GetGrid().Insert(ECS::EntityIndex(static_cast<uint32>(entityID)), 0.0f, 0.0f);
 
         CryptoSession crypto;
-        crypto.Init(sessionKey, clientRandom);
+        crypto.Init(payloadOpt->sessionKey.Data(), clientRandom);
 
-        WorldSession ws;
-        ws.sessionID    = sessionID;
-        ws.accountID    = accountID;
-        ws.entity       = entity;
-        ws.crypto       = std::move(crypto);
-        ws.gateServerID = gateServerID;
-        ws.lastRecvTime = std::chrono::steady_clock::now();
-        ws.disconnected = false;
+        WorldSession session {
+            .sessionID    = sessionID,
+            .accountID    = accountID,
+            .entityID     = entityID,
+            .crypto       = std::move(crypto),
+            .gateServerID = gateServerID,
+            .lastRecvTime = std::chrono::steady_clock::now(),
+            .disconnected = false,
+        };
 
-        sessions[sessionID] = std::move(ws);
+        sessions[sessionID] = std::move(session);
 
-        Log::Info("EnterWorld: accountID={} → entity=({},{}) sessionID={}",
+        Log::Info("EnterWorldHandler: session {} account {} entered world, entityID={}",
+                  sessionID,
                   accountID,
-                  entity.sceneId,
-                  entity.entityId,
-                  sessionID);
+                  entityID);
 
-        SendRsp(sessionID, entity.entityId, entity.sceneId, 0.0f, 0.0f, 0.0f, gateSendFn);
-    }
-
-    void EnterWorldHandler::HandleReconnect(uint32                                    sessionID,
-                                            uint16                                    gateServerID,
-                                            std::unordered_map<uint32, WorldSession> &sessions,
-                                            uint32                                    accountID,
-                                            const uint8                              *reconnectSeed,
-                                            size_t                                    seedLen,
-                                            uint64                                    clientRandom,
-                                            GateSendFn                                gateSendFn)
-    {
-        // 找到旧 Session
-        uint32 oldSessionID = 0;
-        for (auto &[sid, ws] : sessions)
-        {
-            if (ws.accountID == accountID)
-            {
-                oldSessionID = sid;
-                break;
-            }
-        }
-
-        auto  oldEntry  = sessions.extract(oldSessionID);
-        auto &ws        = oldEntry.mapped();
-        ws.disconnected = false;
-        ws.gateServerID = gateServerID;
-        ws.lastRecvTime = std::chrono::steady_clock::now();
-
-        // 如果新 sessionID 已在 sessions 中存在（极罕见但非不可能），
-        // extract + insert 会静默覆盖——暴露给日志比掩盖好
-        if (sessionID != oldSessionID && sessions.contains(sessionID))
-        {
-            Log::Error("EnterWorld: sessionID {} already in use during reconnect! "
-                       "accountID={} oldSessionID={}",
-                       sessionID,
-                       accountID,
-                       oldSessionID);
-            SendError(sessionID, 2004, "Internal error", gateSendFn);
-            return;
-        }
-        ws.sessionID = sessionID;
-
-        // 旋转密钥
-        if (seedLen > 0)
-        {
-            ws.crypto.RotateReconnectKey(reconnectSeed, seedLen);
-        }
-        else
-        {
-            // 没有 reconnectSeed 时用 nonce 作为种子
-            uint8 fallbackSeed[8];
-            std::memcpy(fallbackSeed, &clientRandom, 8);
-            ws.crypto.RotateReconnectKey(fallbackSeed, 8);
-        }
-
-        sessions[sessionID] = std::move(ws);
-
-        Log::Info("EnterWorld: RECONNECT accountID={} sessionID {}→{}", accountID, oldSessionID, sessionID);
-
-        SendRsp(sessionID, ws.entity.entityId, ws.entity.sceneId, 0.0f, 0.0f, 0.0f, gateSendFn);
-    }
-
-    void
-    EnterWorldHandler::SendError(uint32 sessionID, uint32 errorCode, const char *msg, GateSendFn gateSendFn)
-    {
-        Proto::LoginEnterWorldRsp rsp;
-        rsp.mutable_error()->set_code(errorCode);
-        rsp.mutable_error()->set_message(msg);
-        // 零分配序列化
-        size_t bodySize = static_cast<size_t>(rsp.ByteSizeLong());
-        auto   buf      = ByteBuffer::Own(bodySize);
-        if (!rsp.SerializeToArray(buf.WritePtr(), static_cast<int>(bodySize)))
-        {
-            Log::Error("EnterWorldHandler::SendError: SerializeToArray failed");
-            return;
-        }
-        buf.SetWritePos(bodySize);
-        // 错误响应不加密（World 侧可能尚未完成 CryptoSession 初始化）
-        gateSendFn(sessionID, Proto::MSG_LOGIN_ENTER_WORLD_RSP, std::move(buf));
-    }
-
-    void EnterWorldHandler::SendRsp(uint32     sessionID,
-                                    uint32     playerID,
-                                    uint32     sceneID,
-                                    float      x,
-                                    float      y,
-                                    float      z,
-                                    GateSendFn gateSendFn)
-    {
+        // 回包（player_id 已按决策 2 改为 uint64——直接传完整 EntityID）
         Proto::LoginEnterWorldRsp rsp;
         rsp.mutable_error()->set_code(0);
-        rsp.set_player_id(playerID);
-        rsp.set_scene_id(sceneID);
-        rsp.mutable_position()->set_x(x);
-        rsp.mutable_position()->set_y(y);
-        rsp.mutable_position()->set_z(z);
+        rsp.set_player_id(static_cast<uint64>(entityID));
+        rsp.set_scene_id(defaultScene.SceneID());
+        rsp.mutable_position()->set_x(0.0f);
+        rsp.mutable_position()->set_y(0.0f);
+        rsp.mutable_position()->set_z(0.0f);
 
-        // 零分配序列化
-        size_t bodySize = static_cast<size_t>(rsp.ByteSizeLong());
-        auto   buf      = ByteBuffer::Own(bodySize);
-        rsp.SerializeToArray(buf.WritePtr(), static_cast<int>(bodySize));
+        size_t                bodySize = static_cast<size_t>(rsp.ByteSizeLong());
+        auto                  buf      = ByteBuffer::Own(bodySize);
+        [[maybe_unused]] bool ret      = rsp.SerializeToArray(buf.WritePtr(), static_cast<int>(bodySize));
         buf.SetWritePos(bodySize);
-        gateSendFn(sessionID, Proto::MSG_LOGIN_ENTER_WORLD_RSP, std::move(buf));
-    }
 
+        gateSendFunc(sessionID, Proto::MSG_LOGIN_ENTER_WORLD_RSP, std::move(buf));
+    }
 } // namespace MMO

@@ -2,12 +2,12 @@
  * @file SessionToken.h
  * @brief 50 字节自包含凭证（全部明文段按大端序存储）
  *
- * [worldServerId: 2B] [accountId: 4B] [expireTime: 4B] [encryptedSessionKey: 32B] [HMAC: 8B]
+ * [worldServerID: 2B] [accountID: 4B] [expireTime: 4B] [encryptedSessionKey: 32B] [HMAC: 8B]
  * ↑─── 明文段 10B ───↑   ↑─── 加密段 32B ───↑  ↑─HMAC─↑
  *
  * 所有数值字段在存储时固定为大端序（网络序），
- * WorldServerId()/AccountId()/ExpireTime() 在读取时自动转换为主机序。
- * GateServer 读 token[0..1] 用大端解析即可获得 worldServerId，无需解密。
+ * WorldServerID()/AccountID()/ExpireTime() 在读取时自动转换为主机序。
+ * GateServer 读 token[0..1] 用大端解析即可获得 worldServerID，无需解密。
  */
 #pragma once
 
@@ -26,7 +26,7 @@ namespace MMO::Crypto
     struct SessionToken
     {
         static constexpr size_t kTotalSize  = 50; // 总大小
-        static constexpr size_t kPlainSize  = 10; // worldServerId(2B) + accountId(4B) + expireTime(4B)
+        static constexpr size_t kPlainSize  = 10; // worldServerID(2B) + accountID(4B) + expireTime(4B)
         static constexpr size_t kKeyEncSize = 32; // AES-256-ECB 加密的 SessionKey
         static constexpr size_t kHmacSize   = 8;  // HMAC-SHA256 截断（64 位，碰撞概率 2^-64）
 
@@ -35,9 +35,9 @@ namespace MMO::Crypto
         // ── 明文段读取 ──
 
         /**
-         * @brief 读取 WorldServerId（大端→主机序）
+         * @brief 读取 WorldServerID（大端→主机序）
          */
-        uint16 WorldServerId() const
+        uint16 WorldServerID() const
         {
             uint16 id;
             std::memcpy(&id, data, 2);
@@ -49,9 +49,9 @@ namespace MMO::Crypto
         }
 
         /**
-         * @brief 读取 AccountId（大端→主机序）
+         * @brief 读取 AccountID（大端→主机序）
          */
-        uint32 AccountId() const
+        uint32 AccountID() const
         {
             uint32 id;
             std::memcpy(&id, data + 2, 4);
@@ -79,9 +79,9 @@ namespace MMO::Crypto
         // ── 明文段写入（LoginServer 签发时内部使用，全部按大端存储）──
 
         /**
-         * @brief 设置 WorldServerId（主机序→大端存储）
+         * @brief 设置 WorldServerID（主机序→大端存储）
          */
-        void SetWorldServerId(uint16 id)
+        void SetWorldServerID(uint16 id)
         {
             if constexpr (std::endian::native == std::endian::little)
             {
@@ -91,9 +91,9 @@ namespace MMO::Crypto
         }
 
         /**
-         * @brief 设置 AccountId（主机序→大端存储）
+         * @brief 设置 AccountID（主机序→大端存储）
          */
-        void SetAccountId(uint32 id)
+        void SetAccountID(uint32 id)
         {
             if constexpr (std::endian::native == std::endian::little)
             {
@@ -177,15 +177,15 @@ namespace MMO::Crypto
          * @brief 签发 SessionToken
          * @param lss             LoginServerSecret (32B, 与 WorldServer 共享)
          * @param sessionKey      ECDH 产生的 32B SessionKey
-         * @param worldServerId   目标 WorldServer ID
-         * @param accountId       玩家账号 ID
+         * @param worldServerID   目标 WorldServer ID
+         * @param accountID       玩家账号 ID
          * @param expireTime      过期时间戳
          * @return SessionToken，失败返回 nullopt
          */
         static std::optional<SessionToken> Issue(const uint8 *lss,
                                                  const uint8 *sessionKey,
-                                                 uint16       worldServerId,
-                                                 uint32       accountId,
+                                                 uint16       worldServerID,
+                                                 uint32       accountID,
                                                  uint32       expireTime);
 
         /**
@@ -193,7 +193,7 @@ namespace MMO::Crypto
          */
         struct TokenPayload
         {
-            uint32     accountId;  // 玩家账号 ID
+            uint32     accountID;  // 玩家账号 ID
             uint32     expireTime; // 过期时间戳
             ByteBuffer sessionKey; // 32B SessionKey
         };

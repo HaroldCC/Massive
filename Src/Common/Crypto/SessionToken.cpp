@@ -30,8 +30,8 @@ namespace MMO::Crypto
     {
         SessionToken token;
 
-        token.SetWorldServerId(worldServerId);
-        token.SetAccountId(accountId);
+        token.SetWorldServerID(worldServerId);
+        token.SetAccountID(accountId);
         token.SetExpireTime(expireTime);
 
         auto encrypted = Aes256Ecb::Encrypt(lss, sessionKey, Aes256Ecb::kKeySize);
@@ -84,7 +84,7 @@ namespace MMO::Crypto
         }
 
         TokenPayload payload;
-        payload.accountId  = token.AccountId();
+        payload.accountID  = token.AccountID();
         payload.expireTime = token.ExpireTime();
         payload.sessionKey = std::move(*decrypted);
 

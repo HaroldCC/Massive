@@ -10,10 +10,10 @@
 #include <chrono>
 
 #include "Common/Core/Types.h"
-#include "Common/ECS/Entity.h"
 #include "Common/Network/CryptoSession.h"
 #include "Common/Queue/LogicMessage.h"
 #include "Common/Queue/MPSCQueue.h"
+#include "Common/ECS/EntityID.h"
 
 namespace MMO
 {
@@ -30,7 +30,7 @@ namespace MMO
     {
         uint32        sessionID = 0;    // Gate 分配的 sessionID
         uint32        accountID = 0;    // 玩家账号 ID
-        Entity        entity;           // World 侧的玩家 Entity
+        ECS::EntityID entityID  = 0;    // 对应 ECS EntityID（可无效，断线时为 kInvalidEntityID）
         CryptoSession crypto;           // AES-256-GCM 加解密上下文
         uint16        gateServerID = 0; // 当前连接的 Gate 实例 ID
         uint32        gateConnIdx  = 0; // 对应 Gate 连接在 GateConnectionMgr 中的索引

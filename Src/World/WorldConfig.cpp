@@ -8,8 +8,6 @@
 #include "Common/Crypto/Hex.h"
 #include "Common/Log/Log.h"
 
-#include <cstdlib>
-#include <cstring>
 #include <fstream>
 #include <string>
 
@@ -40,18 +38,12 @@ namespace MMO
         cfg.world.maxPlayers    = loader.GetUInt16("world.max_players", 10000);
         cfg.world.gateAddresses = loader.GetStringArray("world.gate_addresses");
 
-        // 常驻场景配置（MVP: 简单数组，后续扩展为 TOML table array）
+        // 常驻场景 ID 列表（场景参数由新 ECS 层 SceneConfig 统一管理，见 Docs/ECS 设计文档）
         auto sceneIDs = loader.GetStringArray("world.persistent_scenes");
         for (const auto &sidStr : sceneIDs)
         {
-            uint32      sceneId = static_cast<uint32>(std::stoul(sidStr));
-            SceneConfig sc;
-            sc.id           = sceneId;
-            sc.name         = "scene_" + std::to_string(sceneId);
-            sc.gridSize     = 50.0f;
-            sc.viewRadiusXZ = 100.0f;
-            sc.viewRadiusY  = 15.0f;
-            cfg.world.persistentScenes.push_back(std::move(sc));
+            uint32 sceneId = static_cast<uint32>(std::stoul(sidStr));
+            cfg.world.persistentScenes.push_back(sceneId);
         }
 
         // 脚本引擎配置

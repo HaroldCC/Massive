@@ -330,7 +330,7 @@ namespace MMO
                                     [[maybe_unused]] const Proto::HeartbeatReq &req)
     {
         Proto::HeartbeatRsp rsp;
-        auto                nowMs = static_cast<uint64>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        auto nowMs = static_cast<uint64>(std::chrono::duration_cast<std::chrono::milliseconds>(
                                              std::chrono::system_clock::now().time_since_epoch())
                                              .count());
         rsp.set_server_time(nowMs);

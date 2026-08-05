@@ -412,7 +412,7 @@ namespace MMO::TestClient
         }
 
         Proto::HeartbeatReq req;
-        auto                nowMs = static_cast<uint64>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        auto nowMs = static_cast<uint64>(std::chrono::duration_cast<std::chrono::milliseconds>(
                                              std::chrono::system_clock::now().time_since_epoch())
                                              .count());
         req.set_client_time(nowMs);

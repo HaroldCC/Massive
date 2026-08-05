@@ -27,9 +27,9 @@ using uint64 = uint64_t;
 inline constexpr size_t kMaxHandlers = 4096;
 
 /**
- * @brief 逻辑帧间隔 50ms = 20 ticks/s
+ * @brief 逻辑帧间隔 20ms
  */
-inline constexpr auto kTickInterval = std::chrono::milliseconds(50);
+inline constexpr auto kTickInterval = std::chrono::milliseconds(20);
 
 /**
  * @brief MPSC 队列容量上限（防内存打爆）

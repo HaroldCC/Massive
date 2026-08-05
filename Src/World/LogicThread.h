@@ -30,7 +30,7 @@ namespace MMO
     class LogicThread
     {
     public:
-        using TickCallback = std::function<void(std::chrono::milliseconds)>;
+        using TickCallback = std::function<void(float dtSeconds)>;
         using DispatchCallback =
             std::function<void(uint32 sessionID, WorldSession &ws, const LogicMessage &msg)>;
 
@@ -94,9 +94,16 @@ namespace MMO
         // 动态入口门控——根据 Tick 负载自动调整每 Tick 处理的消息数
         uint32 _currentMsgLimit = kMaxMessagesPerTick;
 
+        float _accumulator = 0.0f; // 追帧欠账（秒）
+
         static constexpr size_t kMaxMessagesPerTick = 1000;
-        static constexpr auto   kTickInterval       = std::chrono::milliseconds(20);
         static constexpr auto   kMaxElapsed         = std::chrono::milliseconds(50);
+
+        // 固定模拟步长（秒）20ms
+        static constexpr float kFixedDeltaTime = 0.02f; // 20ms
+
+        // 单帧追帧上限——防死亡螺旋
+        static constexpr uint32 kMaxCatchupSteps = 3;
     };
 
 } // namespace MMO
