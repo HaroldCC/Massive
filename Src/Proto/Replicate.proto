@@ -14,26 +14,26 @@ message PositionDelta
 
 message EntitySpawnNtf
 {
-    uint32 entity_id   = 1;
-    uint32 entity_type = 2; // 0=Player, 1=NPC, 2=Monster
-    PositionDelta position = 3;
-    int32  hp_current = 4;
-    int32  hp_max     = 5;
+    uint64        entity_id   = 1;
+    uint32        entity_type = 2;
+    PositionDelta position    = 3;
+    int32         hp_current  = 4;
+    int32         hp_max      = 5;
 }
 
 message EntityUpdateNtf
 {
-    uint32 entity_id = 1;
+    uint64 entity_id = 1;
     // optional — 只有变更字段才序列化
-    optional PositionDelta position    = 2;
-    optional int32         hp_current  = 3;
-    optional bool          is_dead     = 4;
+    optional PositionDelta position     = 2;
+    optional int32         hp_current   = 3;
+    optional bool          is_dead      = 4;
     optional bool          is_in_combat = 5;
 }
 
 message EntityDespawnNtf
 {
-    uint32 entity_id = 1;
+    uint64 entity_id = 1;
 }
 
 // 批量通知——每帧合并

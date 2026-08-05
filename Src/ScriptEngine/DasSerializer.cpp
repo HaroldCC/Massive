@@ -8,6 +8,8 @@
 #include "daScript/misc/smart_ptr.h"
 #include "Common/Log/Log.h"
 
+#include <openssl/rand.h>
+
 #include <cstddef>
 #include <cstring>
 #include <exception>
@@ -125,10 +127,14 @@ namespace MMO
                 return false;
             }
 
+            // 随机 12 字节 IV（Aes256Gcm::kIvSize）——GCM 要求 IV 唯一，
+            // 同密钥下任何两次加密 IV 不得重用（blobLen 派生会重用，安全缺陷）
             uint8 iv[Aes256Gcm::kIvSize] = {0};
-            std::memcpy(iv,
-                        &blobLen,
-                        sizeof(blobLen) < Aes256Gcm::kIvSize ? sizeof(blobLen) : Aes256Gcm::kIvSize);
+            if (RAND_bytes(iv, static_cast<int>(Aes256Gcm::kIvSize)) != 1)
+            {
+                Log::Error("DasLangSerializer Save: RAND_bytes failed");
+                return false;
+            }
 
             auto enc = Crypto::Aes256Gcm::Encrypt(key, iv, blob, blobLen);
             if (!enc)

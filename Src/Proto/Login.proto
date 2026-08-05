@@ -22,32 +22,32 @@ message HeartbeatRsp
 
 message LoginAuthReq
 {
-    string username = 1;
-    string password = 2;
+    string username      = 1;
+    string password      = 2;
     bytes  client_dh_key = 3;  // 客户端 ECDH 公钥（32B）
 }
 
 message LoginAuthRsp
 {
-    ErrorInfo error = 1;            // code != 0 表示失败
-    repeated string gate_ips = 2;  // 可连接的 GateServer 地址列表
-    bytes  session_token = 3;      // 46B SessionToken
-    bytes  server_dh_key = 4;      // 服务器 ECDH 公钥（32B）
+    ErrorInfo       error         = 1;            // code != 0 表示失败
+    repeated string gate_ips      = 2;  // 可连接的 GateServer 地址列表
+    bytes           session_token = 3;      // 46B SessionToken
+    bytes           server_dh_key = 4;      // 服务器 ECDH 公钥（32B）
 }
 
 // ── 进入世界（Client → GateServer → WorldServer）──
 
 message LoginEnterWorldReq
 {
-    bytes  session_token = 1;  // 46B SessionToken（明文，Gate 读取路由）
-    uint64 nonce = 2;          // 防重放随机数
+    bytes  session_token  = 1;  // 46B SessionToken（明文，Gate 读取路由）
+    uint64 nonce          = 2;          // 防重放随机数
     bytes  reconnect_seed = 3;  // 重连种子（8B，首次登录填 0，参见 CryptoSession::RotateReconnectKey）
 }
 
 message LoginEnterWorldRsp
 {
-    ErrorInfo error = 1;
-    uint32  player_id = 2;
-    uint32  scene_id = 3;
-    Vector3 position = 4;
+    ErrorInfo error     = 1;
+    uint64    player_id = 2;
+    uint32    scene_id  = 3;
+    Vector3   position  = 4;
 }

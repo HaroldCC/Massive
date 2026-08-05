@@ -1,0 +1,64 @@
+syntax = "proto3";
+
+package MMO.Proto;
+
+// 事件类型枚举（uint16 值空间，与 das 侧 EGameEventType 一一对应）
+enum EGameEventType
+{
+    GAME_EVENT_NONE             = 0;
+    GAME_EVENT_ENTITY_ENTER_AOI = 1;  // EntityEnterAOIEvent
+    GAME_EVENT_ENTITY_LEAVE_AOI = 2;  // EntityLeaveAOIEvent
+    GAME_EVENT_ENTITY_DAMAGED   = 3;  // EntityDamagedEvent
+    GAME_EVENT_ENTITY_DIED      = 4;  // EntityDiedEvent
+    GAME_EVENT_ENTITY_SPAWNED   = 5;  // EntitySpawnedEvent
+    GAME_EVENT_SKILL_CAST       = 6;  // SkillCastEvent
+    GAME_EVENT_BUFF_APPLIED     = 7;  // BuffAppliedEvent
+    GAME_EVENT_BUFF_EXPIRED     = 8;  // BuffExpiredEvent
+}
+
+message EntityEnterAOIEvent
+{
+    uint64 observer_id = 1;
+    uint64 entity_id   = 2;
+}
+
+message EntityLeaveAOIEvent {
+    uint64 observer_id = 1;
+    uint64 entity_id   = 2;
+}
+
+message EntityDamagedEvent  {
+    uint64 target_id   = 1;
+    uint64 attacker_id = 2;
+    int32  damage      = 3;
+}
+
+message EntityDiedEvent
+{
+    uint64 entity_id = 1;
+}
+
+message EntitySpawnedEvent
+{
+    uint64 entity_id   = 1;
+    uint32 entity_type = 2;
+}
+
+message SkillCastEvent
+{
+    uint64 caster_id = 1;
+    uint64 target_id = 2;
+    uint32 skill_id  = 3;
+}
+
+message BuffAppliedEvent
+{
+    uint64 target_id = 1;
+    uint32 buff_id   = 2;
+}
+
+message BuffExpiredEvent
+{
+    uint64 target_id = 1;
+    uint32 buff_id   = 2;
+}
