@@ -1,6 +1,7 @@
 #include "DasCommonModule.h"
 #include "Common/Log/Log.h"
 #include "Proto/AutoGen/EMsgIDBind.gen.h"
+#include "Proto/AutoGen/MsgTypeRegistry.gen.h"
 #include "daScript/ast/ast.h"
 #include "daScript/daScript.h"
 #include "daScript/simulate/debug_info.h"
@@ -134,6 +135,14 @@ namespace MMO
 
         // EMsgID 枚举绑定——全局共享 ID 值空间，所有服务 require Common 即可引用
         RegisterEMsgIDEnumeration(*this);
+
+        // 消息宏命名查表（ScriptLayer_06 §3.1：命名约定单一真相源）
+        // 消息类型名 → EMsgID 值。绑定在 Common（[msg_handler] 宏 MsgHandlerRegistry.das
+        // 只 require Common，宏 apply 的 macroContext 里可见）。
+        // 纯查询（SideEffects::none）；cppName 全限定（AOT 发射需要）。
+        das::addExtern<DAS_BIND_FUN(MMO::Script::MsgTypeToID)>(
+            *this, lib, "MsgTypeToID", das::SideEffects::none, "MMO::Script::MsgTypeToID")
+            ->args({"typeName"});
 
         // 脚本侧强类型 EntityID（ManagedValueAnnotation 值类型）——脚本拿 EntityID 而非裸 uint64，
         // 与 sessionID/accountID 强区分（官方 dasUnitTest EntityId 同款范式）

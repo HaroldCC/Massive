@@ -1,8 +1,11 @@
 #include "WorldScriptModule.h"
 
+#include "World/AutoGen/EventTypeRegistry.gen.h"
 #include "World/AutoGen/GameEventBindings.gen.h"
 #include "World/AutoGen/ProtoBindIndex.gen.h"
 #include "World/DasModule/WorldBridge.h"
+// addExtern/DAS_BIND_FUN 模板定义在 ast_interop.h（DasCommonModule 经 daScript.h 引入）
+#include "daScript/daScript.h"
 
 namespace MMO
 {
@@ -17,6 +20,12 @@ namespace MMO
         RegisterAllGameEventBindings(*this, lib);
         // 注册 Bridge 实体操作绑定（脚本读/写组件）
         RegisterWorldBridge(*this, lib);
+        // 事件宏命名查表（ScriptLayer_06 §3.1：命名约定单一真相源）
+        // 事件类型（EGameEventType）绑在 world 模块，[game_event] 宏 require world 可见。
+        // 纯查询（SideEffects::none）；cppName 全限定（AOT 发射需要）。
+        das::addExtern<DAS_BIND_FUN(MMO::Script::EventTypeToID)>(
+            *this, lib, "EventTypeToID", das::SideEffects::none, "MMO::Script::EventTypeToID")
+            ->args({"typeName"});
     }
 
     das::ModuleAotType WorldScriptModule::aotRequire(das::TextWriter &tw) const
@@ -26,6 +35,8 @@ namespace MMO
         tw << "#include \"World/AutoGen/ProtoBindIndex.gen.h\"\n";
         // 事件类型（GameEventEnvelope / *Event / EGameEventType）
         tw << "#include \"World/AutoGen/GameEventBindings.gen.h\"\n";
+        // 事件宏命名查表（宏 apply 调用 EventTypeToID）
+        tw << "#include \"World/AutoGen/EventTypeRegistry.gen.h\"\n";
         tw << "#include \"ScriptEngine/GameEventBus.h\"\n";
         // Bridge 实体操作（脚本调 EntityGetPosition 等）
         tw << "#include \"World/DasModule/WorldBridge.h\"\n";

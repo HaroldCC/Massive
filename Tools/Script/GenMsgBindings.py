@@ -957,6 +957,172 @@ def event_msg_to_enum(event_msg_name: str) -> str:
     return "GAME_EVENT" + snake.upper()
 
 
+# ═══════════════════════════════════════════════════════════════
+# TypeNameRegistry 查表生成器（ScriptLayer_06 §3.1：命名约定单一真相源）
+# ──
+# 产出 MsgTypeToID(name)→EMsgID 值 / EventTypeToID(name)→EGameEventType 值。
+# 分层（宏 apply 的 macroContext 可见性约束）：
+#   · MsgTypeToID   → 公共层（Src/Proto/AutoGen，绑 Common）——[msg_handler] 宏
+#                     （MsgHandlerRegistry.das）只 require Common，宏 apply 能看到。
+#   · EventTypeToID → 服务层（cpp_out，绑 world）——[game_event] 宏
+#                     （GameEventRegistry.das）require world，宏 apply 能看到。
+# 宏 apply() 直接查表，das 侧零命名规则。未注册返回 -1（哨兵，ID 必须为正 int32）。
+# ═══════════════════════════════════════════════════════════════
+
+def generate_msg_type_registry_h() -> str:
+    lines = [
+        "/**",
+        " * @file MsgTypeRegistry.gen.h",
+        " * @brief 自动生成文件——消息宏命名查表（命名约定单一真相源，ScriptLayer_06 §3.1）",
+        " *",
+        " * 生成工具: Tools/Script/GenMsgBindings.py",
+        " * @warning 不要手动编辑——新增 proto 消息后重新生成",
+        " */",
+        "#pragma once",
+        "",
+        "#include <cstdint>",
+        "",
+        "namespace MMO::Script",
+        "{",
+        "    /**",
+        "     * @brief 消息类型名 → EMsgID 值",
+        "     * @param typeName 脚本侧 handle 类型名（如 \"MoveReq\"）",
+        "     * @return EMsgID 值（正 int32）；未注册返回 -1（哨兵）",
+        "     */",
+        "    int64_t MsgTypeToID(const char *typeName);",
+        "} // namespace MMO::Script",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def generate_msg_type_registry_cpp(req_msg_names: list[str],
+                                   msg_id_entries: list[tuple[str, int]]) -> str:
+    """生成 MsgTypeToID 实现（绑 Common，公共层）。
+
+    req_msg_names  —— 全部 *Req 消息名（MoveReq 等）
+    msg_id_entries —— EMsgID 枚举 [(名, 值), ...]
+    """
+    # 消息名 → 枚举值：按命名约定 camel_to_msg_id，查 EMsgID 枚举值
+    msg_id_by_name: dict[str, int] = {}
+    for name in req_msg_names:
+        enum_name = camel_to_msg_id(name)  # MoveReq → MSG_MOVE_REQ
+        for en, ev in msg_id_entries:
+            if en == enum_name:
+                msg_id_by_name[name] = ev
+                break
+
+    lines = [
+        "/**",
+        " * @file MsgTypeRegistry.gen.cpp",
+        " * @brief 自动生成文件——消息宏命名查表（命名约定单一真相源，ScriptLayer_06 §3.1）",
+        " *",
+        " * 生成工具: Tools/Script/GenMsgBindings.py",
+        " * @warning 不要手动编辑——新增 proto 消息后重新生成",
+        " */",
+        '#include "MsgTypeRegistry.gen.h"',
+        "",
+        "#include <MsgID.pb.h>",
+        "",
+        "#include <string>",
+        "#include <unordered_map>",
+        "",
+        "namespace MMO::Script",
+        "{",
+        "    int64_t MsgTypeToID(const char *typeName)",
+        "    {",
+        "        static const std::unordered_map<std::string, int64_t> table = {",
+    ]
+    for name, value in sorted(msg_id_by_name.items()):
+        lines.append(f'            {{ "{name}", static_cast<int64_t>({PROTO_NS}::{camel_to_msg_id(name)}) }},')
+    lines += [
+        "        };",
+        "        auto it = table.find(nullptr != typeName ? typeName : \"\");",
+        "        return it == table.end() ? -1 : it->second;",
+        "    }",
+        "} // namespace MMO::Script",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def generate_event_type_registry_h() -> str:
+    lines = [
+        "/**",
+        " * @file EventTypeRegistry.gen.h",
+        " * @brief 自动生成文件——事件宏命名查表（命名约定单一真相源，ScriptLayer_06 §3.1）",
+        " *",
+        " * 生成工具: Tools/Script/GenMsgBindings.py",
+        " * @warning 不要手动编辑——新增 proto 事件后重新生成",
+        " */",
+        "#pragma once",
+        "",
+        "#include <cstdint>",
+        "",
+        "namespace MMO::Script",
+        "{",
+        "    /**",
+        "     * @brief 事件类型名 → EGameEventType 值",
+        "     * @param typeName 脚本侧 handle 类型名（如 \"EntityDamagedEvent\"）",
+        "     * @return EGameEventType 值（正 int32）；未注册返回 -1（哨兵）",
+        "     */",
+        "    int64_t EventTypeToID(const char *typeName);",
+        "} // namespace MMO::Script",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def generate_event_type_registry_cpp(event_msg_names: list[str],
+                                     event_enum_values: list[tuple[str, int]]) -> str:
+    """生成 EventTypeToID 实现（绑 world，服务层）。
+
+    event_msg_names  —— 全部 *Event 消息名（EntityDamagedEvent 等）
+    event_enum_values—— EGameEventType 枚举 [(名, 值), ...]
+    """
+    # 事件名 → 枚举值：event_msg_to_enum，查 EGameEventType 枚举值
+    ev_id_by_name: dict[str, int] = {}
+    for name in event_msg_names:
+        enum_name = event_msg_to_enum(name)  # EntityDamagedEvent → GAME_EVENT_ENTITY_DAMAGED
+        for en, ev in event_enum_values:
+            if en == enum_name:
+                ev_id_by_name[name] = ev
+                break
+
+    lines = [
+        "/**",
+        " * @file EventTypeRegistry.gen.cpp",
+        " * @brief 自动生成文件——事件宏命名查表（命名约定单一真相源，ScriptLayer_06 §3.1）",
+        " *",
+        " * 生成工具: Tools/Script/GenMsgBindings.py",
+        " * @warning 不要手动编辑——新增 proto 事件后重新生成",
+        " */",
+        '#include "World/AutoGen/EventTypeRegistry.gen.h"',
+        "",
+        "#include <GameEvent.pb.h>",
+        "",
+        "#include <string>",
+        "#include <unordered_map>",
+        "",
+        "namespace MMO::Script",
+        "{",
+        "    int64_t EventTypeToID(const char *typeName)",
+        "    {",
+        "        static const std::unordered_map<std::string, int64_t> table = {",
+    ]
+    for name, value in sorted(ev_id_by_name.items()):
+        lines.append(f'            {{ "{name}", static_cast<int64_t>({PROTO_NS}::{event_msg_to_enum(name)}) }},')
+    lines += [
+        "        };",
+        "        auto it = table.find(nullptr != typeName ? typeName : \"\");",
+        "        return it == table.end() ? -1 : it->second;",
+        "    }",
+        "} // namespace MMO::Script",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def generate_game_event_bindings_h(event_msgs: list[MessageInfo]) -> str:
     lines = [
         "/**",
@@ -1226,6 +1392,23 @@ def main():
         (emsgid_out / "EMsgIDBind.gen.cpp").write_text(
             generate_emsgid_bind_cpp(msg_id_entries0), encoding="utf-8")
         print(f"  生成: {emsgid_out / 'EMsgIDBind.gen.cpp'}")
+
+        # 消息宏命名查表（ScriptLayer_06 §3.1）——MsgTypeToID 绑 Common，需在 ScriptEngine 前就绪。
+        # 与 EMsgIDBind 同源：扫描公共层 proto 的 *Req 消息名 → EMsgID 值。
+        # 只扫公共层（MsgID.proto 排外）；服务专属消息由服务层完整流程追加（见下）。
+        req_names0: list[str] = []
+        for pf in sorted(proto_dir.glob("*.proto")):
+            if pf.name == "MsgID.proto":
+                continue
+            info = parse_proto_file(pf)
+            req_names0 += [m.name for m in info.messages if m.name.endswith("Req")]
+        if req_names0:
+            (emsgid_out / "MsgTypeRegistry.gen.h").write_text(
+                generate_msg_type_registry_h(), encoding="utf-8")
+            print(f"  生成: {emsgid_out / 'MsgTypeRegistry.gen.h'}")
+            (emsgid_out / "MsgTypeRegistry.gen.cpp").write_text(
+                generate_msg_type_registry_cpp(req_names0, msg_id_entries0), encoding="utf-8")
+            print(f"  生成: {emsgid_out / 'MsgTypeRegistry.gen.cpp'}")
     if args.only_emsgid:
         print("\n✅ EMsgID 绑定生成完成（--only-emsgid）")
         return
@@ -1281,12 +1464,12 @@ def main():
     # 4.5 GameEvent 绑定（ECS_06 决策 3：类型化事件自动绑定）
     #     生成 GameEventBindings.gen.{h,cpp} 到 cpp_out（World/AutoGen）
     event_msgs = collect_game_events(proto_files)
+    # 从 GameEvent.proto 的 enum EGameEventType 解析真实值（含 GAME_EVENT_NONE=0），
+    # 传给生成器——避免按消息顺序硬编码导致中间插值错位。
+    game_event_proto = proto_files.get("GameEvent.proto")
+    event_enum_values = (game_event_proto.enums.get("EGameEventType")
+                         if game_event_proto else None) or []
     if event_msgs:
-        # 从 GameEvent.proto 的 enum EGameEventType 解析真实值（含 GAME_EVENT_NONE=0），
-        # 传给生成器——避免按消息顺序硬编码导致中间插值错位。
-        game_event_proto = proto_files.get("GameEvent.proto")
-        event_enum_values = (game_event_proto.enums.get("EGameEventType")
-                             if game_event_proto else None) or []
         (cpp_out / "GameEventBindings.gen.h").write_text(
             generate_game_event_bindings_h(event_msgs), encoding="utf-8")
         print(f"  生成: {cpp_out / 'GameEventBindings.gen.h'} ({len(event_msgs)} 个事件)")
@@ -1295,6 +1478,37 @@ def main():
         print(f"  生成: {cpp_out / 'GameEventBindings.gen.cpp'}")
     else:
         print("  ⚠️  未找到 GameEvent.proto 的 *Event 消息，跳过事件绑定生成")
+
+    # 4.6 宏命名查表（ScriptLayer_06 §3.1：命名约定单一真相源）
+    #     宏 apply() 查「类型名→枚举值」，das 侧零命名规则，-1 = 未注册。
+    #     分层：MsgTypeToID（消息，绑 Common）→ 公共层 emsgid_out；
+    #           EventTypeToID（事件，绑 world）→ 服务层 cpp_out。
+    req_msg_names = [m.name for info in closure for m in info.messages if m.name.endswith("Req")]
+    if req_msg_names:
+        # MsgTypeToID —— 公共层（[msg_handler] 宏只 require Common，宏 apply 可见）
+        msg_reg_out = Path(args.emsgid_out) if args.emsgid_out else proto_dir / "AutoGen"
+        msg_reg_out.mkdir(parents=True, exist_ok=True)
+        (msg_reg_out / "MsgTypeRegistry.gen.h").write_text(
+            generate_msg_type_registry_h(), encoding="utf-8")
+        print(f"  生成: {msg_reg_out / 'MsgTypeRegistry.gen.h'}")
+        (msg_reg_out / "MsgTypeRegistry.gen.cpp").write_text(
+            generate_msg_type_registry_cpp(req_msg_names, msg_id_entries), encoding="utf-8")
+        print(f"  生成: {msg_reg_out / 'MsgTypeRegistry.gen.cpp'}")
+    else:
+        print("  ⚠️  无 *Req 消息，跳过 MsgTypeRegistry 生成")
+
+    if event_msgs:
+        # EventTypeToID —— 服务层（[game_event] 宏 require world，宏 apply 可见）
+        event_msg_names = [m.name for m in event_msgs]
+        (cpp_out / "EventTypeRegistry.gen.h").write_text(
+            generate_event_type_registry_h(), encoding="utf-8")
+        print(f"  生成: {cpp_out / 'EventTypeRegistry.gen.h'}")
+        (cpp_out / "EventTypeRegistry.gen.cpp").write_text(
+            generate_event_type_registry_cpp(event_msg_names, event_enum_values),
+            encoding="utf-8")
+        print(f"  生成: {cpp_out / 'EventTypeRegistry.gen.cpp'}")
+    else:
+        print("  ⚠️  无 *Event 消息，跳过 EventTypeRegistry 生成")
 
     # 5. 清理旧 das 产物——仅当显式传 --purge-legacy-das（已完成手写迁移）时执行。
     #    默认不删：否则一次普通构建/测试就会删掉尚在使用的 HandlerRegistry.das。

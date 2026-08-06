@@ -8,9 +8,10 @@ rule("gen_emsgid_bind")
         local protoDir   = path.join(os.projectdir(), "Src/Proto")
         local genScript  = path.join(os.projectdir(), "Tools/Script/GenMsgBindings.py")
         local emsgidCpp  = path.join(protoDir, "AutoGen", "EMsgIDBind.gen.cpp")
+        local msgRegCpp  = path.join(protoDir, "AutoGen", "MsgTypeRegistry.gen.cpp")
 
         -- 兜底：文件缺失才补生成（正常路径由 Proto 的 proto_msgid rule 已生成）
-        if not os.isfile(emsgidCpp) then
+        if not os.isfile(emsgidCpp) or not os.isfile(msgRegCpp) then
             os.vrunv("python", {genScript, "--only-emsgid", "--service", "world",
                                 "--proto-dir", protoDir,
                                 "--cpp-out", path.join(protoDir, "AutoGen"),
@@ -20,6 +21,8 @@ rule("gen_emsgid_bind")
 
         -- 纳入编译（always_added 兜底：若上述生成因 MsgID.proto 未就绪而跳过，编译期也不报文件缺失）
         target:add("files", emsgidCpp, {always_added = true})
+        -- 消息宏命名查表（ScriptLayer_06 §3.1）——与 EMsgIDBind 同源，公共层
+        target:add("files", msgRegCpp, {always_added = true})
     end)
 
 target("ScriptEngine")
