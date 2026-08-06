@@ -25,67 +25,10 @@ require daslib.templates_boost
 
 require Common
 require world     // WorldScriptModule：EGameEventType 枚举 + 各 *Event 类型 + GameEventEnvelope
+require MacroCommon
 
 // 事件分发表：type → handler(ev : void?)，宏注入类型化转换
 var g_EventRegistry : table<uint16, function<(ev : void?) : void>>
-
-// ── 名称转换：EntityDamagedEvent → GAME_EVENT_ENTITY_DAMAGED ──
-
-def private ToUpperChar(c : int) : uint8
-{
-    if (c >= int('a') && c <= int('z'))
-    {
-        return uint8(c - int('a') + int('A'));
-    }
-    return uint8(c);
-}
-
-def private IsUpper(c : int) : bool
-{
-    return c >= int('A') && c <= int('Z');
-}
-
-// EntityDamagedEvent → ENTITY_DAMAGED（驼峰 → 下划线大写）
-def private EventNameToSnake(name : string) : string
-{
-    var out : array<uint8>;
-    let n = length(name);
-    for (i in range(n))
-    {
-        let c = character_at(name, i)
-        if (i > 0 && IsUpper(c))
-        {
-            let prev = character_at(name, i - 1);
-            var insert = false;
-            if (!IsUpper(prev))
-            {
-                insert = true;
-            }
-            elif (i + 1 < n && !IsUpper(character_at(name, i + 1)))
-            {
-                insert = true;
-            }
-            if (insert)
-            {
-                out |> push(uint8('_'));
-            }
-        }
-        out |> push(ToUpperChar(c));
-    }
-    return string(out);
-}
-
-// EntityDamagedEvent → GAME_EVENT_ENTITY_DAMAGED
-def private EventTypeNameToEnum(typeName : string) : string
-{
-    // 去 "Event" 后缀
-    var short = typeName
-    if (length(typeName) >= 5 && typeName |> slice(length(typeName) - 5) == "Event")
-    {
-        short = typeName |> slice(0, length(typeName) - 5)
-    }
-    return "GAME_EVENT_" + EventNameToSnake(short)
-}
 
 [function_macro(name="game_event")]
 class GameEventHandlerAnnotation : AstFunctionAnnotation
@@ -94,53 +37,39 @@ class GameEventHandlerAnnotation : AstFunctionAnnotation
                        args : AnnotationArgumentList, var errors : das_string) : bool
     {
         // 签名: (ev : <Type>Event)——第一个参数类型即事件类型
-        if (length(func.arguments) < 1)
+        if (!MacroCommon::CheckArgCount(func, 1))
         {
             errors := "[game_event] 需要至少一个参数: (ev : <事件类型>)"
             return false
         }
 
-        let evType = func.arguments[0]._type
-        if (evType.baseType != Type.tHandle || evType.annotation == null)
+        // 取事件类型名（空串 = 非 handle）
+        let evTypeName = MacroCommon::GetHandleArgType(func, 0)
+        if (empty(evTypeName))
         {
             errors := "[game_event] 参数必须是事件类型（如 ev : EntityDamagedEvent）"
             return false
         }
+        // evType：用于 $t() 类型 splice 的 TypeDecl（取原始第 0 参类型）
+        let evType = func.arguments[0]._type
 
-        // 从类型名推导枚举名
-        let evTypeName = string(evType.annotation.name)   // "EntityDamagedEvent"
-        let enumName   = EventTypeNameToEnum(evTypeName)  // "GAME_EVENT_ENTITY_DAMAGED"
-
-        // 查 world 模块的 EGameEventType 枚举
-        let cmod = find_compiling_module("world")
-        if (cmod == null)
+        // 查表（命名约定单一真相源）——EventTypeToID 由生成器从 GameEvent.proto 产出，
+        //   -1 = 事件类型拼错或 proto 未定义（替代手写 EventTypeNameToEnum + 枚举遍历 typo 防护）。
+        //   绑定在 world 模块（EventTypeRegistry.gen.cpp），宏 apply 直接调用。
+        let id = EventTypeToID(evTypeName)
+        if (id < 0)
         {
-            errors := "[game_event] 未找到 world 模块——handler 文件需 require world"
+            errors := "[game_event] 事件类型 {evTypeName} 不在 GameEvent.proto——检查命名或重新生成绑定"
             return false
         }
-        let enu = module_find_enumeration(cmod, "EGameEventType")
-        if (enu == null)
-        {
-            errors := "[game_event] world 模块未绑定 EGameEventType 枚举"
-            return false
-        }
+        let evID = uint16(id)   // ⚠️ 只有 id >= 0 才到这里（哨兵 -1 已拦截）
 
-        // typo 防护：确认枚举成员存在
-        var found = false
-        for (e in enu.list)
+        // 编译期查重——同一事件被二次注册 → 编译报错
+        if (!MacroCommon::RegisterID("evt", id, string(func.name)))
         {
-            if (e.name == enumName)
-            {
-                found = true
-                break
-            }
-        }
-        if (!found)
-        {
-            errors := "[game_event] 事件类型 {evTypeName} 推导出的 {enumName} 不在 EGameEventType 中——检查命名或 GameEvent.proto"
+            errors := "[game_event] 事件 {evTypeName} 已被另一个 handler 注册——一个事件只能有一个脚本 handler"
             return false
         }
-        let evID = uint16(find_enum_value(enu, enumName))
 
         // 注入注册代码到 [init]：运行期从 void? payload reinterpret 出类型化事件再调用 handler
         var initBlk <- setup_call_list("game_event`init", func.at, true, true)

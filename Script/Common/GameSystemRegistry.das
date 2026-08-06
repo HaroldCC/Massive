@@ -24,6 +24,7 @@ require daslib.strings_boost
 require daslib.templates_boost
 
 require Common
+require MacroCommon
 
 // 系统注册表：name → (dt)
 var g_SystemRegistry : table<string, function<(dt : float) : void>>
@@ -44,21 +45,34 @@ class GameSystemAnnotation : AstFunctionAnnotation
                        args : AnnotationArgumentList, var errors : das_string) : bool
     {
         // 参数: [game_system(interval = 1.0)] — 1 秒调一次
+        //   tFloat 接受（1.0）；tInt 报编译错（提示写 1.0）；缺失/0 保持每帧语义
         var interval = 0.0
         let arg = find_arg(args, "interval")
-        if (arg is tFloat)
+        if (arg is tInt)
+        {
+            errors := "[game_system] interval 必须是 float 字面量（如 1.0），写整型 {arg} 会被当作每帧——请改为 {arg}.0"
+            return false
+        }
+        elif (arg is tFloat)
         {
             interval = arg as tFloat
         }
 
         // 签名: (dt : float)
-        if (length(func.arguments) < 1 || func.arguments[0]._type.baseType != Type.tFloat)
+        if (!MacroCommon::CheckFirstArgIsFloat(func))
         {
             errors := "[game_system] 需要参数: (dt : float)"
             return false
         }
 
+        // 系统名查重（sys 键空间）——系统名必须唯一
         let name = string(func.name)
+        if (!MacroCommon::RegisterSys("sys", name))
+        {
+            errors := "[game_system] 系统 {name} 已被另一个系统注册——系统名必须唯一"
+            return false
+        }
+
         // interval 是宏期 var float——直接构造 ExprConstFloat 表达式嵌入
         let intervalExpr = new ExprConstFloat(at = func.at, value = interval)
         var initBlk <- setup_call_list("game_system`init", func.at, true, true)

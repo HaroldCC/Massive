@@ -10,57 +10,9 @@ require daslib.strings_boost
 require daslib.templates_boost // $c 模板名解析需要
 
 require Common
+require MacroCommon
 
 var g_HandlerRegistry : table<uint, function<(sessionID : uint, msgPtr : void?) : void>>
-
-// 由消息体转换消息ID
-def private MsgNameToMsgID(name : string) : string
-{
-    var out : array<uint8>;
-    let n = length(name);
-    for (i in range(n))
-    {
-        let c = character_at(name, i)
-        if (i > 0 && IsUpper(c))
-        {
-            let prev = character_at(name, i - 1);
-            var insert = false;
-
-            if (!IsUpper(prev))
-            {
-                insert = true;
-            }
-            elif (i + 1 < n && !IsUpper(character_at(name, i + 1)))
-            {
-                insert = true;
-            }
-
-            if (insert)
-            {
-                out |> push(uint8('_'));
-            }
-        }
-
-        out |> push(ToUpperChar(c));
-    }
-
-    return "MSG_" + string(out);
-}
-
-def private IsUpper(c : int) : bool
-{
-    return c >= int('A') && c <= int('Z');
-}
-
-def private ToUpperChar(c : int) : uint8
-{
-    if (c >= int('a') && c <= int('z'))
-    {
-        return uint8(c - int('a') + int('A'));
-    }
-
-    return uint8(c);
-}
 
 [function_macro(name="msg_handler")]
 class MsgHandlerAnnotation : AstFunctionAnnotation
@@ -69,53 +21,41 @@ class MsgHandlerAnnotation : AstFunctionAnnotation
                        args : AnnotationArgumentList, var errors : das_string) : bool
     {
         // 步骤 1: 签名至少 (sessionID : uint; req : <Msg>)
-        if (length(func.arguments) < 2) {
+        if (!MacroCommon::CheckArgCount(func, 2)) {
             errors := "[msg_handler] 函数至少需要两个参数: (sessionID : uint; req : <消息类型>)"
             return false
         }
 
-        if (func.arguments[0]._type.baseType != Type.tUInt || func.arguments[0]._type.fixedDim != 0) {
+        if (!MacroCommon::CheckFirstArgIsUInt(func)) {
             errors := "[msg_handler] 第一个参数必须是 sessionID : uint"
             return false
         }
 
         // 步骤 2: 第二个参数必须是消息类型（handled type），取类型名
-        let msgType = func.arguments[1]._type
-        if (msgType.baseType != Type.tHandle || msgType.annotation == null) {
+        //   返回空串表示非 handle（类型名不可能为空）
+        let msgTypeName = MacroCommon::GetHandleArgType(func, 1)
+        if (empty(msgTypeName)) {
             errors := "[msg_handler] 第二个参数必须是消息类型（如 req : MoveReq），实际不是 handled type"
             return false
         }
-        let msgTypeName = string(msgType.annotation.name)   // "MoveReq"
-        let msgIdName   = MsgNameToMsgID(msgTypeName)       // "MSG_MOVE_REQ"
+        // msgType：用于 $t() 类型 splice 的 TypeDecl（取原始第 1 参类型）
+        let msgType = func.arguments[1]._type
 
-        // 步骤 3: 定位 C++ 绑定的 EMsgID 枚举
-        //   EMsgID 是全局共享 ID 值空间，绑定在 Common 模块（DasCommonModule），
-        //   所有服务都 require Common。宏侧按约定从 Common 取。
-        let cmod = find_compiling_module("Common")
-        if (cmod == null) {
-            errors := "[msg_handler] 未找到 Common 模块——handler 文件需 require Common"
+        // 步骤 3: 查表（命名约定单一真相源）——MsgTypeToID 由生成器从 proto 产出，
+        //   -1 = 类型名拼错或 proto 未定义（替代手写 MsgNameToMsgID + 枚举遍历 typo 防护）。
+        //   绑定在 Common 模块（MsgTypeRegistry.gen.cpp），宏 apply 直接调用。
+        let id = MsgTypeToID(msgTypeName)
+        if (id < 0) {
+            errors := "[msg_handler] 消息类型 {msgTypeName} 不在 MsgID.proto——检查命名或重新生成绑定"
             return false
         }
-        let enu = module_find_enumeration(cmod, "EMsgID")
-        if (enu == null) {
-            errors := "[msg_handler] Common 模块未绑定 EMsgID 枚举"
+        let msgID = uint(id)   // ⚠️ 只有 id >= 0 才到这里（哨兵 -1 已拦截）
+
+        // 步骤 4: 编译期查重——同一消息 ID 被二次注册 → 编译报错（替代运行期静默覆盖）
+        if (!MacroCommon::RegisterID("msg", id, string(func.name))) {
+            errors := "[msg_handler] 消息 {msgTypeName} 已被另一个 handler 注册——一个消息只能有一个脚本 handler"
             return false
         }
-
-        // 步骤 4: typo 防护——必须先确认成员存在（find_enum_value 未命中返回 0，与 MSG_NONE=0 无法区分）
-        var found = false
-        for (e in enu.list) {
-            if (e.name == msgIdName) {
-                found = true
-                break
-            }
-        }
-
-        if (!found) {
-            errors := "[msg_handler] 消息类型 {msgTypeName} 推导出的 {msgIdName} 不在 EMsgID 中——检查命名或 .proto 是否存在对应 *Req"
-            return false
-        }
-        let msgID = uint(find_enum_value(enu, msgIdName))
 
         // 步骤 5: 注入注册代码到 [init] 块——运行期 context 才会执行
         //   apply() 在编译期 macroContext 运行，直接改全局只影响宏 context；
