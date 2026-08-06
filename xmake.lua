@@ -52,11 +52,44 @@ rule("Rules.das_aot")
         local service = target:extraconf("rules", "Rules.das_aot", "service") or "world"
         local entry = target:extraconf("rules", "Rules.das_aot", "entry") or (service .. "/main.das")
         local aotDir = path.join(target:autogendir(), "aot")
-        -- 多入口：服务入口 + 各分发/注册模块（其 [export] 分发函数跨模块，需单独 AOT）。
+        -- 多入口：服务入口 + 各分发/注册模块（其 [export] 分发函数跨模块，需单独 AOT）
+        --   + 自动扫描含注册宏注解的 handler 文件（ScriptLayer_07 Step 5）：
+        --     未来新增 handler 文件若不在 AOT 批次，注册代码会静默解释执行
+        --     （fail_on_no_aot=false）。扫描 Script/**/*.das，命中注解即视为 handler 文件。
         local dasRoot = path.join(os.projectdir(), "Script")
         local entries = { entry }
         table.join2(entries, target:extraconf("rules", "Rules.das_aot", "extra_aot") or {})
+        for _, f in ipairs(os.files(path.join(dasRoot, "**/*.das"))) do
+            local fp = io.open(f, "r")
+            if fp then
+                local content = fp:read("*a")
+                fp:close()
+                -- 逐行匹配行首注解（注释里的 [msg_handler] 等不算 handler 文件；
+                -- match 的 ^ 锚定文件头不跨行，须逐行扫）
+                local isHandler = false
+                for line in string.gmatch(content, "[^\r\n]+") do
+                    if line:match("^[ \t]*%[msg_handler%]")
+                       or line:match("^[ \t]*%[game_event%]")
+                       or line:match("^[ \t]*%[game_system%]") then
+                        isHandler = true
+                        break
+                    end
+                end
+                if isHandler then
+                    local rel = path.relative(f, dasRoot):gsub("\\", "/")
+                    table.insert(entries, rel)
+                end
+            end
+        end
+        -- 去重（main.das 既是 entry 又含 [msg_handler] 注解，会被扫描重复）
+        local seen, dedup = {}, {}
         for _, e in ipairs(entries) do
+            if not seen[e] then
+                seen[e] = true
+                table.insert(dedup, e)
+            end
+        end
+        for _, e in ipairs(dedup) do
             local outcpp = path.join(aotDir, e:gsub("[/\\]", "_"):gsub("%.das$", "") .. ".das.cpp")
             -- 注册进 sourcebatch（文件此刻可能尚未生成，always_added 允许）
             target:add("files", outcpp, {always_added = true})
@@ -82,6 +115,40 @@ rule("Rules.das_aot")
         local extra = target:extraconf("rules", "Rules.das_aot", "extra_aot") or {}
         local entries = { entry }
         table.join2(entries, extra)
+        -- 自动扫描含注册宏注解的 handler 文件（ScriptLayer_07 Step 5）：
+        --   与 on_config 同步，保证 list.txt 生成与 sourcebatch 注册一致。
+        for _, f in ipairs(os.files(path.join(dasRoot, "**/*.das"))) do
+            local fp = io.open(f, "r")
+            if fp then
+                local content = fp:read("*a")
+                fp:close()
+                -- 逐行匹配行首注解（注释里的 [msg_handler] 等不算 handler 文件；
+                -- match 的 ^ 锚定文件头不跨行，须逐行扫）
+                local isHandler = false
+                for line in string.gmatch(content, "[^\r\n]+") do
+                    if line:match("^[ \t]*%[msg_handler%]")
+                       or line:match("^[ \t]*%[game_event%]")
+                       or line:match("^[ \t]*%[game_system%]") then
+                        isHandler = true
+                        break
+                    end
+                end
+                if isHandler then
+                    local rel = path.relative(f, dasRoot):gsub("\\", "/")
+                    table.insert(entries, rel)
+                end
+            end
+        end
+        -- 去重（main.das 既是 entry 又含 [msg_handler] 注解，会被扫描重复）：
+        --   保留首次出现的顺序，去掉后续重复。
+        local seen, dedup = {}, {}
+        for _, e in ipairs(entries) do
+            if not seen[e] then
+                seen[e] = true
+                table.insert(dedup, e)
+            end
+        end
+        entries = dedup
 
         -- 依赖：入口脚本 + 整个 Script 目录（Handlers/MsgHandlerRegistry 等 require 闭包）
         --   + 绑定/proto 头（ProtoBindIndex.gen.h 等变化 → aotHash 漂移 → 必须重生成 .das.cpp，
